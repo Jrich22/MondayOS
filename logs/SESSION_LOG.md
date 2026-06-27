@@ -259,3 +259,47 @@ Implemented the first production-ready capability: `Monday.learn()` and `Monday.
 5. `Monday.task()` — wire `TaskManager.create()`, `list_active()`, `get()`
 6. `Monday.ask()` — integrate Brain + model call (requires integration layer)
 7. `KnowledgeStore.search()` — filter by type, tags, components (already supported; wire through `Monday.search()`)
+
+---
+
+## 2026-06-27 — Git Checkpoint
+
+### Checkpoint: "Sprint 1.2: implement knowledge capture and search"
+
+**Commit:** `67f1ef7`
+
+**Test results at commit:**
+- **217 passed**
+- **22 skipped** (documented placeholders for Sprint 1.3+)
+- **0 failures**
+
+**What is in this commit:**
+- `docs/MKS.md` — MondayOS Knowledge Specification v1.0 (formal product specification)
+- `docs/DECISIONS.md` — ADR-009: MKS as canonical contract before implementation
+- `knowledge/errors.py` — typed exception hierarchy
+- `knowledge/entry.py` — expanded CKO schema: 12 types, 5 lifecycle states, 13 relationship types, `Relationship` dataclass
+- `knowledge/parser.py` — YAML frontmatter parser; round-trips cleanly; forward-compat metadata passthrough
+- `knowledge/loader.py` — directory walker; silent skip on non-frontmatter files
+- `knowledge/index.py` — in-memory index with incremental `add()` and full `build()`
+- `knowledge/store.py` — Markdown backend: `add()`, `get()`, `search()`, `supersede()`, `list_all()`; sequence tracking in `.sequences.json`
+- `monday/api.py` — `Monday.learn()` and `Monday.search()` fully wired end-to-end
+- `tests/test_knowledge.py` — 64 tests, 0 skipped (complete coverage of entry model, parser, index, store)
+- `tests/test_monday.py` — 89 tests, 5 skipped (`ask` and `task` stubs deferred to future sprints)
+
+**What works:**
+- `Monday.learn()` — persists to `knowledge/{type}/{ID}.md`, publishes `KNOWLEDGE_ENTRY_CREATED` event, returns `LearnResponse` with assigned ID
+- `Monday.search()` — keyword search with title/tag/summary/body scoring, returns ranked results immediately after learn
+- `KnowledgeStore` boots from existing files on init — state survives restarts
+- `KnowledgeParser` round-trips serialize→parse cleanly
+- `TestEncapsulation` still passes — all 6 internal subsystems remain hidden
+
+**No technical debt introduced:**
+- All tests use isolated `tmp_path`; no test artifacts written to project directory
+- Backward-compat aliases `EntryType = KnowledgeType` and `EntryStatus = LifecycleStatus` preserve Sprint 1 contracts
+- `KnowledgeStore` decoupled from `EventBus` — `Monday` orchestrates cross-cutting concerns
+
+**Sprint 1.3 recommended scope:**
+1. `Monday.task()` — wire `TaskManager.create()`, `list_active()`, `get()`; publish task lifecycle events
+2. `Monday.search()` — expose type/tag/component filters via public API
+3. MKS validation layer — enforce VAL-001 through VAL-020 on every write
+4. `KnowledgeIndex.write_markdown_index()` — auto-generate `knowledge/index.md` after every write
