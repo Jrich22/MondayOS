@@ -1,77 +1,243 @@
-"""Knowledge store — primary read/write interface to the knowledge base."""
+"""Knowledge store — the only path to persisted knowledge entries."""
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
 from core.types import EntityId
-from knowledge.entry import EntryType, KnowledgeEntry
+from knowledge.entry import KnowledgeEntry, KnowledgeType, LifecycleStatus
+from knowledge.errors import KnowledgeConflictError, KnowledgeNotFoundError
+from knowledge.index import KnowledgeIndex
+from knowledge.loader import KnowledgeLoader
+from knowledge.parser import KnowledgeParser
+
+# Maps KnowledgeType to the subdirectory name under knowledge/
+_TYPE_DIRS: dict[KnowledgeType, str] = {
+    KnowledgeType.BUG: "bugs",
+    KnowledgeType.DECISION: "decisions",
+    KnowledgeType.TASK: "tasks",
+    KnowledgeType.SPRINT: "sprints",
+    KnowledgeType.FEATURE: "features",
+    KnowledgeType.LESSON: "lessons",
+    KnowledgeType.PATTERN: "patterns",
+    KnowledgeType.RUNBOOK: "runbooks",
+    KnowledgeType.DOCUMENTATION: "docs",
+    KnowledgeType.RESEARCH: "research",
+    KnowledgeType.WEATHER: "weather",
+    KnowledgeType.EXPERIMENT: "experiments",
+}
+
+# Maps KnowledgeType to the MKS ID prefix
+_TYPE_PREFIXES: dict[KnowledgeType, str] = {
+    KnowledgeType.BUG: "BUG",
+    KnowledgeType.DECISION: "DEC",
+    KnowledgeType.TASK: "TASK",
+    KnowledgeType.SPRINT: "SPR",
+    KnowledgeType.FEATURE: "FEA",
+    KnowledgeType.LESSON: "LES",
+    KnowledgeType.PATTERN: "PAT",
+    KnowledgeType.RUNBOOK: "RUN",
+    KnowledgeType.DOCUMENTATION: "DOC",
+    KnowledgeType.RESEARCH: "RES",
+    KnowledgeType.WEATHER: "WEA",
+    KnowledgeType.EXPERIMENT: "EXP",
+}
+
+_SEQUENCES_FILENAME = ".sequences.json"
 
 
 class KnowledgeStore:
     """
     Read/write interface to the MondayOS knowledge base.
 
-    The store is the only path through which knowledge entries are persisted
-    or retrieved. It abstracts the storage backend so callers never deal with
-    files, parsing, or index management directly.
+    Phase 1 uses a Markdown-on-disk backend: entries are YAML-frontmatter
+    Markdown files stored under knowledge/{type}/{ID}.md. An in-memory
+    KnowledgeIndex provides O(1) ID lookups and tag/component filtering.
 
-    Phase 1: Markdown files on disk (knowledge/{type}/ENTRY-ID.md).
-    Phase 2: SQLite index alongside the file store for fast full-text search.
+    Sequence numbers (per-type monotonic counters) are persisted to
+    knowledge/.sequences.json so IDs are stable across restarts.
 
-    TODO: Accept KnowledgeLoader and KnowledgeIndex as constructor arguments.
-    TODO: Implement add() — serialize entry, write file, rebuild index.
-    TODO: Implement get() — lookup in index, load file, parse via KnowledgeParser.
-    TODO: Implement search() — delegate to SearchEngine with source="knowledge".
-    TODO: Implement supersede() — write new entry, update old entry's status.
-    TODO: Publish KNOWLEDGE_ENTRY_CREATED / KNOWLEDGE_ENTRY_UPDATED to EventBus.
+    The StorageBackend protocol defined in MKS 1.0 Section 11 is the
+    migration path to SQLite, PostgreSQL, or Neo4j — swap the backend
+    in __init__ without changing KnowledgeStore's public interface.
     """
+
+    def __init__(self, project_root: Path = Path(".")) -> None:
+        self._knowledge_dir = project_root / "knowledge"
+        self._parser = KnowledgeParser()
+        self._loader = KnowledgeLoader(self._knowledge_dir)
+        self._index = KnowledgeIndex()
+        self._sequences: dict[str, int] = {}
+        self._sequences_path = self._knowledge_dir / _SEQUENCES_FILENAME
+        self._boot()
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     def add(self, entry: KnowledgeEntry) -> EntityId:
         """
-        Persist a new knowledge entry and rebuild the index.
+        Persist a new knowledge entry, assign its ID, and update the index.
 
-        Returns the entry's ID.
-        Raises KnowledgeConflictError if an entry with the same ID already exists.
-        Use supersede() to replace an existing entry.
+        The caller passes entry.id="" to let the store assign the ID.
+        Raises KnowledgeConflictError if a non-empty ID already exists.
         """
-        raise NotImplementedError("TODO: write entry to knowledge/{type}/{id}.md")
+        if entry.id and self._index.lookup(entry.id) is not None:
+            raise KnowledgeConflictError(entry.id)
+
+        entry.id = self._next_id(entry.entry_type)
+
+        if entry.updated_at is None:
+            entry.updated_at = entry.created_at
+        if not entry.updated_by:
+            entry.updated_by = entry.created_by
+
+        self._write_file(entry)
+        self._index.add(entry)
+        return entry.id
 
     def get(self, entry_id: EntityId) -> KnowledgeEntry:
         """
-        Retrieve an entry by ID.
+        Return an entry by ID.
 
         Raises KnowledgeNotFoundError if no entry with that ID exists.
         """
-        raise NotImplementedError("TODO: load and parse knowledge/{type}/{id}.md")
+        entry = self._index.lookup(entry_id)
+        if entry is None:
+            raise KnowledgeNotFoundError(entry_id)
+        return entry
 
     def search(
         self,
         query: str,
-        entry_type: EntryType | None = None,
+        entry_type: KnowledgeType | None = None,
         tags: list[str] | None = None,
         components: list[str] | None = None,
+        limit: int = 10,
     ) -> list[KnowledgeEntry]:
         """
-        Search for active entries matching the query.
+        Keyword search across ACTIVE entries. Results are ranked by score.
 
-        Only ACTIVE entries are returned. Results are ranked by relevance.
-        Optionally filtered by type, tags, or components.
+        Scoring (per query term):
+            +3.0  title match
+            +2.0  tag match
+            +1.0  summary match
+            +0.5  body match
 
-        TODO: Delegate to search.SearchEngine with source="knowledge".
+        Only ACTIVE entries are returned. Optionally filtered by type, tags,
+        or components before scoring.
         """
-        raise NotImplementedError("TODO: integrate with search.SearchEngine")
+        candidates = self._index.all_active()
+
+        if entry_type is not None:
+            candidates = [e for e in candidates if e.entry_type == entry_type]
+        if tags:
+            tag_set = {t.lower() for t in tags}
+            candidates = [e for e in candidates if tag_set & {t.lower() for t in e.tags}]
+        if components:
+            comp_set = set(components)
+            candidates = [e for e in candidates if comp_set & set(e.components)]
+
+        terms = query.lower().split()
+        if not terms:
+            return candidates[:limit]
+
+        scored: list[tuple[float, KnowledgeEntry]] = []
+        for entry in candidates:
+            score = _score_entry(entry, terms)
+            if score > 0.0:
+                scored.append((score, entry))
+
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return [entry for _, entry in scored[:limit]]
 
     def supersede(self, old_id: EntityId, new_entry: KnowledgeEntry) -> EntityId:
         """
         Replace an entry: mark the old one SUPERSEDED, persist the new one.
 
-        The old entry remains in storage with status=SUPERSEDED and
-        superseded_by set to the new entry's ID.
+        Raises KnowledgeNotFoundError if old_id does not exist.
         """
-        raise NotImplementedError
+        old = self.get(old_id)
 
-    def list_all(self, entry_type: EntryType | None = None) -> list[KnowledgeEntry]:
-        """
-        Return all active entries, optionally filtered by type.
+        new_id = self.add(new_entry)
 
-        Does not perform ranking. Use search() when relevance order matters.
-        """
-        raise NotImplementedError
+        # Mark the old entry as superseded
+        old.status = LifecycleStatus.SUPERSEDED
+        old.superseded_by = new_id
+        old.version += 1
+        old.updated_at = datetime.now(tz=timezone.utc)
+
+        self._write_file(old)
+        self._index.add(old)  # removes from ACTIVE secondary indexes, keeps in _by_id
+
+        return new_id
+
+    def list_all(self, entry_type: KnowledgeType | None = None) -> list[KnowledgeEntry]:
+        """Return all ACTIVE entries, optionally filtered by type."""
+        entries = self._index.all_active()
+        if entry_type is not None:
+            entries = [e for e in entries if e.entry_type == entry_type]
+        return entries
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _boot(self) -> None:
+        """Load existing entries from disk and build the in-memory index."""
+        self._load_sequences()
+        entries = self._loader.load_all()
+        self._index.build(entries)
+
+    def _load_sequences(self) -> None:
+        if self._sequences_path.exists():
+            try:
+                self._sequences = json.loads(
+                    self._sequences_path.read_text(encoding="utf-8")
+                )
+            except (json.JSONDecodeError, OSError):
+                self._sequences = {}
+        else:
+            self._sequences = {}
+
+    def _save_sequences(self) -> None:
+        self._knowledge_dir.mkdir(parents=True, exist_ok=True)
+        self._sequences_path.write_text(
+            json.dumps(self._sequences, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def _next_id(self, entry_type: KnowledgeType) -> EntityId:
+        prefix = _TYPE_PREFIXES[entry_type]
+        next_seq = self._sequences.get(prefix, 0) + 1
+        self._sequences[prefix] = next_seq
+        self._save_sequences()
+        return f"{prefix}-{next_seq:04d}"
+
+    def _write_file(self, entry: KnowledgeEntry) -> None:
+        type_dir = self._knowledge_dir / _TYPE_DIRS[entry.entry_type]
+        type_dir.mkdir(parents=True, exist_ok=True)
+        file_path = type_dir / f"{entry.id}.md"
+        file_path.write_text(self._parser.serialize(entry), encoding="utf-8")
+
+
+def _score_entry(entry: KnowledgeEntry, terms: list[str]) -> float:
+    """Score an entry against a list of lowercase query terms."""
+    score = 0.0
+    title_lower = entry.title.lower()
+    summary_lower = entry.summary.lower()
+    body_lower = entry.body.lower()
+    tags_lower = {t.lower() for t in entry.tags}
+
+    for term in terms:
+        if term in title_lower:
+            score += 3.0
+        if term in tags_lower:
+            score += 2.0
+        if term in summary_lower:
+            score += 1.0
+        if term in body_lower:
+            score += 0.5
+
+    return score

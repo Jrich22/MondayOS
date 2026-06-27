@@ -11,6 +11,52 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.0] — 2026-06-27 — Sprint 1.2: Knowledge Capture
+
+### Added
+- `knowledge/errors.py` — typed errors: `KnowledgeParseError`, `KnowledgeNotFoundError`, `KnowledgeConflictError`, `KnowledgeValidationError`
+- `KnowledgeType` enum — 12 types from MKS 1.0 (Bug, Decision, Task, Sprint, Feature, Lesson, Pattern, Runbook, Documentation, Research, Weather, Experiment)
+- `LifecycleStatus` enum — 5 lifecycle states (Draft, Active, Deprecated, Superseded, Archived)
+- `RelationType` enum — 13 typed relationship directions
+- `Relationship` dataclass — typed, directional link between entries
+- `KnowledgeParser` — parses Markdown + YAML frontmatter into `KnowledgeEntry`; serialize round-trips cleanly
+- `KnowledgeLoader` — walks knowledge directory; skips non-frontmatter files silently
+- `KnowledgeIndex` — in-memory index with `build()`, `add()`, `lookup()`, `by_type()`, `by_tag()`, `by_component()`, `all_active()`
+- `KnowledgeStore` — Markdown-on-disk backend: `add()`, `get()`, `search()`, `supersede()`, `list_all()`; ID sequence tracking via `.sequences.json`
+- `Monday.learn()` — end-to-end implementation: validates type, builds CKO, persists via `KnowledgeStore`, publishes `KNOWLEDGE_ENTRY_CREATED` event, returns `LearnResponse`
+- `Monday.search()` — keyword search across knowledge base; results include id, title, summary, entry_type, tags
+
+### Changed
+- `KnowledgeEntry` — aligned to MKS CKO schema: `created_at` (renamed from `created`), added `version`, `summary`, `created_by`, `updated_at`, `updated_by`, `relationships`, `type_fields`; `confidence` changed from `str` to `float` (default `1.0`)
+- `KnowledgeStore.__init__` — now accepts `project_root: Path`; loads existing entries on init
+- `Monday.__init__` — passes `project_root` to `KnowledgeStore`
+- `EntryType`, `EntryStatus` — preserved as backward-compat aliases for `KnowledgeType` and `LifecycleStatus`
+
+### Tests
+- `tests/test_knowledge.py` — 64 tests (0 skipped); covers entry model, relationships, index, parser (with round-trip), and store (with disk I/O via `tmp_path`)
+- `tests/test_monday.py` — 89 tests (5 skipped); `TestLearn` and `TestSearch` use isolated `tmp_path`; learn→search round-trip verified
+
+### Total test counts
+- **217 passed**, **22 skipped**, **0 failures**
+
+---
+
+## [0.2.1] — 2026-06-27 — Sprint 1.2 Pre-work: MKS
+
+### Added
+- `docs/MKS.md` — MondayOS Knowledge Specification v1.0; the canonical contract for all knowledge stored by MondayOS
+- ADR-009: Decision to establish MKS as the formal product specification before Sprint 1.2 implementation
+
+### Changed
+- `docs/KNOWLEDGE_SYSTEM.md` superseded by MKS 1.0 (retained for reference)
+
+### Notes
+- MKS defines 12 knowledge types (Bug, Decision, Task, Sprint, Feature, Lesson, Pattern, Runbook, Documentation, Research, Weather, Experiment)
+- MKS defines CKO base schema, ID rules, relationship graph model, lifecycle, versioning, 20 validation rules, and migration protocol across 5 storage backends
+- Implementation of Sprint 1.2 (`KnowledgeParser`, `KnowledgeLoader`, `KnowledgeIndex`, `KnowledgeStore`) begins after this checkpoint
+
+---
+
 ## [0.2.0] — 2026-06-27 — Sprint 1.1: Public API
 
 ### Added

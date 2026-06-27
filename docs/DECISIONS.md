@@ -257,3 +257,49 @@ Each `Monday` public method returns a dedicated typed dataclass: `AskResponse`, 
 - Adding a field to a response type is non-breaking (old callers ignore it).
 - Removing or renaming a field is a breaking change — reflected in a version bump.
 - The dataclass definitions establish the contract for future implementations before those implementations exist; tests can validate field presence and types before logic is wired up.
+
+---
+
+## ADR-009: MondayOS Knowledge Specification (MKS) as the Canonical Contract
+
+**Date:** 2026-06-27  
+**Status:** Accepted  
+**Deciders:** Lead Software Engineering
+
+### Context
+
+The `knowledge/` module was scaffolded in Sprint 1 with only four entry types (Bug, Decision, Pattern, Runbook) and no formal data model contract. Sprint 1.2 requires implementing `KnowledgeParser`, `KnowledgeLoader`, `KnowledgeIndex`, and `KnowledgeStore`. Without a formal specification, each implementation would make independent field decisions, leading to incompatible data and no migration path between storage backends.
+
+Additionally, MondayOS must support domain-specific knowledge beyond software engineering (weather observations, experiments) and complex cross-entry relationships (bugs leading to decisions leading to features). These requirements were not captured in the ad hoc KNOWLEDGE_SYSTEM.md v0.1.0 document.
+
+### Decision
+
+A formal product specification — the MondayOS Knowledge Specification (MKS) — is established as the canonical contract for all knowledge stored by MondayOS. The MKS defines:
+
+- The Canonical Knowledge Object (CKO) with all fields and their rationale
+- 12 knowledge types with required fields, optional fields, body structure, and validation rules
+- ID format and the type prefix registry
+- A first-class relationship model encoding a directed knowledge graph
+- The lifecycle state machine and valid transitions
+- Versioning rules and the supersession protocol
+- A `StorageBackend` protocol enabling transparent migration between Markdown, SQLite, PostgreSQL, Neo4j, and vector databases
+- A migration protocol that changes no public API
+
+Implementations are **non-conforming** if they do not satisfy MKS validation rules. KNOWLEDGE_SYSTEM.md v0.1.0 is superseded by MKS 1.0.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Expand KNOWLEDGE_SYSTEM.md informally | Produces documentation, not a contract; validation rules remain implicit; different implementers would make conflicting field decisions |
+| Define schema in Python code only | Code is the implementation, not the contract; changing the implementation would silently change the contract; no human-readable source of truth |
+| Adopt an existing knowledge schema (schema.org, etc.) | Too general; not aligned with software engineering and AI agent workflows; would require constant mapping overhead |
+
+### Consequences
+
+- All knowledge implementations (parser, loader, index, store) have an unambiguous field-by-field specification to conform to.
+- The `StorageBackend` protocol means the knowledge backend can be changed at any time without changing `KnowledgeStore`, `Monday`, or any caller above them.
+- Relationships are first-class in the data model from day one, making a future Neo4j migration a straight import rather than a data restructuring.
+- The 12-type catalogue can be extended by adding a new type to the MKS; no existing entries are invalidated.
+- Field-level validation rules (VAL-001 through VAL-020) give `KnowledgeParser` a clear acceptance test.
+- `knowledge/entry.py` must be updated to reflect all 12 types before Sprint 1.2 implementation begins.
