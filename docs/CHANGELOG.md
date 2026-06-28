@@ -11,6 +11,224 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.12.0] — 2026-06-28 — Sprint 1.11: AI Provider Layer
+
+### Added
+- `brain/providers/` subpackage — AI provider abstraction layer (no Architecture Freeze violation — covered by `brain*` glob in pyproject.toml)
+  - `base.py` — `AIProvider` ABC with `ask()`, `plan()`, `summarize()`, `review()` methods; `ProviderResponse` dataclass; `ProviderError` hierarchy (`ProviderAuthError`, `ProviderRateLimitError`, `ProviderUnavailableError`)
+  - `anthropic.py` — `AnthropicProvider` — Claude models via `anthropic` SDK; default model `claude-sonnet-4-6`; full error mapping
+  - `openai.py` — `OpenAIProvider` — GPT-* models via `openai` SDK; default model `gpt-4o-mini`; `base_url` override for Azure / LM Studio; full error mapping
+  - `ollama.py` — `OllamaProvider` — local models via Ollama REST API (`/api/chat`); no SDK dependency; default model `llama3`; default base URL `http://localhost:11434`
+  - `factory.py` — `ProviderConfig` dataclass (type, model, api_key, base_url, timeout, max_tokens, extra); `create_provider(config)` factory returning `AIProvider | None`
+  - `__init__.py` — clean public surface re-exporting all provider types
+- `brain/__init__.py` — exports `AIProvider`, `ProviderConfig`, `ProviderResponse`, `ProviderError` and subclasses, `create_provider`
+- `monday/config.py` — `MondayConfig.provider_config: ProviderConfig | None = None` field; optional, defaults to None (fully deterministic mode)
+- `monday/api.py` — `Monday.__init__` instantiates `self.__provider = create_provider(config.provider_config)`; `Monday.advise()` passes `provider=self.__provider` to `AdvisorEngine`
+- `advisor/engine.py` — `AdvisorEngine.__init__` accepts `provider: AIProvider | None = None`; `_enrich_advisory_with_ai(advisory)` method: runs deterministic synthesis first, then overlays AI-enriched sprint goal if provider available; confidence ceiling raised from 0.85 → 0.95 when AI enrichment succeeds; all provider errors silently swallowed (best-effort enrichment)
+- `tests/test_providers.py` — 54 tests across 9 test classes: `TestProviderResponse`, `TestProviderErrors`, `TestProviderConfig`, `TestCreateProviderFactory`, `TestAnthropicProvider`, `TestOpenAIProvider`, `TestOllamaProvider`, `TestMondayConfigProviderField`, `TestAdvisorAIEnrichment`
+
+### Design Decisions
+- **No provider-specific logic outside provider files** — `monday/api.py` and `advisor/engine.py` depend only on `AIProvider` / `ProviderConfig` from `brain.providers`; no SDK imports leak outside implementation modules
+- **Null provider = deterministic** — `Monday()` with no `provider_config` behaves identically to before; AI enrichment is an additive overlay
+- **Interchangeable via config** — changing `ProviderConfig(type=...)` is the only change needed to swap providers; no application code changes required
+- **Foundation for multi-agent orchestration** — provider abstraction supports future multi-agent workflows without coupling to any specific SDK
+
+### Changed
+- `brain/__init__.py` — re-exports all provider types; docstring updated with provider abstraction summary
+
+---
+
+## [0.11.0] — 2026-06-28 — Sprint 1.10: WeatherBot Onboarding (Project Management)
+
+### Added
+- `monday/project.py` — `ProjectRegistry` class (no new package — Architecture Freeze respected)
+  - `ProjectEntry` dataclass: name, source_path, description, registered_at; `to_dict()` / `from_dict()`
+  - `ProjectRegistry(config_dir)`: `register()`, `get()`, `list()`, `remove()`, `exists()`
+  - Registry persisted to `{mondayos_root}/config/projects.json`
+  - `ProjectAlreadyExistsError` / `ProjectNotFoundError` error types
+  - `overwrite=True` flag for re-registration
+- `Monday.project(action, name, path, description, overwrite)` — register, list, get, remove external projects; returns `ProjectResponse`
+- `Monday.onboard(project_name, reports_dir)` — full onboarding pipeline:
+  1. Look up project in registry
+  2. Create secondary `Monday` instance pointing at external project root
+  3. Run `migrate` — import project documentation into WeatherBot's knowledge store
+  4. Run `doctor` — health inspection of external project
+  5. Run `advise` — engineering advisory using external project's data
+  6. Generate comprehensive Markdown report at `{mondayos_root}/projects/{name}/ONBOARDING_REPORT.md`
+  7. Return `OnboardResponse` with health_score, sprint_goal, confidence, report_path, composite data
+- `ProjectResponse` dataclass — in `monday/types.py`; fields: action, success, project_name, data, message
+- `OnboardResponse` dataclass — in `monday/types.py`; fields: action, success, project_name, migrate_summary, health_score, grade, sprint_goal, confidence, report_path, data, message
+- `_generate_onboarding_report()` — pure function producing Markdown onboarding report with 9 sections answering all onboarding questions
+- CLI `monday project register <name> <path> [--description DESC] [--overwrite]`
+- CLI `monday project list`
+- CLI `monday project get <name>`
+- CLI `monday project remove <name>`
+- CLI `monday onboard <project_name> [--output DIR]` — runs full pipeline, prints summary, shows report path
+- WeatherBot external project at `/Users/jrich/AI-Labs/WeatherBot/` (v0.3.1):
+  - Python weather CLI — `client.py`, `models.py`, `cache.py`, `alerts.py`, `cli.py`
+  - Tests: `test_models.py`, `test_client.py`
+  - Documentation: `docs/CHANGELOG.md` (4 versions), `docs/DECISIONS.md` (5 ADRs), `docs/ROADMAP.md` (4 phases)
+  - 20 knowledge entries imported via `monday migrate`
+  - First production project managed entirely by MondayOS
+
+### Onboarding Report: WeatherBot
+Generated at `projects/weatherbot/ONBOARDING_REPORT.md`. Key findings:
+- Health Score: 100/100 (Excellent) — clean git, tests present, full documentation, valid config
+- Advisory Confidence: 55% — knowledge base populated but single-type entries (sprint/decision/feature only)
+- Knowledge base: 20 entries (7 feature, 5 decision, 4 documentation, 4 sprint)
+- Knowledge gaps: no pattern, lesson, bug, or runbook entries captured yet
+- Technical debt: 3 TODO/FIXME markers, no tracked bugs
+- Sprint goal: "Continue forward momentum" (no critical or high issues)
+- Recommended tasks: expand knowledge base with missing types; run `monday ask` to validate
+
+### Changed
+- `monday/__init__.py` — exports `ProjectResponse`, `OnboardResponse`
+- `monday/api.py` — imports `ProjectResponse`, `OnboardResponse`; `Monday.project()` and `Monday.onboard()` added; `_generate_onboarding_report()` helper added
+- `monday/cli.py` — `_register_project()`, `_register_onboard()`, `_cmd_project_register()`, `_cmd_project_list()`, `_cmd_project_get()`, `_cmd_project_remove()`, `_cmd_onboard()` added; `_build_parser()` registers both commands
+- `pyproject.toml` — re-installed editable package to register `advisor*` in editable finder mapping
+
+### Tests
+- `tests/test_project.py` — 43 tests across 5 test classes:
+  - `TestProjectEntry` (4 tests) — to_dict, from_dict, path property, missing field defaults
+  - `TestProjectRegistry` (14 tests) — register/get, persistence, duplicate error, overwrite, missing-path error, not-found error, list, remove, exists, cross-instance persistence
+  - `TestMondayProject` (9 tests) — register/list/get/remove actions, error cases, unknown action
+  - `TestMondayOnboard` (6 tests) — unknown project, missing path, success, report file written, all sections present, custom reports_dir, data keys
+  - `TestCLIProject` (6 tests) — register, list empty/with-entries, get found/not-found, remove
+  - `TestCLIOnboard` (3 tests) — unknown project error, success output, report path shown
+- **Total: 658 passed, 12 skipped, 0 failures**
+
+---
+
+## [0.10.0] — 2026-06-28 — Sprint 1.9: Engineering Advisor (monday advise)
+
+### Added
+- `advisor/` package — pure-data engineering advisory engine
+  - `advisor/advisory.py` — `Risk` dataclass (title, severity, category, impact, recommendation, source), `Action` dataclass (title, priority, category, rationale, effort, command), `Advisory` dataclass with `to_dict()` — complete structured advisory output
+  - `advisor/reasoning.py` — pure synthesis functions (no I/O, fully testable):
+    - `synthesize_risks(doctor_report, knowledge_entries, active_tasks)` — merges findings from Doctor, Knowledge Store, and Tasks into ranked Risk list; deduplicates by `category:title[:40]`; sorts critical → high → medium → low
+    - `synthesize_next_actions(risks, active_tasks, knowledge_entries, doctor_report, workflow_runs)` — 6-priority action ladder (fix-critical → unblock-blocked → compound-value → high-warnings → documentation → health-check); deduplicated, capped at 10, renumbered
+    - `synthesize_sprint_goal(risks, active_tasks, knowledge_entries)` — decision tree returning `(goal, rationale)`: criticals → urgent backlog → empty KB → blocked tasks → in-progress → healthy default
+    - `synthesize_debt(doctor_report, knowledge_entries)` — aggregates TODO markers, known bugs, deprecated entries, and failing tests
+    - `synthesize_knowledge_gaps(knowledge_entries, active_tasks)` — identifies missing entry types and task topics with no KB coverage; capped at 8
+    - `synthesize_documentation_gaps(doctor_report)` — extracts WARNING/CRITICAL documentation findings
+    - `summarize_repository(name, doctor_report, knowledge_entries, active_tasks, workflow_runs)` — template-based natural-language paragraph; no external model
+    - `compute_confidence(knowledge_entries, active_tasks, workflow_runs, doctor_ran_cleanly)` — scales 0.25 base → max 0.85; bonus for diverse KB types; never claims full certainty
+  - `advisor/engine.py` — `AdvisorEngine`: composes Doctor, KnowledgeStore, TaskManager, workflow logs; accepts pre-computed `DoctorReport` to avoid double-running; `_load_workflow_runs()` reads last 20 `logs/workflows/*.json`
+  - `advisor/__init__.py` — clean public exports
+- `Monday.advise(doctor_report=None)` — public API; lazy-imports `advisor`; returns `AdviseResponse`
+- `AdviseResponse` dataclass — in `monday/types.py`; fields: `action`, `success`, `confidence`, `sprint_goal`, `risks`, `next_actions`, `repository_summary`, `data`, `message`
+- CLI `monday advise [--json] [--brief]`
+  - Default: CTO-grade advisory report with confidence, health score, risks, next actions, sprint goal, debt summary, knowledge and documentation gaps
+  - `--json`: machine-readable full advisory (Advisory.to_dict())
+  - `--brief`: single-screen summary (sprint goal + top 3 actions + confidence)
+  - 64-column wrapped output with `═` major dividers and `─` section dividers
+
+### Changed
+- `monday/__init__.py` — exports `AdviseResponse`
+- `monday/api.py` — imports `AdviseResponse`; `Monday.advise()` method added
+- `monday/cli.py` — `_register_advise()`, `_cmd_advise()`, `_print_advisory()`, `_print_brief()`, `_wrap()`, `_thin()` added; `_build_parser()` registers advise command
+- `pyproject.toml` — `advisor*` added to `packages.find.include` and `coverage.run.source`
+
+### Tests
+- `tests/test_advisor.py` — tests across 12 test classes covering all reasoning functions, engine, Monday API, and CLI
+
+---
+
+## [0.9.0] — 2026-06-28 — Sprint 1.8: Repository Intelligence (monday doctor)
+
+### Added
+- `doctor/` package — pluggable repository health inspection engine
+  - `doctor/finding.py` — `Finding` dataclass, `Severity` enum (CRITICAL / WARNING / INFO / OK)
+  - `doctor/result.py` — `AnalyzerResult` dataclass, `DoctorReport` with `build()` factory, `_compute_health_score()` (deduction schedule: CRITICAL −15 each capped at 45, WARNING −5 each capped at 30), `_health_grade()` (Excellent / Good / Fair / Poor / Critical)
+  - `doctor/base.py` — `BaseAnalyzer` ABC: `NAME` class var, `analyze() → AnalyzerResult`
+  - `doctor/inspector.py` — `RepositoryInspector`: `available_analyzers()`, `run() → DoctorReport`; `_REGISTERED_ANALYZERS` list for pluggable discovery; exception isolation per analyzer
+  - `doctor/analyzers/git.py` — `GitAnalyzer`: repo presence (CRITICAL if missing), current branch, dirty tree (WARNING), recent commits, unpushed commits
+  - `doctor/analyzers/tests.py` — `TestAnalyzer`: test file count (CRITICAL if zero), `.pytest_cache` last-failed reading (CRITICAL if failures), clean run (OK), coverage configuration check — does not execute pytest
+  - `doctor/analyzers/code_quality.py` — `CodeQualityAnalyzer`: TODO/FIXME/HACK/XXX scan (INFO ≤10, WARNING >10), large files >500 KB (WARNING), empty directories (INFO); excludes .venv/.git/__pycache__/node_modules
+  - `doctor/analyzers/knowledge_health.py` — `KnowledgeHealthAnalyzer`: entry count, empty-body entries (WARNING), broken `superseded_by` references (WARNING), untagged entries (INFO), orphaned import-index entries (WARNING)
+  - `doctor/analyzers/documentation.py` — `DocumentationAnalyzer`: README.md / CHANGELOG.md (WARNING if missing), DECISIONS.md (INFO if missing), module docstrings in top-level packages (INFO), broken internal Markdown links (WARNING); skips HTTP links and anchors
+  - `doctor/analyzers/task_health.py` — `TaskHealthAnalyzer`: BLOCKED tasks (WARNING), tasks without objectives (WARNING), unassigned in-progress tasks (INFO), P0/P1 tasks still in BACKLOG (WARNING), status breakdown (INFO)
+  - `doctor/analyzers/config.py` — `ConfigAnalyzer`: pyproject.toml TOML validity (CRITICAL if malformed), required sections check (WARNING if missing), `requires-python` vs. running interpreter (WARNING if mismatch), workflow YAML validity (WARNING per malformed file)
+  - `doctor/__init__.py` — clean public exports
+- `Monday.doctor(analyzers=None)` — public API; lazy-imports `doctor`; returns `DoctorResponse`
+- `DoctorResponse` dataclass — in `monday/types.py`; fields: `action`, `success`, `health_score`, `grade`, `summary`, `recommendations`, `data`, `message`
+- CLI `monday doctor [--json] [--verbose] [--only ANALYZER ...]`
+  - Default: human-readable report with health score bar, findings by severity, top 5 recommendations
+  - `--json`: machine-readable full report (DoctorReport.to_dict())
+  - `--verbose`: shows passing (OK) findings and detail text for all findings
+  - `--only git tests`: run subset of analyzers
+  - Exit code: 0 if score ≥ 60, 1 otherwise
+
+### Changed
+- `monday/__init__.py` — exports `DoctorResponse`
+- `monday/api.py` — imports `DoctorResponse`; `Monday.doctor()` method added
+- `monday/cli.py` — `_register_doctor()`, `_cmd_doctor()`, `_print_doctor_report()`, `_all_findings()`, `_score_bar()` added; `_build_parser()` registers doctor command
+- `pyproject.toml` — `doctor*` added to `packages.find.include` and `coverage.run.source`
+
+### Tests
+- `tests/test_doctor.py` — 69 tests across 9 test classes:
+  - `TestFinding` (2 tests) — to_dict, severity values
+  - `TestDoctorReport` (9 tests) — score perfect/critical-deduction/critical-cap/warning-deduction/warning-cap/floor/grade-labels/recommendations-ranked/to_dict-structure/all_findings-flattened
+  - `TestRepositoryInspector` (5 tests) — available analyzers, run returns DoctorReport, analyzer subset, unknown name skipped, exception surfaced as CRITICAL, all analyzers smoke test
+  - `TestGitAnalyzer` (6 tests) — no .git critical, git dir no-critical, dirty-tree warning, clean-tree ok, no-commits warning, result name
+  - `TestTestAnalyzer` (5 tests) — no files critical, files found info, no cache info, lastfailed critical, clean cache ok
+  - `TestCodeQualityAnalyzer` (7 tests) — no markers ok, few markers info, many markers warning, large file warning, no large files ok, empty dir info, venv excluded
+  - `TestDocumentationAnalyzer` (9 tests) — missing README warning, present ok, missing CHANGELOG warning, missing DECISIONS info, broken link warning, valid link ok, HTTP links skip, missing docstring info, docstring ok
+  - `TestConfigAnalyzer` (6 tests) — no pyproject critical, valid ok, missing section warning, valid YAML ok, invalid YAML warning, no workflow dir info
+  - `TestTaskHealthAnalyzer` (5 tests) — no Monday skip, no tasks info, blocked warning, no-objective warning (mocked), clean ok
+  - `TestMondayDoctor` (7 tests) — returns DoctorResponse, score range, grade present, summary nonempty, data is full report, analyzer subset, healthy repo high score
+  - `TestCLIDoctor` (6 tests) — runs, JSON output, verbose, --only flag, JSON has recommendations, healthy repo exits zero
+- **Total: 540 passed, 12 skipped, 0 failures**
+
+---
+
+## [0.8.0] — 2026-06-28 — Sprint 1.7: Knowledge Migration Engine
+
+### Added
+- `migrate/` package — knowledge migration engine: converts existing project documentation into canonical MondayOS Knowledge Objects
+  - `migrate/engine.py` — `MigrationEngine`: `list_sources()`, `run(sources, dry_run, overwrite, progress_callback)` → `ImportReport`, `rollback(run_id)` → `RollbackReport`; import index at `knowledge/.import_index.json` for idempotency; SHA-256[:16] fingerprinting for change detection
+  - `migrate/candidate.py` — `KnowledgeCandidate` dataclass: pre-validation knowledge object; auto-fills `fingerprint` and `summary` in `__post_init__`; `slugify()` helper for stable `source_ref` discriminators
+  - `migrate/report.py` — `ImportReport` (start, write, load, round-trip), `RollbackReport`, `ImportedEntry`, `SkippedEntry`, `FailedEntry`; run reports written to `logs/migrations/{run_id[:8]}.json`
+  - `migrate/errors.py` — typed error hierarchy: `MigrationError`, `SourceNotFoundError`, `UnknownSourceError`, `ParseError`, `RollbackError`
+  - `migrate/parsers/` — 6 source document parsers, all extending `BaseParser`:
+    - `ChangelogParser` — `docs/CHANGELOG.md` → Sprint entries (one per versioned section; skips `[Unreleased]`; deduplicates versions)
+    - `DecisionsParser` — `docs/DECISIONS.md` → Decision/ADR entries
+    - `SessionLogParser` — `logs/SESSION_LOG.md` → Sprint entries + Bug entries from "Known technical debt" bullets
+    - `RoadmapParser` — `docs/ROADMAP.md` → Documentation (phase goals) + Feature (milestones) entries
+    - `WorkflowsParser` — `docs/WORKFLOWS.md` → Pattern (step types) + Documentation + Runbook (CLI/API usage) entries
+    - `SelfHostingParser` — `docs/SELF_HOSTING_PLAN.md` → Feature (opportunities) + Runbook (workflow designs) + Documentation (part summaries) entries
+  - `migrate/__init__.py` — clean public exports
+- `Monday.migrate(action, sources, dry_run, overwrite, run_id, progress_callback)` — public API for knowledge migration; actions: `list-sources`, `run`, `rollback`; returns `MigrateResponse`
+- `MigrateResponse` dataclass — in `monday/types.py`; fields: `action`, `success`, `dry_run`, `run_id`, `sources_processed`, `candidates_found`, `imported_count`, `skipped_count`, `failed_count`, `data`, `message`
+- `KnowledgeStore.remove(entry_id)` — hard delete of a knowledge entry from disk; rebuilds the in-memory index; used by migration rollback
+- `Monday._remove_knowledge_entry(entry_id)` — thin shim exposing `KnowledgeStore.remove()` to the migration engine
+- CLI `monday migrate [SOURCE ...] [--dry-run] [--overwrite] [--run-id ID] [--quiet]`
+  - `monday migrate` — import all registered sources
+  - `monday migrate changelog` — import a single named source
+  - `monday migrate list` — list all registered source documents with exists/missing status
+  - `monday migrate rollback <run-id>` — undo a prior run by run_id prefix
+  - `monday migrate --dry-run` — preview candidates without writing entries
+- `docs/SELF_HOSTING_PLAN.md` (Initiative 006) — 523-line self-hosting audit and migration plan: current-state file-write audit, 10 prioritised opportunities, 6 workflow designs, activity→workflow mapping, 4-phase migration plan
+
+### Changed
+- `monday/__init__.py` — exports `MigrateResponse`
+- `monday/api.py` — imports `MigrateResponse`; `Monday.migrate()` method added; `Monday._remove_knowledge_entry()` shim added
+- `monday/cli.py` — `_register_migrate()` and `_cmd_migrate*` command handlers added; `_build_parser()` registers migrate command
+- `pyproject.toml` — `migrate*` added to `packages.find.include` and `coverage.run.source`
+
+### Tests
+- `tests/test_migrate.py` — 76 tests across 6 test classes:
+  - `TestKnowledgeCandidate` (5 tests) — fingerprint auto-fill, summary extraction, explicit overrides, slugify
+  - `TestImportReport` (4 tests) — start/counters/write+load round-trip/to_dict
+  - `TestChangelogParser` (9 tests) — versioned sections, skip Unreleased, source_refs, entry_type, confidence, sprint tags, deduplication, empty text, source_info
+  - `TestDecisionsParser` (5 tests), `TestSessionLogParser` (5 tests), `TestRoadmapParser` (4 tests), `TestWorkflowsParser` (4 tests), `TestSelfHostingParser` (5 tests) — parser-specific extraction and source_ref correctness
+  - `TestMigrationEngine` (17 tests) — list_sources, source_exists, unknown source raises, dry-run (no writes, no index), real import, index persistence, idempotency, overwrite, missing file graceful skip, log written, progress callback, rollback (removes entries, unknown run_id raises, clears index), low-confidence skip, empty-content skip
+  - `TestMondayMigrate` (10 tests) — list-sources, exists flag, run, dry-run, unknown source, rollback requires run_id, rollback unknown, rollback removes entries, unknown action, run with no files
+  - `TestCLIMigrate` (6 tests) — list, dry-run, unknown source, rollback needs run-id, quiet flag, full run
+- **Total: 471 passed, 12 skipped, 0 failures**
+
+---
+
 ## [0.7.0] — 2026-06-28 — Sprint 1.6: End-to-End Workflow
 
 ### Added

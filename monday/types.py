@@ -129,6 +129,144 @@ class WorkflowResponse:
 
 
 @dataclass
+class AdviseResponse:
+    """
+    Response from Monday.advise().
+
+    Attributes:
+        action:           Always "advise".
+        success:          True if the advisory completed without internal errors.
+        confidence:       0.0–1.0 confidence in the analysis (scales with data richness).
+        sprint_goal:      Recommended sprint focus.
+        risks:            Top engineering risks, ranked by severity.
+        next_actions:     Highest-value next actions, ranked.
+        repository_summary: One-paragraph state-of-the-project narrative.
+        data:             Full Advisory as a dict (for --json output).
+        message:          Status or error message.
+    """
+
+    action: str
+    success: bool
+    confidence: float = 0.0
+    sprint_goal: str = ""
+    risks: list[dict[str, Any]] = field(default_factory=list)
+    next_actions: list[dict[str, Any]] = field(default_factory=list)
+    repository_summary: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+    message: str = ""
+
+
+@dataclass
+class DoctorResponse:
+    """
+    Response from Monday.doctor().
+
+    Attributes:
+        action:         Always "inspect".
+        success:        True if the inspection completed without internal errors.
+        health_score:   0–100 composite health score.
+        grade:          Human label: Excellent / Good / Fair / Poor / Critical.
+        summary:        One-line summary (e.g. "3 critical, 2 warnings").
+        recommendations: Ranked list of actionable recommendations.
+        data:           Full DoctorReport as a dict (for --json output).
+        message:        Status or error message.
+    """
+
+    action: str
+    success: bool
+    health_score: int = 0
+    grade: str = ""
+    summary: str = ""
+    recommendations: list[str] = field(default_factory=list)
+    data: dict[str, Any] = field(default_factory=dict)
+    message: str = ""
+
+
+@dataclass
+class MigrateResponse:
+    """
+    Response from Monday.migrate().
+
+    Attributes:
+        action:             The action requested (list-sources, run, rollback).
+        success:            True if the action completed without error.
+        dry_run:            True if the run was a dry-run (no entries written).
+        run_id:             UUID of this migration run (empty for list-sources).
+        sources_processed:  Source names that were processed.
+        candidates_found:   Total candidates found across all sources.
+        imported_count:     Number of entries imported (or would-import on dry-run).
+        skipped_count:      Number of candidates skipped.
+        failed_count:       Number of candidates that failed.
+        data:               Action-specific payload (source list, import report dict).
+        message:            Human-readable status or error message.
+    """
+
+    action: str
+    success: bool
+    dry_run: bool = False
+    run_id: str = ""
+    sources_processed: list[str] = field(default_factory=list)
+    candidates_found: int = 0
+    imported_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+    data: dict[str, Any] = field(default_factory=dict)
+    message: str = ""
+
+
+@dataclass
+class ProjectResponse:
+    """
+    Response from Monday.project().
+
+    Attributes:
+        action:      The action requested (register, list, get, remove).
+        success:     True if the action completed without error.
+        project_name: Name of the project acted on (empty for list).
+        data:        Action-specific payload (entry dict or list of entries).
+        message:     Human-readable status or error message.
+    """
+
+    action: str
+    success: bool
+    project_name: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+    message: str = ""
+
+
+@dataclass
+class OnboardResponse:
+    """
+    Response from Monday.onboard().
+
+    Attributes:
+        action:           Always "onboard".
+        success:          True if all onboarding steps completed without error.
+        project_name:     Name of the project that was onboarded.
+        migrate_summary:  Human-readable migration result.
+        health_score:     Repository health score (0–100).
+        grade:            Health grade (Excellent / Good / Fair / Poor / Critical).
+        sprint_goal:      Recommended sprint goal from the advisor.
+        confidence:       Advisory confidence score (0.0–1.0).
+        report_path:      Absolute path to the generated onboarding report.
+        data:             Full composite payload (migrate + doctor + advisory dicts).
+        message:          Status or error message.
+    """
+
+    action: str
+    success: bool
+    project_name: str = ""
+    migrate_summary: str = ""
+    health_score: int = 0
+    grade: str = ""
+    sprint_goal: str = ""
+    confidence: float = 0.0
+    report_path: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+    message: str = ""
+
+
+@dataclass
 class ModuleStatus:
     """Status of a single internal MondayOS module."""
 

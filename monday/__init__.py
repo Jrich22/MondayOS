@@ -20,13 +20,18 @@ For configuration:
     ))
 
 Public surface:
-    Monday        — the main API class
-    MondayConfig  — optional configuration dataclass
-    AskResponse   — return type of Monday.ask()
-    LearnResponse — return type of Monday.learn()
-    SearchResponse — return type of Monday.search()
+    Monday           — the main API class
+    MondayConfig     — optional configuration dataclass
+    AskResponse      — return type of Monday.ask()
+    LearnResponse    — return type of Monday.learn()
+    SearchResponse   — return type of Monday.search()
     TaskResponse     — return type of Monday.task()
     WorkflowResponse — return type of Monday.workflow()
+    MigrateResponse  — return type of Monday.migrate()
+    DoctorResponse   — return type of Monday.doctor()
+    AdviseResponse   — return type of Monday.advise()
+    ProjectResponse  — return type of Monday.project()
+    OnboardResponse  — return type of Monday.onboard()
     StatusResponse   — return type of Monday.status()
     ModuleStatus     — per-module health in StatusResponse
 """
@@ -35,9 +40,14 @@ from __future__ import annotations
 from monday.api import Monday
 from monday.config import MondayConfig
 from monday.types import (
+    AdviseResponse,
     AskResponse,
+    DoctorResponse,
     LearnResponse,
+    MigrateResponse,
     ModuleStatus,
+    OnboardResponse,
+    ProjectResponse,
     SearchResponse,
     StatusResponse,
     TaskResponse,
@@ -47,11 +57,16 @@ from monday.types import (
 __all__ = [
     "Monday",
     "MondayConfig",
+    "AdviseResponse",
     "AskResponse",
+    "DoctorResponse",
     "LearnResponse",
+    "MigrateResponse",
+    "OnboardResponse",
+    "ProjectResponse",
     "SearchResponse",
+    "StatusResponse",
     "TaskResponse",
     "WorkflowResponse",
-    "StatusResponse",
     "ModuleStatus",
 ]

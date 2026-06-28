@@ -45,3 +45,6 @@ secrets/
 # Logs (runtime output, not the curated SESSION_LOG.md)
 logs/*.log
 logs/*.jsonl
+
+# Project registry — runtime state with machine-specific absolute paths
+config/projects.json

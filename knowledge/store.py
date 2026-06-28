@@ -180,6 +180,23 @@ class KnowledgeStore:
             entries = [e for e in entries if e.entry_type == entry_type]
         return entries
 
+    def remove(self, entry_id: EntityId) -> None:
+        """
+        Delete a knowledge entry from disk and rebuild the in-memory index.
+
+        Used by the migration rollback path. Raises KnowledgeNotFoundError
+        if entry_id does not exist.
+        """
+        entry = self.get(entry_id)
+        type_dir = self._knowledge_dir / _TYPE_DIRS[entry.entry_type]
+        file_path = type_dir / f"{entry_id}.md"
+        if file_path.exists():
+            file_path.unlink()
+        # Rebuild the index from remaining files on disk
+        entries = self._loader.load_all()
+        self._index = KnowledgeIndex()
+        self._index.build(entries)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

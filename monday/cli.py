@@ -85,6 +85,11 @@ def _build_parser() -> argparse.ArgumentParser:
     _register_learn(subparsers)
     _register_task(subparsers)
     _register_workflow(subparsers)
+    _register_migrate(subparsers)
+    _register_doctor(subparsers)
+    _register_advise(subparsers)
+    _register_project(subparsers)
+    _register_onboard(subparsers)
 
     return parser
 
@@ -649,6 +654,689 @@ def _cmd_workflow_run(args: argparse.Namespace) -> int:
             print(f"  {mark:8}  {s['step_id']}  ({s['step_type']})")
 
     return 0
+
+
+# ---------------------------------------------------------------------------
+# migrate
+# ---------------------------------------------------------------------------
+
+def _register_migrate(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "migrate",
+        help="Import existing project documentation into the knowledge base.",
+        description=(
+            "Convert existing project documents into MondayOS Knowledge Objects.\n\n"
+            "examples:\n"
+            "  monday migrate                        # import all sources\n"
+            "  monday migrate --dry-run              # preview without writing\n"
+            "  monday migrate changelog              # import CHANGELOG.md only\n"
+            "  monday migrate session-log decisions  # import two sources\n"
+            "  monday migrate list                   # list registered sources\n"
+            "  monday migrate rollback <run-id>      # undo a prior run\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "sources",
+        nargs="*",
+        metavar="SOURCE",
+        help=(
+            "Source name(s) to import. Special values: 'list' (show sources), "
+            "'rollback' (undo a run, requires --run-id). "
+            "Omit to import all sources."
+        ),
+    )
+    p.add_argument(
+        "--dry-run", "-n",
+        action="store_true",
+        default=False,
+        help="Parse and validate but do not write any entries.",
+    )
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=False,
+        help="Re-import entries that are already in the knowledge base.",
+    )
+    p.add_argument(
+        "--run-id",
+        metavar="ID",
+        default="",
+        help="Run ID prefix for rollback (first 8 characters is sufficient).",
+    )
+    p.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        default=False,
+        help="Suppress per-candidate progress output.",
+    )
+    p.set_defaults(func=_cmd_migrate)
+
+
+def _cmd_migrate(args: argparse.Namespace) -> int:
+    sources = list(args.sources) if args.sources else []
+
+    # Detect special subcommands passed as positional args
+    if sources == ["list"]:
+        return _cmd_migrate_list(args)
+    if sources and sources[0] == "rollback":
+        return _cmd_migrate_rollback(args)
+
+    # Normal run
+    source_names = sources or None
+    monday = _monday(args)
+
+    progress = None if args.quiet else lambda msg: print(msg)
+
+    r = monday.migrate(
+        action="run",
+        sources=source_names,
+        dry_run=args.dry_run,
+        overwrite=args.overwrite,
+        progress_callback=progress,
+    )
+
+    print()
+    dry_label = "[dry-run] " if args.dry_run else ""
+    print(f"{dry_label}Migration complete  (run: {r.run_id[:8] if r.run_id else '—'})")
+    _hr()
+    print(f"  Candidates found : {r.candidates_found}")
+    print(f"  Imported         : {r.imported_count}")
+    print(f"  Skipped          : {r.skipped_count}")
+    if r.failed_count:
+        print(f"  Failed           : {r.failed_count}")
+        # Show failed entries from the report
+        failed = r.data.get("failed", [])
+        for f in failed[:10]:
+            print(f"    ✗ {f.get('source_ref', '?')}: {f.get('error', '')[:80]}")
+
+    if not r.success and r.failed_count > 0:
+        return 1
+    return 0
+
+
+def _cmd_migrate_list(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.migrate(action="list-sources")
+
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+
+    sources = r.data.get("sources", [])
+    print(f"Registered sources ({r.data.get('count', 0)})")
+    _hr()
+    for s in sources:
+        exists_mark = "ok  " if s["exists"] else "MISS"
+        types = ", ".join(s["entry_types"])
+        print(f"  {exists_mark}  {s['name']:20}  {s['source_file']}")
+        print(f"          types: {types}")
+        if s.get("description"):
+            print(f"          {s['description'][:100]}")
+    return 0
+
+
+def _cmd_migrate_rollback(args: argparse.Namespace) -> int:
+    run_id = args.run_id
+    if not run_id:
+        # Try to get it from positional args: migrate rollback <id>
+        sources = list(args.sources) if args.sources else []
+        if len(sources) >= 2:
+            run_id = sources[1]
+    if not run_id:
+        print("Error: --run-id is required for rollback", file=sys.stderr)
+        return 1
+
+    monday = _monday(args)
+    r = monday.migrate(action="rollback", run_id=run_id)
+
+    if r.success:
+        print(f"Rollback complete: removed {r.imported_count} entries")
+    else:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+def _register_doctor(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "doctor",
+        help="Inspect repository health and surface engineering risks.",
+        description=(
+            "Run a comprehensive repository health check.\n\n"
+            "Analyzers: git, tests, code-quality, knowledge, documentation, tasks, config\n\n"
+            "examples:\n"
+            "  monday doctor\n"
+            "  monday doctor --json\n"
+            "  monday doctor --verbose\n"
+            "  monday doctor --only git tests\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--json", "-j",
+        action="store_true",
+        default=False,
+        help="Output machine-readable JSON instead of the human-readable report.",
+    )
+    p.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        default=False,
+        help="Show details for every finding, including passing checks.",
+    )
+    p.add_argument(
+        "--only",
+        nargs="+",
+        metavar="ANALYZER",
+        default=None,
+        help=(
+            "Run only the specified analyzer(s). "
+            "Choices: git tests code-quality knowledge documentation tasks config"
+        ),
+    )
+    p.set_defaults(func=_cmd_doctor)
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    import json as _json
+
+    monday = _monday(args)
+    r = monday.doctor(analyzers=args.only)
+
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(_json.dumps(r.data, indent=2))
+        return 0 if r.health_score >= 60 else 1
+
+    return _print_doctor_report(r, verbose=args.verbose)
+
+
+def _print_doctor_report(r: Any, *, verbose: bool) -> int:
+    from doctor.finding import Severity
+
+    report = r.data
+    fbs_raw = {
+        "critical": [f for f in _all_findings(report) if f["severity"] == "critical"],
+        "warning":  [f for f in _all_findings(report) if f["severity"] == "warning"],
+        "info":     [f for f in _all_findings(report) if f["severity"] == "info"],
+        "ok":       [f for f in _all_findings(report) if f["severity"] == "ok"],
+    }
+
+    # Header
+    print()
+    print("MondayOS Doctor — Repository Health Report")
+    _hr()
+    score = report["health_score"]
+    grade = report["grade"]
+    bar = _score_bar(score)
+    print(f"Health Score : {score}/100  {bar}  ({grade})")
+    print(f"Generated    : {report.get('generated_at', '')[:19].replace('T', ' ')} UTC")
+    elapsed = report.get("total_duration_ms", 0)
+    print(f"Duration     : {elapsed:.0f}ms")
+    print()
+
+    # Sections by severity
+    for sev_key, label, icon in [
+        ("critical", "CRITICAL", "✗"),
+        ("warning",  "WARNINGS", "⚠"),
+        ("info",     "INFO",     "·"),
+    ]:
+        findings = fbs_raw[sev_key]
+        if not findings:
+            continue
+        print(f"{label} ({len(findings)})")
+        _hr()
+        for f in findings:
+            cat = f["category"].upper()
+            print(f"  {icon} [{cat}] {f['title']}")
+            if verbose and f.get("detail"):
+                for line in f["detail"].splitlines():
+                    print(f"      {line}")
+            if f.get("recommendation"):
+                print(f"      → {f['recommendation']}")
+        print()
+
+    if verbose:
+        ok_findings = fbs_raw["ok"]
+        if ok_findings:
+            print(f"PASSING ({len(ok_findings)})")
+            _hr()
+            for f in ok_findings:
+                cat = f["category"].upper()
+                print(f"  ✓ [{cat}] {f['title']}")
+            print()
+
+    # Recommendations
+    recs = report.get("recommendations", [])
+    if recs:
+        print(f"RECOMMENDATIONS (top {min(len(recs), 5)})")
+        _hr()
+        for i, rec in enumerate(recs[:5], 1):
+            print(f"  {i}. {rec}")
+        print()
+
+    # Footer
+    n_crit = len(fbs_raw["critical"])
+    n_warn = len(fbs_raw["warning"])
+    if n_crit == 0 and n_warn == 0:
+        print("  All checks passing. Repository looks healthy.")
+    elif n_crit > 0:
+        print(f"  {n_crit} critical issue(s) require attention.")
+    else:
+        print(f"  {n_warn} warning(s) should be addressed.")
+    print()
+
+    return 0 if score >= 60 else 1
+
+
+def _all_findings(report: Any) -> list[Any]:
+    """Flatten findings from all analyzers in the report dict."""
+    out = []
+    for analyzer in report.get("analyzers", []):
+        out.extend(analyzer.get("findings", []))
+    return out
+
+
+def _score_bar(score: int, width: int = 20) -> str:
+    filled = round(score / 100 * width)
+    return "[" + "█" * filled + "░" * (width - filled) + "]"
+
+
+# ---------------------------------------------------------------------------
+# advise
+# ---------------------------------------------------------------------------
+
+_WIDE = 64  # report column width
+
+
+def _register_advise(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "advise",
+        help="Engineering advisory: risks, next actions, sprint goal.",
+        description=(
+            "Produce an engineering advisory by synthesising repository health,\n"
+            "knowledge, tasks, and workflow history.\n\n"
+            "examples:\n"
+            "  monday advise\n"
+            "  monday advise --json\n"
+            "  monday advise --brief\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--json", "-j",
+        action="store_true",
+        default=False,
+        help="Output machine-readable JSON instead of the human-readable advisory.",
+    )
+    p.add_argument(
+        "--brief", "-b",
+        action="store_true",
+        default=False,
+        help="Print a condensed single-screen summary (risks + top action only).",
+    )
+    p.set_defaults(func=_cmd_advise)
+
+
+def _cmd_advise(args: argparse.Namespace) -> int:
+    import json as _json
+
+    monday = _monday(args)
+    r = monday.advise()
+
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(_json.dumps(r.data, indent=2))
+        return 0
+
+    if args.brief:
+        return _print_brief(r)
+
+    return _print_advisory(r)
+
+
+def _print_advisory(r: Any) -> int:
+    advisory = r.data
+    conf_pct = f"{advisory.get('confidence', 0):.0%}"
+    score = advisory.get("health_score", 0)
+    grade = advisory.get("health_grade", "")
+
+    # ══ Header ══════════════════════════════════════════════════════════
+    print()
+    print("═" * _WIDE)
+    import datetime as _dt
+    date_str = _dt.datetime.now().strftime("%Y-%m-%d")
+    print(f"  ENGINEERING ADVISORY  —  {date_str}")
+    print("═" * _WIDE)
+    print(f"  Confidence {conf_pct}  ·  Health {score}/100 ({grade})")
+    print("═" * _WIDE)
+
+    # ── Repository Summary ───────────────────────────────────────────────
+    summary = advisory.get("repository_summary", "")
+    if summary:
+        print()
+        print("REPOSITORY SUMMARY")
+        _thin()
+        _wrap(summary, indent=2)
+
+    # ── Top Risks ────────────────────────────────────────────────────────
+    risks = advisory.get("risks", [])
+    if risks:
+        print()
+        print("TOP RISKS")
+        _thin()
+        for risk in risks[:5]:
+            sev = risk["severity"].upper()
+            bullet = "●" if risk["severity"] == "critical" else "○"
+            print(f"  {bullet} [{sev}] {risk['title']}")
+            if risk.get("impact"):
+                _wrap(risk["impact"], indent=6)
+            if risk.get("recommendation"):
+                cmd = risk.get("recommendation", "")
+                print(f"      → {cmd}")
+
+    # ── Next Actions ─────────────────────────────────────────────────────
+    actions = advisory.get("next_actions", [])
+    if actions:
+        print()
+        print("NEXT ACTIONS  (ranked by value)")
+        _thin()
+        for action in actions[:6]:
+            effort = action.get("effort", "")
+            cmd = action.get("command", "")
+            cat = action.get("category", "")
+            pri = action.get("priority", "")
+            print(f"  {pri}. {action['title']:<40} [{cat}]  ~{effort}")
+            if cmd:
+                print(f"     $ {cmd}")
+
+    # ── Sprint Goal ──────────────────────────────────────────────────────
+    sprint_goal = advisory.get("sprint_goal", "")
+    sprint_rationale = advisory.get("sprint_rationale", "")
+    if sprint_goal:
+        print()
+        print("RECOMMENDED SPRINT GOAL")
+        _thin()
+        print(f'  "{sprint_goal}"')
+        if sprint_rationale:
+            print()
+            _wrap(sprint_rationale, indent=2)
+
+    # ── Debt + Gaps (two-column) ─────────────────────────────────────────
+    debt_items = advisory.get("debt_items", [])
+    knowledge_gaps = advisory.get("knowledge_gaps", [])
+    doc_gaps = advisory.get("documentation_gaps", [])
+
+    has_debt = bool(debt_items)
+    has_gaps = bool(knowledge_gaps or doc_gaps)
+
+    if has_debt or has_gaps:
+        print()
+        left_header = "TECHNICAL DEBT" if has_debt else ""
+        right_header = "KNOWLEDGE & DOC GAPS" if has_gaps else ""
+
+        col = (_WIDE // 2) - 2
+
+        def _pad(s: str) -> str:
+            return s[:col].ljust(col)
+
+        print(f"  {_pad(left_header)}  {right_header}")
+        _thin()
+
+        gap_items = knowledge_gaps[:4] + [f"[doc] {g}" for g in doc_gaps[:3]]
+        max_rows = max(len(debt_items[:5]), len(gap_items))
+        for i in range(max_rows):
+            left = f"• {debt_items[i][:col - 2]}" if i < len(debt_items) else ""
+            right = f"• {gap_items[i][:col - 2]}" if i < len(gap_items) else ""
+            print(f"  {_pad(left)}  {right}")
+
+    # ── Footer ───────────────────────────────────────────────────────────
+    sources = advisory.get("data_sources", advisory.get("data_sources", []))
+    print()
+    print("═" * _WIDE)
+    sources_label = " + ".join(sources) if sources else "doctor"
+    print(f"  Confidence: {conf_pct}  ·  Sources: {sources_label}")
+    print(f"  Run `monday advise --json` for machine-readable output.")
+    print("═" * _WIDE)
+    print()
+
+    return 0
+
+
+def _print_brief(r: Any) -> int:
+    advisory = r.data
+    conf_pct = f"{advisory.get('confidence', 0):.0%}"
+    score = advisory.get("health_score", 0)
+    grade = advisory.get("health_grade", "")
+
+    print(f"\nHealth {score}/100 ({grade})  ·  Confidence {conf_pct}\n")
+
+    risks = advisory.get("risks", [])
+    if risks:
+        print("Risks:")
+        for risk in risks[:3]:
+            sev = risk["severity"].upper()
+            print(f"  [{sev}] {risk['title']}")
+
+    sprint_goal = advisory.get("sprint_goal", "")
+    if sprint_goal:
+        print(f'\nSprint: "{sprint_goal}"')
+
+    actions = advisory.get("next_actions", [])
+    if actions:
+        top = actions[0]
+        cmd = top.get("command", "")
+        print(f"\nTop action: {top['title']}")
+        if cmd:
+            print(f"  $ {cmd}")
+
+    print()
+    return 0
+
+
+def _wrap(text: str, indent: int = 0, width: int = _WIDE) -> None:
+    """Word-wrap text to width, printing with the given indent."""
+    prefix = " " * indent
+    avail = width - indent
+    words = text.split()
+    line: list[str] = []
+    for word in words:
+        if sum(len(w) + 1 for w in line) + len(word) > avail:
+            print(prefix + " ".join(line))
+            line = [word]
+        else:
+            line.append(word)
+    if line:
+        print(prefix + " ".join(line))
+
+
+def _thin() -> None:
+    print("─" * _WIDE)
+
+
+# ---------------------------------------------------------------------------
+# project
+# ---------------------------------------------------------------------------
+
+def _register_project(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "project",
+        help="Register and manage external projects.",
+        description=(
+            "Register external repositories so MondayOS can run doctor,\n"
+            "migrate, and advise against them.\n\n"
+            "examples:\n"
+            "  monday project register weatherbot /path/to/WeatherBot --description \"Weather CLI\"\n"
+            "  monday project list\n"
+            "  monday project get weatherbot\n"
+            "  monday project remove weatherbot\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    project_sub = p.add_subparsers(title="project actions", metavar="<action>")
+
+    # register
+    reg = project_sub.add_parser("register", help="Register a new project.")
+    reg.add_argument("name", help="Unique project name (slug).")
+    reg.add_argument("path", help="Absolute path to the project source directory.")
+    reg.add_argument("--description", default="", help="Human-readable description.")
+    reg.add_argument("--overwrite", action="store_true", help="Replace existing entry.")
+    reg.set_defaults(func=_cmd_project_register)
+
+    # list
+    ls = project_sub.add_parser("list", help="List all registered projects.")
+    ls.set_defaults(func=_cmd_project_list)
+
+    # get
+    get = project_sub.add_parser("get", help="Show details for a registered project.")
+    get.add_argument("name", help="Project name.")
+    get.set_defaults(func=_cmd_project_get)
+
+    # remove
+    rm = project_sub.add_parser("remove", help="Remove a project from the registry.")
+    rm.add_argument("name", help="Project name.")
+    rm.set_defaults(func=_cmd_project_remove)
+
+    p.set_defaults(func=lambda a: (p.print_help(), 0)[1])
+
+
+def _cmd_project_register(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.project(
+        "register",
+        name=args.name,
+        path=args.path,
+        description=args.description,
+        overwrite=args.overwrite,
+    )
+    if r.success:
+        print(f"Registered: {r.project_name}")
+        print(f"  Path: {r.data.get('source_path', '')}")
+        if r.data.get("description"):
+            print(f"  Desc: {r.data['description']}")
+        print(f"  At:   {r.data.get('registered_at', '')}")
+    else:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_project_list(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.project("list")
+    projects = r.data.get("projects", [])
+    if not projects:
+        print("No projects registered.")
+        print("Use: monday project register <name> <path>")
+        return 0
+    print(f"\n{'Name':<20}  {'Path':<50}  Description")
+    print("─" * 90)
+    for p in projects:
+        name = p.get("name", "")
+        path = p.get("source_path", "")
+        desc = p.get("description", "")
+        # Truncate for display
+        if len(path) > 48:
+            path = "…" + path[-47:]
+        print(f"{name:<20}  {path:<50}  {desc}")
+    print()
+    return 0
+
+
+def _cmd_project_get(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.project("get", name=args.name)
+    if r.success:
+        d = r.data
+        print(f"\nProject: {d.get('name', '')}")
+        print(f"  Path       : {d.get('source_path', '')}")
+        print(f"  Description: {d.get('description', '') or '(none)'}")
+        print(f"  Registered : {d.get('registered_at', '')}")
+        print()
+    else:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_project_remove(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.project("remove", name=args.name)
+    if r.success:
+        print(r.message)
+    else:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# onboard
+# ---------------------------------------------------------------------------
+
+def _register_onboard(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "onboard",
+        help="Run a full onboarding pipeline against a registered project.",
+        description=(
+            "Runs migrate, doctor, and advise against a registered project,\n"
+            "then generates a comprehensive Markdown onboarding report.\n\n"
+            "examples:\n"
+            "  monday onboard weatherbot\n"
+            "  monday onboard weatherbot --output ./reports\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("project_name", help="Registered project name.")
+    p.add_argument(
+        "--output",
+        metavar="DIR",
+        default="",
+        help="Directory for the onboarding report (default: projects/<name>/ inside MondayOS).",
+    )
+    p.set_defaults(func=_cmd_onboard)
+
+
+def _cmd_onboard(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+
+    print(f"\nOnboarding project: {args.project_name}")
+    print("  Step 1/3: Migrating documentation …")
+    sys.stdout.flush()
+
+    reports_dir = Path(args.output) if args.output else None
+    r = monday.onboard(args.project_name, reports_dir=reports_dir)
+
+    if not r.success and not r.report_path:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+
+    print(f"  Step 2/3: Migration — {r.migrate_summary}")
+    print(f"  Step 3/3: Analysis complete")
+    print()
+    print("═" * 64)
+    print(f"  ONBOARDING COMPLETE — {r.project_name.upper()}")
+    print("═" * 64)
+    print(f"  Health Score  : {r.health_score}/100 ({r.grade})")
+    print(f"  Confidence    : {r.confidence:.0%}")
+    print(f"  Sprint Goal   : {r.sprint_goal}")
+    print("─" * 64)
+    print(f"  Report        : {r.report_path}")
+    print("═" * 64)
+    print()
+
+    return 0 if r.success else 1
 
 
 # ---------------------------------------------------------------------------

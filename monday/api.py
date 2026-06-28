@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from brain import Brain, BrainConfig
+from brain import Brain, BrainConfig, create_provider
 from brain.reasoner import ReasoningEngine
 from events import EventBus
 from events.types import Event, EventType
@@ -21,9 +21,14 @@ from knowledge.entry import KnowledgeEntry, KnowledgeType, LifecycleStatus
 from memory import SessionMemory
 from monday.config import MondayConfig
 from monday.types import (
+    AdviseResponse,
     AskResponse,
+    DoctorResponse,
     LearnResponse,
+    MigrateResponse,
     ModuleStatus,
+    OnboardResponse,
+    ProjectResponse,
     SearchResponse,
     StatusResponse,
     TaskResponse,
@@ -86,6 +91,7 @@ class Monday:
         self.__search = SearchEngine()
         self.__tasks = TaskManager(self._config.project_root)
         self.__reasoner = ReasoningEngine(self.__knowledge, self.__tasks)
+        self.__provider = create_provider(self._config.provider_config)
 
     # ------------------------------------------------------------------
     # Public API
@@ -673,6 +679,474 @@ class Monday:
             message=f"Unknown action {action!r}. Valid actions: list, show, run",
         )
 
+    def migrate(
+        self,
+        action: str = "run",
+        sources: list[str] | None = None,
+        dry_run: bool = False,
+        overwrite: bool = False,
+        run_id: str = "",
+        progress_callback: Any = None,
+    ) -> MigrateResponse:
+        """
+        Import existing project documentation into the MondayOS knowledge base.
+
+        Actions:
+            list-sources — list all registered source documents and their status.
+            run          — parse and import knowledge candidates from source documents.
+            rollback     — remove entries created in a prior run (requires run_id).
+
+        Args:
+            action:            One of: list-sources, run, rollback.
+            sources:           Source names to process (None = all). Ignored for
+                               list-sources and rollback.
+            dry_run:           If True, parse and validate but do not write entries.
+            overwrite:         If True, re-import entries already in the index.
+            run_id:            Prior run_id for rollback action.
+            progress_callback: Optional callable(message: str) for progress output.
+
+        Returns:
+            MigrateResponse with success=True on success or success=False with
+            a descriptive message on failure. Does not raise.
+        """
+        from migrate import MigrationEngine, UnknownSourceError
+        from migrate.errors import RollbackError
+
+        logs_dir = self._config.project_root / "logs" / "migrations"
+        engine = MigrationEngine(
+            monday=self,
+            project_root=self._config.project_root,
+            logs_dir=logs_dir,
+        )
+
+        if action == "list-sources":
+            source_infos = engine.list_sources()
+            return MigrateResponse(
+                action="list-sources",
+                success=True,
+                data={
+                    "sources": [
+                        {
+                            "name": s.name,
+                            "source_file": s.source_file,
+                            "description": s.description,
+                            "entry_types": s.entry_types,
+                            "exists": engine.source_exists(s.name),
+                        }
+                        for s in source_infos
+                    ],
+                    "count": len(source_infos),
+                },
+                message=f"{len(source_infos)} source(s) registered",
+            )
+
+        if action == "run":
+            try:
+                report = engine.run(
+                    sources=sources,
+                    dry_run=dry_run,
+                    overwrite=overwrite,
+                    progress_callback=progress_callback,
+                )
+                return MigrateResponse(
+                    action="run",
+                    success=report.failed_count == 0,
+                    dry_run=dry_run,
+                    run_id=report.run_id,
+                    sources_processed=report.sources,
+                    candidates_found=report.candidates_found,
+                    imported_count=report.imported_count,
+                    skipped_count=report.skipped_count,
+                    failed_count=report.failed_count,
+                    data=report.to_dict(),
+                    message=(
+                        f"{'[dry-run] ' if dry_run else ''}"
+                        f"{report.imported_count} imported, "
+                        f"{report.skipped_count} skipped, "
+                        f"{report.failed_count} failed"
+                        + (f" — {report.failed_count} error(s)" if report.failed_count else "")
+                    ),
+                )
+            except UnknownSourceError as exc:
+                return MigrateResponse(
+                    action="run",
+                    success=False,
+                    dry_run=dry_run,
+                    message=str(exc),
+                )
+            except Exception as exc:
+                return MigrateResponse(
+                    action="run",
+                    success=False,
+                    dry_run=dry_run,
+                    message=f"Migration failed: {exc}",
+                )
+
+        if action == "rollback":
+            if not run_id:
+                return MigrateResponse(
+                    action="rollback",
+                    success=False,
+                    message="run_id is required for action 'rollback'",
+                )
+            try:
+                rollback_report = engine.rollback(run_id)
+                return MigrateResponse(
+                    action="rollback",
+                    success=len(rollback_report.failed) == 0,
+                    run_id=run_id,
+                    imported_count=len(rollback_report.removed),
+                    failed_count=len(rollback_report.failed),
+                    data={
+                        "removed": rollback_report.removed,
+                        "failed": rollback_report.failed,
+                    },
+                    message=rollback_report.message,
+                )
+            except RollbackError as exc:
+                return MigrateResponse(
+                    action="rollback",
+                    success=False,
+                    run_id=run_id,
+                    message=str(exc),
+                )
+            except Exception as exc:
+                return MigrateResponse(
+                    action="rollback",
+                    success=False,
+                    run_id=run_id,
+                    message=f"Rollback failed: {exc}",
+                )
+
+        return MigrateResponse(
+            action=action,
+            success=False,
+            message=f"Unknown action {action!r}. Valid actions: list-sources, run, rollback",
+        )
+
+    def advise(
+        self,
+        doctor_report: Any = None,
+    ) -> AdviseResponse:
+        """
+        Produce an engineering advisory for this repository.
+
+        Synthesises repository health (Doctor), knowledge store, active tasks,
+        and workflow history into a structured advisory — without calling any
+        external AI model.
+
+        The advisory answers:
+          - What is the current state of the project?
+          - What should we build next?
+          - What risks exist?
+          - What is the expected impact?
+          - What is the recommended sprint goal?
+
+        Args:
+            doctor_report: Pre-computed DoctorReport to avoid re-running inspection.
+                           Pass None to run the full inspection internally.
+
+        Returns:
+            AdviseResponse with confidence, sprint_goal, risks, next_actions,
+            repository_summary, and the full Advisory dict in `data`.
+            Does not raise.
+        """
+        from advisor.engine import AdvisorEngine
+
+        try:
+            engine = AdvisorEngine(
+                monday=self,
+                project_root=self._config.project_root,
+                provider=self.__provider,
+            )
+            advisory = engine.analyze(doctor_report=doctor_report)
+        except Exception as exc:
+            return AdviseResponse(
+                action="advise",
+                success=False,
+                message=f"Advisory failed: {exc}",
+            )
+
+        return AdviseResponse(
+            action="advise",
+            success=True,
+            confidence=advisory.confidence,
+            sprint_goal=advisory.sprint_goal,
+            risks=[r.to_dict() for r in advisory.risks[:10]],
+            next_actions=[a.to_dict() for a in advisory.next_actions[:10]],
+            repository_summary=advisory.repository_summary,
+            data=advisory.to_dict(),
+            message=f"Confidence: {advisory.confidence:.0%}",
+        )
+
+    def doctor(
+        self,
+        analyzers: list[str] | None = None,
+    ) -> DoctorResponse:
+        """
+        Inspect the repository and return a comprehensive health report.
+
+        Runs all registered analyzers (or a subset if analyzers is provided)
+        and aggregates the results into a health score, grade, and ranked
+        recommendations.
+
+        Args:
+            analyzers: Optional list of analyzer names to run. None runs all.
+                       Available: git, tests, code-quality, knowledge,
+                       documentation, tasks, config.
+
+        Returns:
+            DoctorResponse with health_score (0–100), grade, recommendations,
+            and the full report dict in `data`. Does not raise.
+        """
+        from doctor import RepositoryInspector
+        from doctor.finding import Severity
+
+        try:
+            inspector = RepositoryInspector(
+                project_root=self._config.project_root,
+                monday=self,
+                analyzer_names=analyzers,
+            )
+            report = inspector.run()
+        except Exception as exc:
+            return DoctorResponse(
+                action="inspect",
+                success=False,
+                message=f"Inspection failed: {exc}",
+            )
+
+        fbs = report.findings_by_severity
+        n_critical = len(fbs[Severity.CRITICAL])
+        n_warning = len(fbs[Severity.WARNING])
+        n_info = len(fbs[Severity.INFO])
+
+        parts = []
+        if n_critical:
+            parts.append(f"{n_critical} critical")
+        if n_warning:
+            parts.append(f"{n_warning} warning(s)")
+        if n_info:
+            parts.append(f"{n_info} info")
+        summary = ", ".join(parts) if parts else "No issues found"
+
+        return DoctorResponse(
+            action="inspect",
+            success=True,
+            health_score=report.health_score,
+            grade=report.grade,
+            summary=summary,
+            recommendations=report.recommendations,
+            data=report.to_dict(),
+            message=f"Health: {report.health_score}/100 ({report.grade})",
+        )
+
+    def project(
+        self,
+        action: str,
+        name: str = "",
+        path: str = "",
+        description: str = "",
+        overwrite: bool = False,
+    ) -> ProjectResponse:
+        """
+        Register, list, retrieve, or remove external projects.
+
+        Actions:
+            register — add a new project (requires name and path).
+            list     — return all registered projects.
+            get      — return metadata for a named project (requires name).
+            remove   — remove a project from the registry (requires name).
+
+        Args:
+            action:      One of: register, list, get, remove.
+            name:        Project name slug (required for register/get/remove).
+            path:        Absolute source path (required for register).
+            description: Optional human-readable description (for register).
+            overwrite:   If True, replace existing registration (for register).
+
+        Returns:
+            ProjectResponse with success=True on success or success=False with
+            a descriptive message on failure. Does not raise.
+        """
+        from monday.project import ProjectAlreadyExistsError, ProjectNotFoundError, ProjectRegistry
+
+        registry = ProjectRegistry(self._config.project_root / "config")
+
+        if action == "register":
+            if not name or not path:
+                return ProjectResponse(
+                    action="register",
+                    success=False,
+                    message="'name' and 'path' are required for action 'register'",
+                )
+            try:
+                entry = registry.register(name, path, description=description, overwrite=overwrite)
+                return ProjectResponse(
+                    action="register",
+                    success=True,
+                    project_name=name,
+                    data=entry.to_dict(),
+                    message=f"Registered project {name!r} → {entry.source_path}",
+                )
+            except ProjectAlreadyExistsError as exc:
+                return ProjectResponse(action="register", success=False, project_name=name, message=str(exc))
+            except ValueError as exc:
+                return ProjectResponse(action="register", success=False, project_name=name, message=str(exc))
+
+        if action == "list":
+            entries = registry.list()
+            return ProjectResponse(
+                action="list",
+                success=True,
+                data={
+                    "projects": [e.to_dict() for e in entries],
+                    "count": len(entries),
+                },
+                message=f"{len(entries)} project(s) registered",
+            )
+
+        if action == "get":
+            if not name:
+                return ProjectResponse(action="get", success=False, message="'name' is required for action 'get'")
+            try:
+                entry = registry.get(name)
+                return ProjectResponse(
+                    action="get",
+                    success=True,
+                    project_name=name,
+                    data=entry.to_dict(),
+                    message=f"Project {name!r} — {entry.source_path}",
+                )
+            except ProjectNotFoundError as exc:
+                return ProjectResponse(action="get", success=False, project_name=name, message=str(exc))
+
+        if action == "remove":
+            if not name:
+                return ProjectResponse(action="remove", success=False, message="'name' is required for action 'remove'")
+            try:
+                registry.remove(name)
+                return ProjectResponse(
+                    action="remove",
+                    success=True,
+                    project_name=name,
+                    message=f"Project {name!r} removed from registry",
+                )
+            except ProjectNotFoundError as exc:
+                return ProjectResponse(action="remove", success=False, project_name=name, message=str(exc))
+
+        return ProjectResponse(
+            action=action,
+            success=False,
+            message=f"Unknown action {action!r}. Valid actions: register, list, get, remove",
+        )
+
+    def onboard(
+        self,
+        project_name: str,
+        reports_dir: Path | None = None,
+    ) -> OnboardResponse:
+        """
+        Run a full MondayOS onboarding pipeline against a registered project.
+
+        Steps executed:
+            1. Look up project in the registry.
+            2. Run migrate against the project's documentation.
+            3. Run doctor (health inspection).
+            4. Run advise (engineering advisory).
+            5. Generate a Markdown onboarding report.
+            6. Save report to {reports_dir}/{project_name}/ONBOARDING_REPORT.md.
+
+        Args:
+            project_name: Name of a registered project (see Monday.project("register")).
+            reports_dir:  Directory for reports. Defaults to
+                          {mondayos_root}/projects/{project_name}/.
+
+        Returns:
+            OnboardResponse with health_score, sprint_goal, report_path, and
+            the composite data payload. Does not raise.
+        """
+        from monday.project import ProjectNotFoundError, ProjectRegistry
+        from monday import Monday, MondayConfig
+
+        registry = ProjectRegistry(self._config.project_root / "config")
+
+        try:
+            entry = registry.get(project_name)
+        except ProjectNotFoundError as exc:
+            return OnboardResponse(
+                action="onboard",
+                success=False,
+                project_name=project_name,
+                message=str(exc),
+            )
+
+        source_path = entry.path
+        if not source_path.exists():
+            return OnboardResponse(
+                action="onboard",
+                success=False,
+                project_name=project_name,
+                message=f"Project source path no longer exists: {source_path}",
+            )
+
+        # Create a Monday instance pointing at the external project
+        project_monday = Monday(MondayConfig(project_root=source_path))
+
+        # ── Step 1: Migrate ─────────────────────────────────────────────────
+        migrate_resp = project_monday.migrate(action="run")
+        migrate_summary = migrate_resp.message
+
+        # ── Step 2: Doctor ───────────────────────────────────────────────────
+        doctor_resp = project_monday.doctor()
+
+        # ── Step 3: Advise ───────────────────────────────────────────────────
+        advise_resp = project_monday.advise()
+
+        # ── Step 4: Generate report ─────────────────────────────────────────
+        if reports_dir is None:
+            reports_dir = self._config.project_root / "projects" / project_name
+        reports_dir = Path(reports_dir)
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_path = reports_dir / "ONBOARDING_REPORT.md"
+
+        report_md = _generate_onboarding_report(
+            project_name=project_name,
+            entry=entry,
+            migrate_resp=migrate_resp,
+            doctor_resp=doctor_resp,
+            advise_resp=advise_resp,
+        )
+        report_path.write_text(report_md, encoding="utf-8")
+
+        success = doctor_resp.success and advise_resp.success
+
+        return OnboardResponse(
+            action="onboard",
+            success=success,
+            project_name=project_name,
+            migrate_summary=migrate_summary,
+            health_score=doctor_resp.health_score,
+            grade=doctor_resp.grade,
+            sprint_goal=advise_resp.sprint_goal,
+            confidence=advise_resp.confidence,
+            report_path=str(report_path),
+            data={
+                "migrate": migrate_resp.data,
+                "doctor": doctor_resp.data,
+                "advisory": advise_resp.data,
+            },
+            message=(
+                f"Onboarding complete — health {doctor_resp.health_score}/100 ({doctor_resp.grade}), "
+                f"confidence {advise_resp.confidence:.0%}. "
+                f"Report: {report_path}"
+            ),
+        )
+
+    def _remove_knowledge_entry(self, entry_id: str) -> None:
+        """Remove a knowledge entry by ID. Used by migration rollback."""
+        self.__knowledge.remove(entry_id)
+
     def status(self) -> StatusResponse:
         """
         Return the current health and configuration status of this Monday instance.
@@ -737,3 +1211,273 @@ def _extract_summary(content: str) -> str:
         if stripped and not stripped.startswith("#"):
             return stripped[:500]
     return content.replace("\n", " ").strip()[:500]
+
+
+def _generate_onboarding_report(
+    project_name: str,
+    entry: Any,
+    migrate_resp: Any,
+    doctor_resp: Any,
+    advise_resp: Any,
+) -> str:
+    """
+    Generate a complete Markdown onboarding report.
+
+    Combines migrate, doctor, and advisory data into a structured document
+    that answers all onboarding questions defined in Initiative 010.
+    """
+    from datetime import datetime, timezone
+    lines: list[str] = []
+
+    now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    lines.append(f"# {project_name.title()} — MondayOS Onboarding Report")
+    lines.append("")
+    lines.append(f"**Generated:** {now}  ")
+    lines.append(f"**Source path:** `{entry.source_path}`  ")
+    lines.append(f"**Description:** {entry.description or '(none)'}  ")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # ── Executive Summary ────────────────────────────────────────────────
+    lines.append("## Executive Summary")
+    lines.append("")
+    advisory = advise_resp.data or {}
+    repo_summary = advisory.get("repository_summary", "")
+    if repo_summary:
+        lines.append(repo_summary)
+        lines.append("")
+
+    lines.append(
+        f"| Metric | Value |"
+    )
+    lines.append("| --- | --- |")
+    lines.append(f"| Health Score | {doctor_resp.health_score}/100 ({doctor_resp.grade}) |")
+    lines.append(f"| Advisory Confidence | {advise_resp.confidence:.0%} |")
+    migrate_data = migrate_resp.data or {}
+    imported = migrate_resp.imported_count
+    skipped_count = migrate_resp.skipped_count
+    total_kb = imported + skipped_count  # skipped = already in index
+    lines.append(f"| Knowledge Entries in Base | {total_kb} ({imported} new this run) |")
+    lines.append(f"| Sprint Recommendation | {advise_resp.sprint_goal or '(none)'} |")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # ── What MondayOS Knows About This Project ───────────────────────────
+    # Infer knowledge base size from the advisory summary (more reliable than
+    # the migration run count, which is 0 on repeat runs due to idempotency).
+    repo_summary_lower = advisory.get("repository_summary", "").lower()
+    kb_size_from_advisory = 0
+    import re as _re
+    _kb_match = _re.search(r"(\d+) active entr", repo_summary_lower)
+    if _kb_match:
+        kb_size_from_advisory = int(_kb_match.group(1))
+    total_known = imported + migrate_resp.skipped_count + kb_size_from_advisory
+
+    lines.append("## What MondayOS Knows")
+    lines.append("")
+    if kb_size_from_advisory > 0:
+        lines.append(
+            f"**Knowledge base:** {kb_size_from_advisory} active entries "
+            f"({imported} newly imported this run, {migrate_resp.skipped_count} already present)."
+        )
+        lines.append("")
+        sources = migrate_resp.sources_processed or []
+        if sources:
+            lines.append("**Source documents:**")
+            for src in sources:
+                lines.append(f"- `{src}`")
+            lines.append("")
+    elif imported > 0:
+        lines.append(f"**{imported} knowledge entries** were imported from project documentation.")
+        lines.append("")
+        sources = migrate_resp.sources_processed or []
+        if sources:
+            lines.append("**Sources imported:**")
+            for src in sources:
+                lines.append(f"- `{src}`")
+            lines.append("")
+        skipped = migrate_resp.skipped_count
+        if skipped:
+            lines.append(f"*{skipped} candidate(s) were skipped (already imported or below confidence threshold).*")
+            lines.append("")
+    else:
+        lines.append("No knowledge entries found. Run `monday migrate` to import project documentation.")
+        lines.append("")
+
+    # ── Documentation Inventory ──────────────────────────────────────────
+    lines.append("## Documentation Inventory")
+    lines.append("")
+    doctor_data = doctor_resp.data or {}
+    doc_findings = [
+        f for r in doctor_data.get("analyzers", [])
+        if r.get("name") == "documentation"
+        for f in r.get("findings", [])
+    ]
+    if doc_findings:
+        for finding in doc_findings:
+            sev = finding.get("severity", "info").upper()
+            title = finding.get("title", "")
+            detail = finding.get("detail", "")
+            rec = finding.get("recommendation", "")
+            lines.append(f"- **[{sev}]** {title}")
+            if detail:
+                lines.append(f"  - {detail}")
+            if rec:
+                lines.append(f"  - *Recommendation:* {rec}")
+    else:
+        lines.append("*No documentation findings recorded.*")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # ── Knowledge Gaps ───────────────────────────────────────────────────
+    lines.append("## Knowledge Gaps")
+    lines.append("")
+    gaps = advisory.get("knowledge_gaps", [])
+    doc_gaps = advisory.get("documentation_gaps", [])
+    if gaps:
+        lines.append("**Missing knowledge types:**")
+        for gap in gaps:
+            lines.append(f"- {gap}")
+        lines.append("")
+    if doc_gaps:
+        lines.append("**Documentation gaps:**")
+        for gap in doc_gaps:
+            lines.append(f"- {gap}")
+        lines.append("")
+    if not gaps and not doc_gaps:
+        lines.append("*No knowledge gaps detected.*")
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # ── Engineering Risks ────────────────────────────────────────────────
+    lines.append("## Engineering Risks")
+    lines.append("")
+    risks = advisory.get("risks", [])
+    if risks:
+        for risk in risks:
+            sev = risk.get("severity", "").upper()
+            title = risk.get("title", "")
+            impact = risk.get("impact", "")
+            rec = risk.get("recommendation", "")
+            lines.append(f"### [{sev}] {title}")
+            if impact:
+                lines.append(f"**Impact:** {impact}")
+                lines.append("")
+            if rec:
+                lines.append(f"**Recommendation:** {rec}")
+                lines.append("")
+    else:
+        lines.append("*No engineering risks detected.*")
+        lines.append("")
+
+    # ── Doctor Findings Detail ───────────────────────────────────────────
+    lines.append("## Health Report")
+    lines.append("")
+    lines.append(f"**Score:** {doctor_resp.health_score}/100 ({doctor_resp.grade})")
+    lines.append("")
+    summary = doctor_resp.summary
+    if summary:
+        lines.append(f"**Summary:** {summary}")
+        lines.append("")
+    recs = doctor_resp.recommendations or []
+    if recs:
+        lines.append("**Top Recommendations:**")
+        for rec in recs[:5]:
+            lines.append(f"1. {rec}")
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # ── What Should Be Built Next ────────────────────────────────────────
+    lines.append("## What to Build Next")
+    lines.append("")
+    sprint_goal = advisory.get("sprint_goal", "")
+    sprint_rationale = advisory.get("sprint_rationale", "")
+    if sprint_goal:
+        lines.append(f"**Recommended Sprint Goal:** {sprint_goal}")
+        lines.append("")
+    if sprint_rationale:
+        lines.append(sprint_rationale)
+        lines.append("")
+
+    actions = advisory.get("next_actions", [])
+    if actions:
+        lines.append("**Next Actions (ranked by value):**")
+        lines.append("")
+        for action in actions:
+            title = action.get("title", "")
+            rationale = action.get("rationale", "")
+            effort = action.get("effort", "")
+            cmd = action.get("command", "")
+            priority = action.get("priority", 0)
+            lines.append(f"{priority}. **{title}** ({effort})")
+            if rationale:
+                lines.append(f"   - {rationale}")
+            if cmd:
+                lines.append(f"   - `$ {cmd}`")
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # ── Technical Debt ───────────────────────────────────────────────────
+    lines.append("## Technical Debt")
+    lines.append("")
+    debt_summary = advisory.get("technical_debt_summary", "")
+    debt_items = advisory.get("debt_items", [])
+    if debt_summary:
+        lines.append(debt_summary)
+        lines.append("")
+    if debt_items:
+        for item in debt_items:
+            lines.append(f"- {item}")
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # ── Recommended Tasks ────────────────────────────────────────────────
+    lines.append("## Recommended Tasks to Create")
+    lines.append("")
+    lines.append(
+        "The following tasks are recommended based on the advisory analysis. "
+        "Create them with `monday task create --title \"...\" --objective \"...\"` "
+        f"against the {project_name} project root."
+    )
+    lines.append("")
+    tasks: list[tuple[str, str, str]] = []
+    if risks:
+        for risk in [r for r in risks if r.get("severity") in ("critical", "high")][:3]:
+            title = f"Fix: {risk.get('title', '')}"
+            obj = risk.get("recommendation", "")
+            prio = "P0" if risk.get("severity") == "critical" else "P1"
+            tasks.append((prio, title, obj))
+    if gaps:
+        tasks.append(("P2", "Expand knowledge base", "Add missing knowledge types: " + ", ".join(gaps[:3])))
+    if doc_gaps:
+        tasks.append(("P2", "Close documentation gaps", "Address: " + "; ".join(doc_gaps[:2])))
+    if actions:
+        top_action = actions[0]
+        cmd = top_action.get("command", "")
+        tasks.append(("P1", top_action.get("title", ""), top_action.get("rationale", "")))
+
+    if tasks:
+        for prio, title, obj in tasks:
+            lines.append(f"- **[{prio}]** {title}")
+            if obj:
+                lines.append(f"  - *Objective:* {obj}")
+        lines.append("")
+    else:
+        lines.append("*No tasks recommended — project appears healthy.*")
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # ── Footer ───────────────────────────────────────────────────────────
+    lines.append("*Generated by MondayOS. Run `monday onboard " + project_name + "` to refresh.*")
+    lines.append("")
+
+    return "\n".join(lines)
