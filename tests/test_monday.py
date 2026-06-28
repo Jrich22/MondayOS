@@ -423,8 +423,10 @@ class TestSearch:
 # ---------------------------------------------------------------------------
 
 class TestTask:
-    def setup_method(self) -> None:
-        self.monday = Monday()
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path: Path) -> None:
+        self.monday = Monday(MondayConfig(project_root=tmp_path))
+        self.tmp_path = tmp_path
 
     def test_returns_task_response(self) -> None:
         assert isinstance(self.monday.task("list"), TaskResponse)
@@ -459,10 +461,86 @@ class TestTask:
         assert isinstance(r, TaskResponse)
 
     def test_task_create_creates_task(self) -> None:
-        pytest.skip("TODO: implement TaskManager.create() and wire to Monday.task('create')")
+        r = self.monday.task(
+            "create",
+            title="Wire up the task API",
+            objective="Monday.task('create') should persist tasks to disk.",
+            task_type="feature",
+            priority="P2",
+        )
+        assert r.success is True
+        assert r.task_id is not None
+        assert r.task_id.startswith("TASK-")
+        assert r.data["status"] == "backlog"
+
+        active_file = self.tmp_path / "tasks" / "active" / f"{r.task_id}.md"
+        assert active_file.exists()
 
     def test_task_list_returns_active_tasks(self) -> None:
-        pytest.skip("TODO: implement TaskManager.list_active() and wire to Monday.task('list')")
+        self.monday.task(
+            "create",
+            title="First task",
+            objective="Objective A.",
+            task_type="feature",
+            priority="P2",
+        )
+        self.monday.task(
+            "create",
+            title="Second task",
+            objective="Objective B.",
+            task_type="fix",
+            priority="P1",
+        )
+        r = self.monday.task("list")
+        assert r.success is True
+        assert r.data["count"] == 2
+        titles = {t["title"] for t in r.data["tasks"]}
+        assert "First task" in titles
+        assert "Second task" in titles
+
+    def test_task_complete_marks_task_done(self) -> None:
+        # create → assign → in_progress → complete (via Monday.task)
+        from tasks import TaskManager, TaskStatus, TaskType, TaskPriority
+        mgr = TaskManager(self.tmp_path)
+        task = mgr.create(
+            title="Complete me",
+            task_type=TaskType.FEATURE,
+            priority=TaskPriority.P2,
+            objective="Test completion.",
+            created_by="human:test",
+        )
+        mgr.update_status(task.id, TaskStatus.ASSIGNED, changed_by="human:test")
+        mgr.update_status(task.id, TaskStatus.IN_PROGRESS, changed_by="human:test")
+
+        r = self.monday.task("complete", task_id=task.id)
+        assert r.success is True
+        assert r.data["status"] == "completed"
+
+    def test_task_complete_requires_task_id(self) -> None:
+        r = self.monday.task("complete")
+        assert r.success is False
+        assert "task_id" in r.message.lower()
+
+    def test_task_get_retrieves_by_id(self) -> None:
+        created = self.monday.task(
+            "create",
+            title="Retrieve me",
+            objective="Should be retrievable.",
+            task_type="docs",
+            priority="P3",
+        )
+        r = self.monday.task("get", task_id=created.task_id)
+        assert r.success is True
+        assert r.data["title"] == "Retrieve me"
+
+    def test_task_get_unknown_id_returns_failure(self) -> None:
+        r = self.monday.task("get", task_id="TASK-9999")
+        assert r.success is False
+
+    def test_task_unknown_action_returns_failure(self) -> None:
+        r = self.monday.task("frobnicate")
+        assert r.success is False
+        assert "frobnicate" in r.message
 
 
 # ---------------------------------------------------------------------------

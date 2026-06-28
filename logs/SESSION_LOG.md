@@ -257,6 +257,70 @@ Implemented the first production-ready capability: `Monday.learn()` and `Monday.
 3. `Monday.learn()` — MKS validation: VAL-001 through VAL-020
 4. `KnowledgeIndex.write_markdown_index()` — generate `knowledge/index.md` after every write
 5. `Monday.task()` — wire `TaskManager.create()`, `list_active()`, `get()`
+
+---
+
+## 2026-06-27 — Sprint 1.3: Task Capture
+
+### Session Summary
+
+Implemented the second production-ready capability: `Monday.task()` for create, get, list, and complete. Tasks now persist to disk with a full audit trail (status_history), survive restarts via sequence tracking, and move to `tasks/completed/` on terminal status.
+
+### Completed
+
+**`tasks/errors.py`** — New: typed exception hierarchy (`TaskError`, `TaskNotFoundError`, `TaskValidationError`, `InvalidTransitionError`, `TaskParseError`)
+
+**`tasks/parser.py`** — Implemented fully:
+- `parse(raw, source_path)` — parses YAML frontmatter into `Task`; validates required fields; deserializes `status_history` list including `from_status: null` for initial creation
+- `serialize(task)` — builds deterministic YAML frontmatter (alphabetical key sort); round-trips cleanly
+
+**`tasks/manager.py`** — Implemented fully (Markdown-on-disk backend):
+- `__init__(project_root)` — sets up `tasks/active/` and `tasks/completed/` dirs; loads sequence counter from `tasks/.sequences.json`
+- `create(...)` — validates title/objective; assigns `TASK-NNNN` ID; builds `StatusTransition` with `from_status=None`; writes to `tasks/active/`
+- `get(task_id)` — searches `active/` then `completed/`; raises `TaskNotFoundError` if not found
+- `update_status(task_id, new_status, changed_by, reason)` — validates via `task.can_transition_to()`; raises `InvalidTransitionError` on illegal transition; appends transition to `status_history`; moves file to `tasks/completed/` if terminal
+- `list_active(...)` — scans `tasks/active/*.md`, parses each, applies optional filters; skips README/index files silently
+- `assign()`, `block()`, `append_work_log()`, `archive()` — convenience methods implemented
+
+**`tasks/__init__.py`** — Exports expanded to include all error types and `TaskParser`
+
+**`monday/api.py`** — Wired:
+- `Monday.__init__` — `TaskManager` now receives `project_root`
+- `Monday.task(action='create')` — validates, creates via `TaskManager`, publishes `TASK_CREATED`, returns `TaskResponse`
+- `Monday.task(action='get')` — retrieves by `task_id`, returns full task dict in `data`
+- `Monday.task(action='list'/'list_active')` — lists active tasks, echoes original action string in response
+- `Monday.task(action='complete')` — transitions to COMPLETED, publishes `TASK_COMPLETED`, returns `TaskResponse`
+- Unknown actions return `success=False` with descriptive message
+
+**Test results:**
+- `tests/test_tasks.py` — **46 tests, 0 skipped, 0 failures** (removed 2 NotImplementedError stubs; added TestTaskParser + full TestTaskManager)
+- `tests/test_monday.py` — **97 tests, 3 skipped, 0 failures** (TestTask upgraded to tmp_path autouse fixture; 7 new end-to-end tests)
+- **Total: 250 passed, 15 skipped, 0 failures**
+
+### Architectural Decisions Made
+
+**`TaskManager` is unaware of EventBus:** Same pattern as `KnowledgeStore` — `Monday` orchestrates all cross-cutting concerns. `TaskManager` creates/reads/updates/archives; `Monday.task()` publishes events after the store operation succeeds.
+
+**`tasks/active/` and `tasks/completed/` are separate directories:** Terminal tasks (COMPLETED, CANCELLED) move from `active/` to `completed/` so `list_active()` only needs to scan one directory. `get()` checks both locations to support full retrieval.
+
+**Action echo in `_task_list`:** When caller invokes `task("list")`, the response returns `action="list"` (not `"list_active"`), preserving the caller's original action string in the response for API stability.
+
+**`from_status: null` in initial StatusTransition:** The first `StatusTransition` in `status_history` always has `from_status=None` — this records the creation event without implying a prior state. The YAML roundtrip preserves `null` cleanly.
+
+### State at End
+
+- 250 tests pass, 15 skipped (all skipped are appropriate future-sprint placeholders)
+- `Monday.task()` is production-ready for create, get, list, and complete
+- `Monday.learn()` and `Monday.search()` remain production-ready from Sprint 1.2
+- `Monday.ask()` remains a typed stub
+
+### Sprint 1.4 Candidates
+
+1. `Monday.task(action='update')` — partial field updates (title, priority, context, acceptance_criteria)
+2. `Monday.task(action='assign')` — assign a task to an agent or human
+3. `SearchEngine` — unified search across knowledge + tasks
+4. `Monday.learn()` — type_fields population per MKS schema (currently only body stored)
+5. `Monday.learn()` — MKS validation rules VAL-001 through VAL-020
 6. `Monday.ask()` — integrate Brain + model call (requires integration layer)
 7. `KnowledgeStore.search()` — filter by type, tags, components (already supported; wire through `Monday.search()`)
 

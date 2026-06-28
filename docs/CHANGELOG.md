@@ -11,6 +11,36 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.4.0] — 2026-06-27 — Sprint 1.3: Task Capture
+
+### Added
+- `tasks/errors.py` — typed error hierarchy: `TaskError`, `TaskNotFoundError`, `TaskValidationError`, `InvalidTransitionError`, `TaskParseError`
+- `tasks/parser.py` — `TaskParser.parse()` and `TaskParser.serialize()`: Markdown + YAML frontmatter I/O for `Task` objects; round-trips cleanly; handles `status_history` with `from_status: null` for initial creation; alphabetically sorted keys for determinism
+- `TaskManager.create()` — validates required fields, assigns stable ID (`TASK-NNNN`), builds initial `StatusTransition`, persists to `tasks/active/{ID}.md`, returns `Task`
+- `TaskManager.get()` — retrieves by ID from `tasks/active/` then `tasks/completed/`; raises `TaskNotFoundError` if absent
+- `TaskManager.update_status()` — validates transition via `Task.can_transition_to()`, appends `StatusTransition` to history, moves file to `tasks/completed/` on terminal status
+- `TaskManager.list_active()` — scans `tasks/active/`, parses each file, applies optional filters (status, priority, assigned_to, task_type)
+- `TaskManager.assign()`, `TaskManager.block()`, `TaskManager.append_work_log()`, `TaskManager.archive()` — convenience wrappers
+- Sequence tracking in `tasks/.sequences.json` — survives restarts, consistent across instances
+- `Monday.task(action='create')` — validates and delegates to `TaskManager.create()`; publishes `TASK_CREATED` event; returns `TaskResponse`
+- `Monday.task(action='get')` — retrieves task by `task_id`; returns `TaskResponse` with full task dict
+- `Monday.task(action='list')` / `action='list_active'` — lists active tasks; optional filters via kwargs; returns `TaskResponse` with `data.tasks` list
+- `Monday.task(action='complete')` — transitions task to COMPLETED via `TaskManager.update_status()`; publishes `TASK_COMPLETED` event; returns `TaskResponse`
+
+### Changed
+- `tasks/__init__.py` — now exports all error types (`TaskError`, `TaskNotFoundError`, `TaskValidationError`, `InvalidTransitionError`, `TaskParseError`) and `TaskParser`
+- `Monday.__init__` — `TaskManager` now receives `project_root` so task files are written to the configured project directory
+- `Monday.task()` — fully implemented for `create`, `get`, `list`/`list_active`, and `complete`; unknown actions return `success=False` with descriptive message
+
+### Tests
+- `tests/test_tasks.py` — removed two `NotImplementedError` stubs; added `TestTaskParser` (7 tests) and `TestTaskManager` (19 tests) with full disk I/O via `tmp_path`; total 46 task tests
+- `tests/test_monday.py` — `TestTask` converted from `setup_method` to `autouse` fixture with `tmp_path`; 7 new tests: create/get/list/complete end-to-end; removed 2 skipped stubs
+
+### Total test counts
+- **250 passed**, **15 skipped**, **0 failures**
+
+---
+
 ## [0.3.0] — 2026-06-27 — Sprint 1.2: Knowledge Capture
 
 ### Added

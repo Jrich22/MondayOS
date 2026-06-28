@@ -27,7 +27,16 @@ from monday.types import (
     TaskResponse,
 )
 from search import SearchEngine
-from tasks import TaskManager
+from tasks import (
+    ApprovalLevel,
+    InvalidTransitionError,
+    TaskManager,
+    TaskNotFoundError,
+    TaskPriority,
+    TaskStatus,
+    TaskType,
+    TaskValidationError,
+)
 
 _VERSION = "0.1.0"
 
@@ -72,7 +81,7 @@ class Monday:
         self.__knowledge = KnowledgeStore(self._config.project_root)
         self.__memory = SessionMemory(session_id=self._session_id)
         self.__search = SearchEngine()
-        self.__tasks = TaskManager()
+        self.__tasks = TaskManager(self._config.project_root)
 
     # ------------------------------------------------------------------
     # Public API
@@ -225,19 +234,211 @@ class Monday:
         **kwargs: Any,
     ) -> TaskResponse:
         """
-        Create, retrieve, update, or list tasks.
+        Create, retrieve, update, or list tasks through the TaskManager.
 
-        TODO: Route each action to the appropriate TaskManager method.
-        TODO: Validate action against the supported action set.
-        TODO: Publish task lifecycle events to EventBus.
+        Actions:
+            create      — create a new task (requires title, objective, task_type, priority)
+            get         — retrieve a task by task_id
+            list        — alias for list_active
+            list_active — list all active tasks; optional filters: status, priority, task_type
+            complete    — transition a task to COMPLETED (requires task_id)
+
+        Returns a TaskResponse with success=True on success or success=False with
+        a descriptive message on failure. Does not raise.
         """
+        if action in ("list", "list_active"):
+            return self._task_list(action, kwargs)
+
+        if action == "create":
+            return self._task_create(title, objective, kwargs)
+
+        if action == "get":
+            return self._task_get(task_id)
+
+        if action == "complete":
+            return self._task_complete(task_id, kwargs)
+
         return TaskResponse(
             action=action,
             success=False,
             task_id=task_id or None,
             data={},
-            message="",
+            message=f"Unknown action {action!r}. Valid actions: create, get, list_active, complete",
         )
+
+    def _task_create(self, title: str, objective: str, kwargs: dict[str, Any]) -> TaskResponse:
+        try:
+            task_type_raw = kwargs.get("task_type", "feature")
+            priority_raw = kwargs.get("priority", "P2")
+            created_by = kwargs.get("created_by", f"human:{self._session_id}")
+            approval_raw = kwargs.get("approval_required", "human-review")
+            context = kwargs.get("context", "")
+            acceptance_criteria = kwargs.get("acceptance_criteria")
+
+            try:
+                task_type = TaskType(task_type_raw)
+            except ValueError:
+                valid = [t.value for t in TaskType]
+                return TaskResponse(
+                    action="create",
+                    success=False,
+                    task_id=None,
+                    data={},
+                    message=f"Unknown task_type {task_type_raw!r}. Valid values: {valid}",
+                )
+
+            try:
+                priority = TaskPriority(priority_raw)
+            except ValueError:
+                valid = [p.value for p in TaskPriority]
+                return TaskResponse(
+                    action="create",
+                    success=False,
+                    task_id=None,
+                    data={},
+                    message=f"Unknown priority {priority_raw!r}. Valid values: {valid}",
+                )
+
+            try:
+                approval = ApprovalLevel(approval_raw)
+            except ValueError:
+                approval = ApprovalLevel.HUMAN_REVIEW
+
+            created_task = self.__tasks.create(
+                title=title,
+                task_type=task_type,
+                priority=priority,
+                objective=objective,
+                created_by=created_by,
+                approval_required=approval,
+                context=context,
+                acceptance_criteria=list(acceptance_criteria) if acceptance_criteria else None,
+            )
+
+            self.__bus.publish(Event(
+                event_type=EventType.TASK_CREATED,
+                source="monday",
+                timestamp=datetime.now(tz=timezone.utc),
+                payload={"task_id": created_task.id, "title": created_task.title},
+                session_id=self._session_id,
+            ))
+
+            return TaskResponse(
+                action="create",
+                success=True,
+                task_id=created_task.id,
+                data=_task_to_dict(created_task),
+                message=f"Created {created_task.id}",
+            )
+        except TaskValidationError as exc:
+            return TaskResponse(
+                action="create",
+                success=False,
+                task_id=None,
+                data={},
+                message=str(exc),
+            )
+
+    def _task_get(self, task_id: str) -> TaskResponse:
+        if not task_id:
+            return TaskResponse(
+                action="get",
+                success=False,
+                task_id=None,
+                data={},
+                message="task_id is required for action 'get'",
+            )
+        try:
+            found = self.__tasks.get(task_id)
+            return TaskResponse(
+                action="get",
+                success=True,
+                task_id=found.id,
+                data=_task_to_dict(found),
+                message=f"Found {found.id}",
+            )
+        except TaskNotFoundError as exc:
+            return TaskResponse(
+                action="get",
+                success=False,
+                task_id=task_id,
+                data={},
+                message=str(exc),
+            )
+
+    def _task_list(self, action: str, kwargs: dict[str, Any]) -> TaskResponse:
+        status_raw = kwargs.get("status")
+        priority_raw = kwargs.get("priority")
+        task_type_raw = kwargs.get("task_type")
+        assigned_to = kwargs.get("assigned_to")
+
+        status = TaskStatus(status_raw) if status_raw else None
+        priority = TaskPriority(priority_raw) if priority_raw else None
+        task_type = TaskType(task_type_raw) if task_type_raw else None
+
+        tasks = self.__tasks.list_active(
+            status=status,
+            priority=priority,
+            assigned_to=assigned_to,
+            task_type=task_type,
+        )
+
+        return TaskResponse(
+            action=action,
+            success=True,
+            task_id=None,
+            data={"tasks": [_task_to_dict(t) for t in tasks], "count": len(tasks)},
+            message=f"{len(tasks)} active task(s)",
+        )
+
+    def _task_complete(self, task_id: str, kwargs: dict[str, Any]) -> TaskResponse:
+        if not task_id:
+            return TaskResponse(
+                action="complete",
+                success=False,
+                task_id=None,
+                data={},
+                message="task_id is required for action 'complete'",
+            )
+        changed_by = kwargs.get("changed_by", f"human:{self._session_id}")
+        reason = kwargs.get("reason", "")
+        try:
+            updated = self.__tasks.update_status(
+                task_id=task_id,
+                new_status=TaskStatus.COMPLETED,
+                changed_by=changed_by,
+                reason=reason,
+            )
+            self.__bus.publish(Event(
+                event_type=EventType.TASK_COMPLETED,
+                source="monday",
+                timestamp=datetime.now(tz=timezone.utc),
+                payload={"task_id": updated.id},
+                session_id=self._session_id,
+            ))
+            return TaskResponse(
+                action="complete",
+                success=True,
+                task_id=updated.id,
+                data=_task_to_dict(updated),
+                message=f"{updated.id} marked COMPLETED",
+            )
+        except TaskNotFoundError as exc:
+            return TaskResponse(
+                action="complete",
+                success=False,
+                task_id=task_id,
+                data={},
+                message=str(exc),
+            )
+        except InvalidTransitionError as exc:
+            return TaskResponse(
+                action="complete",
+                success=False,
+                task_id=task_id,
+                data={},
+                message=str(exc),
+            )
 
     def status(self) -> StatusResponse:
         """
@@ -276,6 +477,24 @@ class Monday:
 
 def _new_session_id() -> str:
     return str(uuid.uuid4())
+
+
+def _task_to_dict(task: Any) -> dict[str, Any]:
+    """Convert a Task to a plain dict for TaskResponse.data."""
+    return {
+        "id": task.id,
+        "title": task.title,
+        "task_type": task.task_type.value,
+        "status": task.status.value,
+        "priority": task.priority.value,
+        "created_by": task.created_by,
+        "objective": task.objective,
+        "context": task.context,
+        "assigned_to": task.assigned_to,
+        "acceptance_criteria": list(task.acceptance_criteria),
+        "created": task.created.isoformat(),
+        "updated": task.updated.isoformat(),
+    }
 
 
 def _extract_summary(content: str) -> str:

@@ -17,17 +17,31 @@ Approval:     none | human-review | human-approval
 See docs/TASK_SYSTEM.md for the full lifecycle diagram and schema.
 
 Public interface:
-    TaskManager      — create, read, update, archive tasks (the only mutation path)
-    Task             — task data model
-    TaskType         — enum of task type variants
-    TaskStatus       — enum of lifecycle statuses
-    TaskPriority     — enum of priority levels P0–P3
-    ApprovalLevel    — enum of human approval gate levels
-    StatusTransition — immutable record of a single status change
+    TaskManager          — create, read, update, archive tasks (the only mutation path)
+    Task                 — task data model
+    TaskType             — enum of task type variants
+    TaskStatus           — enum of lifecycle statuses
+    TaskPriority         — enum of priority levels P0–P3
+    ApprovalLevel        — enum of human approval gate levels
+    StatusTransition     — immutable record of a single status change
+    TaskParser           — serialize/deserialize tasks to Markdown+YAML
+    TaskError            — base exception class
+    TaskNotFoundError    — raised when a task cannot be found by ID
+    TaskValidationError  — raised when a required field is missing or invalid
+    InvalidTransitionError — raised when a status transition is not permitted
+    TaskParseError       — raised when a task file cannot be parsed
 """
 from __future__ import annotations
 
+from tasks.errors import (
+    InvalidTransitionError,
+    TaskError,
+    TaskNotFoundError,
+    TaskParseError,
+    TaskValidationError,
+)
 from tasks.manager import TaskManager
+from tasks.parser import TaskParser
 from tasks.task import ApprovalLevel, StatusTransition, Task, TaskPriority, TaskStatus, TaskType
 
 __all__ = [
@@ -38,4 +52,10 @@ __all__ = [
     "TaskPriority",
     "ApprovalLevel",
     "StatusTransition",
+    "TaskParser",
+    "TaskError",
+    "TaskNotFoundError",
+    "TaskValidationError",
+    "InvalidTransitionError",
+    "TaskParseError",
 ]
