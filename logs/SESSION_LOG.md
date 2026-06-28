@@ -260,6 +260,65 @@ Implemented the first production-ready capability: `Monday.learn()` and `Monday.
 
 ---
 
+## 2026-06-27 — Sprint 1.5: Monday CLI
+
+### Session Summary
+
+Implemented the `monday` command-line interface — the canonical interface for humans, Claude Code, and future automation. The CLI contains zero business logic: every command invokes `Monday()` through the public API. All five public methods are now reachable from the terminal.
+
+### Completed
+
+**`monday/cli.py`** — New: full CLI via `argparse`
+- `main(argv=None) -> int` — accepts optional argv list for testability; returns exit code without calling `sys.exit()` directly
+- `monday status` — prints version, session, uptime, health, per-module ok/FAIL
+- `monday ask "<prompt>"` — prints answer block, confidence, engine, sources, supporting entries, related decisions, related tasks, suggested next actions
+- `monday search "<query>" [--limit N]` — prints ranked results with ID, title, type, tags, and summary excerpt
+- `monday learn [--title] [--type] [--tags] [--components] [--content]` — three input modes: all-flags (non-interactive), stdin pipe (detected via `sys.stdin.isatty()`), interactive guided prompts
+- `monday task list [--status] [--priority] [--type]` — tabular active task list with ID, priority, status, title
+- `monday task create --title --objective [opts]` — creates task, prints ID and key fields
+- `monday task get TASK-ID` — prints full task detail block
+- `monday task complete TASK-ID [--reason] [--changed-by]` — completes task; rejects invalid transitions with error
+
+**`pyproject.toml`** — Updated:
+- Added `[project.scripts]` → `monday = "monday.cli:main"`
+- Added `monday*` to `packages.find` include list and coverage source
+- Fixed build backend from `setuptools.backends.legacy:build` → `setuptools.build_meta` (required for current Python/setuptools versions)
+
+**`docs/CLI.md`** — New: full specification covering installation, design principles, all commands with flags/examples/output, error handling, automation patterns
+
+**Test results:**
+- `tests/test_cli.py` — **52 tests, 0 skipped, 0 failures**
+- **Total: 321 passed, 12 skipped, 0 failures**
+
+### Architectural Decisions Made
+
+**Zero business logic in CLI:** The CLI does not import `KnowledgeStore`, `TaskManager`, `ReasoningEngine`, or any other internal class. It imports only `Monday` and `MondayConfig`. This enforces the public API boundary and means the CLI can evolve independently of internal implementations.
+
+**`main(argv=None) -> int` signature:** Standard argparse pattern — accepts optional argv list so tests can call `main([...])` without touching `sys.argv`. Returns int exit code instead of calling `sys.exit()` directly; the setuptools entry-point wrapper calls `sys.exit(main())`.
+
+**`--project-root` as a global flag:** Placed on the top-level parser (before the subcommand) so a single `--project-root` configures all commands. The alternative (per-subcommand flag) would be verbose. In all tests, `--project-root str(tmp_path)` provides isolation.
+
+**Learn command: three input modes:** Non-interactive when all flags are provided; stdin pipe when `not sys.stdin.isatty()`; interactive prompts otherwise. Tests use the flag-based mode exclusively (stdin.isatty() is False in pytest; interactive mode requires real terminal).
+
+**Integration tests via `main([argv])` not subprocess:** Tests import `monday.cli.main` and call it directly. This is faster than subprocess, gives access to `capsys` and `monkeypatch`, and doesn't require the package to be installed (works with the editable install). The test file imports nothing from internal modules — all assertions are on CLI text output.
+
+### State at End
+
+- 321 tests pass, 12 skipped, 0 failures
+- `monday` binary installed and verified working
+- All five public API methods accessible from the terminal
+- Pipe-safe, automation-friendly output
+
+### Sprint 1.6 Candidates
+
+1. `monday learn --file PATH` — read content from a file rather than stdin or flag
+2. `monday task update TASK-ID --status in-progress` — status transitions via CLI
+3. `monday ask` — LLM integration (Claude API) as step 7 of reasoning pipeline
+4. `monday search --type bug --tags homebrew` — filtered search via CLI flags
+5. `monday status --json` — machine-readable JSON output for automation
+
+---
+
 ## 2026-06-27 — Sprint 1.4: Engineering Intelligence
 
 ### Session Summary

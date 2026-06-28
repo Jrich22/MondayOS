@@ -11,6 +11,30 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.6.0] — 2026-06-27 — Sprint 1.5: Monday CLI
+
+### Added
+- `monday/cli.py` — `monday` command-line interface; zero business logic; all commands invoke `Monday()` through the public API
+  - `monday status` — system health, module status, version, session ID, uptime
+  - `monday ask "<prompt>"` — delegates to `Monday.ask()`; prints answer, confidence, engine, sources, supporting entries, related decisions, related tasks, suggested next actions
+  - `monday search "<query>" [--limit N]` — delegates to `Monday.search()`; prints ranked results with type and tags
+  - `monday learn [--title] [--type] [--tags] [--components] [--content]` — delegates to `Monday.learn()`; supports non-interactive (all flags), stdin pipe, and interactive guided prompts
+  - `monday task list [--status] [--priority] [--type]` — delegates to `Monday.task("list")`
+  - `monday task create --title --objective [--type] [--priority] [--created-by]` — delegates to `Monday.task("create")`
+  - `monday task get TASK-ID` — delegates to `Monday.task("get")`
+  - `monday task complete TASK-ID [--reason] [--changed-by]` — delegates to `Monday.task("complete")`
+- `docs/CLI.md` — full CLI specification: installation, design principles, all commands, flags, output format, error handling, automation patterns
+- `[project.scripts]` in `pyproject.toml` — registers `monday` as a pip-installable entry point (`monday = "monday.cli:main"`)
+
+### Changed
+- `pyproject.toml` — added `[project.scripts]`; added `monday*` to `packages.find` include list and coverage source list; fixed build backend from `setuptools.backends.legacy:build` to `setuptools.build_meta`
+
+### Tests
+- `tests/test_cli.py` — 52 integration tests across 7 test classes: `TestHelp`, `TestStatusCommand`, `TestAskCommand`, `TestSearchCommand`, `TestLearnCommand`, `TestTaskCommand`, `TestEndToEnd`; all tests invoke `monday.cli.main()` directly with explicit argv; no subprocess required; uses `capsys` and `tmp_path` throughout
+- **Total: 321 passed, 12 skipped, 0 failures**
+
+---
+
 ## [0.5.0] — 2026-06-27 — Sprint 1.4: Engineering Intelligence
 
 ### Added
