@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from brain import Brain, BrainConfig
+from brain.reasoner import ReasoningEngine
 from events import EventBus
 from events.types import Event, EventType
 from knowledge import KnowledgeStore
@@ -82,6 +83,7 @@ class Monday:
         self.__memory = SessionMemory(session_id=self._session_id)
         self.__search = SearchEngine()
         self.__tasks = TaskManager(self._config.project_root)
+        self.__reasoner = ReasoningEngine(self.__knowledge, self.__tasks)
 
     # ------------------------------------------------------------------
     # Public API
@@ -93,18 +95,38 @@ class Monday:
         context: dict[str, Any] | None = None,
     ) -> AskResponse:
         """
-        Submit a natural language prompt to MondayOS and receive a response.
+        Answer an engineering question using knowledge already stored in MondayOS.
 
-        TODO: Delegate to Brain.execute_task() with a RESEARCH task type.
-        TODO: Populate sources from SearchEngine results used to ground the answer.
-        TODO: Populate model_used and confidence from the RoutingDecision log.
+        The ReasoningEngine searches the knowledge store and active tasks,
+        traverses entry relationships, ranks results, and synthesises a
+        plain-text answer — all without calling an external model.
+
+        Supported question types:
+            "Have we seen this before?"         — HISTORICAL lookup
+            "What do we know about X?"          — SUMMARY across all types
+            "Show related bugs / ADRs / tasks"  — TYPE_FILTER search
+            "What is currently blocked?"        — BLOCKED_TASKS filter
+            "What changed recently?"            — RECENT_CHANGES by updated_at
+            "What should I read first about X?" — ONBOARDING ordered by connectivity
+
+        Returns an AskResponse with answer text, ranked sources, supporting
+        entries, related tasks and decisions, confidence score, and suggested
+        next actions the caller can execute immediately.
+
+        When an LLM integration is added in a future sprint, it plugs in
+        inside ReasoningEngine — this method signature does not change.
         """
+        result = self.__reasoner.answer(prompt, context=context)
         return AskResponse(
-            answer="",
-            sources=[],
-            model_used="",
-            confidence=0.0,
+            answer=result.answer,
+            sources=result.sources,
+            model_used=result.model_used,
+            confidence=result.confidence,
             task_id=None,
+            supporting_entries=result.supporting_entries,
+            related_tasks=result.related_tasks,
+            related_decisions=result.related_decisions,
+            suggested_next_actions=result.suggested_next_actions,
         )
 
     def learn(

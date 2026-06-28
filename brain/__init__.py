@@ -23,11 +23,15 @@ Public interface:
 from __future__ import annotations
 
 from brain.orchestrator import Brain, BrainConfig
+from brain.reasoner import QuestionIntent, ReasoningEngine, ReasoningResult
 from brain.router import ModelTier, Router, RoutingDecision
 
 __all__ = [
     "Brain",
     "BrainConfig",
+    "QuestionIntent",
+    "ReasoningEngine",
+    "ReasoningResult",
     "Router",
     "RoutingDecision",
     "ModelTier",

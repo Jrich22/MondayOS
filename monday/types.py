@@ -20,11 +20,19 @@ class AskResponse:
     Response from Monday.ask().
 
     Attributes:
-        answer:     The model's response to the prompt.
-        sources:    IDs of knowledge entries or tasks used to form the answer.
-        model_used: Identifier of the model that produced the answer.
-        confidence: Estimated confidence, 0.0–1.0. 0.0 means unknown.
-        task_id:    ID of the task created to fulfill the request, if any.
+        answer:                 Direct answer text synthesized from internal knowledge.
+        sources:                IDs of all knowledge entries and tasks consulted.
+        model_used:             Engine identifier. "monday-reasoning/1.0" for internal
+                                reasoning; a model name when an LLM is wired in.
+        confidence:             Estimated confidence, 0.0–1.0. 0.0 means no evidence
+                                found; 0.95 is the practical maximum without LLM validation.
+        task_id:                ID of a task created to fulfil the request, if any.
+        supporting_entries:     Ranked knowledge entries (non-decision) that support
+                                the answer. Each is a dict with id, title, entry_type,
+                                summary, tags, components, confidence.
+        related_tasks:          Active tasks related to the question topic.
+        related_decisions:      Decision/ADR entries specifically matched.
+        suggested_next_actions: Actionable follow-up calls the user can make immediately.
     """
 
     answer: str
@@ -32,6 +40,10 @@ class AskResponse:
     model_used: str = ""
     confidence: float = 0.0
     task_id: str | None = None
+    supporting_entries: list[dict[str, Any]] = field(default_factory=list)
+    related_tasks: list[dict[str, Any]] = field(default_factory=list)
+    related_decisions: list[dict[str, Any]] = field(default_factory=list)
+    suggested_next_actions: list[str] = field(default_factory=list)
 
 
 @dataclass

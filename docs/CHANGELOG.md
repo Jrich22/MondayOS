@@ -11,6 +11,34 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.5.0] — 2026-06-27 — Sprint 1.4: Engineering Intelligence
+
+### Added
+- `brain/reasoner.py` — `ReasoningEngine`: answers engineering questions using only stored MondayOS knowledge; no external model calls
+  - `QuestionIntent` enum — 9 question intent categories (GENERAL, HISTORICAL, TYPE_BUG, TYPE_DECISION, TYPE_TASK, BLOCKED_TASKS, RECENT_CHANGES, SUMMARY, ONBOARDING)
+  - `ReasoningResult` dataclass — structured output: answer, sources, model_used, confidence, supporting_entries, related_tasks, related_decisions, suggested_next_actions
+  - `_classify_intent()` — keyword pattern matching to route prompts into QuestionIntent
+  - `_extract_terms()` — stop-word stripping and punctuation removal for clean search terms
+  - `_search_knowledge()` — multi-word + per-term supplement strategy; type filtering per intent; RECENT_CHANGES uses `list_all()` sorted by `updated_at`
+  - `_search_tasks()` — BLOCKED_TASKS uses `list_active(status=BLOCKED)`; TYPE_TASK/GENERAL match terms against title and objective
+  - `_traverse_relationships()` — depth-1 BFS over entry relationship graph via `KnowledgeStore.get()`
+  - `_synthesize()` — intent-specific answer templates
+  - `_suggest_actions()` — up to 5 immediately-executable follow-up calls
+  - `_calculate_confidence()` — additive signal model (quantity, summary quality, type alignment, relationship richness); hard cap at 0.95
+- `docs/REASONING_ENGINE.md` — full specification: question processing pipeline, ranking strategy, relationship traversal, confidence model, future LLM/graph/vector integration points
+
+### Changed
+- `AskResponse` — extended with 4 new fields (all default to empty): `supporting_entries`, `related_tasks`, `related_decisions`, `suggested_next_actions`
+- `Monday.ask()` — fully implemented: delegates to `ReasoningEngine`, populates all `AskResponse` fields; `model_used` is now `"monday-reasoning/1.0"`
+- `Monday.__init__` — composes `ReasoningEngine(knowledge_store, task_manager)` as `__reasoner` (name-mangled, not accessible as public attribute)
+- `brain/__init__.py` — exports `ReasoningEngine`, `ReasoningResult`, `QuestionIntent`
+
+### Tests
+- `tests/test_monday.py` — `TestAsk` converted to `tmp_path` autouse fixture; 3 previously-skipped tests implemented; 16 new behavioral tests added (empty knowledge, model_used, historical query, summary query, bug filter, decision filter, blocked tasks, confidence growth, sources populated, supporting entries, suggested actions); 1 new encapsulation test for `__reasoner`
+- **Total: 269 passed, 12 skipped, 0 failures**
+
+---
+
 ## [0.4.0] — 2026-06-27 — Sprint 1.3: Task Capture
 
 ### Added

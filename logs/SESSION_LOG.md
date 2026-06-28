@@ -260,6 +260,72 @@ Implemented the first production-ready capability: `Monday.learn()` and `Monday.
 
 ---
 
+## 2026-06-27 — Sprint 1.4: Engineering Intelligence
+
+### Session Summary
+
+Implemented `Monday.ask()` as an internal reasoning engine over the existing knowledge base and task system. No external model calls. MondayOS can now answer engineering questions using its own accumulated knowledge.
+
+### Completed
+
+**`brain/reasoner.py`** — New: `ReasoningEngine` class with full pipeline:
+- `QuestionIntent` enum — 9 categories: GENERAL, HISTORICAL, TYPE_BUG, TYPE_DECISION, TYPE_TASK, BLOCKED_TASKS, RECENT_CHANGES, SUMMARY, ONBOARDING
+- `ReasoningResult` dataclass — structured output with all `AskResponse` fields
+- `_classify_intent()` — keyword pattern matching; longer patterns checked first to prevent false positives
+- `_extract_terms()` — stop-word removal + punctuation stripping; yields clean search tokens
+- `_search_knowledge()` — multi-word search first, per-term supplement if < 3 results; type filter for BUG/DECISION intents; RECENT_CHANGES uses `list_all()` sorted by `updated_at`
+- `_search_tasks()` — BLOCKED_TASKS → `list_active(status=BLOCKED)`; TYPE_TASK/GENERAL → term match against title and objective
+- `_traverse_relationships()` — depth-1 BFS; silently skips missing targets
+- `_synthesize()` — 9 intent-specific answer templates producing deterministic plain-text output
+- `_suggest_actions()` — up to 5 immediately-executable `monday.*` calls; no results → `learn()` suggestion
+- `_calculate_confidence()` — base (0.10 × results, cap 0.70) + summary bonus (0.04 × top-3 with summary) + type alignment (0.05 × intent-matched entries) + relationship richness (0.02 × relationships); hard cap 0.95
+
+**`brain/__init__.py`** — now exports `ReasoningEngine`, `ReasoningResult`, `QuestionIntent`
+
+**`monday/types.py`** — `AskResponse` extended with 4 new fields (all default empty): `supporting_entries`, `related_tasks`, `related_decisions`, `suggested_next_actions`
+
+**`monday/api.py`** — `Monday.ask()` fully implemented:
+- Composes `__reasoner = ReasoningEngine(knowledge_store, task_manager)` in `__init__`
+- Delegates to `__reasoner.answer(prompt, context)` and maps `ReasoningResult` → `AskResponse`
+- `model_used` is now `"monday-reasoning/1.0"`
+
+**`docs/REASONING_ENGINE.md`** — New: full specification covering question processing pipeline, term extraction, search strategy per intent, relationship traversal, ranking, confidence calculation, answer synthesis templates, suggested actions, storage independence, and future LLM/graph/vector integration points
+
+**Test results:**
+- `tests/test_monday.py` — **110 tests, 0 skipped, 0 failures** (was 94 tests, 3 skipped)
+- **Total: 269 passed, 12 skipped, 0 failures**
+
+### Architectural Decisions Made
+
+**No LLM calls — templates only:** Answer synthesis uses intent-specific string templates. This produces deterministic, testable output. The pipeline is designed so an LLM drops in at the synthesis step only, with steps 1–6 (classification through ranking) unchanged. `model_used = "monday-reasoning/1.0"` is the signal callers can check to know no model was consulted.
+
+**ReasoningEngine is storage-agnostic:** It depends only on `KnowledgeStore.search()`, `.get()`, `.list_all()` and `TaskManager.list_active()`. It does not import `KnowledgeParser`, `KnowledgeLoader`, `KnowledgeIndex`, or `TaskParser`. Swapping to SQLite or Neo4j requires no changes to the reasoning layer.
+
+**Decisions partitioned from supporting entries:** `related_decisions` is a separate field from `supporting_entries`. This lets callers render the ADR log and general knowledge differently in a UI — they are the same type (`KnowledgeEntry`) but logically distinct in most question contexts.
+
+**Hard confidence cap at 0.95:** Without LLM validation of the synthesized answer against source material, claiming certainty would be misleading. The 0.05 gap is reserved for the LLM grounding sprint.
+
+**`__reasoner` is name-mangled:** Follows the established pattern (`__brain`, `__bus`, `__knowledge`, etc.). Not accessible as `monday.reasoner` or `monday._reasoner`. Test added to `TestEncapsulation`.
+
+**`TestAsk` upgraded to `tmp_path`:** Moved from `setup_method` + `Monday()` (non-deterministic if `./knowledge/` exists) to `autouse` fixture with isolated `tmp_path`. Every behavioral test now seeds its own knowledge before asserting.
+
+### State at End
+
+- 269 tests pass, 12 skipped (all skipped are appropriate future-sprint placeholders)
+- `Monday.ask()` is production-ready for internal knowledge reasoning
+- `Monday.learn()`, `Monday.search()`, `Monday.task()` remain production-ready
+- `Monday.status()` remains production-ready
+
+### Sprint 1.5 Candidates
+
+1. `Monday.ask()` — wire LLM call (Claude via API) as step 7 replacement; `model_used` becomes model ID
+2. `SearchEngine` — unified search across knowledge + tasks behind one interface
+3. `Monday.search()` — add `entry_type`, `tags`, `components` filter kwargs
+4. `Monday.learn()` — type_fields population per MKS schema (currently only body stored)
+5. `Monday.learn()` — MKS validation rules VAL-001 through VAL-020
+
+---
+
 ## 2026-06-27 — Sprint 1.3: Task Capture
 
 ### Session Summary

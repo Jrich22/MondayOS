@@ -188,8 +188,12 @@ class TestStatus:
 # ---------------------------------------------------------------------------
 
 class TestAsk:
-    def setup_method(self) -> None:
-        self.monday = Monday()
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path: Path) -> None:
+        self.monday = Monday(MondayConfig(project_root=tmp_path))
+        self.tmp_path = tmp_path
+
+    # ── structural (always pass, even with empty knowledge base) ──────────
 
     def test_returns_ask_response(self) -> None:
         assert isinstance(self.monday.ask("hello"), AskResponse)
@@ -216,6 +220,26 @@ class TestAsk:
         r = self.monday.ask("hello")
         assert hasattr(r, "task_id")
 
+    def test_ask_response_has_supporting_entries_field(self) -> None:
+        r = self.monday.ask("hello")
+        assert hasattr(r, "supporting_entries")
+        assert isinstance(r.supporting_entries, list)
+
+    def test_ask_response_has_related_tasks_field(self) -> None:
+        r = self.monday.ask("hello")
+        assert hasattr(r, "related_tasks")
+        assert isinstance(r.related_tasks, list)
+
+    def test_ask_response_has_related_decisions_field(self) -> None:
+        r = self.monday.ask("hello")
+        assert hasattr(r, "related_decisions")
+        assert isinstance(r.related_decisions, list)
+
+    def test_ask_response_has_suggested_next_actions_field(self) -> None:
+        r = self.monday.ask("hello")
+        assert hasattr(r, "suggested_next_actions")
+        assert isinstance(r.suggested_next_actions, list)
+
     def test_ask_accepts_context_kwarg(self) -> None:
         r = self.monday.ask("hello", context={"component": "memory"})
         assert isinstance(r, AskResponse)
@@ -223,14 +247,153 @@ class TestAsk:
     def test_ask_with_empty_prompt_returns_response(self) -> None:
         assert isinstance(self.monday.ask(""), AskResponse)
 
-    def test_ask_returns_non_empty_answer(self) -> None:
-        pytest.skip("TODO: implement Brain.execute_task() and wire to Monday.ask()")
-
-    def test_ask_populates_sources_from_knowledge(self) -> None:
-        pytest.skip("TODO: implement SearchEngine and wire to Monday.ask()")
+    # ── model identifier ──────────────────────────────────────────────────
 
     def test_ask_populates_model_used(self) -> None:
-        pytest.skip("TODO: implement Router and wire to Monday.ask()")
+        r = self.monday.ask("hello")
+        assert r.model_used == "monday-reasoning/1.0"
+
+    # ── empty knowledge base ──────────────────────────────────────────────
+
+    def test_ask_empty_knowledge_returns_non_empty_answer(self) -> None:
+        r = self.monday.ask("anything")
+        assert r.answer != ""
+
+    def test_ask_empty_knowledge_returns_zero_confidence(self) -> None:
+        r = self.monday.ask("unknown topic zzzz")
+        assert r.confidence == 0.0
+
+    def test_ask_empty_knowledge_suggests_learn_action(self) -> None:
+        r = self.monday.ask("unknown topic zzzz")
+        assert any("monday.learn" in a for a in r.suggested_next_actions)
+
+    # ── with knowledge ────────────────────────────────────────────────────
+
+    def test_ask_returns_non_empty_answer(self) -> None:
+        self.monday.learn(
+            "Resolved missing PATH after Homebrew installation.",
+            title="Homebrew PATH Fix",
+            entry_type="bug",
+            tags=["homebrew", "macos"],
+        )
+        r = self.monday.ask("Have we seen Homebrew PATH issues before?")
+        assert r.answer != ""
+        assert "homebrew" in r.answer.lower() or "path" in r.answer.lower() or "found" in r.answer.lower()
+
+    def test_ask_populates_sources_from_knowledge(self) -> None:
+        result = self.monday.learn(
+            "Homebrew PATH was missing after install.",
+            title="Homebrew PATH Fix",
+            entry_type="bug",
+        )
+        r = self.monday.ask("Have we seen Homebrew PATH issues before?")
+        assert result.entry_id in r.sources
+
+    def test_ask_populates_supporting_entries(self) -> None:
+        self.monday.learn(
+            "Homebrew PATH was missing after install.",
+            title="Homebrew PATH Fix",
+            entry_type="bug",
+        )
+        r = self.monday.ask("Tell me about Homebrew PATH issues")
+        assert len(r.supporting_entries) >= 1
+        entry = r.supporting_entries[0]
+        assert "id" in entry
+        assert "title" in entry
+        assert "entry_type" in entry
+
+    def test_ask_confidence_increases_with_more_matches(self) -> None:
+        r_before = self.monday.ask("homebrew path issue")
+        for i in range(5):
+            self.monday.learn(
+                f"Homebrew PATH issue #{i}: fixed by export.",
+                title=f"Homebrew Fix {i}",
+                entry_type="bug",
+                tags=["homebrew"],
+            )
+        r_after = self.monday.ask("homebrew path issue")
+        assert r_after.confidence > r_before.confidence
+
+    def test_ask_historical_query(self) -> None:
+        self.monday.learn(
+            "We hit the rate limit on the OpenAI API during load tests.",
+            title="OpenAI Rate Limit Hit",
+            entry_type="bug",
+            tags=["openai", "rate-limit"],
+        )
+        r = self.monday.ask("Have we seen OpenAI rate limit issues before?")
+        assert r.confidence > 0.0
+        assert "found" in r.answer.lower() or "yes" in r.answer.lower()
+
+    def test_ask_summary_query(self) -> None:
+        self.monday.learn(
+            "Weather data comes from OpenWeatherMap API.",
+            title="Weather data source",
+            entry_type="research",
+            tags=["weather"],
+        )
+        r = self.monday.ask("Summarize everything we know about Weather observations.")
+        assert r.answer != ""
+        assert r.confidence > 0.0
+
+    def test_ask_decision_type_filter(self) -> None:
+        self.monday.learn(
+            "We chose Python because of its AI ecosystem.",
+            title="Language choice: Python",
+            entry_type="decision",
+            tags=["language", "python"],
+        )
+        r = self.monday.ask("Show all ADRs related to search.")
+        # decisions land in related_decisions, not supporting_entries
+        assert isinstance(r.related_decisions, list)
+
+    def test_ask_bug_type_filter(self) -> None:
+        self.monday.learn(
+            "PATH was missing after Homebrew install.",
+            title="Homebrew PATH Fix",
+            entry_type="bug",
+            tags=["homebrew"],
+        )
+        self.monday.learn(
+            "Pattern: always export PATH in shell profile.",
+            title="PATH export pattern",
+            entry_type="pattern",
+            tags=["homebrew"],
+        )
+        r = self.monday.ask("Show all bugs related to homebrew")
+        # Bug filter — supporting entries should be bugs only
+        for entry in r.supporting_entries:
+            assert entry["entry_type"] == "bug"
+
+    def test_ask_blocked_tasks_intent(self) -> None:
+        from tasks import TaskManager, TaskPriority, TaskStatus, TaskType
+        mgr = TaskManager(self.tmp_path)
+        t = mgr.create(
+            title="Fix auth middleware",
+            task_type=TaskType.FIX,
+            priority=TaskPriority.P1,
+            objective="Resolve the auth bug.",
+            created_by="human:test",
+        )
+        mgr.update_status(t.id, TaskStatus.ASSIGNED, changed_by="human:test")
+        mgr.update_status(t.id, TaskStatus.IN_PROGRESS, changed_by="human:test")
+        mgr.update_status(t.id, TaskStatus.BLOCKED, changed_by="human:test",
+                          reason="Waiting on dependency")
+
+        r = self.monday.ask("What is currently blocked?")
+        assert r.confidence > 0.0
+        blocked_ids = [t["id"] for t in r.related_tasks]
+        assert t.id in blocked_ids
+
+    def test_ask_suggested_next_actions_present_when_knowledge_found(self) -> None:
+        self.monday.learn(
+            "Rate limit handling: use exponential backoff.",
+            title="Rate limit pattern",
+            entry_type="pattern",
+            tags=["api", "rate-limit"],
+        )
+        r = self.monday.ask("What do we know about rate limits?")
+        assert len(r.suggested_next_actions) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -576,3 +739,7 @@ class TestEncapsulation:
     def test_task_manager_not_exposed_as_public_attribute(self) -> None:
         assert not hasattr(self.monday, "task_manager")
         assert not hasattr(self.monday, "_tasks")
+
+    def test_reasoner_not_exposed_as_public_attribute(self) -> None:
+        assert not hasattr(self.monday, "reasoner")
+        assert not hasattr(self.monday, "_reasoner")
