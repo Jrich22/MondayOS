@@ -11,6 +11,41 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.7.0] — 2026-06-28 — Sprint 1.6: End-to-End Workflow
+
+### Added
+- `workflows/` package — multi-step workflow system with YAML definitions, engine, execution state, and error hierarchy
+  - `workflows/definition.py` — `WorkflowDefinition`, `WorkflowStep`, `WorkflowInput`, `StepType` enum (7 step types: `ask`, `search`, `learn`, `task_create`, `task_start`, `task_complete`, `human_approval`)
+  - `workflows/execution.py` — `WorkflowExecution`, `StepExecution`, `WorkflowStatus` enum, `StepStatus` enum; `WorkflowExecution.write_log()` serialises to JSON after every run
+  - `workflows/engine.py` — `WorkflowEngine`: `list_workflows()`, `get_workflow(name)`, `run(name, inputs, approval_handler)`; `{step_id.output_key}` and `{inputs.variable}` template substitution in all step input fields; `ApprovalHandler` callable protocol for human gate injection
+  - `workflows/errors.py` — typed error hierarchy: `WorkflowError`, `WorkflowNotFoundError`, `WorkflowValidationError`, `StepExecutionError`, `ApprovalDenied`
+  - `workflows/__init__.py` — clean public exports
+- `workflows/definitions/implement_function.yaml` — bundled "implement a function" workflow: research → create-task → human-approval → start-task → capture-pattern → complete-task; exercises all 7 step types and demonstrates the full MondayOS coordination loop
+- `Monday.workflow(action, name, inputs, approval_handler)` — public API for workflow management; actions: `list`, `show`, `run`; returns `WorkflowResponse`
+- `WorkflowResponse` dataclass — in `monday/types.py`; fields: `action`, `success`, `workflow_name`, `execution_id`, `status`, `data`, `message`
+- `Monday.task("start", task_id)` — convenience action that chains BACKLOG → ASSIGNED → IN_PROGRESS in two `update_status` calls; required for workflow `task_start` step type
+- CLI `monday workflow list` — lists all available workflow definitions with version and step count
+- CLI `monday workflow show <name>` — shows inputs and ordered steps for a named workflow
+- CLI `monday workflow run <name> [--var KEY=VALUE ...] [--yes]` — executes a workflow; `--var` passes input variables; `--yes` auto-approves all human gates (non-interactive)
+- ADR-010: YAML as the workflow definition format
+
+### Changed
+- `monday/__init__.py` — exports `WorkflowResponse`
+- `monday/cli.py` — module docstring updated; `_register_workflow()` added; `_build_parser()` registers workflow command
+- `pyproject.toml` — `workflows*` added to `packages.find.include` and `coverage.run.source`
+
+### Tests
+- `tests/test_workflows.py` — 74 tests across 6 test classes:
+  - `TestWorkflowDefinition` (11 tests) — YAML loading, all required fields, bad YAML, unknown step type, missing step fields, non-mapping root
+  - `TestWorkflowExecution` (7 tests) — initial state, context seeding, to_dict, write_log creates file, execution_id in log, filename format, directory creation
+  - `TestTemplateResolution` (12 tests) — `_resolve_str` simple/dot/unknown/multi, `_resolve_dict` string/nested/list/non-string, `_to_list` list/str/none/other
+  - `TestWorkflowEngine` (22 tests) — list empty/missing/populated/skip-malformed, get by name/not-found, run search step, version in execution, log written, context accumulation, inputs/defaults, approval approve/reject/stops-steps, step failure, learn output in context, log step ids, version in log, per-call handler override, bad ask/search steps
+  - `TestMondayWorkflow` (11 tests) — list, show, show not found, run, not found, unknown action, full implement-function end-to-end
+  - `TestCLIWorkflow` (8 tests) — list, list empty, show, show not found, run --yes, run --var, bad --var format, --help
+- **Total: 395 passed, 12 skipped, 0 failures**
+
+---
+
 ## [0.6.0] — 2026-06-27 — Sprint 1.5: Monday CLI
 
 ### Added

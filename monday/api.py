@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 from brain import Brain, BrainConfig
 from brain.reasoner import ReasoningEngine
@@ -26,6 +27,7 @@ from monday.types import (
     SearchResponse,
     StatusResponse,
     TaskResponse,
+    WorkflowResponse,
 )
 from search import SearchEngine
 from tasks import (
@@ -280,12 +282,18 @@ class Monday:
         if action == "complete":
             return self._task_complete(task_id, kwargs)
 
+        if action == "start":
+            return self._task_start(task_id)
+
         return TaskResponse(
             action=action,
             success=False,
             task_id=task_id or None,
             data={},
-            message=f"Unknown action {action!r}. Valid actions: create, get, list_active, complete",
+            message=(
+                f"Unknown action {action!r}. "
+                "Valid actions: create, get, list_active, start, complete"
+            ),
         )
 
     def _task_create(self, title: str, objective: str, kwargs: dict[str, Any]) -> TaskResponse:
@@ -413,6 +421,57 @@ class Monday:
             message=f"{len(tasks)} active task(s)",
         )
 
+    def _task_start(self, task_id: str) -> TaskResponse:
+        """Transition a task from BACKLOG → ASSIGNED → IN_PROGRESS in two hops."""
+        if not task_id:
+            return TaskResponse(
+                action="start",
+                success=False,
+                task_id=None,
+                data={},
+                message="task_id is required for action 'start'",
+            )
+        try:
+            task = self.__tasks.get(task_id)
+            changed_by = f"workflow:{self._session_id}"
+            if task.status == TaskStatus.BACKLOG:
+                task = self.__tasks.update_status(
+                    task_id=task_id,
+                    new_status=TaskStatus.ASSIGNED,
+                    changed_by=changed_by,
+                    reason="workflow start",
+                )
+            if task.status == TaskStatus.ASSIGNED:
+                task = self.__tasks.update_status(
+                    task_id=task_id,
+                    new_status=TaskStatus.IN_PROGRESS,
+                    changed_by=changed_by,
+                    reason="workflow start",
+                )
+            return TaskResponse(
+                action="start",
+                success=True,
+                task_id=task.id,
+                data=_task_to_dict(task),
+                message=f"{task.id} is now {task.status.value}",
+            )
+        except TaskNotFoundError as exc:
+            return TaskResponse(
+                action="start",
+                success=False,
+                task_id=task_id,
+                data={},
+                message=str(exc),
+            )
+        except InvalidTransitionError as exc:
+            return TaskResponse(
+                action="start",
+                success=False,
+                task_id=task_id,
+                data={},
+                message=str(exc),
+            )
+
     def _task_complete(self, task_id: str, kwargs: dict[str, Any]) -> TaskResponse:
         if not task_id:
             return TaskResponse(
@@ -461,6 +520,158 @@ class Monday:
                 data={},
                 message=str(exc),
             )
+
+    def workflow(
+        self,
+        action: str,
+        name: str = "",
+        inputs: dict[str, str] | None = None,
+        approval_handler: Callable | None = None,
+    ) -> WorkflowResponse:
+        """
+        List, inspect, or run predefined workflows.
+
+        Actions:
+            list  — return all workflow definitions in the definitions directory.
+            show  — return step definitions for a named workflow.
+            run   — execute a named workflow end-to-end.
+
+        Args:
+            action:           One of: list, show, run.
+            name:             Workflow name (required for show and run).
+            inputs:           Input variables for run (key=value pairs).
+            approval_handler: Callable(message, context) → bool for human_approval
+                              steps. Defaults to a terminal prompt. Inject in tests.
+
+        Returns:
+            WorkflowResponse with success=True on success or success=False with
+            a descriptive message on failure. Does not raise.
+        """
+        from workflows import WorkflowEngine, WorkflowNotFoundError, WorkflowValidationError
+
+        definitions_dir = self._config.project_root / "workflows" / "definitions"
+        logs_dir = self._config.project_root / "logs" / "workflows"
+        engine = WorkflowEngine(
+            monday=self,
+            definitions_dir=definitions_dir,
+            logs_dir=logs_dir,
+            approval_handler=approval_handler,
+        )
+
+        if action == "list":
+            try:
+                workflows = engine.list_workflows()
+                return WorkflowResponse(
+                    action="list",
+                    success=True,
+                    data={
+                        "workflows": [
+                            {
+                                "name": wf.name,
+                                "version": wf.version,
+                                "description": wf.description,
+                                "steps": len(wf.steps),
+                                "triggers": wf.triggers,
+                            }
+                            for wf in workflows
+                        ],
+                        "count": len(workflows),
+                    },
+                    message=f"{len(workflows)} workflow(s) available",
+                )
+            except Exception as exc:
+                return WorkflowResponse(
+                    action="list",
+                    success=False,
+                    message=f"Failed to list workflows: {exc}",
+                )
+
+        if action == "show":
+            if not name:
+                return WorkflowResponse(
+                    action="show",
+                    success=False,
+                    message="name is required for action 'show'",
+                )
+            try:
+                wf = engine.get_workflow(name)
+                return WorkflowResponse(
+                    action="show",
+                    success=True,
+                    workflow_name=wf.name,
+                    data={
+                        "name": wf.name,
+                        "version": wf.version,
+                        "description": wf.description,
+                        "triggers": wf.triggers,
+                        "inputs": {
+                            k: {
+                                "description": spec.description,
+                                "required": spec.required,
+                                "default": spec.default,
+                            }
+                            for k, spec in wf.inputs.items()
+                        },
+                        "steps": [
+                            {
+                                "id": s.id,
+                                "type": s.type.value,
+                                "description": s.description,
+                            }
+                            for s in wf.steps
+                        ],
+                    },
+                    message=f"Workflow '{name}' v{wf.version} — {len(wf.steps)} steps",
+                )
+            except WorkflowNotFoundError as exc:
+                return WorkflowResponse(
+                    action="show",
+                    success=False,
+                    workflow_name=name,
+                    message=str(exc),
+                )
+
+        if action == "run":
+            if not name:
+                return WorkflowResponse(
+                    action="run",
+                    success=False,
+                    message="name is required for action 'run'",
+                )
+            try:
+                execution = engine.run(name, inputs=inputs, approval_handler=approval_handler)
+                return WorkflowResponse(
+                    action="run",
+                    success=execution.status.value == "completed",
+                    workflow_name=execution.workflow_name,
+                    execution_id=execution.execution_id,
+                    status=execution.status.value,
+                    data=execution.to_dict(),
+                    message=(
+                        f"Workflow '{name}' {execution.status.value}"
+                        + (f": {execution.error}" if execution.error else "")
+                    ),
+                )
+            except WorkflowNotFoundError as exc:
+                return WorkflowResponse(
+                    action="run",
+                    success=False,
+                    workflow_name=name,
+                    message=str(exc),
+                )
+            except (WorkflowValidationError, Exception) as exc:
+                return WorkflowResponse(
+                    action="run",
+                    success=False,
+                    workflow_name=name,
+                    message=f"Workflow error: {exc}",
+                )
+
+        return WorkflowResponse(
+            action=action,
+            success=False,
+            message=f"Unknown action {action!r}. Valid actions: list, show, run",
+        )
 
     def status(self) -> StatusResponse:
         """

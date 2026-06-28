@@ -1,0 +1,101 @@
+name: implement-function
+version: "1.0"
+description: >
+  Research existing knowledge, create a tracking task, get human approval,
+  capture the implementation as a reusable pattern, then close the task.
+  Demonstrates the full MondayOS coordination loop without an external model call.
+
+triggers:
+  - human-request
+
+inputs:
+  function_name:
+    description: Name of the function to implement
+    required: true
+  component:
+    description: Component or module the function belongs to
+    required: false
+    default: core
+
+steps:
+  - id: research
+    type: ask
+    description: Search for related patterns, prior decisions, and known bugs
+    input:
+      prompt: >
+        What do we know about implementing {inputs.function_name}
+        in the {inputs.component} component?
+
+  - id: find-related
+    type: search
+    description: Find any open tasks or knowledge entries related to this function
+    input:
+      query: "{inputs.function_name}"
+      limit: 5
+
+  - id: create-task
+    type: task_create
+    description: Create a task to track this implementation
+    input:
+      title: "Implement {inputs.function_name}"
+      objective: >
+        Implement {inputs.function_name} in the {inputs.component} component.
+        Research summary: {research.answer}
+      task_type: feature
+      priority: P2
+      created_by: "workflow:implement-function/1.0"
+
+  - id: approval-gate
+    type: human_approval
+    description: Human reviews the plan before implementation proceeds
+    message: |
+      Ready to implement {inputs.function_name}.
+
+      Component : {inputs.component}
+      Task      : {create-task.task_id}
+      Related   : {find-related.total_found} existing entries found
+
+      Research findings:
+      {research.answer}
+
+      Approve to proceed?
+
+  - id: start-task
+    type: task_start
+    description: Move the task from backlog to in-progress
+    input:
+      task_id: "{create-task.task_id}"
+
+  - id: capture-pattern
+    type: learn
+    description: Document the implementation as a reusable pattern
+    input:
+      title: "Implementation pattern: {inputs.function_name}"
+      entry_type: pattern
+      content: |
+        ## {inputs.function_name}
+
+        Component: {inputs.component}
+        Task: {create-task.task_id}
+
+        ### Research Findings
+        {research.answer}
+
+        ### Related Entries
+        {find-related.total_found} existing entries found via search.
+
+        ### Outcome
+        Implementation tracked and documented via implement-function workflow v1.0.
+      tags:
+        - implementation
+        - pattern
+        - "{inputs.component}"
+
+  - id: complete-task
+    type: task_complete
+    description: Mark the implementation task as complete
+    input:
+      task_id: "{create-task.task_id}"
+      reason: >
+        Implementation completed.
+        Knowledge captured as {capture-pattern.entry_id}.

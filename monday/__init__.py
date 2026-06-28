@@ -25,9 +25,10 @@ Public surface:
     AskResponse   — return type of Monday.ask()
     LearnResponse — return type of Monday.learn()
     SearchResponse — return type of Monday.search()
-    TaskResponse  — return type of Monday.task()
-    StatusResponse — return type of Monday.status()
-    ModuleStatus  — per-module health in StatusResponse
+    TaskResponse     — return type of Monday.task()
+    WorkflowResponse — return type of Monday.workflow()
+    StatusResponse   — return type of Monday.status()
+    ModuleStatus     — per-module health in StatusResponse
 """
 from __future__ import annotations
 
@@ -40,6 +41,7 @@ from monday.types import (
     SearchResponse,
     StatusResponse,
     TaskResponse,
+    WorkflowResponse,
 )
 
 __all__ = [
@@ -49,6 +51,7 @@ __all__ = [
     "LearnResponse",
     "SearchResponse",
     "TaskResponse",
+    "WorkflowResponse",
     "StatusResponse",
     "ModuleStatus",
 ]

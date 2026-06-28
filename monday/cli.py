@@ -13,6 +13,7 @@ Commands:
     search "<query>"    Search the knowledge base.
     learn               Add a new knowledge entry (interactive or with flags).
     task  <action>      Manage tasks: list, create, get, complete.
+    workflow <action>   Manage and run workflows: list, show, run.
 
 Run `monday <command> --help` for per-command help.
 """
@@ -83,6 +84,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _register_search(subparsers)
     _register_learn(subparsers)
     _register_task(subparsers)
+    _register_workflow(subparsers)
 
     return parser
 
@@ -493,6 +495,158 @@ def _cmd_task_complete(args: argparse.Namespace) -> int:
     else:
         print(f"Error: {r.message}", file=sys.stderr)
         return 1
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# workflow
+# ---------------------------------------------------------------------------
+
+def _register_workflow(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "workflow",
+        help="Manage and run workflows (list, show, run).",
+        description=(
+            "Run predefined multi-step workflows or inspect available workflow definitions.\n\n"
+            "examples:\n"
+            "  monday workflow list\n"
+            "  monday workflow show implement-function\n"
+            "  monday workflow run implement-function --var function_name=parse_config\n"
+            "  monday workflow run implement-function "
+            "--var function_name=validate_input --var component=tasks\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    wf_sub = p.add_subparsers(title="workflow actions", metavar="<action>")
+    wf_sub.required = True
+
+    # list
+    p_list = wf_sub.add_parser("list", help="List all available workflow definitions.")
+    p_list.set_defaults(func=_cmd_workflow_list)
+
+    # show
+    p_show = wf_sub.add_parser("show", help="Show steps for a named workflow.")
+    p_show.add_argument("name", metavar="NAME", help="Workflow name (e.g. implement-function).")
+    p_show.set_defaults(func=_cmd_workflow_show)
+
+    # run
+    p_run = wf_sub.add_parser("run", help="Execute a workflow end-to-end.")
+    p_run.add_argument("name", metavar="NAME", help="Workflow name to run.")
+    p_run.add_argument(
+        "--var",
+        action="append",
+        metavar="KEY=VALUE",
+        default=[],
+        dest="vars",
+        help=(
+            "Input variable in KEY=VALUE format. Repeat for multiple variables. "
+            "Example: --var function_name=parse_config --var component=tasks"
+        ),
+    )
+    p_run.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        default=False,
+        help="Auto-approve all human_approval gates (non-interactive).",
+    )
+    p_run.set_defaults(func=_cmd_workflow_run)
+
+
+def _cmd_workflow_list(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.workflow("list")
+
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+
+    workflows = r.data.get("workflows", [])
+    count = r.data.get("count", 0)
+
+    if count == 0:
+        print("No workflows found.")
+        return 0
+
+    print(f"Available workflows ({count})")
+    _hr()
+    for wf in workflows:
+        steps_label = f"{wf['steps']} steps"
+        print(f"  {wf['name']}  v{wf['version']}  ({steps_label})")
+        if wf.get("description"):
+            desc = wf["description"].strip().replace("\n", " ")[:100]
+            print(f"    {desc}")
+    return 0
+
+
+def _cmd_workflow_show(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.workflow("show", name=args.name)
+
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+
+    d = r.data
+    print(f"Workflow: {d['name']}  v{d['version']}")
+    if d.get("description"):
+        print(f"  {d['description'].strip().replace(chr(10), ' ')[:120]}")
+    print()
+
+    if d.get("inputs"):
+        print("Inputs:")
+        for k, spec in d["inputs"].items():
+            req_label = "(required)" if spec["required"] else f"(default: {spec['default'] or 'none'})"
+            print(f"  {k}  {req_label}")
+            if spec.get("description"):
+                print(f"    {spec['description']}")
+        print()
+
+    print("Steps:")
+    for i, step in enumerate(d.get("steps", []), 1):
+        print(f"  {i:2}. [{step['type']:16}] {step['id']}")
+        if step.get("description"):
+            print(f"        {step['description']}")
+
+    return 0
+
+
+def _cmd_workflow_run(args: argparse.Namespace) -> int:
+    # Parse --var KEY=VALUE pairs
+    inputs: dict[str, str] = {}
+    for var in (args.vars or []):
+        if "=" not in var:
+            print(f"Error: --var must be KEY=VALUE, got: {var!r}", file=sys.stderr)
+            return 1
+        k, _, v = var.partition("=")
+        inputs[k.strip()] = v.strip()
+
+    # Build approval handler
+    handler = None
+    if args.yes:
+        handler = lambda msg, ctx: True  # noqa: E731
+
+    monday = _monday(args)
+    r = monday.workflow("run", name=args.name, inputs=inputs or None, approval_handler=handler)
+
+    if r.status == "cancelled":
+        print(f"Workflow cancelled: {r.message}")
+        return 1
+
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+
+    print(f"Workflow '{r.workflow_name}' completed")
+    print(f"  Execution : {r.execution_id}")
+
+    steps = r.data.get("steps", [])
+    if steps:
+        print()
+        print("Steps:")
+        for s in steps:
+            mark = "ok" if s["status"] == "completed" else s["status"].upper()
+            print(f"  {mark:8}  {s['step_id']}  ({s['step_type']})")
 
     return 0
 

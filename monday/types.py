@@ -105,6 +105,30 @@ class TaskResponse:
 
 
 @dataclass
+class WorkflowResponse:
+    """
+    Response from Monday.workflow().
+
+    Attributes:
+        action:        The action requested (list, show, run).
+        success:       True if the action completed without error.
+        workflow_name: Name of the workflow acted on (empty for list).
+        execution_id:  ID of the workflow execution (run action only).
+        status:        Workflow execution status (run action only).
+        data:          Action-specific payload.
+        message:       Human-readable status or error message.
+    """
+
+    action: str
+    success: bool
+    workflow_name: str = ""
+    execution_id: str = ""
+    status: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+    message: str = ""
+
+
+@dataclass
 class ModuleStatus:
     """Status of a single internal MondayOS module."""
 

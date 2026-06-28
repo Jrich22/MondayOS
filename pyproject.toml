@@ -26,7 +26,7 @@ monday = "monday.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["brain*", "core*", "events*", "knowledge*", "memory*", "monday*", "search*", "tasks*"]
+include = ["brain*", "core*", "events*", "knowledge*", "memory*", "monday*", "search*", "tasks*", "workflows*"]
 
 [tool.ruff]
 target-version = "py311"
@@ -46,7 +46,7 @@ testpaths = ["tests"]
 addopts = "--tb=short -q"
 
 [tool.coverage.run]
-source = ["brain", "core", "events", "knowledge", "memory", "monday", "search", "tasks"]
+source = ["brain", "core", "events", "knowledge", "memory", "monday", "search", "tasks", "workflows"]
 omit = ["tests/*"]
 
 [tool.coverage.report]

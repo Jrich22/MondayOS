@@ -1,6 +1,6 @@
 # MondayOS — Architectural Decision Records
 
-**Last Updated:** 2026-06-27
+**Last Updated:** 2026-06-28
 
 This file is the canonical log of all architectural decisions made for MondayOS. Decisions are recorded in the format described in [DOCUMENTATION_STANDARDS.md](DOCUMENTATION_STANDARDS.md).
 
@@ -303,3 +303,51 @@ Implementations are **non-conforming** if they do not satisfy MKS validation rul
 - The 12-type catalogue can be extended by adding a new type to the MKS; no existing entries are invalidated.
 - Field-level validation rules (VAL-001 through VAL-020) give `KnowledgeParser` a clear acceptance test.
 - `knowledge/entry.py` must be updated to reflect all 12 types before Sprint 1.2 implementation begins.
+
+---
+
+## ADR-010: YAML as the Workflow Definition Format
+
+**Date:** 2026-06-28  
+**Status:** Accepted  
+**Deciders:** Lead Software Engineering
+
+### Context
+
+Sprint 1.6 introduces a workflow system — the ability to define multi-step sequences of MondayOS operations, execute them end-to-end, and log every step. A workflow definition format must be chosen.
+
+Requirements:
+- Human-readable and human-editable without a special tool
+- Supports structured data (step lists, input declarations, nested config)
+- Easily parsed in Python without external schema validation tools
+- Compatible with the existing `PyYAML` dependency already in `pyproject.toml`
+- Step definitions must be named, ordered, and independently typed
+
+### Decision
+
+Workflow definitions are stored as YAML files in `workflows/definitions/`. Each file defines one workflow. The schema is:
+- `name`, `version`, `description` — workflow metadata
+- `inputs` — named input variables with description, required flag, and default
+- `steps` — ordered list of named step objects; each step has `id`, `type`, and type-specific `input` fields
+- `triggers` — advisory list of trigger labels (not enforced in Phase 1)
+
+Step types in Phase 1: `ask`, `search`, `learn`, `task_create`, `task_start`, `task_complete`, `human_approval`.
+
+Template substitution in step inputs uses `{step_id.output_key}` and `{inputs.variable_name}` syntax, resolved at runtime from the accumulated execution context.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| JSON | Valid subset of YAML; less readable for humans writing multi-line strings and comments; already using YAML elsewhere |
+| TOML | Good for config files; no native list-of-objects semantics — step ordering and per-step structure are awkward |
+| Python code (decorated functions) | Maximally flexible; but tightly couples workflow authorship to Python knowledge; hard for AI agents to generate safely; not inspectable without running the code |
+| Custom DSL | Full control; high implementation cost; no off-the-shelf parser; adds a language-maintenance burden |
+
+### Consequences
+
+- Any engineer (or AI agent) can read and write workflow definitions without understanding the execution engine.
+- YAML's multi-line string support makes `message:` blocks in `human_approval` steps readable.
+- The `WorkflowDefinition.from_yaml()` class method is the single loading point; schema changes are isolated there.
+- Future phases can add new step types by extending `StepType` without changing the YAML format.
+- Version field in every definition means execution logs can reference the exact definition version that ran.
