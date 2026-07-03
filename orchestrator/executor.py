@@ -279,8 +279,10 @@ class ExecutionOrchestrator:
                 report, t0, status="failed",
                 error=f"Provider execution failed: {exc}",
             )
+        report.model_used = response.model or ""
         self._publish(EventType.MODEL_CALL_COMPLETED, task_id, execution_id,
-                      {"provider": provider.name, "tokens_used": response.tokens_used})
+                      {"provider": provider.name, "model": report.model_used,
+                       "tokens_used": response.tokens_used})
 
         report.result_excerpt = response.content[:500]
 

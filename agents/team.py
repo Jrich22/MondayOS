@@ -46,7 +46,8 @@ class TeamStage:
     run_id: str = ""
     agent_name: str = ""
     provider_used: str = ""
-    status: str = ""            # executed | dry-run | blocked | skipped | …
+    provider_model: str = ""
+    status: str = ""            # executed | dry-run | blocked | unavailable | skipped | …
     verdict: str = ""           # pass | block
     summary: str = ""
 
@@ -186,6 +187,7 @@ class TeamWorkflow:
                 run_id=run.run_id,
                 agent_name=run.agent_name,
                 provider_used=run.provider_used,
+                provider_model=run.provider_model,
                 status=run.status,
                 verdict=verdict,
                 summary=summary,

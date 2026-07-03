@@ -1349,11 +1349,22 @@ class Monday:
 
         try:
             if action == "list":
+                from agents.adapters import availability_for
+
                 agents = runtime.list_agents(role=kwargs.get("role"))
+                rows = []
+                for a in agents:
+                    d = a.to_dict()
+                    av = availability_for(a)
+                    d["available"] = av.available
+                    d["model"] = av.model
+                    d["requires"] = av.env_var
+                    d["provider_status"] = av.reason
+                    rows.append(d)
                 return AgentResponse(
                     action="list", success=True,
-                    data={"agents": [a.to_dict() for a in agents], "count": len(agents)},
-                    message=f"{len(agents)} agent(s)",
+                    data={"agents": rows, "count": len(rows)},
+                    message=f"{len(rows)} agent(s)",
                 )
 
             if action == "register":

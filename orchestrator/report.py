@@ -67,6 +67,7 @@ class ExecutionReport:
 
     # Provider + prompt
     provider_used: str = ""
+    model_used: str = ""
     prompt_summary: str = ""
 
     # Timing

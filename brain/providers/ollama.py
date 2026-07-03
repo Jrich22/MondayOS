@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 
 from brain.providers.base import (
     AIProvider,
+    ProviderAvailability,
     ProviderError,
     ProviderResponse,
     ProviderUnavailableError,
@@ -67,6 +68,17 @@ class OllamaProvider(AIProvider):
     @property
     def capability_tier(self) -> int:
         return 1  # local models trail frontier hosted models
+
+    def availability(self) -> ProviderAvailability:
+        """
+        Local provider: no API key or SDK required. Reported available; actual
+        reachability of the Ollama service surfaces at call time (not pinged here
+        to keep availability checks fast and network-free).
+        """
+        return ProviderAvailability(
+            available=True, provider=_PROVIDER_NAME, model=self._model,
+            reason=f"local Ollama service at {self._base_url} (not verified)",
+        )
 
     def ask(
         self,

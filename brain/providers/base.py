@@ -32,6 +32,49 @@ class ProviderResponse:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ProviderAvailability:
+    """
+    Whether a provider is ready to run, and if not, how to fix it.
+
+    Attributes:
+        available:    True if the provider can execute a call right now.
+        provider:     Provider name (e.g. "openai").
+        model:        The model that would be used.
+        reason:       Human-readable status ("ready" or why it is not).
+        env_var:      Env var that must be set ("" if none required).
+        install_hint: Shell hint to install a missing SDK ("" if not needed).
+    """
+
+    available: bool
+    provider: str = ""
+    model: str = ""
+    reason: str = ""
+    env_var: str = ""
+    install_hint: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "available": self.available,
+            "provider": self.provider,
+            "model": self.model,
+            "reason": self.reason,
+            "env_var": self.env_var,
+            "install_hint": self.install_hint,
+        }
+
+    def instructions(self) -> str:
+        """A single clear line telling the user how to make this provider ready."""
+        if self.available:
+            return f"{self.provider} is ready (model {self.model})."
+        parts = [self.reason or f"{self.provider} is unavailable"]
+        if self.install_hint:
+            parts.append(f"install: {self.install_hint}")
+        if self.env_var:
+            parts.append(f"set {self.env_var}")
+        return "; ".join(parts) + "."
+
+
 # ---------------------------------------------------------------------------
 # Error hierarchy
 # ---------------------------------------------------------------------------
@@ -99,6 +142,17 @@ class AIProvider(ABC):
     def capability_tier(self) -> int:
         """Relative capability: higher is more capable."""
         return 2
+
+    def availability(self) -> "ProviderAvailability":
+        """
+        Report whether this provider can run right now.
+
+        The default assumes a provider with no external requirements (e.g. a
+        local or in-process provider) is always available. Providers that need a
+        network SDK or API key override this to check for them so callers can
+        fail gracefully with clear, actionable instructions before any call.
+        """
+        return ProviderAvailability(available=True, provider=self.name, reason="ready")
 
     @abstractmethod
     def ask(

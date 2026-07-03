@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from brain.providers.base import (
     AIProvider,
     ProviderAuthError,
+    ProviderAvailability,
     ProviderError,
     ProviderRateLimitError,
     ProviderResponse,
@@ -60,6 +61,28 @@ class OpenAIProvider(AIProvider):
     @property
     def capability_tier(self) -> int:
         return 2
+
+    def availability(self) -> ProviderAvailability:
+        """Ready only when the `openai` SDK is importable and a key is set."""
+        import importlib
+
+        try:
+            importlib.import_module("openai")
+        except ImportError:
+            return ProviderAvailability(
+                available=False, provider=_PROVIDER_NAME, model=self._model,
+                reason="openai SDK not installed",
+                env_var="OPENAI_API_KEY", install_hint="pip install openai",
+            )
+        if not self._api_key:
+            return ProviderAvailability(
+                available=False, provider=_PROVIDER_NAME, model=self._model,
+                reason="OPENAI_API_KEY is not set", env_var="OPENAI_API_KEY",
+            )
+        return ProviderAvailability(
+            available=True, provider=_PROVIDER_NAME, model=self._model,
+            reason="ready", env_var="OPENAI_API_KEY",
+        )
 
     def ask(
         self,

@@ -9,6 +9,35 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### MondayOS v2.2 — Real Agent Providers (2026-07-02)
+Makes the multi-agent team use the real OpenAI/Anthropic providers instead of the
+fake agent, with availability checks and graceful key-missing handling. Provider
+mappings are unchanged (CPO/Research → openai/ChatGPT, Lead Engineer/QA/Security/
+Reviewer → anthropic/Claude); review-required is preserved and nothing is
+committed, pushed, changed as a secret, or executed live.
+
+- **Provider availability** — new `ProviderAvailability` on `AIProvider`
+  (`availability()`); OpenAI/Anthropic report unavailable (with the env var + SDK
+  install hint) when the SDK is missing or the key is unset; Ollama/fake are
+  always available. `agents.adapters.availability_for()` resolves it for an agent.
+- **Graceful failure** — `AgentRuntime.run` gates on availability before calling a
+  provider: a missing key/SDK stops with status `unavailable` and clear
+  instructions, and does **not** touch the task. A team stage that resolves to an
+  unavailable provider stops the pipeline with the same message (no live call).
+  Dry-run is never blocked by a missing key.
+- **Provider/model logging** — `model_used` recorded on the execution report;
+  `provider_model` on `AgentRun` and `TeamStage`; `monday agent run` / `team run`
+  print `provider (model)`, and `monday agent list` shows a readiness column.
+- **Docs** — `docs/PROVIDERS.md` (role→provider map, required env vars —
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` — SDK installs, availability, graceful
+  failure).
+- **Tests** — `tests/test_agent_providers.py` (20), fully offline: availability
+  (SDK/key present/absent via `sys.modules`/env mocks), resolution, the runtime
+  and team availability gates, model logging, and `agent list` availability. No
+  test requires live OpenAI/Anthropic credentials.
+
+---
+
 ### MondayOS v2.1 — Agent Team Workflow (2026-07-02)
 Makes the registered agents collaborate on a task end to end:
 **CPO → Lead Engineer → QA → Security → Reviewer → human approval**. A thin

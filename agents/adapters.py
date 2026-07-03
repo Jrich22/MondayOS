@@ -14,10 +14,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from brain.providers.base import AIProvider, ProviderResponse
+from brain.providers.base import AIProvider, ProviderAvailability, ProviderResponse
 from brain.providers.factory import ProviderConfig, create_provider
 
-__all__ = ["FakeAgentProvider", "build_provider_for", "FAKE_PROVIDER"]
+__all__ = ["FakeAgentProvider", "build_provider_for", "availability_for", "FAKE_PROVIDER"]
 
 FAKE_PROVIDER = "fake"
 
@@ -52,6 +52,12 @@ class FakeAgentProvider(AIProvider):
     @property
     def capability_tier(self) -> int:
         return 1
+
+    def availability(self) -> ProviderAvailability:
+        """The fake provider is always available — no key or network needed."""
+        return ProviderAvailability(
+            available=True, provider=self._name, model=f"{self._name}-1", reason="ready",
+        )
 
     def _body(self, verb: str, subject: str) -> str:
         role = f"the {self._role} agent" if self._role else "an agent"
@@ -113,3 +119,21 @@ def build_provider_for(agent: Any, *, role: str = "") -> AIProvider | None:
     except Exception:
         # Unknown type or provider that can't be constructed without credentials.
         return None
+
+
+def availability_for(agent: Any, *, role: str = "") -> ProviderAvailability:
+    """
+    Report provider availability for an agent (or a bare provider name).
+
+    Never raises: an unknown/unconstructable provider is reported unavailable
+    with a clear reason. Used by `monday agent list` and by the runtime's
+    pre-run gate so missing keys fail gracefully.
+    """
+    name = str(getattr(agent, "provider", agent) or "").strip().lower()
+    prov = build_provider_for(agent, role=role)
+    if prov is None:
+        return ProviderAvailability(
+            available=False, provider=name or "(none)",
+            reason=f"unknown or unconstructable provider {name!r}",
+        )
+    return prov.availability()

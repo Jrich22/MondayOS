@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from brain.providers.base import (
     AIProvider,
     ProviderAuthError,
+    ProviderAvailability,
     ProviderError,
     ProviderRateLimitError,
     ProviderResponse,
@@ -58,6 +59,28 @@ class AnthropicProvider(AIProvider):
     @property
     def capability_tier(self) -> int:
         return 3  # highest capability tier
+
+    def availability(self) -> ProviderAvailability:
+        """Ready only when the `anthropic` SDK is importable and a key is set."""
+        import importlib
+
+        try:
+            importlib.import_module("anthropic")
+        except ImportError:
+            return ProviderAvailability(
+                available=False, provider=_PROVIDER_NAME, model=self._model,
+                reason="anthropic SDK not installed",
+                env_var="ANTHROPIC_API_KEY", install_hint="pip install anthropic",
+            )
+        if not self._api_key:
+            return ProviderAvailability(
+                available=False, provider=_PROVIDER_NAME, model=self._model,
+                reason="ANTHROPIC_API_KEY is not set", env_var="ANTHROPIC_API_KEY",
+            )
+        return ProviderAvailability(
+            available=True, provider=_PROVIDER_NAME, model=self._model,
+            reason="ready", env_var="ANTHROPIC_API_KEY",
+        )
 
     def ask(
         self,

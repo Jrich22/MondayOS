@@ -1555,7 +1555,11 @@ def _cmd_agent_list(args: argparse.Namespace) -> int:
     _hr()
     for a in agents:
         mark = "★" if a.get("is_default") else " "
-        print(f"  {mark} {a['id']}  {a['role']:<14} {a['provider']:<10} {a['name']}")
+        if "available" in a:
+            status = "✓ ready" if a.get("available") else f"needs {a.get('requires') or 'setup'}"
+        else:
+            status = ""
+        print(f"  {mark} {a['id']}  {a['role']:<14} {a['provider']:<10} {status:<18} {a['name']}")
     return 0
 
 
@@ -1615,7 +1619,11 @@ def _cmd_agent_run(args: argparse.Namespace) -> int:
     print(f"  Task      : {r.task_id}")
     print(f"  Role      : {r.role}")
     print(f"  Agent     : {r.data.get('agent_name', '') or '(none)'} ({r.agent_id or '—'})")
-    print(f"  Provider  : {r.provider_used or '(none)'}")
+    model = r.data.get("provider_model", "")
+    provider_line = r.provider_used or r.data.get("provider_requested", "") or "(none)"
+    if model:
+        provider_line = f"{provider_line} ({model})"
+    print(f"  Provider  : {provider_line}")
     print(f"  Mode      : {r.data.get('mode', mode)}")
     print(f"  Status    : {r.status}")
     gate = r.data.get("gate", {})
@@ -1720,7 +1728,10 @@ def _cmd_team_run(args: argparse.Namespace) -> int:
     for st in r.stages:
         mark = "✓" if st.get("verdict") == "pass" else "✗"
         role = st.get("role", "")
-        print(f"  {mark} {role:<14} [{st.get('status', ''):<9}] {st.get('verdict', '')}")
+        prov = st.get("provider_used", "") or "—"
+        model = st.get("provider_model", "")
+        prov_label = f"{prov} ({model})" if model else prov
+        print(f"  {mark} {role:<14} [{st.get('status', ''):<9}] {st.get('verdict', ''):<6} {prov_label}")
         summary = (st.get("summary") or "").strip()
         if summary:
             print(f"      {summary[:100]}")

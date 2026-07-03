@@ -21,6 +21,7 @@ from agents.gates import ApprovalGate, GateDecision
 from agents.registry import AgentRegistry
 from agents.roles import get_role, normalize_role
 from agents.types import Agent, AgentRun
+from brain.providers.base import ProviderAvailability
 from orchestrator.report import ExecutionMode
 
 
@@ -166,6 +167,24 @@ class AgentRuntime:
         providers = [prov] if prov is not None else []
         manual_name = prov.name if prov is not None else provider_requested
 
+        # ── Provider availability gate (graceful, key-aware) ─────────────
+        # A run that will actually call a provider (not dry-run) must have a
+        # ready provider. A missing SDK or API key stops here with clear
+        # instructions instead of a raw failure mid-execution.
+        if mode_enum is not ExecutionMode.DRY_RUN:
+            avail = prov.availability() if prov is not None else ProviderAvailability(
+                available=False, provider=provider_requested,
+                reason=f"unknown or unconstructable provider {provider_requested!r}",
+            )
+            if not avail.available:
+                run.status = "unavailable"
+                run.success = False
+                run.provider_model = avail.model
+                run.approval = {"required": False, "decision": "not-required", "by": "", "at": "", "note": ""}
+                run.message = f"Provider unavailable — {avail.instructions()}"
+                self._persist(run)
+                return run
+
         # ── Delegate execution to the orchestrator via Monday.execute ────
         resp = self._monday.execute(
             task_id,
@@ -179,6 +198,7 @@ class AgentRuntime:
         )
 
         run.provider_used = resp.provider_used
+        run.provider_model = resp.data.get("model_used", "") or run.provider_model
         run.status = resp.status
         run.success = resp.success
         run.duration_ms = resp.duration_ms

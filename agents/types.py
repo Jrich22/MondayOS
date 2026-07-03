@@ -79,6 +79,7 @@ class AgentRun:
     agent_name: str = ""
     provider_requested: str = ""
     provider_used: str = ""
+    provider_model: str = ""
     mode: str = ""
     status: str = ""            # blocked | skipped | failed | validation-failed | review | completed | dry-run
     success: bool = False
