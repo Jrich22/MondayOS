@@ -109,6 +109,9 @@ class AgentRuntime:
         autonomous_enabled: bool = False,
         approved: bool = False,
         requested_actions: list[str] | None = None,
+        extra_context: str = "",
+        update_task: bool = True,
+        provider_instance: Any = None,
     ) -> AgentRun:
         """
         Route a task to a role and run it through the orchestrator.
@@ -123,7 +126,10 @@ class AgentRuntime:
 
         self._registry.ensure_seeded()
         agent = self._registry.resolve_by_role(role_slug)
-        provider_requested = (provider or (agent.provider if agent else "")).strip()
+        if provider_instance is not None:
+            provider_requested = provider_instance.name
+        else:
+            provider_requested = (provider or (agent.provider if agent else "")).strip()
 
         run = AgentRun(
             run_id=_new_run_id(),
@@ -153,7 +159,10 @@ class AgentRuntime:
             return self._finish_blocked(run, decision)
 
         # ── Build the provider for this agent/override ───────────────────
-        prov = build_provider_for(agent if not provider else provider, role=role_slug)
+        if provider_instance is not None:
+            prov = provider_instance
+        else:
+            prov = build_provider_for(agent if not provider else provider, role=role_slug)
         providers = [prov] if prov is not None else []
         manual_name = prov.name if prov is not None else provider_requested
 
@@ -165,6 +174,8 @@ class AgentRuntime:
             provider=manual_name,
             providers=providers,
             autonomous_enabled=autonomous_enabled,
+            extra_context=extra_context,
+            update_task=update_task,
         )
 
         run.provider_used = resp.provider_used

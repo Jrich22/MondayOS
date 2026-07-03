@@ -92,6 +92,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _register_onboard(subparsers)
     _register_execute(subparsers)
     _register_agent(subparsers)
+    _register_team(subparsers)
 
     return parser
 
@@ -1657,6 +1658,93 @@ def _cmd_agent_history(args: argparse.Namespace) -> int:
     for run in runs:
         decision = run.get("approval", {}).get("decision", "")
         print(f"  {run['run_id']}  {run.get('role', ''):<14} {run.get('status', ''):<10} {decision:<10} {run.get('task_id', '')}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# team — the Agent Team Workflow
+# ---------------------------------------------------------------------------
+
+def _register_team(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "team",
+        help="Run the agent team end-to-end on a task.",
+        description=(
+            "Run the registered agents as a collaborating team:\n"
+            "  CPO → Lead Engineer → QA → Security → Reviewer → human approval\n\n"
+            "Each stage receives the prior stages' summaries; QA / Security /\n"
+            "Reviewer can stop the pipeline early. Review-required by default —\n"
+            "nothing is committed, pushed, or executed live.\n\n"
+            "examples:\n"
+            "  monday team run TASK-0001\n"
+            "  monday team run TASK-0001 --provider fake\n"
+            "  monday team run TASK-0001 --mode dry-run\n"
+            "  monday team history --task TASK-0001\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    team_sub = p.add_subparsers(title="team actions", metavar="<action>")
+    team_sub.required = True
+
+    p_run = team_sub.add_parser("run", help="Run the full team pipeline on a task.")
+    p_run.add_argument("task_id", metavar="TASK-ID", help="Task to run the team on.")
+    p_run.add_argument("--provider", metavar="NAME", default="", help="Provider override for every stage (e.g. fake).")
+    p_run.add_argument("--mode", metavar="MODE", default="review", help="review (default) | dry-run.")
+    p_run.add_argument("--json", "-j", action="store_true", help="Output the team run record as JSON.")
+    p_run.set_defaults(func=_cmd_team_run)
+
+    p_hist = team_sub.add_parser("history", help="List past team runs.")
+    p_hist.add_argument("--task", dest="task_id", metavar="TASK-ID", help="Filter by task.")
+    p_hist.add_argument("--limit", type=int, default=20, metavar="N", help="Max runs to show (default: 20).")
+    p_hist.set_defaults(func=_cmd_team_history)
+
+
+def _cmd_team_run(args: argparse.Namespace) -> int:
+    import json as _json
+
+    monday = _monday(args)
+    r = monday.team("run", task_id=args.task_id, provider=args.provider, mode=args.mode)
+
+    if args.json:
+        print(_json.dumps(r.data, indent=2, sort_keys=True))
+        return 0 if r.success else 1
+
+    print()
+    print("═" * 64)
+    print(f"  TEAM RUN — {r.team_run_id}")
+    print("═" * 64)
+    print(f"  Task    : {r.task_id}")
+    print(f"  Mode    : {r.data.get('mode', args.mode)}")
+    print(f"  Status  : {r.status}")
+    _hr()
+    for st in r.stages:
+        mark = "✓" if st.get("verdict") == "pass" else "✗"
+        role = st.get("role", "")
+        print(f"  {mark} {role:<14} [{st.get('status', ''):<9}] {st.get('verdict', '')}")
+        summary = (st.get("summary") or "").strip()
+        if summary:
+            print(f"      {summary[:100]}")
+    if r.stopped_at:
+        print("─" * 64)
+        print(f"  Stopped at: {r.stopped_at}")
+    _hr()
+    if r.message:
+        print(f"  {r.message}")
+        _hr()
+    return 0 if r.success else 1
+
+
+def _cmd_team_history(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.team("history", task_id=getattr(args, "task_id", None), limit=args.limit)
+    runs = r.data.get("runs", [])
+    if not runs:
+        print("No team runs yet.")
+        return 0
+    print(f"Team runs ({r.data.get('count', len(runs))})")
+    _hr()
+    for run in runs:
+        print(f"  {run['team_run_id']}  {run.get('status', ''):<17} {run.get('task_id', '')}")
     return 0
 
 

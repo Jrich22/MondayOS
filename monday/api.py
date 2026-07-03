@@ -26,6 +26,7 @@ from monday.types import (
     AskResponse,
     DoctorResponse,
     ExecuteResponse,
+    TeamResponse,
     LearnResponse,
     MigrateResponse,
     ModuleStatus,
@@ -1229,6 +1230,8 @@ class Monday:
         providers: Any = None,
         autonomous_enabled: bool = False,
         max_tokens: int = 2048,
+        extra_context: str = "",
+        update_task: bool = True,
     ) -> ExecuteResponse:
         """
         Execute an engineering task by delegating it to an AI provider.
@@ -1285,6 +1288,8 @@ class Monday:
             autonomous_enabled=autonomous_enabled,
             manual_provider=provider,
             max_tokens=max_tokens,
+            extra_context=extra_context,
+            update_task=update_task,
         )
 
         report = orchestrator.execute(task_id)
@@ -1430,6 +1435,64 @@ class Monday:
         except (ValueError, LookupError) as exc:
             # UnknownRoleError, AgentExistsError, AgentNotFoundError, bad input.
             return AgentResponse(action=action, success=False, message=str(exc))
+
+    def team(self, action: str = "run", **kwargs: Any) -> TeamResponse:
+        """
+        Run the agent team over a task: CPO → Lead Engineer → QA → Security →
+        Reviewer → human approval.
+
+        Each stage is a logged role run that receives the prior stages' summaries;
+        QA / Security / Reviewer can stop the pipeline early with a block verdict.
+        On full pass the task is moved to REVIEW for human approval — nothing is
+        committed, pushed, or executed live. Review-required is the default and
+        only autonomous mode is not offered.
+
+        Actions:
+            run     — run the pipeline. Requires: task_id. Optional: provider,
+                      mode ("review" | "dry-run"), stage_providers.
+            history — list past team runs. Optional: task_id, limit.
+
+        Returns a TeamResponse. Does not raise for expected failures.
+        """
+        from agents.team import TeamWorkflow
+
+        team = TeamWorkflow(
+            monday=self,
+            project_root=self._config.project_root,
+            require_human_approval=self._config.require_human_approval,
+        )
+
+        try:
+            if action == "run":
+                tr = team.run(
+                    task_id=kwargs.get("task_id", ""),
+                    provider=kwargs.get("provider", ""),
+                    mode=kwargs.get("mode", "review"),
+                    stage_providers=kwargs.get("stage_providers"),
+                )
+                return TeamResponse(
+                    action="run", success=tr.success, message=tr.message,
+                    team_run_id=tr.team_run_id, task_id=tr.task_id, status=tr.status,
+                    stopped_at=tr.stopped_at, approval_run_id=tr.approval_run_id,
+                    stages=list(tr.stages), data=tr.to_dict(),
+                )
+
+            if action == "history":
+                runs = team.history(
+                    task_id=kwargs.get("task_id"), limit=int(kwargs.get("limit", 20))
+                )
+                return TeamResponse(
+                    action="history", success=True,
+                    message=f"{len(runs)} team run(s)",
+                    data={"runs": [r.to_dict() for r in runs], "count": len(runs)},
+                )
+
+            return TeamResponse(
+                action=action, success=False,
+                message=f"Unknown action {action!r}. Valid actions: run, history",
+            )
+        except (ValueError, LookupError) as exc:
+            return TeamResponse(action=action, success=False, message=str(exc))
 
     def _remove_knowledge_entry(self, entry_id: str) -> None:
         """Remove a knowledge entry by ID. Used by migration rollback."""

@@ -9,6 +9,36 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### MondayOS v2.1 — Agent Team Workflow (2026-07-02)
+Makes the registered agents collaborate on a task end to end:
+**CPO → Lead Engineer → QA → Security → Reviewer → human approval**. A thin
+coordinator over the Multi-Agent Runtime — each stage is a normal role run, so
+the approval gate, review-required default, and logging apply unchanged. Nothing
+is committed, pushed, or executed live; on a full pass the task moves to REVIEW
+for human approval.
+
+- **New `agents/team.py`** — `TeamWorkflow` runs the fixed `TEAM_SEQUENCE`; QA /
+  Security / Reviewer are blocking (`BLOCKING_ROLES`) and stop the pipeline early
+  on a block verdict or a stage failure. Each stage receives the prior stages'
+  summaries as extra prompt context. `TeamRun` (parent) references its child
+  role-run IDs; `TeamStage` records role/verdict/summary.
+- **Task lifecycle** owned by the team: stages run with `update_task=False` (new
+  orchestrator/`Monday.execute` option) so they execute and capture knowledge
+  without churning the task; the task is moved to IN_PROGRESS once at the start
+  and REVIEW once at the end. New `extra_context` option threads prior summaries
+  into the plan.
+- **Public API:** `Monday.team("run"|"history", …)` → new `TeamResponse`.
+- **CLI:** `monday team run TASK-ID [--provider][--mode review|dry-run][--json]`,
+  `monday team history`.
+- **Records:** parent `logs/agents/team-*.json` + child `logs/agents/run-*.json`.
+- **Docs:** `docs/TEAM_WORKFLOW.md`.
+- **Tests:** `tests/test_team.py` (30) — full fake-agent pipeline, prior-summary
+  propagation, early stop at QA/Security/Reviewer, dry-run, autonomous guard,
+  approval-completes-task, and CLI smoke. `FakeAgentProvider` gained a `verdict`
+  knob to drive blocking stages offline.
+
+---
+
 ### MondayOS v2 — Multi-Agent Runtime (2026-07-02)
 A role-based agent system layered on the Execution Orchestrator. Work is routed
 to a **role** (not a specific model); the registry resolves the role to an agent

@@ -29,9 +29,12 @@ class FakeAgentProvider(AIProvider):
     review-required pipeline can be exercised without any network or API key.
     """
 
-    def __init__(self, name: str = FAKE_PROVIDER, *, role: str = "") -> None:
+    def __init__(self, name: str = FAKE_PROVIDER, *, role: str = "", verdict: str = "pass") -> None:
         self._name = name
         self._role = role
+        # "pass" (default) → normal completion text; "block" → text carrying a
+        # BLOCK marker so the team workflow's verdict logic stops the pipeline.
+        self._verdict = verdict
         self.calls: list[tuple[str, str]] = []
 
     @property
@@ -52,6 +55,12 @@ class FakeAgentProvider(AIProvider):
 
     def _body(self, verb: str, subject: str) -> str:
         role = f"the {self._role} agent" if self._role else "an agent"
+        if self._verdict == "block":
+            return (
+                f"[{self._name}] BLOCK — as {role}, I found a blocking issue and "
+                f"cannot pass this stage. Objective reviewed: {subject.strip()[:160]} "
+                "Human attention is required before proceeding."
+            )
         return (
             f"[{self._name}] Acting as {role}, {verb} the requested work. "
             f"Objective addressed: {subject.strip()[:180]} "

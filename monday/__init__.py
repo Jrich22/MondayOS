@@ -54,6 +54,7 @@ from monday.types import (
     SearchResponse,
     StatusResponse,
     TaskResponse,
+    TeamResponse,
     WorkflowResponse,
 )
 
@@ -72,6 +73,7 @@ __all__ = [
     "SearchResponse",
     "StatusResponse",
     "TaskResponse",
+    "TeamResponse",
     "WorkflowResponse",
     "ModuleStatus",
 ]

@@ -31,6 +31,13 @@ from agents.roles import (
     normalize_role,
 )
 from agents.runtime import AgentRuntime
+from agents.team import (
+    BLOCKING_ROLES,
+    TEAM_SEQUENCE,
+    TeamRun,
+    TeamStage,
+    TeamWorkflow,
+)
 from agents.types import Agent, AgentRun
 
 __all__ = [
@@ -51,4 +58,9 @@ __all__ = [
     "AgentRuntime",
     "FakeAgentProvider",
     "build_provider_for",
+    "TeamWorkflow",
+    "TeamRun",
+    "TeamStage",
+    "TEAM_SEQUENCE",
+    "BLOCKING_ROLES",
 ]

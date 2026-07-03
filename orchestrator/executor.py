@@ -154,6 +154,8 @@ class ExecutionOrchestrator:
         autonomous_enabled: bool = False,
         manual_provider: str = "",
         max_tokens: int = 2048,
+        extra_context: str = "",
+        update_task: bool = True,
     ) -> None:
         self._monday = monday
         self._root = Path(project_root)
@@ -164,6 +166,12 @@ class ExecutionOrchestrator:
         self._autonomous_enabled = autonomous_enabled
         self._manual_provider = manual_provider
         self._max_tokens = max_tokens
+        # extra_context: extra background injected into the plan (e.g. prior
+        # team-stage summaries). update_task: when False, execute the provider
+        # and capture knowledge but leave the task status untouched — used by the
+        # team workflow so intermediate stages don't churn the task lifecycle.
+        self._extra_context = extra_context
+        self._do_task_update = update_task
 
         self._planner = ExecutionPlanner()
         self._validator = ResultValidator()
@@ -208,6 +216,11 @@ class ExecutionOrchestrator:
 
         # ── 3. Planner builds the execution plan ─────────────────────────
         plan = self._planner.plan(task, advisory)
+        if self._extra_context:
+            plan.context = (
+                f"{plan.context}\n\n{self._extra_context}".strip()
+                if plan.context else self._extra_context
+            )
         report.plan = plan.to_dict()
         report.prompt_summary = _summarize(plan.prompt)
 
@@ -285,7 +298,12 @@ class ExecutionOrchestrator:
         report.knowledge_captured = self._capture_knowledge(task, response, provider)
 
         # ── 9. Task update ───────────────────────────────────────────────
-        self._update_task(task_id, report)
+        if self._do_task_update:
+            self._update_task(task_id, report)
+        else:
+            # Provider ran and knowledge was captured, but the task lifecycle is
+            # left to the caller (e.g. the team workflow moves it once at the end).
+            report.task_status = "executed"
 
         # ── 10. Execution report (persisted in _finish) ──────────────────
         return self._finish(report, t0, status=report.task_status or "completed", success=True)
