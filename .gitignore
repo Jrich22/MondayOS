@@ -49,5 +49,10 @@ logs/*.jsonl
 # Execution reports — runtime output of the orchestrator
 logs/executions/
 
+# Agent runtime — run logs and the seeded agent registry (runtime state)
+logs/agents/
+agents/active/
+agents/.sequences.json
+
 # Project registry — runtime state with machine-specific absolute paths
 config/projects.json

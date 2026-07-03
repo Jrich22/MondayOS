@@ -22,6 +22,7 @@ from memory import SessionMemory
 from monday.config import MondayConfig
 from monday.types import (
     AdviseResponse,
+    AgentResponse,
     AskResponse,
     DoctorResponse,
     ExecuteResponse,
@@ -295,6 +296,9 @@ class Monday:
         if action == "review":
             return self._task_review(task_id, kwargs)
 
+        if action == "assign":
+            return self._task_assign(task_id, kwargs)
+
         return TaskResponse(
             action=action,
             success=False,
@@ -302,7 +306,7 @@ class Monday:
             data={},
             message=(
                 f"Unknown action {action!r}. "
-                "Valid actions: create, get, list_active, start, review, complete"
+                "Valid actions: create, get, list_active, start, review, assign, complete"
             ),
         )
 
@@ -515,6 +519,40 @@ class Monday:
         except InvalidTransitionError as exc:
             return TaskResponse(
                 action="review", success=False, task_id=task_id, data={}, message=str(exc),
+            )
+
+    def _task_assign(self, task_id: str, kwargs: dict[str, Any]) -> TaskResponse:
+        """Assign a task to an assignee (person, model, or 'role:<slug>')."""
+        if not task_id:
+            return TaskResponse(
+                action="assign", success=False, task_id=None, data={},
+                message="task_id is required for action 'assign'",
+            )
+        assignee = kwargs.get("assignee", "")
+        if not assignee:
+            return TaskResponse(
+                action="assign", success=False, task_id=task_id, data={},
+                message="assignee is required for action 'assign'",
+            )
+        assigned_by = kwargs.get("assigned_by", f"workflow:{self._session_id}")
+        try:
+            updated = self.__tasks.assign(
+                task_id=task_id, assignee=assignee, assigned_by=assigned_by,
+            )
+            return TaskResponse(
+                action="assign",
+                success=True,
+                task_id=updated.id,
+                data=_task_to_dict(updated),
+                message=f"{updated.id} assigned to {assignee}",
+            )
+        except TaskNotFoundError as exc:
+            return TaskResponse(
+                action="assign", success=False, task_id=task_id, data={}, message=str(exc),
+            )
+        except InvalidTransitionError as exc:
+            return TaskResponse(
+                action="assign", success=False, task_id=task_id, data={}, message=str(exc),
             )
 
     def _task_complete(self, task_id: str, kwargs: dict[str, Any]) -> TaskResponse:
@@ -1275,6 +1313,123 @@ class Monday:
             data=report.to_dict(),
             message=message,
         )
+
+    def agent(self, action: str, **kwargs: Any) -> AgentResponse:
+        """
+        Manage and run the role-based Multi-Agent Runtime.
+
+        Actions:
+            list      — list registered agents (seeds the six defaults on first
+                        use). Optional: role.
+            register  — register a new agent. Requires: name, role. Optional:
+                        provider, capabilities, is_default, description.
+            assign    — assign a task to a role. Requires: task_id, role.
+            run       — route a task to a role and run it through the Execution
+                        Orchestrator under the approval gate. Requires: task_id,
+                        role. Optional: provider, policy, mode, autonomous_enabled,
+                        approved, requested_actions.
+            review    — record a human decision on a run. Requires: run_id,
+                        approve (bool). Optional: by, note.
+            history   — list past runs. Optional: role, task_id, limit.
+
+        Returns an AgentResponse. Does not raise for expected failures.
+        """
+        from agents.runtime import AgentRuntime
+
+        runtime = AgentRuntime(
+            monday=self,
+            project_root=self._config.project_root,
+            require_human_approval=self._config.require_human_approval,
+        )
+
+        try:
+            if action == "list":
+                agents = runtime.list_agents(role=kwargs.get("role"))
+                return AgentResponse(
+                    action="list", success=True,
+                    data={"agents": [a.to_dict() for a in agents], "count": len(agents)},
+                    message=f"{len(agents)} agent(s)",
+                )
+
+            if action == "register":
+                agent = runtime.register(
+                    name=kwargs.get("name", ""),
+                    role=kwargs.get("role", ""),
+                    provider=kwargs.get("provider", ""),
+                    capabilities=kwargs.get("capabilities"),
+                    is_default=bool(kwargs.get("is_default", False)),
+                    description=kwargs.get("description", ""),
+                )
+                return AgentResponse(
+                    action="register", success=True, agent_id=agent.id, role=agent.role,
+                    data={"agent": agent.to_dict()},
+                    message=f"Registered {agent.id} ({agent.name}) for role {agent.role}",
+                )
+
+            if action == "assign":
+                r = runtime.assign(
+                    task_id=kwargs.get("task_id", ""),
+                    role=kwargs.get("role", ""),
+                    assigned_by=kwargs.get("assigned_by", "human:cli"),
+                )
+                return AgentResponse(
+                    action="assign", success=r.success, task_id=kwargs.get("task_id", ""),
+                    role=kwargs.get("role", ""), data=r.data, message=r.message,
+                )
+
+            if action == "run":
+                run = runtime.run(
+                    task_id=kwargs.get("task_id", ""),
+                    role=kwargs.get("role", ""),
+                    provider=kwargs.get("provider", ""),
+                    policy=kwargs.get("policy", "manual"),
+                    mode=kwargs.get("mode", "review"),
+                    autonomous_enabled=bool(kwargs.get("autonomous_enabled", False)),
+                    approved=bool(kwargs.get("approved", False)),
+                    requested_actions=kwargs.get("requested_actions"),
+                )
+                return AgentResponse(
+                    action="run", success=run.success, run_id=run.run_id, task_id=run.task_id,
+                    role=run.role, agent_id=run.agent_id, provider_used=run.provider_used,
+                    status=run.status, data=run.to_dict(), message=run.message,
+                )
+
+            if action == "review":
+                run = runtime.review(
+                    run_id=kwargs.get("run_id", ""),
+                    approve=bool(kwargs.get("approve", False)),
+                    by=kwargs.get("by", "human:cli"),
+                    note=kwargs.get("note", ""),
+                )
+                return AgentResponse(
+                    action="review", success=True, run_id=run.run_id, task_id=run.task_id,
+                    role=run.role, status=run.status, data=run.to_dict(), message=run.message,
+                )
+
+            if action == "history":
+                runs = runtime.history(
+                    role=kwargs.get("role"),
+                    task_id=kwargs.get("task_id"),
+                    limit=int(kwargs.get("limit", 20)),
+                )
+                return AgentResponse(
+                    action="history", success=True,
+                    data={"runs": [r.to_dict() for r in runs], "count": len(runs)},
+                    message=f"{len(runs)} run(s)",
+                )
+
+            return AgentResponse(
+                action=action, success=False,
+                message=(
+                    f"Unknown action {action!r}. "
+                    "Valid actions: list, register, assign, run, review, history"
+                ),
+            )
+        except FileNotFoundError as exc:
+            return AgentResponse(action=action, success=False, message=str(exc))
+        except (ValueError, LookupError) as exc:
+            # UnknownRoleError, AgentExistsError, AgentNotFoundError, bad input.
+            return AgentResponse(action=action, success=False, message=str(exc))
 
     def _remove_knowledge_entry(self, entry_id: str) -> None:
         """Remove a knowledge entry by ID. Used by migration rollback."""

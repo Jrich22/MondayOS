@@ -42,6 +42,7 @@ from monday.api import Monday
 from monday.config import MondayConfig
 from monday.types import (
     AdviseResponse,
+    AgentResponse,
     AskResponse,
     DoctorResponse,
     ExecuteResponse,
@@ -60,6 +61,7 @@ __all__ = [
     "Monday",
     "MondayConfig",
     "AdviseResponse",
+    "AgentResponse",
     "AskResponse",
     "DoctorResponse",
     "ExecuteResponse",

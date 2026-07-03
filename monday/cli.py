@@ -91,6 +91,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _register_project(subparsers)
     _register_onboard(subparsers)
     _register_execute(subparsers)
+    _register_agent(subparsers)
 
     return parser
 
@@ -1453,6 +1454,210 @@ def _cmd_execute(args: argparse.Namespace) -> int:
     print()
 
     return 0 if r.success else 1
+
+
+# ---------------------------------------------------------------------------
+# agent — the Multi-Agent Runtime
+# ---------------------------------------------------------------------------
+
+def _register_agent(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "agent",
+        help="Role-based agent runtime: registry, routing, runs, review.",
+        description=(
+            "Route work to a ROLE (cpo, lead-engineer, qa, security, research,\n"
+            "reviewer), not a specific model. The registry resolves the role to\n"
+            "an agent + provider; runs go through the Execution Orchestrator under\n"
+            "a review-required approval gate; every run is logged and reviewable.\n\n"
+            "examples:\n"
+            "  monday agent list\n"
+            "  monday agent register --name \"Claude Code\" --role lead-engineer\n"
+            "  monday agent assign TASK-0001 --role qa\n"
+            "  monday agent run TASK-0001 --role lead-engineer\n"
+            "  monday agent run TASK-0001 --role lead-engineer --provider fake\n"
+            "  monday agent review run-abc123 --approve\n"
+            "  monday agent history --role qa\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    agent_sub = p.add_subparsers(title="agent actions", metavar="<action>")
+    agent_sub.required = True
+
+    # list
+    p_list = agent_sub.add_parser("list", help="List registered agents.")
+    p_list.add_argument("--role", metavar="ROLE", help="Filter by role slug.")
+    p_list.set_defaults(func=_cmd_agent_list)
+
+    # register
+    p_reg = agent_sub.add_parser("register", help="Register a new agent.")
+    p_reg.add_argument("--name", required=True, metavar="TEXT", help="Agent name.")
+    p_reg.add_argument("--role", required=True, metavar="ROLE", help="Role slug.")
+    p_reg.add_argument("--provider", metavar="NAME", default="", help="Provider (default: role default).")
+    p_reg.add_argument("--default", dest="is_default", action="store_true", help="Make this the role's default agent.")
+    p_reg.add_argument("--description", metavar="TEXT", default="", help="Optional description.")
+    p_reg.set_defaults(func=_cmd_agent_register)
+
+    # assign
+    p_assign = agent_sub.add_parser("assign", help="Assign a task to a role.")
+    p_assign.add_argument("task_id", metavar="TASK-ID", help="Task to assign.")
+    p_assign.add_argument("--role", required=True, metavar="ROLE", help="Role slug to assign to.")
+    p_assign.add_argument("--assigned-by", metavar="WHO", default="human:cli", help="Who is assigning (default: human:cli).")
+    p_assign.set_defaults(func=_cmd_agent_assign)
+
+    # run
+    p_run = agent_sub.add_parser("run", help="Run a task via a role.")
+    p_run.add_argument("task_id", metavar="TASK-ID", help="Task to run.")
+    p_run.add_argument("--role", required=True, metavar="ROLE", help="Role slug to route to.")
+    p_run.add_argument("--provider", metavar="NAME", default="", help="Provider override (e.g. fake, anthropic).")
+    p_run.add_argument("--policy", metavar="POLICY", default="manual", help="Provider selection policy (default: manual).")
+    p_run.add_argument("--mode", metavar="MODE", default="review", help="dry-run | review | autonomous (default: review).")
+    p_run.add_argument("--dry-run", "-n", action="store_true", help="Shortcut for --mode dry-run.")
+    p_run.add_argument("--autonomous", action="store_true", help="Shortcut for --mode autonomous.")
+    p_run.add_argument("--enable-autonomous", action="store_true", help="Explicitly permit autonomous mode.")
+    p_run.add_argument("--approve", action="store_true", help="Provide human approval for this run.")
+    p_run.add_argument(
+        "--action", dest="actions", metavar="ACTION", action="append", default=None,
+        help="Declare an intended action (commit, push, secrets, live_trade, destructive). Repeatable; gated ones require --approve.",
+    )
+    p_run.add_argument("--json", "-j", action="store_true", help="Output the run record as JSON.")
+    p_run.set_defaults(func=_cmd_agent_run)
+
+    # review
+    p_review = agent_sub.add_parser("review", help="Approve or reject a run.")
+    p_review.add_argument("run_id", metavar="RUN-ID", help="Run to review (e.g. run-abc123).")
+    g = p_review.add_mutually_exclusive_group(required=True)
+    g.add_argument("--approve", dest="approve", action="store_true", help="Approve the run.")
+    g.add_argument("--reject", dest="approve", action="store_false", help="Reject the run.")
+    p_review.add_argument("--by", metavar="WHO", default="human:cli", help="Reviewer (default: human:cli).")
+    p_review.add_argument("--note", metavar="TEXT", default="", help="Optional review note.")
+    p_review.set_defaults(func=_cmd_agent_review)
+
+    # history
+    p_hist = agent_sub.add_parser("history", help="List past agent runs.")
+    p_hist.add_argument("--role", metavar="ROLE", help="Filter by role.")
+    p_hist.add_argument("--task", dest="task_id", metavar="TASK-ID", help="Filter by task.")
+    p_hist.add_argument("--limit", type=int, default=20, metavar="N", help="Max runs to show (default: 20).")
+    p_hist.set_defaults(func=_cmd_agent_history)
+
+
+def _cmd_agent_list(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.agent("list", role=getattr(args, "role", None))
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    agents = r.data.get("agents", [])
+    if not agents:
+        print("No agents registered.")
+        return 0
+    print(f"Agents ({r.data.get('count', len(agents))})")
+    _hr()
+    for a in agents:
+        mark = "★" if a.get("is_default") else " "
+        print(f"  {mark} {a['id']}  {a['role']:<14} {a['provider']:<10} {a['name']}")
+    return 0
+
+
+def _cmd_agent_register(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.agent(
+        "register", name=args.name, role=args.role, provider=args.provider,
+        is_default=args.is_default, description=args.description,
+    )
+    if r.success:
+        a = r.data.get("agent", {})
+        print(f"Registered {a.get('id', '')}")
+        print(f"  Name     : {a.get('name', '')}")
+        print(f"  Role     : {a.get('role', '')}")
+        print(f"  Provider : {a.get('provider', '')}")
+        print(f"  Default  : {a.get('is_default', False)}")
+        return 0
+    print(f"Error: {r.message}", file=sys.stderr)
+    return 1
+
+
+def _cmd_agent_assign(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.agent("assign", task_id=args.task_id, role=args.role, assigned_by=args.assigned_by)
+    if r.success:
+        print(f"{args.task_id} assigned to role:{args.role}")
+        return 0
+    print(f"Error: {r.message}", file=sys.stderr)
+    return 1
+
+
+def _cmd_agent_run(args: argparse.Namespace) -> int:
+    import json as _json
+
+    mode = "dry-run" if args.dry_run else ("autonomous" if args.autonomous else args.mode)
+    monday = _monday(args)
+    r = monday.agent(
+        "run",
+        task_id=args.task_id,
+        role=args.role,
+        provider=args.provider,
+        policy=args.policy,
+        mode=mode,
+        autonomous_enabled=args.enable_autonomous,
+        approved=args.approve,
+        requested_actions=args.actions,
+    )
+
+    if args.json:
+        print(_json.dumps(r.data, indent=2, sort_keys=True))
+        return 0 if r.success else 1
+
+    print()
+    print("═" * 64)
+    print(f"  AGENT RUN — {r.run_id}")
+    print("═" * 64)
+    print(f"  Task      : {r.task_id}")
+    print(f"  Role      : {r.role}")
+    print(f"  Agent     : {r.data.get('agent_name', '') or '(none)'} ({r.agent_id or '—'})")
+    print(f"  Provider  : {r.provider_used or '(none)'}")
+    print(f"  Mode      : {r.data.get('mode', mode)}")
+    print(f"  Status    : {r.status}")
+    gate = r.data.get("gate", {})
+    if gate and not gate.get("allowed", True):
+        print(f"  Gate      : BLOCKED — {gate.get('reason', '')}")
+    approval = r.data.get("approval", {})
+    if approval.get("decision"):
+        print(f"  Approval  : {approval.get('decision')}")
+    _hr()
+    if r.message:
+        print(f"  {r.message}")
+        _hr()
+    return 0 if r.success else 1
+
+
+def _cmd_agent_review(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.agent("review", run_id=args.run_id, approve=args.approve, by=args.by, note=args.note)
+    if r.success:
+        print(f"{r.run_id}: {r.data.get('approval', {}).get('decision', '')}")
+        if r.message:
+            print(f"  {r.message}")
+        return 0
+    print(f"Error: {r.message}", file=sys.stderr)
+    return 1
+
+
+def _cmd_agent_history(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.agent("history", role=getattr(args, "role", None), task_id=getattr(args, "task_id", None), limit=args.limit)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    runs = r.data.get("runs", [])
+    if not runs:
+        print("No agent runs yet.")
+        return 0
+    print(f"Agent runs ({r.data.get('count', len(runs))})")
+    _hr()
+    for run in runs:
+        decision = run.get("approval", {}).get("decision", "")
+        print(f"  {run['run_id']}  {run.get('role', ''):<14} {run.get('status', ''):<10} {decision:<10} {run.get('task_id', '')}")
+    return 0
 
 
 # ---------------------------------------------------------------------------

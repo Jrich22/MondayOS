@@ -9,6 +9,40 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### MondayOS v2 — Multi-Agent Runtime (2026-07-02)
+A role-based agent system layered on the Execution Orchestrator. Work is routed
+to a **role** (not a specific model); the registry resolves the role to an agent
+and provider; a **review-required** approval gate governs every run; and each run
+is logged as a reviewable record. MondayOS stays the system of record — agents
+cannot commit, push, touch secrets, or live-trade without explicit human approval.
+Autonomous live execution is intentionally **not** implemented; the runtime only
+plans, captures knowledge, and moves tasks to REVIEW.
+
+- **New `agents/` package** (built on `orchestrator/`, no provider-specific code):
+  - `roles.py` — the six roles (CPO, Lead Engineer, QA, Security, Research,
+    Reviewer) as pure data; adding a role is one table entry. Provider defaults:
+    CPO → openai (ChatGPT), Lead Engineer → anthropic (Claude Code), Research →
+    openai, QA/Security/Reviewer → anthropic (all overridable). `GATED_ACTIONS` =
+    commit/push/secrets/live_trade/destructive.
+  - `gates.py` — `ApprovalGate` enforcing review-required-by-default; blocks
+    gated actions and autonomous completion without approval.
+  - `registry.py` — `AgentRegistry` persisting agents as `agents/active/AGENT-*.md`
+    (+ `.sequences.json`), mirroring `tasks/`; seeds the six default agents.
+  - `runtime.py` — `AgentRuntime` (list/register/assign/run/review/history) that
+    delegates execution to `Monday.execute` and logs each run to `logs/agents/`.
+  - `adapters.py` — role→provider via `brain.providers.factory`, plus the offline
+    `FakeAgentProvider` fake-agent test harness (the `fake` provider).
+- **Public API:** `Monday.agent(action, …)` → `AgentResponse`; new `task("assign")`
+  action (assign to `role:<slug>`).
+- **CLI:** `monday agent list | register | run | review | history | assign`.
+- **Docs:** `docs/AGENTS.md`, `docs/AGENT_ROLES.md`, `docs/APPROVAL_GATES.md`.
+- **Tests:** `tests/test_agents.py` (55) — roles, gate, registry, runtime
+  end-to-end, and CLI smoke, all offline via the fake provider. Suite: 828 passed.
+- `agents*` added to packaged modules + coverage; `logs/agents/`, `agents/active/`,
+  `agents/.sequences.json` gitignored as runtime state.
+
+---
+
 ### Initiative 014 — WeatherBot Product Workspace (2026-06-28)
 WeatherBot becomes the first project managed entirely by MondayOS. Its complete
 project-management structure is populated **through the Monday public API** — no

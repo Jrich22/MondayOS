@@ -310,6 +310,40 @@ class ExecuteResponse:
 
 
 @dataclass
+class AgentResponse:
+    """
+    Response from Monday.agent().
+
+    A single shape across all agent actions (list / register / run / review /
+    history / assign). The action-specific payload lives in ``data``; the flat
+    fields surface the most useful values for the CLI without digging.
+
+    Attributes:
+        action:        The agent action performed.
+        success:       True if the action succeeded.
+        message:       Human-readable status or error message.
+        run_id:        Run identifier (run / review actions).
+        task_id:       The task involved (run / review / assign actions).
+        role:          The role routed to (run / assign actions).
+        agent_id:      Resolved/registered agent id.
+        provider_used: Provider that executed a run ("" if none).
+        status:        Run/pipeline outcome (blocked / review / completed / …).
+        data:          Full action payload (agents list, run record, history, …).
+    """
+
+    action: str
+    success: bool
+    message: str = ""
+    run_id: str = ""
+    task_id: str = ""
+    role: str = ""
+    agent_id: str = ""
+    provider_used: str = ""
+    status: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ModuleStatus:
     """Status of a single internal MondayOS module."""
 
