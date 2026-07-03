@@ -267,6 +267,49 @@ class OnboardResponse:
 
 
 @dataclass
+class ExecuteResponse:
+    """
+    Response from Monday.execute().
+
+    Attributes:
+        action:             Always "execute".
+        success:            True if the task was executed and validated.
+        task_id:            The task that was executed.
+        execution_id:       Unique ID of this execution (also the report filename).
+        mode:               Execution mode used (dry-run / review / autonomous).
+        provider_used:      Name of the AI provider that executed the task ("" if none).
+        status:             Pipeline outcome: dry-run / skipped / blocked / failed /
+                            validation-failed / review / completed.
+        prompt_summary:     One-line summary of the prompt sent to the provider.
+        duration_ms:        Wall-clock execution time in milliseconds.
+        files_changed:      Files modified by the execution (autonomous mode only).
+        knowledge_captured: IDs of knowledge entries captured from the result.
+        follow_up_tasks:    IDs of any follow-up tasks created.
+        confidence:         Validator confidence in the result, 0.0–1.0.
+        report_path:        Path to the persisted execution report JSON.
+        data:               Full ExecutionReport as a dict.
+        message:            Human-readable status or error message.
+    """
+
+    action: str
+    success: bool
+    task_id: str = ""
+    execution_id: str = ""
+    mode: str = ""
+    provider_used: str = ""
+    status: str = ""
+    prompt_summary: str = ""
+    duration_ms: float = 0.0
+    files_changed: list[str] = field(default_factory=list)
+    knowledge_captured: list[str] = field(default_factory=list)
+    follow_up_tasks: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    report_path: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+    message: str = ""
+
+
+@dataclass
 class ModuleStatus:
     """Status of a single internal MondayOS module."""
 

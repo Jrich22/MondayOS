@@ -75,6 +75,31 @@ class AIProvider(ABC):
     def name(self) -> str:
         """Provider identifier: "anthropic" | "openai" | "ollama"."""
 
+    # ------------------------------------------------------------------
+    # Selection metadata
+    #
+    # Used by policy-based provider selection (e.g. the Execution
+    # Orchestrator). Concrete, non-abstract properties with sensible
+    # defaults describing a generic remote provider; implementations
+    # override to expose their own profile. Keeping this on the provider
+    # ensures all provider-specific knowledge stays inside provider files.
+    # ------------------------------------------------------------------
+
+    @property
+    def is_local(self) -> bool:
+        """True if the provider runs locally (no network, no per-token cost)."""
+        return False
+
+    @property
+    def cost_tier(self) -> int:
+        """Relative monetary cost: 0 (free/local) … higher is pricier."""
+        return 2
+
+    @property
+    def capability_tier(self) -> int:
+        """Relative capability: higher is more capable."""
+        return 2
+
     @abstractmethod
     def ask(
         self,

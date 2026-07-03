@@ -32,6 +32,7 @@ Public surface:
     AdviseResponse   — return type of Monday.advise()
     ProjectResponse  — return type of Monday.project()
     OnboardResponse  — return type of Monday.onboard()
+    ExecuteResponse  — return type of Monday.execute()
     StatusResponse   — return type of Monday.status()
     ModuleStatus     — per-module health in StatusResponse
 """
@@ -43,6 +44,7 @@ from monday.types import (
     AdviseResponse,
     AskResponse,
     DoctorResponse,
+    ExecuteResponse,
     LearnResponse,
     MigrateResponse,
     ModuleStatus,
@@ -60,6 +62,7 @@ __all__ = [
     "AdviseResponse",
     "AskResponse",
     "DoctorResponse",
+    "ExecuteResponse",
     "LearnResponse",
     "MigrateResponse",
     "OnboardResponse",

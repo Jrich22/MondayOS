@@ -9,6 +9,126 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Initiative 014 — WeatherBot Product Workspace (2026-06-28)
+WeatherBot becomes the first project managed entirely by MondayOS. Its complete
+project-management structure is populated **through the Monday public API** — no
+hand-authored docs that could instead be structured knowledge or tasks. No new
+platform capabilities, no architectural changes, no new subsystems (Architecture
+Freeze respected).
+
+- `projects/weatherbot/setup_workspace.py` — re-runnable populator (the single
+  structured source of truth) that builds the workspace via
+  `Monday.project()`, `Monday.learn()`, `Monday.task()`, and `Monday.workflow()`.
+- `projects/weatherbot/PRODUCT_WORKSPACE.md` — generated index mapping the created
+  knowledge entries and tasks; includes the "onboard via MondayOS alone" commands.
+- Created in the MondayOS stores (scoped to the `weatherbot` component):
+  - **Knowledge (8 entries):** Overview & current state (`DOC-0001`), Project
+    Charter — vision/goals/constraints/metrics (`DOC-0002`), Product Roadmap
+    (`DOC-0003`), Risk Register — technical/product/operational (`DOC-0004`),
+    Definition of Done (`DEC-0001`), Engineering Backlog map (`DOC-0005`), Sprint
+    Zero (`SPR-0001`), and an implementation pattern from the workflow demo (`PAT-0001`).
+  - **Tasks (19):** 5 epics (`TASK-0001..0005`) + 13 features/tasks
+    (`TASK-0006..0018`) with dependencies expressed in task context, plus one
+    workflow-created task (`TASK-0019`).
+  - **Workflow:** `implement-function` run end-to-end (auto-approved) to verify
+    the managed engineering loop; produced `TASK-0019` + `PAT-0001`.
+- Verified onboarding experience: `monday ask "What is WeatherBot…"` resolves the
+  charter/overview at 82% confidence; `monday search weatherbot` returns all
+  entries; `monday task list` shows the live backlog; `monday advise` ranks next
+  work. Test suite unaffected (773 passed, 12 skipped).
+
+---
+
+## [1.0.0b1] — 2026-06-28 — Sprint 1.13: v1.0 Beta Release (Product Quality)
+
+First public **beta-quality** release. Documentation, coherence, and
+verification — no new platform capabilities, no architectural changes, no new
+subsystems.
+
+### Added
+- `README.md` — full rewrite: vision, features, architecture diagram, quick
+  start, CLI examples, WeatherBot onboarding example, roadmap, doc map
+- `RELEASE.md` — beta features, limitations, known issues, upgrade path
+- `CONTRIBUTING.md` — development workflow, coding standards, PR process,
+  testing requirements, architecture boundaries
+- `RELEASE_CHECKLIST.md` — repeatable release checklist with this beta's
+  verification results recorded
+- `docs/ARCHITECTURE_DIAGRAM.md` — as-built component + data-flow diagrams,
+  provider abstraction, dependency rules
+- `docs/BETA_ROADMAP.md` — Phase 1 status, beta→1.0 work, Phase 2/3 outlook
+
+### Changed
+- Version bumped `0.1.0` → `1.0.0b1` (`pyproject.toml`, `monday/api.py` `_VERSION`)
+- Version-pinned tests updated (`tests/test_monday.py`, `tests/test_cli.py`)
+
+### Verified
+- Clean-room install confirmed: pristine source copy + fresh venv +
+  `pip install -e ".[dev]"` → `monday status` healthy (`v1.0.0b1`); CLI task
+  create/list, external project register + onboard (report generated), and
+  `execute --dry-run` all working; `pytest` green from the clean copy.
+- **Tests: 773 passed, 12 skipped, 0 failures** (in-tree and clean-copy).
+
+### Notes
+- No on-disk format changes; no data migration required from the 0.x line.
+- Public `Monday` API remains additive and backward-compatible.
+
+---
+
+## [0.13.0] — 2026-06-28 — Sprint 1.12: Execution Orchestrator
+
+### Added
+- `orchestrator/` package — the Execution Orchestrator. Receives engineering work
+  and delegates it to AI providers; coordinates, never implements, models. No new
+  *core* subsystem was needed — it composes existing ones (Architecture Freeze respected).
+  - `report.py` — `ExecutionMode` (DRY_RUN | REVIEW | AUTONOMOUS) and `ExecutionReport`
+    (provider used, prompt summary, duration, success, files changed, knowledge captured,
+    follow-up tasks, confidence, validation, plan); persists to `logs/executions/{id}.json`
+  - `planner.py` — `ExecutionPlanner` / `ExecutionPlan`: deterministic, provider-agnostic
+    plan built from the task + optional advisory context (runs before provider selection)
+  - `queue.py` — `ExecutionQueue` / `ExecutionUnit`: stable priority queue (P0→P3, FIFO ties)
+  - `validator.py` — `ResultValidator` / `ValidationResult`: deterministic checks
+    (non-empty, sufficient length, not-a-refusal, addresses-objective) gating capture/update
+  - `executor.py` — `ExecutionOrchestrator` (the pipeline) plus `ProviderSelectionPolicy`
+    (PREFER_LOCAL | LOWEST_COST | HIGHEST_CAPABILITY | MANUAL) and `select_provider()`
+- `Monday.execute(task_id, mode, policy, provider, providers, autonomous_enabled, max_tokens)`
+  — runs the full pipeline: advisor prioritises → plan → queue → provider selection →
+  provider executes (through `AIProvider` only) → validation → knowledge capture →
+  task update → persisted execution report. Returns `ExecuteResponse`.
+- `ExecuteResponse` dataclass (`monday/types.py`); exported from `monday/__init__.py`
+- `Monday.task("review")` — IN_PROGRESS → REVIEW transition (public extension point used
+  by the orchestrator's review-required mode)
+- CLI `monday execute TASK-0001` with `--mode`, `--dry-run`, `--policy`, `--provider`,
+  `--enable-autonomous`, `--json`
+- Provider selection metadata on `AIProvider` (`is_local`, `cost_tier`, `capability_tier`)
+  — concrete defaults on the base, overridden per provider. Keeps all provider-specific
+  knowledge inside provider files so no provider-specific code lives in the orchestrator.
+- `tests/test_orchestrator.py` — 57 tests: enum parsing, policy-based selection, queue
+  ordering, planner, validator, report persistence, and end-to-end `Monday.execute`
+  (dry-run / review / autonomous gating / no-provider / provider-failure / validation-failure /
+  terminal-task / event emission)
+
+### Safety
+- Three execution modes; default is **Review Required**. No autonomous file modification
+  unless `--mode autonomous` AND `--enable-autonomous` are both set; otherwise autonomous
+  runs are **blocked**. Dry-run makes no provider call and no mutations.
+
+### Design Decisions
+- **Orchestrator coordinates; providers execute** — execution goes exclusively through the
+  `AIProvider` abstraction; selection uses only generic provider metadata
+- **Deterministic planning + validation** — planning and validation never call a model, so
+  dry-runs are free and weak/empty AI results cannot silently mutate project state
+- **Reuse, not duplication** — advise / learn / task flow through the Monday public API;
+  audit events publish on the shared `EventBus` (MODEL_CALL_STARTED/COMPLETED/FAILED)
+- **Foundation for multi-agent orchestration** — the queue + policy + provider abstraction
+  generalise to batch and multi-provider execution
+
+### Changed
+- `brain/providers/base.py`, `anthropic.py`, `openai.py`, `ollama.py` — added selection metadata
+- `monday/api.py` — `Monday.execute()`, `_task_review()`, `ExecuteResponse` import
+- `monday/cli.py` — `execute` command registered
+- `pyproject.toml` — `orchestrator*` added to packages and coverage source
+- `.gitignore` — ignore `logs/executions/` (runtime reports)
+
 ---
 
 ## [0.12.0] — 2026-06-28 — Sprint 1.11: AI Provider Layer

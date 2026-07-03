@@ -1,0 +1,171 @@
+{
+  "execution_id": "06c063f3-1b49-44f9-ba18-2f93899bb443",
+  "workflow_name": "implement-function",
+  "workflow_version": "1.0",
+  "status": "completed",
+  "started_at": "2026-06-28T22:58:22.579614+00:00",
+  "completed_at": "2026-06-28T22:58:22.594715+00:00",
+  "inputs": {
+    "function_name": "cache_read_through",
+    "component": "weatherbot"
+  },
+  "context": {
+    "inputs.function_name": "cache_read_through",
+    "inputs.component": "weatherbot",
+    "research.answer": "Found 5 entries about 'implementing cache_read_through weatherbot component':\n  \u2022 [DOC-0001] WeatherBot \u2014 Overview & Current State\n  \u2022 [DOC-0002] WeatherBot Project Charter\n  \u2022 [DOC-0003] WeatherBot Product Roadmap\n  \u2022 [DOC-0004] WeatherBot Risk Register\n  \u2022 [DEC-0001] WeatherBot \u2014 Definition of Done\n\nTop entry: WeatherBot is a command-line application that fetches current weather conditions",
+    "research.confidence": 0.82,
+    "research.sources": [
+      "DOC-0001",
+      "DOC-0002",
+      "DOC-0003",
+      "DOC-0004",
+      "DEC-0001",
+      "TASK-0001",
+      "TASK-0004",
+      "TASK-0005"
+    ],
+    "research.model_used": "monday-reasoning/1.0",
+    "find-related.results": [],
+    "find-related.total_found": 0,
+    "create-task.task_id": "TASK-0019",
+    "create-task.success": true,
+    "approval-gate.approved": true,
+    "start-task.task_id": "TASK-0019",
+    "start-task.success": true,
+    "start-task.status": "in-progress",
+    "capture-pattern.entry_id": "PAT-0001",
+    "capture-pattern.accepted": true,
+    "complete-task.task_id": "TASK-0019",
+    "complete-task.success": true
+  },
+  "steps": [
+    {
+      "step_id": "research",
+      "step_type": "ask",
+      "status": "completed",
+      "started_at": "2026-06-28T22:58:22.579619+00:00",
+      "completed_at": "2026-06-28T22:58:22.589333+00:00",
+      "input": {
+        "prompt": "What do we know about implementing cache_read_through in the weatherbot component?\n"
+      },
+      "output": {
+        "answer": "Found 5 entries about 'implementing cache_read_through weatherbot component':\n  \u2022 [DOC-0001] WeatherBot \u2014 Overview & Current State\n  \u2022 [DOC-0002] WeatherBot Project Charter\n  \u2022 [DOC-0003] WeatherBot Product Roadmap\n  \u2022 [DOC-0004] WeatherBot Risk Register\n  \u2022 [DEC-0001] WeatherBot \u2014 Definition of Done\n\nTop entry: WeatherBot is a command-line application that fetches current weather conditions",
+        "confidence": 0.82,
+        "sources": [
+          "DOC-0001",
+          "DOC-0002",
+          "DOC-0003",
+          "DOC-0004",
+          "DEC-0001",
+          "TASK-0001",
+          "TASK-0004",
+          "TASK-0005"
+        ],
+        "model_used": "monday-reasoning/1.0"
+      },
+      "error": ""
+    },
+    {
+      "step_id": "find-related",
+      "step_type": "search",
+      "status": "completed",
+      "started_at": "2026-06-28T22:58:22.589336+00:00",
+      "completed_at": "2026-06-28T22:58:22.589367+00:00",
+      "input": {
+        "query": "cache_read_through",
+        "limit": 5
+      },
+      "output": {
+        "results": [],
+        "total_found": 0
+      },
+      "error": ""
+    },
+    {
+      "step_id": "create-task",
+      "step_type": "task_create",
+      "status": "completed",
+      "started_at": "2026-06-28T22:58:22.589369+00:00",
+      "completed_at": "2026-06-28T22:58:22.589973+00:00",
+      "input": {
+        "title": "Implement cache_read_through",
+        "objective": "Implement cache_read_through in the weatherbot component. Research summary: Found 5 entries about 'implementing cache_read_through weatherbot component':\n  \u2022 [DOC-0001] WeatherBot \u2014 Overview & Current State\n  \u2022 [DOC-0002] WeatherBot Project Charter\n  \u2022 [DOC-0003] WeatherBot Product Roadmap\n  \u2022 [DOC-0004] WeatherBot Risk Register\n  \u2022 [DEC-0001] WeatherBot \u2014 Definition of Done\n\nTop entry: WeatherBot is a command-line application that fetches current weather conditions\n",
+        "task_type": "feature",
+        "priority": "P2",
+        "created_by": "workflow:implement-function/1.0"
+      },
+      "output": {
+        "task_id": "TASK-0019",
+        "success": true
+      },
+      "error": ""
+    },
+    {
+      "step_id": "approval-gate",
+      "step_type": "human_approval",
+      "status": "completed",
+      "started_at": "2026-06-28T22:58:22.589975+00:00",
+      "completed_at": "2026-06-28T22:58:22.589981+00:00",
+      "input": {},
+      "output": {
+        "approved": true
+      },
+      "error": ""
+    },
+    {
+      "step_id": "start-task",
+      "step_type": "task_start",
+      "status": "completed",
+      "started_at": "2026-06-28T22:58:22.589983+00:00",
+      "completed_at": "2026-06-28T22:58:22.592874+00:00",
+      "input": {
+        "task_id": "TASK-0019"
+      },
+      "output": {
+        "task_id": "TASK-0019",
+        "success": true,
+        "status": "in-progress"
+      },
+      "error": ""
+    },
+    {
+      "step_id": "capture-pattern",
+      "step_type": "learn",
+      "status": "completed",
+      "started_at": "2026-06-28T22:58:22.592877+00:00",
+      "completed_at": "2026-06-28T22:58:22.593240+00:00",
+      "input": {
+        "title": "Implementation pattern: cache_read_through",
+        "entry_type": "pattern",
+        "content": "## cache_read_through\n\nComponent: weatherbot\nTask: TASK-0019\n\n### Research Findings\nFound 5 entries about 'implementing cache_read_through weatherbot component':\n  \u2022 [DOC-0001] WeatherBot \u2014 Overview & Current State\n  \u2022 [DOC-0002] WeatherBot Project Charter\n  \u2022 [DOC-0003] WeatherBot Product Roadmap\n  \u2022 [DOC-0004] WeatherBot Risk Register\n  \u2022 [DEC-0001] WeatherBot \u2014 Definition of Done\n\nTop entry: WeatherBot is a command-line application that fetches current weather conditions\n\n### Related Entries\n0 existing entries found via search.\n\n### Outcome\nImplementation tracked and documented via implement-function workflow v1.0.\n",
+        "tags": [
+          "implementation",
+          "pattern",
+          "weatherbot"
+        ]
+      },
+      "output": {
+        "entry_id": "PAT-0001",
+        "accepted": true
+      },
+      "error": ""
+    },
+    {
+      "step_id": "complete-task",
+      "step_type": "task_complete",
+      "status": "completed",
+      "started_at": "2026-06-28T22:58:22.593242+00:00",
+      "completed_at": "2026-06-28T22:58:22.594713+00:00",
+      "input": {
+        "task_id": "TASK-0019",
+        "reason": "Implementation completed. Knowledge captured as PAT-0001.\n"
+      },
+      "output": {
+        "task_id": "TASK-0019",
+        "success": true
+      },
+      "error": ""
+    }
+  ],
+  "error": ""
+}

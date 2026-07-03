@@ -47,6 +47,18 @@ class AnthropicProvider(AIProvider):
     def name(self) -> str:
         return _PROVIDER_NAME
 
+    @property
+    def is_local(self) -> bool:
+        return False
+
+    @property
+    def cost_tier(self) -> int:
+        return 3  # frontier hosted model — highest cost tier
+
+    @property
+    def capability_tier(self) -> int:
+        return 3  # highest capability tier
+
     def ask(
         self,
         prompt: str,

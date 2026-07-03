@@ -24,6 +24,7 @@ from monday.types import (
     AdviseResponse,
     AskResponse,
     DoctorResponse,
+    ExecuteResponse,
     LearnResponse,
     MigrateResponse,
     ModuleStatus,
@@ -46,7 +47,7 @@ from tasks import (
     TaskValidationError,
 )
 
-_VERSION = "0.1.0"
+_VERSION = "1.0.0b1"
 
 
 class Monday:
@@ -291,6 +292,9 @@ class Monday:
         if action == "start":
             return self._task_start(task_id)
 
+        if action == "review":
+            return self._task_review(task_id, kwargs)
+
         return TaskResponse(
             action=action,
             success=False,
@@ -298,7 +302,7 @@ class Monday:
             data={},
             message=(
                 f"Unknown action {action!r}. "
-                "Valid actions: create, get, list_active, start, complete"
+                "Valid actions: create, get, list_active, start, review, complete"
             ),
         )
 
@@ -476,6 +480,41 @@ class Monday:
                 task_id=task_id,
                 data={},
                 message=str(exc),
+            )
+
+    def _task_review(self, task_id: str, kwargs: dict[str, Any]) -> TaskResponse:
+        """Transition a task IN_PROGRESS → REVIEW (awaiting human review)."""
+        if not task_id:
+            return TaskResponse(
+                action="review",
+                success=False,
+                task_id=None,
+                data={},
+                message="task_id is required for action 'review'",
+            )
+        changed_by = kwargs.get("changed_by", f"workflow:{self._session_id}")
+        reason = kwargs.get("reason", "")
+        try:
+            updated = self.__tasks.update_status(
+                task_id=task_id,
+                new_status=TaskStatus.REVIEW,
+                changed_by=changed_by,
+                reason=reason,
+            )
+            return TaskResponse(
+                action="review",
+                success=True,
+                task_id=updated.id,
+                data=_task_to_dict(updated),
+                message=f"{updated.id} moved to REVIEW",
+            )
+        except TaskNotFoundError as exc:
+            return TaskResponse(
+                action="review", success=False, task_id=task_id, data={}, message=str(exc),
+            )
+        except InvalidTransitionError as exc:
+            return TaskResponse(
+                action="review", success=False, task_id=task_id, data={}, message=str(exc),
             )
 
     def _task_complete(self, task_id: str, kwargs: dict[str, Any]) -> TaskResponse:
@@ -1141,6 +1180,100 @@ class Monday:
                 f"confidence {advise_resp.confidence:.0%}. "
                 f"Report: {report_path}"
             ),
+        )
+
+    def execute(
+        self,
+        task_id: str,
+        mode: str = "review",
+        policy: str = "prefer-local",
+        provider: str = "",
+        providers: Any = None,
+        autonomous_enabled: bool = False,
+        max_tokens: int = 2048,
+    ) -> ExecuteResponse:
+        """
+        Execute an engineering task by delegating it to an AI provider.
+
+        The Execution Orchestrator coordinates the full pipeline: the advisor
+        prioritises, a deterministic planner builds an execution plan, a provider
+        is selected by policy, the provider executes through the AIProvider
+        abstraction, the result is validated, knowledge is captured, the task is
+        updated, and an execution report is persisted to logs/executions/.
+
+        MondayOS does not implement any AI model here — it coordinates providers.
+
+        Args:
+            task_id:            ID of the task to execute (e.g. "TASK-0001").
+            mode:               Safety mode: "dry-run" | "review" | "autonomous".
+                                Default "review" — execute and capture, but stop
+                                the task at REVIEW for a human. No autonomous file
+                                modification unless mode is "autonomous" AND
+                                autonomous_enabled is True.
+            policy:             Provider selection policy: "prefer-local" |
+                                "lowest-cost" | "highest-capability" | "manual".
+            provider:           Explicit provider name override (manual selection).
+            providers:          Optional explicit list of AIProvider instances.
+                                Defaults to this instance's configured provider.
+            autonomous_enabled: Must be True for "autonomous" mode to act.
+            max_tokens:         Max output tokens for the provider execution call.
+
+        Returns:
+            ExecuteResponse describing the outcome. Does not raise.
+        """
+        from orchestrator.executor import ExecutionMode, ExecutionOrchestrator, ProviderSelectionPolicy
+
+        try:
+            mode_enum = ExecutionMode.from_str(mode)
+        except ValueError as exc:
+            return ExecuteResponse(action="execute", success=False, task_id=task_id, message=str(exc))
+        try:
+            policy_enum = ProviderSelectionPolicy.from_str(policy)
+        except ValueError as exc:
+            return ExecuteResponse(action="execute", success=False, task_id=task_id, message=str(exc))
+
+        if providers is None:
+            available = [self.__provider] if self.__provider is not None else []
+        else:
+            available = list(providers)
+
+        orchestrator = ExecutionOrchestrator(
+            monday=self,
+            project_root=self._config.project_root,
+            providers=available,
+            policy=policy_enum,
+            mode=mode_enum,
+            bus=self.__bus,
+            autonomous_enabled=autonomous_enabled,
+            manual_provider=provider,
+            max_tokens=max_tokens,
+        )
+
+        report = orchestrator.execute(task_id)
+        report_path = str(self._config.project_root / "logs" / "executions" / f"{report.execution_id}.json")
+
+        message = report.error or (
+            f"{report.status} via {report.provider_used}" if report.provider_used
+            else report.status
+        )
+
+        return ExecuteResponse(
+            action="execute",
+            success=report.success,
+            task_id=report.task_id,
+            execution_id=report.execution_id,
+            mode=report.mode,
+            provider_used=report.provider_used,
+            status=report.status,
+            prompt_summary=report.prompt_summary,
+            duration_ms=report.duration_ms,
+            files_changed=list(report.files_changed),
+            knowledge_captured=list(report.knowledge_captured),
+            follow_up_tasks=list(report.follow_up_tasks),
+            confidence=report.confidence,
+            report_path=report_path,
+            data=report.to_dict(),
+            message=message,
         )
 
     def _remove_knowledge_entry(self, entry_id: str) -> None:

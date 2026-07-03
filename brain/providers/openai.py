@@ -49,6 +49,18 @@ class OpenAIProvider(AIProvider):
     def name(self) -> str:
         return _PROVIDER_NAME
 
+    @property
+    def is_local(self) -> bool:
+        return False
+
+    @property
+    def cost_tier(self) -> int:
+        return 2  # hosted, but defaults to an economical model (gpt-4o-mini)
+
+    @property
+    def capability_tier(self) -> int:
+        return 2
+
     def ask(
         self,
         prompt: str,

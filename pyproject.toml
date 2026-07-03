@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mondayos"
-version = "0.1.0"
+version = "1.0.0b1"
 description = "AI Operating System — multi-model coordination platform"
 requires-python = ">=3.11"
 dependencies = [
@@ -26,7 +26,7 @@ monday = "monday.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["advisor*", "brain*", "core*", "doctor*", "events*", "knowledge*", "memory*", "migrate*", "monday*", "search*", "tasks*", "workflows*"]
+include = ["advisor*", "brain*", "core*", "doctor*", "events*", "knowledge*", "memory*", "migrate*", "monday*", "orchestrator*", "search*", "tasks*", "workflows*"]
 
 [tool.ruff]
 target-version = "py311"
@@ -46,7 +46,7 @@ testpaths = ["tests"]
 addopts = "--tb=short -q"
 
 [tool.coverage.run]
-source = ["advisor", "brain", "core", "doctor", "events", "knowledge", "memory", "migrate", "monday", "search", "tasks", "workflows"]
+source = ["advisor", "brain", "core", "doctor", "events", "knowledge", "memory", "migrate", "monday", "orchestrator", "search", "tasks", "workflows"]
 omit = ["tests/*"]
 
 [tool.coverage.report]

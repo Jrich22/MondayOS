@@ -56,6 +56,18 @@ class OllamaProvider(AIProvider):
     def name(self) -> str:
         return _PROVIDER_NAME
 
+    @property
+    def is_local(self) -> bool:
+        return True  # runs against a local Ollama service
+
+    @property
+    def cost_tier(self) -> int:
+        return 0  # local — no per-token cost
+
+    @property
+    def capability_tier(self) -> int:
+        return 1  # local models trail frontier hosted models
+
     def ask(
         self,
         prompt: str,

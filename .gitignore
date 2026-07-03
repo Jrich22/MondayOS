@@ -46,5 +46,8 @@ secrets/
 logs/*.log
 logs/*.jsonl
 
+# Execution reports — runtime output of the orchestrator
+logs/executions/
+
 # Project registry — runtime state with machine-specific absolute paths
 config/projects.json

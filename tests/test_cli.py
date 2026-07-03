@@ -92,7 +92,7 @@ class TestStatusCommand:
 
     def test_output_contains_version(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
         _, out, _ = _run([*_root(tmp_path), "status"], capsys)
-        assert "MondayOS v0.1.0" in out
+        assert "MondayOS v1.0.0b1" in out
 
     def test_output_contains_session(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
         _, out, _ = _run([*_root(tmp_path), "status"], capsys)

@@ -72,11 +72,11 @@ class TestInstantiation:
         assert monday is not None
 
     def test_monday_has_version(self) -> None:
-        assert Monday.VERSION == "0.1.0"
+        assert Monday.VERSION == "1.0.0b1"
 
     def test_monday_repr_contains_version(self) -> None:
         monday = Monday()
-        assert "0.1.0" in repr(monday)
+        assert "1.0.0b1" in repr(monday)
 
     def test_monday_repr_contains_session_id(self) -> None:
         monday = Monday()

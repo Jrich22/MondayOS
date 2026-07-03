@@ -90,6 +90,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _register_advise(subparsers)
     _register_project(subparsers)
     _register_onboard(subparsers)
+    _register_execute(subparsers)
 
     return parser
 
@@ -1333,6 +1334,121 @@ def _cmd_onboard(args: argparse.Namespace) -> int:
     print(f"  Sprint Goal   : {r.sprint_goal}")
     print("─" * 64)
     print(f"  Report        : {r.report_path}")
+    print("═" * 64)
+    print()
+
+    return 0 if r.success else 1
+
+
+# ---------------------------------------------------------------------------
+# execute
+# ---------------------------------------------------------------------------
+
+def _register_execute(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "execute",
+        help="Execute a task by delegating it to an AI provider.",
+        description=(
+            "Run the Execution Orchestrator against a task. The advisor\n"
+            "prioritises, a plan is built, a provider is selected by policy,\n"
+            "the provider executes through the abstraction, the result is\n"
+            "validated, knowledge is captured, the task is updated, and an\n"
+            "execution report is persisted.\n\n"
+            "Safety modes:\n"
+            "  --dry-run        plan + select provider, no provider call, no changes\n"
+            "  (default)        review-required: execute, capture, stop at REVIEW\n"
+            "  --enable-autonomous --mode autonomous   complete the task automatically\n\n"
+            "examples:\n"
+            "  monday execute TASK-0001\n"
+            "  monday execute TASK-0001 --dry-run\n"
+            "  monday execute TASK-0001 --policy highest-capability\n"
+            "  monday execute TASK-0001 --provider ollama\n"
+            "  monday execute TASK-0001 --mode autonomous --enable-autonomous\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("task_id", metavar="TASK-ID", help="Task ID to execute (e.g. TASK-0001).")
+    p.add_argument(
+        "--mode",
+        metavar="MODE",
+        default="review",
+        help="Execution mode: dry-run | review | autonomous (default: review).",
+    )
+    p.add_argument(
+        "--dry-run", "-n",
+        action="store_true",
+        default=False,
+        help="Shortcut for --mode dry-run (plan only, no provider call, no changes).",
+    )
+    p.add_argument(
+        "--policy",
+        metavar="POLICY",
+        default="prefer-local",
+        help=(
+            "Provider selection policy: prefer-local | lowest-cost | "
+            "highest-capability | manual (default: prefer-local)."
+        ),
+    )
+    p.add_argument(
+        "--provider",
+        metavar="NAME",
+        default="",
+        help="Explicit provider override (e.g. anthropic, openai, ollama).",
+    )
+    p.add_argument(
+        "--enable-autonomous",
+        action="store_true",
+        default=False,
+        help="Explicitly permit autonomous mode to complete tasks. Required for --mode autonomous.",
+    )
+    p.add_argument(
+        "--json", "-j",
+        action="store_true",
+        default=False,
+        help="Output the execution report as JSON.",
+    )
+    p.set_defaults(func=_cmd_execute)
+
+
+def _cmd_execute(args: argparse.Namespace) -> int:
+    import json as _json
+
+    mode = "dry-run" if args.dry_run else args.mode
+
+    monday = _monday(args)
+    r = monday.execute(
+        args.task_id,
+        mode=mode,
+        policy=args.policy,
+        provider=args.provider,
+        autonomous_enabled=args.enable_autonomous,
+    )
+
+    if args.json:
+        print(_json.dumps(r.data, indent=2))
+        return 0 if r.success else 1
+
+    print()
+    print("═" * 64)
+    print(f"  EXECUTION — {r.task_id}")
+    print("═" * 64)
+    print(f"  Mode        : {r.mode}")
+    print(f"  Status      : {r.status}")
+    print(f"  Provider    : {r.provider_used or '(none)'}")
+    if r.prompt_summary:
+        print(f"  Prompt      : {r.prompt_summary}")
+    print(f"  Duration    : {r.duration_ms:.0f}ms")
+    if r.status not in ("dry-run",):
+        print(f"  Confidence  : {r.confidence:.0%}")
+    if r.knowledge_captured:
+        print(f"  Knowledge   : {', '.join(r.knowledge_captured)}")
+    if r.follow_up_tasks:
+        print(f"  Follow-ups  : {', '.join(r.follow_up_tasks)}")
+    print("─" * 64)
+    if not r.success and r.message:
+        print(f"  {r.message}")
+        print("─" * 64)
+    print(f"  Report      : {r.report_path}")
     print("═" * 64)
     print()
 
