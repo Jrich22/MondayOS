@@ -255,6 +255,7 @@ class AgentRuntime:
             run.message = f"Rejected by {by}; task {run.task_id} left for rework."
 
         self._persist(run)
+        self._sync_parent_team_run(run, approve=approve, by=by)
         return run
 
     def get_run(self, run_id: str) -> AgentRun:
@@ -304,6 +305,51 @@ class AgentRuntime:
         run.message = decision.reason
         self._persist(run)
         return run
+
+    def _sync_parent_team_run(self, run: AgentRun, approve: bool, by: str) -> None:
+        """
+        Propagate a human review decision to the parent team run, if any.
+
+        A team run (``logs/agents/team-*.json``) reaches ``awaiting-approval``
+        with its final reviewer stage recorded as ``approval_run_id``. Reviewing
+        that run here is the terminal human decision, so leave the team run's
+        status in sync: ``completed`` on approve, ``changes-requested`` on
+        reject. A no-op for standalone runs (nothing references them) and for
+        team runs already past the gate. Written directly as JSON to avoid a
+        circular import with agents.team; TeamRun.from_dict ignores extra keys.
+        """
+        if not self._runs_dir.exists():
+            return
+        for path in self._runs_dir.glob("team-*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if data.get("approval_run_id") != run.run_id:
+                continue
+            if data.get("status") != "awaiting-approval":
+                return  # decision already recorded; don't clobber
+            now = _now_iso()
+            if approve:
+                data["status"] = "completed"
+                data["success"] = True
+                data["message"] = f"Approved by {by}; task {run.task_id} completed."
+            else:
+                data["status"] = "changes-requested"
+                data["success"] = False
+                data["message"] = f"Rejected by {by}; task {run.task_id} left for rework."
+            data["approval"] = {
+                "decision": "approved" if approve else "rejected",
+                "by": by,
+                "at": now,
+            }
+            try:
+                path.write_text(
+                    json.dumps(data, indent=2, sort_keys=True), encoding="utf-8"
+                )
+            except Exception:
+                pass
+            return  # a run is the approval gate of at most one team run
 
     def _run_path(self, run_id: str) -> Path:
         return self._runs_dir / f"{run_id}.json"
