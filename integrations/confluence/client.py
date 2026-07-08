@@ -30,6 +30,23 @@ class ConfluenceError(Exception):
     """Raised when a Confluence API call fails or is misconfigured."""
 
 
+def normalize_site(base_url: str) -> str:
+    """Return the Atlassian site root, without a trailing ``/wiki`` or slash.
+
+    On Confluence Cloud both the REST API and the web UI live under
+    ``<site>/wiki``. Users may set ``CONFLUENCE_BASE_URL`` as either the bare
+    site (``https://x.atlassian.net``) or with the wiki suffix already attached
+    (``https://x.atlassian.net/wiki``). We normalise to the bare site so the
+    ``/wiki`` segment is added exactly once when building request and page
+    URLs — otherwise a base URL that includes ``/wiki`` produces a doubled
+    ``/wiki/wiki`` path, which returns no page data (blank id, bogus URL).
+    """
+    site = base_url.strip().rstrip("/")
+    while site.lower().endswith("/wiki"):
+        site = site[: -len("/wiki")].rstrip("/")
+    return site
+
+
 @dataclass
 class PageResult:
     """The outcome of a create/update/fetch, normalised across clients."""
@@ -68,7 +85,9 @@ class HttpConfluenceClient(ConfluenceClient):
     """Confluence Cloud client backed by ``urllib`` and HTTP Basic auth."""
 
     def __init__(self, base_url: str, email: str, api_token: str, timeout: float = 30.0) -> None:
-        self._base = base_url.rstrip("/")
+        # Site root without '/wiki'; the '/wiki' prefix is added exactly once
+        # when building request paths and page URLs (see normalize_site).
+        self._site = normalize_site(base_url)
         self._email = email
         self._token = api_token
         self._timeout = timeout
@@ -125,22 +144,40 @@ class HttpConfluenceClient(ConfluenceClient):
 
     def _to_result(self, data: dict[str, Any]) -> PageResult:
         links = data.get("_links", {}) or {}
-        webui = links.get("webui", "")
-        base = links.get("base") or self._base
-        url = f"{base}{webui}" if webui else f"{self._base}/wiki/spaces"
+        page_id = str(data.get("id") or "")
+        url = self._page_url(links.get("webui", ""), links.get("base", ""), page_id)
         version = int((data.get("version") or {}).get("number", 1))
         return PageResult(
-            id=str(data.get("id", "")),
+            id=page_id,
             title=data.get("title", ""),
             url=url,
             version=version,
         )
 
+    def _page_url(self, webui: str, link_base: str, page_id: str) -> str:
+        """Build a web UI URL with exactly one ``/wiki`` segment.
+
+        ``webui`` from the API is a site-relative path like
+        ``/spaces/ENG/pages/123/Title`` (no ``/wiki`` prefix); ``link_base``,
+        when present, is the ``<site>/wiki`` root. We rebuild from the
+        normalised site so neither a ``/wiki``-suffixed base URL nor a
+        ``/wiki``-prefixed ``webui`` can produce a doubled ``/wiki/wiki``.
+        """
+        base = normalize_site(link_base) if link_base else self._site
+        if webui:
+            suffix = webui if webui.startswith("/") else f"/{webui}"
+            if suffix.lower().startswith("/wiki/") or suffix.lower() == "/wiki":
+                suffix = suffix[len("/wiki"):] or "/"
+            return f"{base}/wiki{suffix}"
+        if page_id:
+            return f"{base}/wiki/pages/viewpage.action?pageId={page_id}"
+        return f"{base}/wiki/spaces"
+
     def _request(self, method: str, path: str, payload: dict[str, Any] | None) -> dict[str, Any]:
         import urllib.error
         import urllib.request
 
-        url = f"{self._base}{path}"
+        url = f"{self._site}{path}"
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
         token = base64.b64encode(f"{self._email}:{self._token}".encode()).decode("ascii")
         req = urllib.request.Request(url, data=body, method=method)

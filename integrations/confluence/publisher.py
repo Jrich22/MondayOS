@@ -172,6 +172,18 @@ class ConfluencePublisher:
         except ConfluenceError as exc:
             return self._fail(doc, checksum, f"Confluence publish failed: {exc}")
 
+        # A successful create/update must yield a page id. A blank id means the
+        # API call did not land on a real page (e.g. a misconfigured base URL
+        # that produced a doubled '/wiki' path): fail loudly instead of
+        # recording a useless mapping and reporting a false success.
+        if not page.id:
+            return self._fail(
+                doc, checksum,
+                "Confluence returned no page id, so the publish did not complete. "
+                "Check CONFLUENCE_BASE_URL — it should be the site root "
+                "(e.g. https://your-org.atlassian.net), not a '/wiki' URL.",
+            )
+
         now = _now_iso()
         record = PublishRecord(
             doc_id=doc.doc_id, source=doc.source or doc.doc_id, title=doc.title,

@@ -54,5 +54,8 @@ logs/agents/
 agents/active/
 agents/.sequences.json
 
+# Confluence publish mapping/history — local runtime state (never secrets)
+logs/publish/
+
 # Project registry — runtime state with machine-specific absolute paths
 config/projects.json

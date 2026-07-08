@@ -24,6 +24,8 @@ from integrations.confluence import (
     ConfluenceConfig,
     ConfluencePublisher,
     FakeConfluenceClient,
+    HttpConfluenceClient,
+    PageResult,
     PublishDoc,
     PublishEvent,
     PublishRecord,
@@ -159,6 +161,71 @@ class TestFakeClient(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# HTTP client URL building (base URL normalisation + page-id parsing)
+# ---------------------------------------------------------------------------
+
+class TestHttpClientUrls(unittest.TestCase):
+    """The real client must build single-'/wiki' URLs and parse the page id,
+    regardless of whether CONFLUENCE_BASE_URL includes a '/wiki' suffix."""
+
+    # A representative Confluence Cloud content response.
+    _RESPONSE = {
+        "id": "123456",
+        "title": "Roadmap",
+        "version": {"number": 3},
+        "_links": {
+            "base": "https://acme.atlassian.net/wiki",
+            "webui": "/spaces/ENG/pages/123456/Roadmap",
+        },
+    }
+
+    def _client(self, base_url: str) -> HttpConfluenceClient:
+        return HttpConfluenceClient(base_url, "a@b.c", "token")
+
+    def test_site_normalised_without_wiki(self):
+        self.assertEqual(self._client("https://acme.atlassian.net")._site,
+                         "https://acme.atlassian.net")
+
+    def test_site_normalised_with_wiki_suffix(self):
+        for base in (
+            "https://acme.atlassian.net/wiki",
+            "https://acme.atlassian.net/wiki/",
+            "https://acme.atlassian.net/wiki/wiki",  # already doubled by a prior edit
+        ):
+            with self.subTest(base=base):
+                self.assertEqual(self._client(base)._site, "https://acme.atlassian.net")
+
+    def test_page_url_without_wiki_base(self):
+        r = self._client("https://acme.atlassian.net")._to_result(self._RESPONSE)
+        self.assertEqual(r.id, "123456")
+        self.assertEqual(r.version, 3)
+        self.assertEqual(r.url, "https://acme.atlassian.net/wiki/spaces/ENG/pages/123456/Roadmap")
+        self.assertNotIn("/wiki/wiki", r.url)
+
+    def test_page_url_with_wiki_base_is_not_doubled(self):
+        # This is the reported bug: base URL carried a '/wiki' suffix.
+        r = self._client("https://acme.atlassian.net/wiki")._to_result(self._RESPONSE)
+        self.assertEqual(r.id, "123456")
+        self.assertEqual(r.url, "https://acme.atlassian.net/wiki/spaces/ENG/pages/123456/Roadmap")
+        self.assertNotIn("/wiki/wiki", r.url)
+
+    def test_fallback_url_never_doubles_wiki(self):
+        # Even a degenerate/empty response must not produce '/wiki/wiki'.
+        r = self._client("https://acme.atlassian.net/wiki")._to_result({})
+        self.assertNotIn("/wiki/wiki", r.url)
+        self.assertTrue(r.url.startswith("https://acme.atlassian.net/wiki"))
+
+    def test_request_path_has_single_wiki(self):
+        # The request URL is <site>/wiki/rest/api/... for either base form.
+        for base in ("https://acme.atlassian.net", "https://acme.atlassian.net/wiki"):
+            with self.subTest(base=base):
+                c = self._client(base)
+                url = f"{c._site}/wiki/rest/api/content"
+                self.assertEqual(url, "https://acme.atlassian.net/wiki/rest/api/content")
+                self.assertNotIn("/wiki/wiki", url)
+
+
+# ---------------------------------------------------------------------------
 # Mapping / history store
 # ---------------------------------------------------------------------------
 
@@ -260,6 +327,31 @@ class TestPublisher(unittest.TestCase):
         r = pub.publish(self._doc())
         self.assertFalse(r.success)
         self.assertIn("space", r.message.lower())
+
+    def test_created_page_must_have_non_empty_page_id(self):
+        # A client that returns a blank id (the doubled-'/wiki' failure mode)
+        # must produce a failed publish, not a false "created" with no mapping.
+        class _BlankIdClient(FakeConfluenceClient):
+            def create_page(self, *a, **k):
+                return PageResult(id="", title="T", url="https://x/wiki/wiki/spaces", version=1)
+
+        pub = ConfluencePublisher(
+            self.root, ConfluenceConfig(space_key="ENG"), client=_BlankIdClient()
+        )
+        r = pub.publish(self._doc())
+        self.assertFalse(r.success)
+        self.assertEqual(r.action, "failed")
+        self.assertFalse(r.page_id)
+        self.assertIn("page id", r.message.lower())
+        # No bogus mapping was recorded for the doc.
+        self.assertIsNone(PublishStore(self.root).get("docs/ROADMAP.md"))
+
+    def test_created_page_stores_page_id(self):
+        r = self.pub.publish(self._doc())
+        rec = PublishStore(self.root).get("docs/ROADMAP.md")
+        self.assertTrue(r.page_id)
+        self.assertTrue(rec.page_id)
+        self.assertEqual(rec.page_id, r.page_id)
 
     def test_metadata_is_recorded(self):
         r = self.pub.publish(self._doc())
