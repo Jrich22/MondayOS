@@ -126,6 +126,32 @@ class TestTeamPipeline(unittest.TestCase):
         got = self.monday.task("get", task_id=self.task_id)
         self.assertEqual(got.data["status"], "completed")
 
+    def test_approval_updates_parent_team_run(self):
+        # Approving the gate run must move the parent team run off
+        # awaiting-approval to completed, mirroring the task lifecycle.
+        r = self._team()
+        self.assertEqual(r.status, "awaiting-approval")
+        self.monday.agent("review", run_id=r.approval_run_id, approve=True, by="human:test")
+        hist = self.monday.team("history", task_id=self.task_id)
+        parent = hist.data["runs"][0]
+        self.assertEqual(parent["status"], "completed")
+        self.assertTrue(parent["success"])
+        self.assertEqual(parent["approval"]["decision"], "approved")
+        self.assertEqual(parent["approval"]["by"], "human:test")
+
+    def test_rejection_marks_parent_changes_requested(self):
+        # Rejecting the gate run leaves the task for rework and the parent
+        # team run reflects changes-requested (not stuck at awaiting-approval).
+        r = self._team()
+        self.monday.agent("review", run_id=r.approval_run_id, approve=False, by="human:test")
+        hist = self.monday.team("history", task_id=self.task_id)
+        parent = hist.data["runs"][0]
+        self.assertEqual(parent["status"], "changes-requested")
+        self.assertFalse(parent["success"])
+        self.assertEqual(parent["approval"]["decision"], "rejected")
+        got = self.monday.task("get", task_id=self.task_id)
+        self.assertEqual(got.data["status"], "review")  # left for rework
+
     def test_no_source_files_written(self):
         self._team()
         self.assertEqual(list(self.root.rglob("*.py")), [])

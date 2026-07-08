@@ -9,6 +9,41 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### MondayOS v2.3 — Confluence Publishing Integration (2026-07-07)
+Adds Confluence as an outbound documentation publishing target. **MondayOS
+remains the system of record** — content flows one way (MondayOS → Confluence),
+the doc → page mapping is stored locally, and Confluence is never read as a
+source of truth. Credentials come from the environment only; nothing is
+committed to source.
+
+- **Integration package** — new `integrations/confluence/`:
+  `config.py` (env-var config + credential checks, token never exposed),
+  `converter.py` (Markdown → Confluence storage-format XHTML: headings, bullets,
+  numbered lists, code blocks, tables, links, inline emphasis),
+  `client.py` (`HttpConfluenceClient` over the Cloud REST v1 API using only the
+  standard library, plus an offline `FakeConfluenceClient`),
+  `mapping.py` (local `PublishStore` — doc-ID → page-ID mapping + append-only
+  history under `logs/publish/confluence.json`),
+  `publisher.py` (`ConfluencePublisher` — create/update/dry-run with safety).
+- **Public API** — `Monday.publish(action, …)` resolves a document from the
+  system of record (knowledge entry or `docs/` file / explicit `--file`) and
+  publishes it; `PublishResponse` added.
+- **CLI** — `monday publish confluence [DOC_ID] [--file] [--space] [--parent]
+  [--update-page] [--dry-run] [--force] [--title]` and `monday publish history`.
+- **Safety** — a page is only overwritten when a mapping exists or
+  `--update-page` is given (otherwise a new page is created); unchanged content
+  is skipped as `up-to-date` unless `--force`; `--dry-run` previews the decision
+  and makes no network calls (needs no credentials); missing credentials fail
+  clearly before any call.
+- **Metadata** — every publish records source, page ID, URL, space, checksum,
+  timestamp, status, and version locally.
+- **Docs** — `docs/CONFLUENCE.md` (setup, commands, safety model, conversion,
+  offline testing seam).
+- **Tests** — `tests/test_confluence.py` (37), fully offline via the fake client
+  and the `MONDAYOS_CONFLUENCE_FAKE` seam: converter, credentials, mapping
+  store, publisher create/update/dry-run/unchanged/explicit-page, and the API +
+  CLI paths. No test requires a real Confluence account.
+
 ### MondayOS v2.2 — Real Agent Providers (2026-07-02)
 Makes the multi-agent team use the real OpenAI/Anthropic providers instead of the
 fake agent, with availability checks and graceful key-missing handling. Provider

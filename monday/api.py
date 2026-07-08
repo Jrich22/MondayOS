@@ -32,6 +32,7 @@ from monday.types import (
     ModuleStatus,
     OnboardResponse,
     ProjectResponse,
+    PublishResponse,
     SearchResponse,
     StatusResponse,
     TaskResponse,
@@ -1505,6 +1506,157 @@ class Monday:
         except (ValueError, LookupError) as exc:
             return TeamResponse(action=action, success=False, message=str(exc))
 
+    def publish(self, action: str = "confluence", **kwargs: Any) -> PublishResponse:
+        """
+        Publish a MondayOS document to an external destination (Confluence).
+
+        MondayOS stays the system of record — content is read from a local
+        file or knowledge entry and pushed to Confluence as a downstream page.
+        The MondayOS-doc-ID → Confluence-page-ID mapping and a publish history
+        are stored locally under ``logs/publish/``.
+
+        Actions:
+            confluence — publish/preview a document. Provide a source via
+                         ``doc_id`` (knowledge entry ID or a docs/ file) or
+                         ``file`` (explicit path). Optional: ``space_key``,
+                         ``parent_id``, ``update_page``, ``title``,
+                         ``dry_run`` (preview only, needs no credentials),
+                         ``force``. A ``client`` may be injected for testing.
+            history    — list past publish events. Optional: ``limit``.
+
+        Returns a PublishResponse. Does not raise for expected failures such as
+        missing credentials or an unresolvable document.
+        """
+        from integrations.confluence import (
+            ConfluenceConfig,
+            ConfluencePublisher,
+        )
+
+        root = self._config.project_root
+
+        try:
+            if action == "history":
+                publisher = ConfluencePublisher(root, ConfluenceConfig.from_env())
+                events = publisher.history(limit=int(kwargs.get("limit", 20)))
+                return PublishResponse(
+                    action="history", success=True,
+                    message=f"{len(events)} publish event(s)",
+                    data={"history": events, "count": len(events)},
+                )
+
+            if action != "confluence":
+                return PublishResponse(
+                    action=action, success=False,
+                    message=f"Unknown action {action!r}. Valid actions: confluence, history",
+                )
+
+            # Resolve the document from the MondayOS system of record.
+            try:
+                doc = self._resolve_publish_doc(
+                    doc_id=kwargs.get("doc_id", ""),
+                    file=kwargs.get("file", ""),
+                    title=kwargs.get("title", ""),
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                return PublishResponse(action=action, success=False, message=str(exc))
+
+            config = ConfluenceConfig.from_env()
+            dry_run = bool(kwargs.get("dry_run", False))
+            client = kwargs.get("client")  # test/demo injection
+
+            # A real publish needs credentials up front; a dry run does not.
+            if not dry_run and client is None:
+                # A space key is only required when creating a brand-new page.
+                needs_space = not (
+                    kwargs.get("update_page") or self._publish_has_mapping(root, doc.doc_id)
+                )
+                check = config.credential_check(require_space=needs_space)
+                if not check.ok:
+                    return PublishResponse(
+                        action=action, success=False, doc_id=doc.doc_id,
+                        status="failed", message=check.instructions(),
+                    )
+
+            publisher = ConfluencePublisher(root, config, client=client)
+            result = publisher.publish(
+                doc,
+                space_key=kwargs.get("space_key", ""),
+                parent_id=kwargs.get("parent_id", ""),
+                update_page=kwargs.get("update_page", ""),
+                dry_run=dry_run,
+                force=bool(kwargs.get("force", False)),
+            )
+            return PublishResponse(
+                action=action, success=result.success, message=result.message,
+                doc_id=result.doc_id, page_id=result.page_id, url=result.url,
+                status=result.action, dry_run=result.dry_run, data=result.to_dict(),
+            )
+        except (ValueError, LookupError) as exc:
+            return PublishResponse(action=action, success=False, message=str(exc))
+
+    def _publish_has_mapping(self, root: Path, doc_id: str) -> bool:
+        from integrations.confluence import PublishStore
+        return PublishStore(root).get(doc_id) is not None
+
+    def _resolve_publish_doc(self, doc_id: str, file: str, title: str) -> Any:
+        """
+        Resolve a publish request to concrete content from the system of record.
+
+        Precedence: an explicit ``file`` path, then a ``doc_id`` interpreted
+        first as a knowledge entry ID and then as a docs/ file. The returned
+        PublishDoc carries a stable doc_id used for the local page mapping.
+        """
+        from integrations.confluence import PublishDoc
+
+        root = Path(self._config.project_root)
+
+        if file:
+            path = Path(file)
+            if not path.is_absolute():
+                path = root / file
+            if not path.exists():
+                raise FileNotFoundError(f"File not found: {file}")
+            markdown = path.read_text(encoding="utf-8")
+            return PublishDoc(
+                doc_id=doc_id or file,
+                title=title or _first_heading(markdown) or path.stem,
+                markdown=markdown,
+                source=file,
+            )
+
+        if not doc_id:
+            raise ValueError("Provide a document to publish: a DOC_ID or --file PATH.")
+
+        # Try a knowledge entry first (system of record).
+        try:
+            entry = self.__knowledge.get(doc_id)
+        except Exception:
+            entry = None
+        if entry is not None:
+            return PublishDoc(
+                doc_id=doc_id,
+                title=title or entry.title,
+                markdown=entry.body,
+                source=doc_id,
+            )
+
+        # Fall back to a documentation file identified by DOC_ID.
+        for candidate in (root / doc_id, root / "docs" / f"{doc_id}.md", root / f"{doc_id}.md"):
+            if candidate.exists():
+                markdown = candidate.read_text(encoding="utf-8")
+                rel = candidate.relative_to(root) if candidate.is_relative_to(root) else candidate
+                return PublishDoc(
+                    doc_id=doc_id,
+                    title=title or _first_heading(markdown) or candidate.stem,
+                    markdown=markdown,
+                    source=str(rel),
+                )
+
+        raise ValueError(
+            f"Cannot resolve document {doc_id!r}. Pass a knowledge entry ID, a "
+            "docs/ name, or use --file PATH."
+        )
+
     def _remove_knowledge_entry(self, entry_id: str) -> None:
         """Remove a knowledge entry by ID. Used by migration rollback."""
         self.__knowledge.remove(entry_id)
@@ -1546,6 +1698,15 @@ class Monday:
 
 def _new_session_id() -> str:
     return str(uuid.uuid4())
+
+
+def _first_heading(markdown: str) -> str:
+    """Return the text of the first Markdown ATX heading, or "" if none."""
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip()
+    return ""
 
 
 def _task_to_dict(task: Any) -> dict[str, Any]:

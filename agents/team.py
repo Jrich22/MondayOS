@@ -67,7 +67,11 @@ class TeamRun:
     team_run_id: str
     task_id: str
     mode: str = ""
-    status: str = ""            # awaiting-approval | blocked | failed | dry-run
+    # awaiting-approval | completed | changes-requested | blocked | failed |
+    # dry-run | rejected. A run reaching REVIEW is 'awaiting-approval' until the
+    # human decision on approval_run_id lands (see AgentRuntime.review), which
+    # transitions it to 'completed' (approved) or 'changes-requested' (rejected).
+    status: str = ""
     success: bool = False
     created_at: str = ""
     sequence: list[str] = field(default_factory=list)
@@ -76,6 +80,7 @@ class TeamRun:
     stopped_at: str = ""
     stopped_reason: str = ""
     approval_run_id: str = ""
+    approval: dict[str, Any] = field(default_factory=dict)  # {decision, by, at} once reviewed
     message: str = ""
 
     def to_dict(self) -> dict[str, Any]:
