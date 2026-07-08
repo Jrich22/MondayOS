@@ -9,7 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from agents.adapters import FakeAgentProvider
-from agents.team import BLOCKING_ROLES, TEAM_SEQUENCE, TeamWorkflow, _derive_verdict
+from agents.team import BLOCKING_ROLES, STOPPING_VERDICTS, TEAM_SEQUENCE, TeamWorkflow, _derive_verdict
 from agents.types import AgentRun
 from monday import Monday, MondayConfig
 from monday.cli import main
@@ -30,23 +30,52 @@ class TestTeamConstants(unittest.TestCase):
 
 
 class TestDeriveVerdict(unittest.TestCase):
-    def _run(self, role, *, success=True, status="executed", excerpt="", message=""):
+    """The team stage verdict comes from the structured AgentVerdict only (v2.4)."""
+
+    def _run(self, role, *, success=True, status="executed", verdict=None, excerpt="", message=""):
         return AgentRun(
             run_id="r", task_id="t", role=role, success=success, status=status,
+            verdict=(verdict if verdict is not None else {}),
             execution={"result_excerpt": excerpt}, message=message,
         )
 
     def test_pass_normal(self):
-        self.assertEqual(_derive_verdict("qa", self._run("qa", excerpt="all good")), "pass")
-
-    def test_block_marker(self):
         self.assertEqual(
-            _derive_verdict("security", self._run("security", excerpt="BLOCK: risky")), "block"
+            _derive_verdict("qa", self._run("qa", verdict={"verdict": "pass"})), "pass"
         )
 
-    def test_non_blocking_role_ignores_marker(self):
-        # cpo / lead-engineer are productive, not gatekeepers.
-        self.assertEqual(_derive_verdict("cpo", self._run("cpo", excerpt="REJECT")), "pass")
+    def test_structured_block_blocks(self):
+        self.assertEqual(
+            _derive_verdict("security", self._run("security", verdict={"verdict": "block"})),
+            "block",
+        )
+
+    def test_structured_needs_changes_stops(self):
+        self.assertEqual(
+            _derive_verdict("qa", self._run("qa", verdict={"verdict": "needs_changes"})),
+            "needs_changes",
+        )
+        self.assertIn("needs_changes", STOPPING_VERDICTS)
+
+    def test_prose_blocker_does_not_block(self):
+        # The word "blocker"/"blocking" in prose must NOT veto — only structure does.
+        run = self._run(
+            "security",
+            verdict={"verdict": "pass"},
+            excerpt="I found a potential blocker earlier but it is a blocking issue no longer.",
+        )
+        self.assertEqual(_derive_verdict("security", run), "pass")
+
+    def test_no_structured_verdict_defaults_pass(self):
+        # A blocking role with no structured verdict at all → pass (never block).
+        self.assertEqual(_derive_verdict("security", self._run("security")), "pass")
+
+    def test_non_blocking_role_ignores_block_verdict(self):
+        # cpo / lead-engineer are productive, not gatekeepers — even a structured
+        # block from them does not halt the pipeline.
+        self.assertEqual(
+            _derive_verdict("cpo", self._run("cpo", verdict={"verdict": "block"})), "pass"
+        )
 
     def test_failed_run_blocks(self):
         self.assertEqual(_derive_verdict("qa", self._run("qa", success=False)), "block")

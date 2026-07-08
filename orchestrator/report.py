@@ -93,6 +93,9 @@ class ExecutionReport:
     # Detail
     plan: dict[str, Any] = field(default_factory=dict)
     result_excerpt: str = ""
+    # Full, untruncated provider response, preserved for humans (structured
+    # verdict parsing consumes this; result_excerpt remains a short preview).
+    result_full: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

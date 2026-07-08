@@ -285,6 +285,7 @@ class ExecutionOrchestrator:
                        "tokens_used": response.tokens_used})
 
         report.result_excerpt = response.content[:500]
+        report.result_full = response.content or ""
 
         # ── 7. Result validation ─────────────────────────────────────────
         validation = self._validator.validate(plan, response, task)

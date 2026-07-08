@@ -12,6 +12,7 @@ so `monday agent run` works with no API keys configured.
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from brain.providers.base import AIProvider, ProviderAvailability, ProviderResponse
@@ -32,8 +33,10 @@ class FakeAgentProvider(AIProvider):
     def __init__(self, name: str = FAKE_PROVIDER, *, role: str = "", verdict: str = "pass") -> None:
         self._name = name
         self._role = role
-        # "pass" (default) → normal completion text; "block" → text carrying a
-        # BLOCK marker so the team workflow's verdict logic stops the pipeline.
+        # The structured verdict this fake emits: "pass" (default), "block", or
+        # "needs_changes". It is expressed as a real JSON verdict object in the
+        # response body (see _body), so the team workflow stops the pipeline from
+        # the structured signal — not from prose.
         self._verdict = verdict
         self.calls: list[tuple[str, str]] = []
 
@@ -61,17 +64,49 @@ class FakeAgentProvider(AIProvider):
 
     def _body(self, verb: str, subject: str) -> str:
         role = f"the {self._role} agent" if self._role else "an agent"
+        # Deliberately include the words "blocker"/"blocking" in ordinary prose to
+        # prove the structured path is what decides: the verdict comes from the
+        # JSON object below, never from these words.
         if self._verdict == "block":
-            return (
-                f"[{self._name}] BLOCK — as {role}, I found a blocking issue and "
-                f"cannot pass this stage. Objective reviewed: {subject.strip()[:160]} "
-                "Human attention is required before proceeding."
+            prose = (
+                f"[{self._name}] Acting as {role}, I reviewed the work. I identified "
+                f"a blocking issue that must be resolved before this can proceed. "
+                f"Objective reviewed: {subject.strip()[:160]}"
             )
-        return (
-            f"[{self._name}] Acting as {role}, {verb} the requested work. "
-            f"Objective addressed: {subject.strip()[:180]} "
-            "A concrete result was produced and is ready for human review."
-        )
+            payload = {
+                "verdict": "block",
+                "confidence": "high",
+                "summary": "A blocking issue was found; the stage cannot pass.",
+                "findings": ["Blocking issue identified during review."],
+                "recommendations": ["Resolve the blocking issue and re-run the stage."],
+            }
+        elif self._verdict == "needs_changes":
+            prose = (
+                f"[{self._name}] Acting as {role}, I reviewed the work. It is close, "
+                f"but changes are needed. Objective reviewed: {subject.strip()[:160]}"
+            )
+            payload = {
+                "verdict": "needs_changes",
+                "confidence": "medium",
+                "summary": "Changes are requested before this can pass.",
+                "findings": ["Minor issues found during review."],
+                "recommendations": ["Address the noted changes and re-submit."],
+            }
+        else:
+            prose = (
+                f"[{self._name}] Acting as {role}, {verb} the requested work. "
+                f"Objective addressed: {subject.strip()[:180]} "
+                "A concrete result was produced and is ready for human review. "
+                "There is no blocker here."
+            )
+            payload = {
+                "verdict": "pass",
+                "confidence": "high",
+                "summary": "Work completed and ready for human review.",
+                "findings": [],
+                "recommendations": [],
+            }
+        return f"{prose}\n\n```json\n{json.dumps(payload, indent=2)}\n```"
 
     def ask(self, prompt: str, context: str = "", max_tokens: int = 1024, **kwargs: Any) -> ProviderResponse:
         self.calls.append(("ask", prompt))

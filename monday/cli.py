@@ -1627,6 +1627,10 @@ def _cmd_agent_run(args: argparse.Namespace) -> int:
     print(f"  Provider  : {provider_line}")
     print(f"  Mode      : {r.data.get('mode', mode)}")
     print(f"  Status    : {r.status}")
+    verdict = r.data.get("verdict", {})
+    if verdict.get("verdict"):
+        conf = verdict.get("confidence", "")
+        print(f"  Verdict   : {verdict['verdict']}" + (f" ({conf})" if conf else ""))
     gate = r.data.get("gate", {})
     if gate and not gate.get("allowed", True):
         print(f"  Gate      : BLOCKED — {gate.get('reason', '')}")
@@ -1726,13 +1730,17 @@ def _cmd_team_run(args: argparse.Namespace) -> int:
     print(f"  Mode    : {r.data.get('mode', args.mode)}")
     print(f"  Status  : {r.status}")
     _hr()
+    _VERDICT_MARK = {"pass": "✓", "needs_changes": "⚠", "block": "✗"}
     for st in r.stages:
-        mark = "✓" if st.get("verdict") == "pass" else "✗"
+        verdict = st.get("verdict", "")
+        mark = _VERDICT_MARK.get(verdict, "✗")
         role = st.get("role", "")
         prov = st.get("provider_used", "") or "—"
         model = st.get("provider_model", "")
         prov_label = f"{prov} ({model})" if model else prov
-        print(f"  {mark} {role:<14} [{st.get('status', ''):<9}] {st.get('verdict', ''):<6} {prov_label}")
+        conf = (st.get("confidence") or "").strip()
+        verdict_label = f"{verdict} ({conf})" if conf else verdict
+        print(f"  {mark} {role:<14} [{st.get('status', ''):<9}] {verdict_label:<20} {prov_label}")
         summary = (st.get("summary") or "").strip()
         if summary:
             print(f"      {summary[:100]}")
