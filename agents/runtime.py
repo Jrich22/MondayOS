@@ -21,6 +21,7 @@ from agents.gates import ApprovalGate, GateDecision
 from agents.registry import AgentRegistry
 from agents.roles import get_role, normalize_role
 from agents.types import Agent, AgentRun
+from agents.verdicts import parse_verdict
 from brain.providers.base import ProviderAvailability
 from orchestrator.report import ExecutionMode
 
@@ -208,6 +209,11 @@ class AgentRuntime:
         run.execution = dict(resp.data)
         run.message = resp.message
         run.approval = _approval_for(mode_enum, decision, approved)
+        # Reduce the provider response to one structured verdict, once, here —
+        # before any workflow consumes it. Prefer the full response; the excerpt
+        # is a safe fallback for older/partial reports.
+        verdict_text = resp.data.get("result_full") or resp.data.get("result_excerpt") or ""
+        run.verdict = parse_verdict(verdict_text, role=role_slug).to_dict()
         self._persist(run)
         return run
 

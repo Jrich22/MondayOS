@@ -91,6 +91,11 @@ class AgentRun:
     knowledge_captured: list[str] = field(default_factory=list)
     execution_id: str = ""
     execution: dict[str, Any] = field(default_factory=dict)
+    # Structured reduction of the provider response (agents.verdicts.AgentVerdict
+    # as a dict: verdict/confidence/summary/findings/recommendations/source). The
+    # team workflow inspects only this — never the raw prose. Empty for runs that
+    # never called a provider (blocked / unavailable / dry-run without output).
+    verdict: dict[str, Any] = field(default_factory=dict)
     message: str = ""
 
     def to_dict(self) -> dict[str, Any]:

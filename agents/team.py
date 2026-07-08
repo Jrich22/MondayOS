@@ -8,10 +8,16 @@ The team executes a fixed sequence of roles end to end:
 Each stage is a normal role run (reused from AgentRuntime, logged as an AgentRun
 under logs/agents/), and every stage receives the summaries of all prior stages
 as extra context. QA, Security, and Reviewer are **blocking** — if any returns a
-block verdict, the pipeline stops early. When all stages pass, the task is moved
-to REVIEW awaiting the final human approval; nothing is committed, pushed, or
-executed live. The whole run is recorded as one parent TeamRun that references
-its child role-run IDs.
+`block` (or `needs_changes`) verdict, the pipeline stops early. When all stages
+pass, the task is moved to REVIEW awaiting the final human approval; nothing is
+committed, pushed, or executed live. The whole run is recorded as one parent
+TeamRun that references its child role-run IDs.
+
+Verdicts are **structured** (MondayOS v2.4). Each stage run carries an
+``AgentVerdict`` (see agents.verdicts) with an explicit ``verdict`` field; the
+workflow inspects only that field and never scans the model's prose. This
+replaced the old substring matching, which falsely vetoed on words like
+"blocker" appearing in explanatory text.
 """
 from __future__ import annotations
 
@@ -25,17 +31,31 @@ from typing import Any
 from agents.roles import get_role
 from agents.runtime import AgentRuntime
 from agents.types import AgentRun
+from agents.verdicts import BLOCK, NEEDS_CHANGES, PASS
 
 # The collaboration order. Human Approval is the terminal gate, not an agent run.
 TEAM_SEQUENCE: tuple[str, ...] = ("cpo", "lead-engineer", "qa", "security", "reviewer")
 
-# Roles whose block verdict stops the pipeline early.
+# Roles whose non-pass verdict stops the pipeline early.
 BLOCKING_ROLES: frozenset[str] = frozenset({"qa", "security", "reviewer"})
 
-# Markers a blocking stage may emit to veto the pipeline. Deliberately strong
-# tokens to avoid false positives on ordinary prose. A production provider would
-# be prompted to emit an explicit verdict; this is the documented convention.
-BLOCK_MARKERS: tuple[str, ...] = ("BLOCK", "REJECT", "VETO", "NOT APPROVED", "DO NOT MERGE")
+# Verdicts (from a blocking role) that stop the pipeline. `block` is a hard veto;
+# `needs_changes` sends the work back for rework before human approval.
+STOPPING_VERDICTS: frozenset[str] = frozenset({BLOCK, NEEDS_CHANGES})
+
+# Appended to every stage's context so providers emit a structured verdict. The
+# parser (agents.verdicts) still handles responses that ignore this, but asking
+# for it makes real providers return the machine-readable object directly.
+VERDICT_INSTRUCTION: str = (
+    "When you finish, end your response with a single JSON object on its own, "
+    "in a ```json code block, of exactly this shape:\n"
+    '{"verdict": "pass" | "needs_changes" | "block", '
+    '"confidence": "high" | "medium" | "low", '
+    '"summary": "one sentence", '
+    '"findings": ["..."], "recommendations": ["..."]}\n'
+    "Use \"block\" only for a genuine blocking defect. This JSON is the only "
+    "signal the workflow reads — do not rely on wording elsewhere in your reply."
+)
 
 
 @dataclass
@@ -48,7 +68,8 @@ class TeamStage:
     provider_used: str = ""
     provider_model: str = ""
     status: str = ""            # executed | dry-run | blocked | unavailable | skipped | …
-    verdict: str = ""           # pass | block
+    verdict: str = ""           # pass | needs_changes | block (structured)
+    confidence: str = ""        # from the structured verdict, for humans
     summary: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -195,6 +216,7 @@ class TeamWorkflow:
                 provider_model=run.provider_model,
                 status=run.status,
                 verdict=verdict,
+                confidence=str((run.verdict or {}).get("confidence", "")),
                 summary=summary,
             ).to_dict())
             team.child_run_ids.append(run.run_id)
@@ -206,10 +228,12 @@ class TeamWorkflow:
                 team.stopped_reason = run.message or "stage did not succeed"
                 stopped = True
                 break
-            if verdict == "block":
-                team.status = "blocked"
+            if verdict in STOPPING_VERDICTS:
+                # `block` is a hard veto; `needs_changes` sends the work back for
+                # rework. Both stop the pipeline short of human approval.
+                team.status = "blocked" if verdict == BLOCK else "changes-requested"
                 team.stopped_at = role
-                team.stopped_reason = summary or f"{role} blocked the pipeline"
+                team.stopped_reason = summary or f"{role} returned verdict '{verdict}'"
                 stopped = True
                 break
 
@@ -278,28 +302,40 @@ class TeamWorkflow:
 
 
 def _derive_verdict(role: str, run: AgentRun) -> str:
-    """Return "pass" or "block" for a completed stage run."""
+    """
+    Return the stage verdict — ``pass`` | ``needs_changes`` | ``block`` — from
+    the structured AgentVerdict only. Never inspects prose.
+
+    Structural failures always block, regardless of role: a run that did not
+    succeed, or was gate-blocked, cannot advance the pipeline. Otherwise only a
+    blocking role (QA / Security / Reviewer) can stop the pipeline, and only via
+    its structured verdict. Non-blocking roles (CPO, Lead Engineer) are
+    productive, not gatekeepers — their verdict never halts the team.
+    """
     if not run.success or run.status == "blocked":
-        return "block"
+        return BLOCK
     if role in BLOCKING_ROLES:
-        text = f"{run.execution.get('result_excerpt', '')} {run.message}".upper()
-        if any(marker in text for marker in BLOCK_MARKERS):
-            return "block"
-    return "pass"
+        verdict = str((run.verdict or {}).get("verdict") or PASS)
+        if verdict in STOPPING_VERDICTS:
+            return verdict
+    return PASS
 
 
 def _summary(run: AgentRun) -> str:
-    excerpt = (run.execution.get("result_excerpt", "") or "").strip()
-    text = excerpt or (run.message or "").strip()
+    """Short, human-facing summary — the structured verdict's summary first."""
+    structured = str((run.verdict or {}).get("summary") or "").strip()
+    text = structured or (run.execution.get("result_excerpt", "") or "").strip() or (run.message or "").strip()
     return text[:240]
 
 
 def _context_from(prior: list[tuple[str, str]]) -> str:
-    if not prior:
-        return ""
-    lines = ["Prior stage summaries (for your context):"]
-    for role, summary in prior:
-        lines.append(f"- {get_role(role).title}: {summary}")
+    lines: list[str] = []
+    if prior:
+        lines.append("Prior stage summaries (for your context):")
+        for role, summary in prior:
+            lines.append(f"- {get_role(role).title}: {summary}")
+        lines.append("")
+    lines.append(VERDICT_INSTRUCTION)
     return "\n".join(lines)
 
 
