@@ -375,6 +375,34 @@ class TeamResponse:
 
 
 @dataclass
+class PublishResponse:
+    """
+    Response from Monday.publish().
+
+    Attributes:
+        action:    The publish action ("confluence" or "history").
+        success:   True if the publish (or preview) completed without error.
+        message:   Human-readable status (includes the page URL on success).
+        doc_id:    MondayOS document identifier that was published.
+        page_id:   Confluence page ID (empty until a real create/update).
+        url:       Confluence page URL (empty for dry runs / failures).
+        status:    created | updated | up-to-date | dry-run | failed.
+        dry_run:   True when this was a preview that made no changes.
+        data:      Full result payload (summary, checksum, history, etc.).
+    """
+
+    action: str
+    success: bool
+    message: str = ""
+    doc_id: str = ""
+    page_id: str = ""
+    url: str = ""
+    status: str = ""
+    dry_run: bool = False
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ModuleStatus:
     """Status of a single internal MondayOS module."""
 

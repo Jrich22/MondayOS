@@ -2,7 +2,7 @@
 
 **Version:** 0.1.0  
 **Status:** Active  
-**Last Updated:** 2026-06-27
+**Last Updated:** 2026-07-07
 
 ---
 
@@ -191,6 +191,7 @@ The engineering foundation is being established:
 - **Multi-user support:** Role-based access; different engineers can have different permission levels for task creation, agent oversight, and knowledge base editing.
 - **Shared knowledge base:** Knowledge accumulated by all agents on the team is visible to all agents and engineers.
 - **External integrations:** GitHub PR creation and review, Slack notifications for approval gates, Linear/Jira task sync (bidirectional).
+  - ✅ **Confluence document publishing** (v2.3, delivered early) — publish roadmaps, sprint summaries, architecture docs, release notes, and agent/research reports to Confluence as an outbound target. MondayOS stays the system of record: content flows one way, the doc→page mapping is stored locally, and credentials live in the environment only. See [CONFLUENCE.md](CONFLUENCE.md).
 - **Workflow marketplace:** Community-contributed workflow definitions that can be imported and used.
 - **Audit and compliance exports:** Full audit trail exported in structured format for security and compliance review.
 - **Self-improvement loop:** MondayOS analyzes its own task history to identify recurring patterns and suggest knowledge entries that have not been written.

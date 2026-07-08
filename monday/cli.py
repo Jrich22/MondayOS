@@ -93,6 +93,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _register_execute(subparsers)
     _register_agent(subparsers)
     _register_team(subparsers)
+    _register_publish(subparsers)
 
     return parser
 
@@ -1756,6 +1757,121 @@ def _cmd_team_history(args: argparse.Namespace) -> int:
     _hr()
     for run in runs:
         print(f"  {run['team_run_id']}  {run.get('status', ''):<17} {run.get('task_id', '')}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# publish
+# ---------------------------------------------------------------------------
+
+def _register_publish(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "publish",
+        help="Publish MondayOS documents to Confluence.",
+        description=(
+            "Publish a MondayOS document (roadmap, sprint summary, architecture\n"
+            "doc, release notes, agent/research report) to Confluence.\n\n"
+            "MondayOS stays the system of record — content is read from a local\n"
+            "file or knowledge entry and pushed to a Confluence page. The\n"
+            "doc-ID → page-ID mapping and history are stored locally.\n\n"
+            "Credentials come from the environment only (never source):\n"
+            "  CONFLUENCE_BASE_URL, CONFLUENCE_EMAIL,\n"
+            "  CONFLUENCE_API_TOKEN, CONFLUENCE_SPACE_KEY\n\n"
+            "examples:\n"
+            "  monday publish confluence RES-0007\n"
+            "  monday publish confluence --file docs/ROADMAP.md\n"
+            "  monday publish confluence --file docs/ROADMAP.md --space ENG\n"
+            "  monday publish confluence --file docs/ROADMAP.md --parent 123456\n"
+            "  monday publish confluence --file docs/ROADMAP.md --dry-run\n"
+            "  monday publish history\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pub_sub = p.add_subparsers(title="publish actions", metavar="<action>")
+    pub_sub.required = True
+
+    c = pub_sub.add_parser("confluence", help="Publish a document to Confluence.")
+    c.add_argument("doc_id", nargs="?", default="", metavar="DOC_ID",
+                   help="MondayOS document to publish (knowledge entry ID or docs/ name).")
+    c.add_argument("--file", metavar="PATH", default="",
+                   help="Publish content from an explicit file path.")
+    c.add_argument("--title", metavar="TEXT", default="",
+                   help="Page title (defaults to the document's first heading).")
+    c.add_argument("--space", dest="space_key", metavar="KEY", default="",
+                   help="Confluence space key (overrides CONFLUENCE_SPACE_KEY).")
+    c.add_argument("--parent", dest="parent_id", metavar="PAGE_ID", default="",
+                   help="Parent page ID to nest the new page under.")
+    c.add_argument("--update-page", dest="update_page", metavar="PAGE_ID", default="",
+                   help="Explicitly update this existing page (overwrite).")
+    c.add_argument("--dry-run", action="store_true",
+                   help="Preview what would be published without calling Confluence.")
+    c.add_argument("--force", action="store_true",
+                   help="Publish even if the content is unchanged since last time.")
+    c.set_defaults(func=_cmd_publish_confluence)
+
+    h = pub_sub.add_parser("history", help="Show local publish history.")
+    h.add_argument("--limit", type=int, default=20, metavar="N",
+                   help="Max events to show (default: 20).")
+    h.set_defaults(func=_cmd_publish_history)
+
+
+def _cmd_publish_confluence(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.publish(
+        "confluence",
+        doc_id=args.doc_id,
+        file=args.file,
+        title=args.title,
+        space_key=args.space_key,
+        parent_id=args.parent_id,
+        update_page=args.update_page,
+        dry_run=args.dry_run,
+        force=args.force,
+    )
+
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+
+    if r.dry_run:
+        summary = r.data.get("summary", {})
+        print("Dry run — no changes made.")
+        _hr()
+        print(f"  Document : {r.doc_id}")
+        print(f"  Would    : {summary.get('would', '')}")
+        print(f"  Page     : {summary.get('page_id', '(new)')}")
+        print(f"  Space    : {summary.get('space_key', '(default)')}")
+        print(f"  Changed  : {summary.get('content_changed', True)}")
+        print(f"  Size     : {summary.get('storage_bytes', 0)} bytes (storage format)")
+        print(f"  Checksum : {summary.get('new_checksum', '')[:16]}")
+        _hr()
+        return 0
+
+    print(f"{r.status.title()}: {r.doc_id}")
+    _hr()
+    print(f"  Page ID  : {r.page_id}")
+    if r.url:
+        print(f"  URL      : {r.url}")
+    print(f"  Status   : {r.status}")
+    if r.message:
+        print(f"  {r.message}")
+    _hr()
+    return 0
+
+
+def _cmd_publish_history(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.publish("history", limit=args.limit)
+    events = r.data.get("history", [])
+    if not events:
+        print("No publish history yet.")
+        return 0
+    print(f"Publish history ({r.data.get('count', len(events))})")
+    _hr()
+    for e in events:
+        at = (e.get("at", "") or "")[:19]
+        page = e.get("page_id", "") or "—"
+        print(f"  {at}  {e.get('action', ''):<10} {e.get('doc_id', ''):<20} {page}")
     return 0
 
 
