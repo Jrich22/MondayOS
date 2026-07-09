@@ -222,3 +222,35 @@ export const SlidersIcon = (p: IconProps) => (
     <circle cx="12" cy="12" r="2" />
   </svg>
 );
+
+export const ArrowRightIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M5 12h14M12 5l7 7-7 7" />
+  </svg>
+);
+
+export const AlertTriangleIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M10.3 3.7 2.5 17a2 2 0 0 0 1.7 3h15.6a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z" />
+    <path d="M12 9v4M12 17h.01" />
+  </svg>
+);
+
+export const MicIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="9" y="3" width="6" height="11" rx="3" />
+    <path d="M6 11a6 6 0 0 0 12 0M12 17v4M9 21h6" />
+  </svg>
+);
+
+export const TrendingUpIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M3 17l6-6 4 4 8-8M15 7h6v6" />
+  </svg>
+);
+
+export const FlagIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M5 21V4M5 4h11l-1.5 3.5L16 11H5" />
+  </svg>
+);

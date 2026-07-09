@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useEvent } from "@/lib/store";
 import { formatEventDate, formatTimeRange } from "@/lib/format";
 import { classificationLabel } from "@/lib/classification";
@@ -39,6 +39,23 @@ type TabKey =
   | "assistant"
   | "analytics";
 
+const TAB_KEYS: TabKey[] = [
+  "overview",
+  "guests",
+  "rollcall",
+  "agenda",
+  "vendors",
+  "documents",
+  "communications",
+  "assistant",
+  "analytics",
+];
+
+/** Resolve a `?tab=` query value to a valid tab, defaulting to overview. */
+function initialTab(raw: string | null): TabKey {
+  return TAB_KEYS.includes(raw as TabKey) ? (raw as TabKey) : "overview";
+}
+
 const TABS: { key: TabKey; label: string; icon: ReactNode }[] = [
   { key: "overview", label: "Overview", icon: <LayoutIcon /> },
   { key: "guests", label: "Guests", icon: <UsersIcon /> },
@@ -61,8 +78,11 @@ const TABS: { key: TabKey; label: string; icon: ReactNode }[] = [
  */
 export function EventDetail() {
   const { id } = useParams();
+  const [params] = useSearchParams();
   const event = useEvent(id);
-  const [tab, setTab] = useState<TabKey>("overview");
+  // Seed the active tab from `?tab=` so Mission Control's quick actions and the
+  // AI briefing can deep-link straight to Guests / AI Assistant / etc.
+  const [tab, setTab] = useState<TabKey>(() => initialTab(params.get("tab")));
 
   if (!event) {
     return (
@@ -71,7 +91,7 @@ export function EventDetail() {
         <p className="mt-2 text-sm text-ink-muted">
           This event doesn't exist or was removed.
         </p>
-        <Link to="/" className="mt-4">
+        <Link to="/events" className="mt-4">
           <Button variant="outline">Back to events</Button>
         </Link>
       </div>
@@ -82,7 +102,7 @@ export function EventDetail() {
     <div className="animate-fade-up">
       {/* Header */}
       <header className="mb-6">
-        <Link to="/" className="focus-ring text-sm text-ink-muted hover:text-ink">
+        <Link to="/events" className="focus-ring text-sm text-ink-muted hover:text-ink">
           ← Events
         </Link>
         <div className="mt-3 flex flex-wrap items-start justify-between gap-4">

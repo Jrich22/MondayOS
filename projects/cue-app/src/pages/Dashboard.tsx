@@ -76,7 +76,7 @@ export function Dashboard() {
             <span className="font-medium">{justCreated.title}</span> was created.
           </span>
           <button
-            onClick={() => navigate("/", { replace: true })}
+            onClick={() => navigate("/events", { replace: true })}
             className="focus-ring ml-auto rounded-md px-2 py-0.5 text-xs text-ink-muted hover:text-ink"
           >
             Dismiss

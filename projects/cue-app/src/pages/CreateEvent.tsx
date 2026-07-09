@@ -64,7 +64,7 @@ export function CreateEvent() {
       host: currentUser.name,
     });
     createEvent(event);
-    navigate(`/?created=${event.id}`);
+    navigate(`/events?created=${event.id}`);
   }
 
   return (
@@ -72,7 +72,7 @@ export function CreateEvent() {
       {/* Heading */}
       <div className="mb-8">
         <Link
-          to="/"
+          to="/events"
           className="focus-ring text-sm text-ink-muted transition-colors hover:text-ink"
         >
           ← Back to events
@@ -263,7 +263,7 @@ export function CreateEvent() {
       <div className="fixed inset-x-0 bottom-0 z-20 border-t border-line bg-canvas/85 backdrop-blur-xl">
         <div className="mx-auto flex max-w-3xl items-center justify-between gap-3 px-5 py-3.5 sm:px-8">
           <Link
-            to="/"
+            to="/events"
             className="focus-ring rounded-xl px-3 py-2 text-sm font-medium text-ink-muted hover:text-ink"
           >
             Cancel

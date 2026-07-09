@@ -76,6 +76,15 @@ export function useGuests(eventId: string): Guest[] {
   return useMemo(() => all.filter((g) => g.eventId === eventId), [all, eventId]);
 }
 
+/**
+ * React hook: the full, reactive roster across every event. Mission Control
+ * reasons over all events at once, so it needs the flat list (it filters per
+ * event itself, in lib/mission).
+ */
+export function useAllGuests(): Guest[] {
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
 /** Non-reactive roster lookup for a single event. */
 export function getGuests(eventId: string): Guest[] {
   return snapshot.filter((g) => g.eventId === eventId);
