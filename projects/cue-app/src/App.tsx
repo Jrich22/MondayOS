@@ -6,6 +6,8 @@ import { Dashboard } from "@/pages/Dashboard";
 import { CreateEvent } from "@/pages/CreateEvent";
 import { EventDetail } from "@/pages/EventDetail";
 import { RollCall } from "@/pages/RollCall";
+import { People } from "@/pages/People";
+import { PersonProfile } from "@/pages/PersonProfile";
 import { ComingSoon } from "@/pages/ComingSoon";
 
 /**
@@ -45,6 +47,8 @@ function ShellLayout() {
             <Route path="/events/new" element={<CreateEvent />} />
             <Route path="/events/:id" element={<EventDetail />} />
             <Route path="/events" element={<Dashboard />} />
+            <Route path="/people" element={<People />} />
+            <Route path="/people/:id" element={<PersonProfile />} />
             <Route path="/guests" element={<ComingSoon title="Guests" task="TASK-0035" />} />
             <Route path="/portfolio" element={<ComingSoon title="Portfolio" task="TASK-0026" />} />
             <Route path="/assistant" element={<ComingSoon title="AI Assistant" task="TASK-0036" />} />

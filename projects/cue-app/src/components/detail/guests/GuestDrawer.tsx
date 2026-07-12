@@ -1,11 +1,13 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { Link } from "react-router-dom";
 import type { CueEvent, Guest, GuestRole, RsvpStatus } from "@/lib/types";
 import { ALL_ROLES, ROLE_META, RSVP_META, RSVP_ORDER, initials, withCheckIn } from "@/lib/guests-select";
 import { addGuest, removeGuest, updateGuest } from "@/lib/guests";
+import { personIdForGuest } from "@/lib/people";
 import { Field, TextInput, TextArea, Select } from "@/components/ui/Field";
 import { Switch } from "@/components/ui/Switch";
 import { Button } from "@/components/ui/Button";
-import { StarIcon, CloseIcon, TrashIcon, CheckIcon } from "@/components/icons";
+import { StarIcon, CloseIcon, TrashIcon, CheckIcon, NetworkIcon } from "@/components/icons";
 import { cn } from "@/lib/cn";
 
 /**
@@ -114,6 +116,16 @@ export function GuestDrawer({
               <p className="truncate text-xs text-ink-muted">
                 {draft.professional.jobTitle || "Attendee record"}
               </p>
+              {mode === "edit" && (
+                <Link
+                  to={`/people/${personIdForGuest(guest)}`}
+                  onClick={onClose}
+                  className="focus-ring mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-brand-300 hover:text-brand-200"
+                >
+                  <NetworkIcon width={12} height={12} />
+                  View relationship profile
+                </Link>
+              )}
             </div>
           </div>
           <button
