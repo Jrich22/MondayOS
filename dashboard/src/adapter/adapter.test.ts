@@ -1,9 +1,28 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { selectAdapter } from "./index";
 import { createDemoAdapter } from "./demoAdapter";
 import { clearActionLog, getActionLog } from "./log";
 
 describe("adapter selection — live vs demo", () => {
+  // Selection must be deterministic regardless of the developer's environment:
+  // it must ignore a real VITE_MONDAYOS_API in .env.local and must never depend
+  // on a MondayOS API happening to run on localhost. So each test here starts
+  // with no configured base URL and with real network access prohibited — a
+  // stray probe would fail rather than silently succeed against a live server.
+  beforeEach(() => {
+    vi.stubEnv("VITE_MONDAYOS_API", "");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("network access is disabled in this test");
+      }),
+    );
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
   it("falls back to demo when no API is configured", async () => {
     const sel = await selectAdapter();
     expect(sel.mode).toBe("demo");

@@ -1,4 +1,5 @@
 import {
+  memo,
   Suspense,
   useEffect,
   useMemo,
@@ -89,7 +90,7 @@ function usePageVisible(): boolean {
   return visible;
 }
 
-export function MondayBrain({
+function MondayBrainImpl({
   state = "idle",
   onActivate,
   quality = "auto",
@@ -178,3 +179,15 @@ export function MondayBrain({
     </div>
   );
 }
+
+/**
+ * The Brain sits at the persistent center of Mission Control, above a store that
+ * re-renders on every live event (health pings, activity/revision refreshes, SSE
+ * ticks). Wrapping the component in `memo` keeps that churn from reaching the R3F
+ * Canvas: it only re-renders when a prop it actually cares about changes (chiefly
+ * `state`), so the WebGL context and postprocessing pipeline are never torn down
+ * and rebuilt by an unrelated snapshot refresh — that teardown was the LIVE-mode
+ * "failing light bulb" flicker. A genuine `state` change still flows through as a
+ * prop update, which the scene eases into via uniforms rather than a remount.
+ */
+export const MondayBrain = memo(MondayBrainImpl);

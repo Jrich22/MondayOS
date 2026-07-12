@@ -1,4 +1,4 @@
-import { useEffect, useRef, type MutableRefObject } from "react";
+import { useEffect, useMemo, useRef, type MutableRefObject } from "react";
 import { useFrame, useThree } from "@react-three/fiber";
 import { EffectComposer, Bloom } from "@react-three/postprocessing";
 import * as THREE from "three";
@@ -47,6 +47,28 @@ export function BrainScene({ state, tier, haloCount, reducedMotion, pointer }: P
   // Keep rendering while mounted (frameloop is "always" by default, but this is
   // explicit and harmless if the loop is ever gated).
   useEffect(() => void invalidate(), [invalidate]);
+
+  // The postprocessing pipeline is built exactly once and never rebuilt. A brain
+  // *state* change re-renders this component (the `state` prop is new), but the
+  // EffectComposer/Bloom must NOT be recreated with it — recreating the composer
+  // drops a frame of unprocessed (bloom-less) rendering, which reads as a flash.
+  // Bloom intensity is driven every frame through `bloomRef` below, so the pass
+  // needs no reactive props; a stable element keeps it mounted across renders.
+  const postProcessing = useMemo(
+    () => (
+      <EffectComposer>
+        <Bloom
+          ref={bloomRef as never}
+          intensity={0.9}
+          luminanceThreshold={0.08}
+          luminanceSmoothing={0.9}
+          mipmapBlur
+          radius={0.7}
+        />
+      </EffectComposer>
+    ),
+    [],
+  );
 
   useFrame((_, delta) => {
     const v = visual.current;
@@ -99,16 +121,7 @@ export function BrainScene({ state, tier, haloCount, reducedMotion, pointer }: P
         <GlassShell visual={visual} />
         <ParticleHalo count={haloCount} visual={visual} />
       </group>
-      <EffectComposer>
-        <Bloom
-          ref={bloomRef as never}
-          intensity={0.9}
-          luminanceThreshold={0.08}
-          luminanceSmoothing={0.9}
-          mipmapBlur
-          radius={0.7}
-        />
-      </EffectComposer>
+      {postProcessing}
     </>
   );
 }
