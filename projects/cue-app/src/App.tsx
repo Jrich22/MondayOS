@@ -1,6 +1,7 @@
 import { HashRouter, Routes, Route } from "react-router-dom";
 import { Sidebar } from "@/components/shell/Sidebar";
 import { Topbar } from "@/components/shell/Topbar";
+import { MissionControl } from "@/pages/MissionControl";
 import { Dashboard } from "@/pages/Dashboard";
 import { CreateEvent } from "@/pages/CreateEvent";
 import { EventDetail } from "@/pages/EventDetail";
@@ -12,6 +13,9 @@ import { ComingSoon } from "@/pages/ComingSoon";
  * self-contained with no server-side route config — appropriate for the
  * static, mock-data MVP. The dashboard is the index route; later surfaces are
  * routed to tasteful placeholders until their tasks land.
+ *
+ * Mission Control (TASK-0042) is the index route — the organizer's home screen.
+ * The Events catalog (formerly the index) now lives at /events.
  *
  * The Roll Call Command Center (TASK-0040) is deliberately routed *outside* the
  * shell: it is a full-viewport operational mode with its own top bar, so it must
@@ -37,10 +41,10 @@ function ShellLayout() {
         <Topbar />
         <main className="mx-auto w-full max-w-7xl flex-1 px-5 py-8 sm:px-8">
           <Routes>
-            <Route path="/" element={<Dashboard />} />
+            <Route path="/" element={<MissionControl />} />
             <Route path="/events/new" element={<CreateEvent />} />
             <Route path="/events/:id" element={<EventDetail />} />
-            <Route path="/events" element={<ComingSoon title="Events" task="TASK-0034" />} />
+            <Route path="/events" element={<Dashboard />} />
             <Route path="/guests" element={<ComingSoon title="Guests" task="TASK-0035" />} />
             <Route path="/portfolio" element={<ComingSoon title="Portfolio" task="TASK-0026" />} />
             <Route path="/assistant" element={<ComingSoon title="AI Assistant" task="TASK-0036" />} />

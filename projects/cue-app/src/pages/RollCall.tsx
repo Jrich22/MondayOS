@@ -49,7 +49,7 @@ export function RollCall() {
       <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-canvas text-center">
         <h1 className="text-xl font-semibold text-ink">Event not found</h1>
         <p className="text-sm text-ink-muted">This event doesn't exist or was removed.</p>
-        <Link to="/">
+        <Link to="/events">
           <Button variant="outline">Back to events</Button>
         </Link>
       </div>

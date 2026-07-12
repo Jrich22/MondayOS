@@ -18,14 +18,14 @@ interface NavItem {
 }
 
 /**
- * Primary navigation. The dashboard is live now; later Sprint 1 surfaces are
- * shown with a "soon" marker so the shell reads as a real product while those
- * tasks are still in flight. The nav is data-driven so adding a surface is one
- * entry.
+ * Primary navigation. Mission Control and Events are live now; later surfaces
+ * are shown with a "soon" marker so the shell reads as a real product while
+ * those tasks are still in flight. The nav is data-driven so adding a surface is
+ * one entry.
  */
 const NAV: NavItem[] = [
-  { to: "/", label: "Dashboard", icon: <LayoutIcon /> },
-  { to: "/events", label: "Events", icon: <CalendarIcon />, soon: true },
+  { to: "/", label: "Mission Control", icon: <LayoutIcon /> },
+  { to: "/events", label: "Events", icon: <CalendarIcon /> },
   { to: "/guests", label: "Guests", icon: <UsersIcon />, soon: true },
   { to: "/portfolio", label: "Portfolio", icon: <BuildingIcon />, soon: true },
   { to: "/assistant", label: "AI Assistant", icon: <SparklesIcon />, soon: true },
