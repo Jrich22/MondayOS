@@ -6,6 +6,7 @@ import { Dashboard } from "@/pages/Dashboard";
 import { CreateEvent } from "@/pages/CreateEvent";
 import { EventDetail } from "@/pages/EventDetail";
 import { RollCall } from "@/pages/RollCall";
+import { CheckIn } from "@/pages/CheckIn";
 import { People } from "@/pages/People";
 import { PersonProfile } from "@/pages/PersonProfile";
 import { Communications } from "@/pages/Communications";
@@ -20,15 +21,17 @@ import { ComingSoon } from "@/pages/ComingSoon";
  * Mission Control (TASK-0042) is the index route — the organizer's home screen.
  * The Events catalog (formerly the index) now lives at /events.
  *
- * The Roll Call Command Center (TASK-0040) is deliberately routed *outside* the
- * shell: it is a full-viewport operational mode with its own top bar, so it must
- * not sit inside the sidebar + width-capped main content area.
+ * The Roll Call Command Center (TASK-0040) and the Check-In Kiosk (TASK-0045)
+ * are deliberately routed *outside* the shell: they are full-viewport operational
+ * modes with their own top bar, so they must not sit inside the sidebar +
+ * width-capped main content area.
  */
 export default function App() {
   return (
     <HashRouter>
       <Routes>
         <Route path="/events/:id/rollcall" element={<RollCall />} />
+        <Route path="/events/:id/checkin" element={<CheckIn />} />
         <Route path="/*" element={<ShellLayout />} />
       </Routes>
     </HashRouter>
