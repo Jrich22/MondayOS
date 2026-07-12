@@ -255,6 +255,37 @@ export const FlagIcon = (p: IconProps) => (
   </svg>
 );
 
+export const NetworkIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="5" r="2.4" />
+    <circle cx="5" cy="18" r="2.4" />
+    <circle cx="19" cy="18" r="2.4" />
+    <path d="M12 7.4v4.1M10.4 13.2 6.6 16M13.6 13.2 17.4 16" />
+    <path d="M12 11.5a2 2 0 0 0-2 2M12 11.5a2 2 0 0 1 2 2" />
+  </svg>
+);
+
+export const UserIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="8" r="3.6" />
+    <path d="M5 20v-1a5 5 0 0 1 5-5h4a5 5 0 0 1 5 5v1" />
+  </svg>
+);
+
+export const LinkIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M9 15l6-6" />
+    <path d="M10.5 6.5 12 5a4 4 0 0 1 6 6l-1.5 1.5M13.5 17.5 12 19a4 4 0 0 1-6-6l1.5-1.5" />
+  </svg>
+);
+
+export const HistoryIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M3.5 12a8.5 8.5 0 1 1 2.6 6.1M3.5 12H8M3.5 12V7.5" />
+    <path d="M12 7.5V12l3 1.8" />
+  </svg>
+);
+
 export const MegaphoneIcon = (p: IconProps) => (
   <svg {...base(p)}>
     <path d="M3 11v2a1 1 0 0 0 1 1h2l9 5V5L6 10H4a1 1 0 0 0-1 1Z" />
