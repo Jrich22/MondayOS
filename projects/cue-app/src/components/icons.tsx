@@ -285,3 +285,51 @@ export const HistoryIcon = (p: IconProps) => (
     <path d="M12 7.5V12l3 1.8" />
   </svg>
 );
+
+export const HomeIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M4 11.5 12 4l8 7.5M6 10v9a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-9" />
+    <path d="M10 20v-5h4v5" />
+  </svg>
+);
+
+export const ScanIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2" />
+    <path d="M4 12h16" />
+  </svg>
+);
+
+export const CameraIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M4 8a2 2 0 0 1 2-2h1.5l1-2h5l1 2H18a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8Z" />
+    <circle cx="12" cy="12.5" r="3.2" />
+  </svg>
+);
+
+export const KeyboardIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="2.5" y="6" width="19" height="12" rx="2" />
+    <path d="M6 9.5h.01M9.5 9.5h.01M13 9.5h.01M16.5 9.5h.01M6 13h.01M17.5 13h.01M9 13h6" />
+  </svg>
+);
+
+export const PrinterIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M6 9V4h12v5M6 18H5a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2h-1" />
+    <rect x="7" y="15" width="10" height="6" rx="1" />
+  </svg>
+);
+
+export const DownloadIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M12 3v12M7.5 10.5 12 15l4.5-4.5M5 20h14" />
+  </svg>
+);
+
+export const UserPlusIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="9" cy="8" r="3.4" />
+    <path d="M3.5 20v-1a5 5 0 0 1 5-5h1a5 5 0 0 1 3 1M17 8v6M14 11h6" />
+  </svg>
+);

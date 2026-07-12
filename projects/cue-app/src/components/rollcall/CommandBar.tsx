@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import type { CueEvent } from "@/lib/types";
 import type { LiveMetrics } from "@/lib/rollcall";
-import { ArrowLeftIcon } from "@/components/icons";
+import { ArrowLeftIcon, ScanIcon } from "@/components/icons";
 import { cn } from "@/lib/cn";
 
 /**
@@ -75,6 +75,13 @@ export function CommandBar({
         <BarStat label="Checked in" value={metrics.checkedIn} accent="text-status-live" />
         <BarStat label="Remaining" value={metrics.remaining} />
         <BarStat label="Walk-ins" value={metrics.walkIns} accent="text-status-draft" />
+        <Link
+          to={`/events/${event.id}/checkin`}
+          className="focus-ring hidden shrink-0 items-center gap-1.5 rounded-xl border border-line-strong px-3 py-2 text-xs font-medium text-ink-muted hover:text-ink sm:inline-flex"
+        >
+          <ScanIcon width={15} height={15} />
+          Check-in kiosk
+        </Link>
         <div className="hidden items-center gap-2 border-l border-line pl-5 text-sm font-medium text-ink-muted sm:flex">
           <LiveClock />
         </div>
