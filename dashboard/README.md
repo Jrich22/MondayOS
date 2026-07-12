@@ -54,5 +54,34 @@ learning`. The component detects WebGL, tiers particle counts by device, honors
 `prefers-reduced-motion`, pauses when the tab is hidden, and falls back to a 2D
 canvas when WebGL is unavailable.
 
-`os-data.ts` is the single seam to the backend: today it returns a deterministic
-mock snapshot; when a MondayOS web API lands, only this module changes.
+## Live vs demo (Phase 2)
+
+The dashboard talks to MondayOS through one seam — the **adapter**
+(`src/adapter/`). Two implementations share the `MondayAdapter` interface:
+
+- **`realAdapter`** → the MondayOS dashboard API (`../dashboard_api`, a
+  localhost HTTP bridge). Timeouts on every request, read-only retries, no
+  fallback once a write begins, structured-error parsing, and a health signal
+  that drives the **LIVE / DEGRADED** badge.
+- **`demoAdapter`** → the offline demo dataset (the **DEMO DATA** badge).
+
+`selectAdapter()` probes `VITE_MONDAYOS_API/health`; reachable → LIVE, otherwise
+→ demo. So the app works offline out of the box, and goes live with no code
+change:
+
+```bash
+python -m dashboard_api                 # start the API (repo root)
+cp dashboard/.env.example dashboard/.env.local   # sets VITE_MONDAYOS_API
+npm run dev                             # dashboard now runs LIVE
+```
+
+Live updates use **SSE** (`/events`) with **polling** (`/revision`) as a
+documented fallback. Writes (create task, run team, approve/reject) preview →
+confirm → execute through MondayOS, which enforces its own ApprovalGate — the
+Brain never bypasses it.
+
+## State layers
+
+`state/store.tsx` owns client state + a read cache; `command/` classifies and
+executes commands; `adapter/` is the only path to MondayOS. No business logic
+lives in components.

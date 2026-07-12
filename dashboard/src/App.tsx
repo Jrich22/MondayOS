@@ -1,11 +1,19 @@
+import { AppProvider } from "@/state/store";
 import { MissionControl } from "@/pages/MissionControl";
+import { ErrorBoundary } from "@/common/ErrorBoundary";
 
 /**
- * MondayOS Mission Control is a single-surface dashboard for now — the OS's
- * operating view. No router yet: the dashboard is the app. As the OS grows
- * (agent detail, knowledge browser, product drill-downs) this becomes the shell
- * around those routes.
+ * MondayOS Mission Control. A single interactive surface: Monday's Brain as the
+ * command + navigation center, with workspaces opening beside it. The AppProvider
+ * owns client state and the adapter boundary to MondayOS (live or demo); the
+ * top-level ErrorBoundary keeps a failure from blanking the whole OS.
  */
 export default function App() {
-  return <MissionControl />;
+  return (
+    <ErrorBoundary label="MondayOS">
+      <AppProvider>
+        <MissionControl />
+      </AppProvider>
+    </ErrorBoundary>
+  );
 }
