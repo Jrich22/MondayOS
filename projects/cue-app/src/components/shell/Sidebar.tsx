@@ -8,6 +8,7 @@ import {
   BuildingIcon,
   SparklesIcon,
   SettingsIcon,
+  MailIcon,
 } from "@/components/icons";
 import type { ReactNode } from "react";
 
@@ -28,6 +29,7 @@ const NAV: NavItem[] = [
   { to: "/", label: "Mission Control", icon: <LayoutIcon /> },
   { to: "/events", label: "Events", icon: <CalendarIcon /> },
   { to: "/people", label: "People", icon: <NetworkIcon /> },
+  { to: "/communications", label: "Communications", icon: <MailIcon /> },
   { to: "/guests", label: "Guests", icon: <UsersIcon />, soon: true },
   { to: "/portfolio", label: "Portfolio", icon: <BuildingIcon />, soon: true },
   { to: "/assistant", label: "AI Assistant", icon: <SparklesIcon />, soon: true },
