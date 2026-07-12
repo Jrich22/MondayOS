@@ -333,3 +333,78 @@ export const UserPlusIcon = (p: IconProps) => (
     <path d="M3.5 20v-1a5 5 0 0 1 5-5h1a5 5 0 0 1 3 1M17 8v6M14 11h6" />
   </svg>
 );
+
+export const MegaphoneIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M3 11v2a1 1 0 0 0 1 1h2l9 5V5L6 10H4a1 1 0 0 0-1 1Z" />
+    <path d="M15 8a4 4 0 0 1 0 8M7 14v4a1 1 0 0 0 1 1h1a1 1 0 0 0 1-1v-2" />
+  </svg>
+);
+
+export const MoonIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z" />
+  </svg>
+);
+
+export const SunIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="12" r="4" />
+    <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+  </svg>
+);
+
+export const HeartIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M12 20s-7-4.35-9.5-8.5C1 8.5 2.5 5 6 5c2 0 3.2 1.2 4 2.5C10.8 6.2 12 5 14 5c3.5 0 5 3.5 3.5 6.5C19 15.65 12 20 12 20Z" />
+  </svg>
+);
+
+export const ClipboardIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="6" y="4" width="12" height="17" rx="2" />
+    <path d="M9 4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1H9V4ZM9 11h6M9 15h4" />
+  </svg>
+);
+
+export const EyeIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" />
+    <circle cx="12" cy="12" r="2.8" />
+  </svg>
+);
+
+export const CursorClickIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M9 3v4M5 5l2.5 2.5M3 9h4M15 15l6 2-3 1-1 3-2-6Z" />
+    <path d="M9 9l5 5" />
+  </svg>
+);
+
+export const DeviceMobileIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="7" y="3" width="10" height="18" rx="2.5" />
+    <path d="M11 18h2" />
+  </svg>
+);
+
+export const SendIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7Z" />
+  </svg>
+);
+
+export const CopyIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="9" y="9" width="12" height="12" rx="2" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  </svg>
+);
+
+export const CalendarClockIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M21 10.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h6M3 9h18M8 3v3M16 3v3" />
+    <circle cx="17.5" cy="16.5" r="4" />
+    <path d="M17.5 15v1.7l1.2.8" />
+  </svg>
+);

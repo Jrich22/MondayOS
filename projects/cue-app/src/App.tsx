@@ -9,6 +9,7 @@ import { RollCall } from "@/pages/RollCall";
 import { CheckIn } from "@/pages/CheckIn";
 import { People } from "@/pages/People";
 import { PersonProfile } from "@/pages/PersonProfile";
+import { Communications } from "@/pages/Communications";
 import { ComingSoon } from "@/pages/ComingSoon";
 
 /**
@@ -52,6 +53,7 @@ function ShellLayout() {
             <Route path="/events" element={<Dashboard />} />
             <Route path="/people" element={<People />} />
             <Route path="/people/:id" element={<PersonProfile />} />
+            <Route path="/communications" element={<Communications />} />
             <Route path="/guests" element={<ComingSoon title="Guests" task="TASK-0035" />} />
             <Route path="/portfolio" element={<ComingSoon title="Portfolio" task="TASK-0026" />} />
             <Route path="/assistant" element={<ComingSoon title="AI Assistant" task="TASK-0036" />} />
