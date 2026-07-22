@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import type { CueEvent, Guest, GuestAttendance, RsvpStatus } from "./types";
 import {
   newInvitation,
+  rotate,
+  allowanceChange,
   rsvpToken,
   parseRsvpToken,
   isRsvpSignatureValid,
@@ -71,6 +73,75 @@ describe("invitation model & token", () => {
     // same fields but the current invitation is v2 → signature check still passes
     // for v1 (it's a real v1 token); resolveRsvp handles the version mismatch.
     expect(isRsvpSignatureValid(v1)).toBe(true);
+  });
+});
+
+describe("opaque token envelope (finding #6)", () => {
+  it("round-trips through the base64url envelope", () => {
+    const token = rsvpToken(inv({ tokenVersion: 3 }));
+    expect(parseRsvpToken(token)).toMatchObject({ eventId: "evt-1", guestId: "g-1", version: 3 });
+  });
+  it("exposes NO plainly-readable eventId/guestId/delimiters", () => {
+    const token = rsvpToken(inv());
+    expect(token).not.toContain("evt-1");
+    expect(token).not.toContain("g-1");
+    expect(token).not.toContain("|");
+    expect(token).not.toContain("CUERSVP1");
+  });
+  it("rejects a malformed (non-envelope) token", () => {
+    expect(parseRsvpToken("")).toBeNull();
+    expect(parseRsvpToken("!!! not base64 !!!")).toBeNull();
+    expect(parseRsvpToken("evt-1|g-1|1|abc")).toBeNull(); // the old plaintext form is now invalid
+  });
+  it("a tampered envelope does not resolve as valid", () => {
+    const token = rsvpToken(inv());
+    const last = token[token.length - 1];
+    const tampered = token.slice(0, -1) + (last === "A" ? "B" : "A");
+    const parsed = parseRsvpToken(tampered);
+    // Either it no longer decodes to a valid payload, or the signature fails.
+    expect(parsed === null || !isRsvpSignatureValid(parsed)).toBe(true);
+  });
+});
+
+describe("rotate lifecycle (finding #3)", () => {
+  it("increments version, resets delivery, preserves rotation history and respondedAt", () => {
+    const base = inv({ tokenVersion: 1, delivered: true, deliveredAt: "2026-08-10T00:00:00Z", respondedAt: "2026-08-12T00:00:00Z", rotationCount: 0 });
+    const r = rotate(base, NOW);
+    expect(r.tokenVersion).toBe(2);
+    expect(r.delivered).toBe(false);
+    expect(r.deliveredAt).toBeUndefined();
+    expect(r.rotationCount).toBe(1);
+    expect(r.rotatedAt).toBeTruthy();
+    expect(r.respondedAt).toBe("2026-08-12T00:00:00Z"); // overall response history preserved
+    expect(r.status).toBe("active");
+  });
+});
+
+describe("allowance invariant (finding #2)", () => {
+  it("refuses to drop below the accepted plus-one count, with a reason", () => {
+    const res = allowanceChange(1, 2);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toMatch(/already accepted 2/i);
+  });
+  it("allows setting equal to or above the accepted count", () => {
+    expect(allowanceChange(2, 2)).toEqual({ ok: true, allowance: 2 });
+    expect(allowanceChange(5, 2)).toEqual({ ok: true, allowance: 5 });
+  });
+  it("floors negatives to zero when nothing is accepted", () => {
+    expect(allowanceChange(-3, 0)).toEqual({ ok: true, allowance: 0 });
+  });
+});
+
+describe("rsvp enablement (finding #5)", () => {
+  const guest = makeGuest("invited", {}, "g-1");
+  it("resolves to rsvp-disabled when the event has RSVP off", () => {
+    const ev = makeEvent({ capacity: { maxAttendees: null, rsvpEnabled: false, waitlistEnabled: false } });
+    const i = inv();
+    expect(resolveRsvp(rsvpToken(i), { event: ev, guest, invitation: i, now: NOW }).status).toBe("rsvp-disabled");
+  });
+  it("blocks a response decision when RSVP is off", () => {
+    const ev = makeEvent({ capacity: { maxAttendees: null, rsvpEnabled: false, waitlistEnabled: false } });
+    expect(decideResponse(ev, [], inv(), { choice: "confirmed", plusOnes: 0 }).kind).toBe("blocked");
   });
 });
 

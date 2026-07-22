@@ -46,7 +46,15 @@ export interface Invitation {
   issuedAt: string;
   deliveredAt?: string;
   revokedAt?: string;
+  /** Latest rotation time (historical: see `rotationCount`). */
   rotatedAt?: string;
+  /** How many times the token has been rotated/reissued (historical). */
+  rotationCount: number;
+  /**
+   * Most-recent guest response time — OVERALL, not per token version. A response
+   * updates the canonical Guest, which persists across token rotation, so this
+   * is not reset on rotate. (Tested in invitation-store.test.ts.)
+   */
   respondedAt?: string;
   updatedAt: string;
 }
@@ -62,10 +70,58 @@ export function newInvitation(eventId: string, guestId: string, now: number): In
     status: "active",
     plusOneAllowance: 0,
     delivered: false,
+    rotationCount: 0,
     createdAt: iso,
     issuedAt: iso,
     updatedAt: iso,
   };
+}
+
+/**
+ * Rotate/reissue: a NEW undelivered link. Increments the version (invalidating
+ * the old token), resets token-specific delivery state, preserves historical
+ * rotation info (`rotationCount`, latest `rotatedAt`), and keeps `respondedAt`
+ * (the guest's overall response persists on the canonical Guest). Pure.
+ */
+export function rotate(inv: Invitation, now: number): Invitation {
+  const iso = new Date(now).toISOString();
+  return {
+    ...inv,
+    tokenVersion: inv.tokenVersion + 1,
+    status: "active",
+    issuedAt: iso,
+    rotatedAt: iso,
+    rotationCount: inv.rotationCount + 1,
+    delivered: false,        // new link has not been delivered
+    deliveredAt: undefined,
+    updatedAt: iso,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Plus-one allowance invariant (domain logic, not just an input attribute)
+// ---------------------------------------------------------------------------
+
+export type AllowanceChange =
+  | { ok: true; allowance: number }
+  | { ok: false; reason: string };
+
+/**
+ * An allowance may never drop below the guest's ALREADY-ACCEPTED plus-one count
+ * — that would silently invalidate an accepted response. Reducing to below the
+ * accepted count is refused with an explanation; the organizer must reconcile
+ * the response first. Nonnegative; floored.
+ */
+export function allowanceChange(requested: number, acceptedPlusOnes: number): AllowanceChange {
+  const next = Math.max(0, Math.floor(requested) || 0);
+  const accepted = Math.max(0, Math.floor(acceptedPlusOnes) || 0);
+  if (next < accepted) {
+    return {
+      ok: false,
+      reason: `The guest has already accepted ${accepted} plus-one${accepted === 1 ? "" : "s"}. Reduce their response first, then lower the allowance.`,
+    };
+  }
+  return { ok: true, allowance: next };
 }
 
 // ---------------------------------------------------------------------------
@@ -81,14 +137,35 @@ function rsvpSignature(eventId: string, guestId: string, version: number): strin
   return hash36(`${eventId}${SEP}${guestId}${SEP}${version}${SEP}cue-rsvp-v1`);
 }
 
+/** URL-safe base64 (no padding) — keeps the token opaque in the URL. */
+function b64urlEncode(s: string): string {
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlDecode(s: string): string | null {
+  try {
+    const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
+    return atob(s.replace(/-/g, "+").replace(/_/g, "/") + pad);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The opaque, PII-free response token. The inner payload binds prefix, event,
+ * guest, version, and signature; the whole payload is base64url-wrapped so the
+ * URL exposes NO plainly-readable eventId/guestId/delimiters. Still fully
+ * client-resolvable and signature/version-validated — but NOT production-secure
+ * without a backend-held secret (DEC-0011 §6).
+ */
 export function rsvpToken(inv: Invitation): string {
-  return [
+  const payload = [
     RSVP_PREFIX,
     inv.eventId,
     inv.guestId,
     String(inv.tokenVersion),
     rsvpSignature(inv.eventId, inv.guestId, inv.tokenVersion),
   ].join(SEP);
+  return b64urlEncode(payload);
 }
 
 export interface RsvpTokenParts {
@@ -99,7 +176,9 @@ export interface RsvpTokenParts {
 }
 
 export function parseRsvpToken(raw: string): RsvpTokenParts | null {
-  const parts = raw.trim().split(SEP);
+  const payload = b64urlDecode(raw.trim());
+  if (payload === null) return null;
+  const parts = payload.split(SEP);
   if (parts.length !== 5) return null;
   const [prefix, eventId, guestId, v, sig] = parts;
   const version = Number(v);
@@ -122,7 +201,8 @@ export type RsvpResolution =
   | "rotated"
   | "wrong-event"
   | "expired"
-  | "event-started";
+  | "event-started"
+  | "rsvp-disabled";
 
 export interface RsvpResolveResult {
   status: RsvpResolution;
@@ -159,6 +239,9 @@ export function resolveRsvp(raw: string, ctx: RsvpResolveContext): RsvpResolveRe
     return { status: "invalid", reason: "This invitation no longer exists." };
   }
   const found = { event: ctx.event, guest: ctx.guest, invitation: ctx.invitation };
+  if (!ctx.event.capacity.rsvpEnabled) {
+    return { status: "rsvp-disabled", ...found, reason: "RSVP is turned off for this event." };
+  }
   if (ctx.invitation.status === "revoked") {
     return { status: "revoked", ...found, reason: "This invitation has been revoked." };
   }
@@ -208,6 +291,9 @@ export function decideResponse(
   invitation: Invitation,
   desired: DesiredResponse,
 ): ResponseOutcome {
+  if (!event.capacity.rsvpEnabled) {
+    return { kind: "blocked", reason: "RSVP is turned off for this event." };
+  }
   const plusOnes = clampPlusOnes(desired.plusOnes, invitation.plusOneAllowance);
 
   if (desired.choice === "declined") {

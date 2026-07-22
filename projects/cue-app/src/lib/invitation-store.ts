@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
-import { newInvitation, type Invitation } from "./invitation";
+import { newInvitation, rotate, allowanceChange, type Invitation } from "./invitation";
+import { getGuests, updateGuest } from "./guests";
 
 /**
  * Invitation store — the single seam every invitation surface reads/writes
@@ -81,19 +82,30 @@ export function issueInvitation(eventId: string, guestId: string): Invitation {
   return commit(newInvitation(eventId, guestId, nowMs()));
 }
 
-/** Set the nonnegative plus-one allowance. No-op if no invitation exists. */
-export function setAllowance(guestId: string, allowance: number): Invitation | undefined {
+export type AllowanceResult =
+  | { ok: true; invitation: Invitation }
+  | { ok: false; reason: string };
+
+/**
+ * Set the nonnegative plus-one allowance, enforcing the invariant that it never
+ * drops below the guest's already-ACCEPTED plus-one count (domain logic — see
+ * `allowanceChange`). Rejects with an explanation rather than silently clamping.
+ */
+export function setAllowance(guestId: string, allowance: number): AllowanceResult {
   const inv = snapshot[guestId];
-  if (!inv) return undefined;
-  return commit({ ...inv, plusOneAllowance: Math.max(0, Math.floor(allowance) || 0) });
+  if (!inv) return { ok: false, reason: "No invitation exists for this guest." };
+  const guest = getGuests(inv.eventId).find((g) => g.id === guestId);
+  const accepted = guest ? Math.max(0, guest.attendance.plusOnes) : 0;
+  const change = allowanceChange(allowance, accepted);
+  if (!change.ok) return { ok: false, reason: change.reason };
+  return { ok: true, invitation: commit({ ...inv, plusOneAllowance: change.allowance }) };
 }
 
-/** Rotate the token: bump the version so all prior links stop working now. */
+/** Rotate/reissue the token: new undelivered link; all prior links stop now. */
 export function rotateInvitation(guestId: string): Invitation | undefined {
   const inv = snapshot[guestId];
   if (!inv) return undefined;
-  const iso = new Date(nowMs()).toISOString();
-  return commit({ ...inv, tokenVersion: inv.tokenVersion + 1, status: "active", issuedAt: iso, rotatedAt: iso });
+  return commit(rotate(inv, nowMs()));
 }
 
 /** Revoke the invitation: prior links stop working immediately. */
@@ -103,10 +115,23 @@ export function revokeInvitation(guestId: string): Invitation | undefined {
   return commit({ ...inv, status: "revoked", revokedAt: new Date(nowMs()).toISOString() });
 }
 
-/** Simulated delivery — updates canonical invitation-delivery state (no provider). */
-export function markDelivered(guestId: string): Invitation | undefined {
+/**
+ * Simulated delivery — the single operation that keeps the two records in sync:
+ * it updates BOTH the invitation delivery state/timestamp AND the canonical
+ * `Guest.communication.invitationSent`, so they cannot silently diverge. Call
+ * only on a genuine (successful) delivery, never on a failed clipboard attempt.
+ */
+export function recordSimulatedDelivery(guestId: string): Invitation | undefined {
   const inv = snapshot[guestId];
   if (!inv) return undefined;
+  const guest = getGuests(inv.eventId).find((g) => g.id === guestId);
+  if (guest && !guest.communication.invitationSent) {
+    updateGuest({
+      ...guest,
+      communication: { ...guest.communication, invitationSent: true },
+      updatedAt: new Date(nowMs()).toISOString(),
+    });
+  }
   return commit({ ...inv, delivered: true, deliveredAt: new Date(nowMs()).toISOString() });
 }
 

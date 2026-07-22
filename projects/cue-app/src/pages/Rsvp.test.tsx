@@ -81,6 +81,25 @@ describe("token lifecycle states", () => {
     renderToken(oldToken);
     expect(screen.getByRole('heading').textContent).toMatch(/replaced/i);
   });
+  it("shows an unavailable state when RSVP is disabled for the event (finding #5)", () => {
+    __resetStore();
+    createEvent({ ...futureEvent(), capacity: { maxAttendees: null, rsvpEnabled: false, waitlistEnabled: false } });
+    const inv = issueInvitation(EVENT_ID, GUEST_ID);
+    renderToken(rsvpToken(inv));
+    expect(screen.getByRole("heading").textContent).toMatch(/RSVP isn't available/i);
+  });
+});
+
+describe("event timezone on the guest surface (finding #4)", () => {
+  it("shows the event's local time with its zone label, not the browser's", () => {
+    // 02:00Z is 19:00 the previous day in Los Angeles (the event's timezone).
+    __resetStore();
+    createEvent({ ...futureEvent(), startsAt: "2026-09-02T02:00:00Z", timezone: "America/Los_Angeles" });
+    const inv = issueInvitation(EVENT_ID, GUEST_ID);
+    renderToken(rsvpToken(inv));
+    expect(screen.getByText(/Sep 1, 2026/)).toBeTruthy();
+    expect(screen.getByText(/PDT/)).toBeTruthy();
+  });
 });
 
 describe("canonical-state loop", () => {

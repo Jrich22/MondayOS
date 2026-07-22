@@ -12,7 +12,7 @@ import {
   type Invitation,
   type RsvpChoice,
 } from "@/lib/invitation";
-import { formatEventDate } from "@/lib/format";
+import { formatEventDateTz } from "@/lib/format";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
 
@@ -66,6 +66,7 @@ const STATE_UI: Record<string, { title: string; tone: "neutral" | "warn" | "erro
   "wrong-event": { title: "This link is for a different event", tone: "error" },
   expired: { title: "This event has ended", tone: "neutral" },
   "event-started": { title: "Responses are closed", tone: "warn" },
+  "rsvp-disabled": { title: "RSVP isn't available for this event", tone: "warn" },
 };
 
 function ResponseForm({
@@ -115,7 +116,7 @@ function ResponseForm({
       <header className="rounded-2xl border border-line bg-white/5 p-5">
         <p className="text-xs uppercase tracking-wide text-ink-muted">You're invited</p>
         <h1 id="rsvp-h" className="mt-1 text-xl font-semibold text-ink">{e.title}</h1>
-        <p className="mt-1 text-sm text-ink-muted">{formatEventDate(e.startsAt)}</p>
+        <p className="mt-1 text-sm text-ink-muted">{formatEventDateTz(e.startsAt, e.timezone)}</p>
         <p className="text-sm text-ink-muted">{[e.venue, e.city].filter(Boolean).join(" · ")}</p>
         {e.summary && <p className="mt-3 text-sm text-ink-muted">{e.summary}</p>}
       </header>
