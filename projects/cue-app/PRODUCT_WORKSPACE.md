@@ -51,4 +51,40 @@ monday advise                             # what to work on next
 - `TASK-0036` AI assistant placeholder
 - `TASK-0037` Seed demo data
 
+## Implemented state (reconciled 2026-07-21 · TASK-0046)
+
+Evidence: `projects/cue-app` source + tests, git history, and merged PRs #3–#7.
+
+**Sprint 1 — MVP foundation — SHIPPED ✓** (all merged to `main` in `4560b42`)
+- `TASK-0030` App shell — **completed** (was stranded in `review`; corrected)
+- `TASK-0031` Auth placeholder — **completed** (was stranded in `review`; corrected)
+- `TASK-0032` Event dashboard · `TASK-0033` Create-event flow ·
+  `TASK-0034` Event detail · `TASK-0035` Guest list model ·
+  `TASK-0036` AI assistant placeholder · `TASK-0037` Seed demo data — **completed**
+
+**Sprint 2 — SHIPPED ✓** (beyond the original Sprint 1 plan)
+- `TASK-0038` Multi-Organization Architecture — **completed** (`4560b42`)
+- `TASK-0039` Organization & Relationship Intelligence Foundation — **completed**
+- `TASK-0040` Roll Call Command Center — **completed** (PR #3)
+- `TASK-0041` Event Lifecycle Workspace — **completed** (`4560b42`)
+- `TASK-0042` Mission Control Dashboard — **completed** (PR #4)
+- `TASK-0043` Communications Center — **completed** (PR #5)
+- `TASK-0044` Relationship Intelligence — **completed** (PR #6)
+- `TASK-0045` QR & Badge Check-In — **completed** (PR #7)
+
+**Not yet built** (backlog epics): AI Agenda Builder (`TASK-0022`), Invite & RSVP
+(`TASK-0023`), Vendor/Venue Tracker (`TASK-0024`), Run-of-Show (`TASK-0025`),
+Post-Event Recap (`TASK-0027`).
+
+See [`RECONCILIATION.md`](RECONCILIATION.md) for evidence, reused-ID canonical
+mappings, and the next-increment analysis.
+
+---
+
+> ⚠️ **Regeneration caution:** the historical instruction below runs
+> `setup_workspace.py --force`. Its overwrite behavior has **not** been verified
+> against the now-reconciled ledger; running it could clobber corrected statuses
+> and restored records. Inspect the script and prove it is non-destructive before
+> using `--force`.
+
 *Regenerate this workspace with* `python projects/cue-app/setup_workspace.py --force`.
