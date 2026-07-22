@@ -9,6 +9,7 @@ import {
   capacityDemand,
   currentMember,
   localDate,
+  withRiskChange,
   type EventPlan,
   type ReadinessState,
   type MilestoneStatus,
@@ -72,6 +73,8 @@ function PlanningWorkspace({ event }: { event: CueEvent }) {
   const demand = useMemo(() => capacityDemand(event, guests), [event, guests]);
 
   const update = (next: Partial<EventPlan>) => savePlan({ ...plan, ...next });
+  // Every risk-register mutation invalidates a prior review acknowledgement.
+  const updateRisks = (risks: EventPlan["risks"]) => savePlan(withRiskChange(plan, risks));
   const me = currentMember();
   const ownerName = (ownerId?: string | null) =>
     ownerId ? plan.members.find((m) => m.id === ownerId)?.name ?? me.name : "Unassigned";
@@ -266,7 +269,7 @@ function PlanningWorkspace({ event }: { event: CueEvent }) {
               <button
                 className={cn("focus-ring rounded-lg border px-2 py-0.5 text-xs", k.blocker ? "border-rose-500/40 text-rose-300" : "border-line text-ink-muted")}
                 aria-label={`${k.blocker ? "Blocker" : "Risk"} — click to toggle`}
-                onClick={() => update({ risks: plan.risks.map((x) => (x.id === k.id ? { ...x, blocker: !x.blocker } : x)) })}
+                onClick={() => updateRisks(plan.risks.map((x) => (x.id === k.id ? { ...x, blocker: !x.blocker } : x)))}
               >
                 {k.blocker ? "blocker" : "risk"}
               </button>
@@ -276,17 +279,17 @@ function PlanningWorkspace({ event }: { event: CueEvent }) {
                 onClick={() => {
                   const order = ["open", "mitigating", "resolved"] as const;
                   const next = order[(order.indexOf(k.status) + 1) % order.length];
-                  update({ risks: plan.risks.map((x) => (x.id === k.id ? { ...x, status: next } : x)) });
+                  updateRisks(plan.risks.map((x) => (x.id === k.id ? { ...x, status: next } : x)));
                 }}
               >
                 {k.status}
               </button>
-              <RemoveButton label={`Remove risk ${k.title}`} onClick={() => update({ risks: plan.risks.filter((x) => x.id !== k.id) })} />
+              <RemoveButton label={`Remove risk ${k.title}`} onClick={() => updateRisks(plan.risks.filter((x) => x.id !== k.id))} />
             </li>
           ))}
           {plan.risks.length === 0 && <li className="text-sm text-ink-muted">No risks logged.</li>}
         </ul>
-        <RiskAdd onAdd={(title, severity, blocker) => update({ risks: [...plan.risks, { id: planId("k"), title, severity, status: "open", blocker }] })} />
+        <RiskAdd onAdd={(title, severity, blocker) => updateRisks([...plan.risks, { id: planId("k"), title, severity, status: "open", blocker }])} />
       </section>
 
       <p className="pb-6 text-center text-xs text-ink-muted">

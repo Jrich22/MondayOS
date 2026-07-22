@@ -181,6 +181,18 @@ export function emptyPlan(event: CueEvent, now: number): EventPlan {
   };
 }
 
+/**
+ * Apply a change to the risk register, INVALIDATING any prior review
+ * acknowledgement. Any material mutation — add, remove, reclassify (risk vs
+ * blocker), or status change — must force the operator to review the register
+ * again, so `risksReviewed` resets to false. Readiness therefore cannot read
+ * Complete off a stale acknowledgement. The explicit review toggle does NOT go
+ * through here; it is the only path that sets `risksReviewed` true.
+ */
+export function withRiskChange(plan: EventPlan, risks: Risk[]): EventPlan {
+  return { ...plan, risks, risksReviewed: false };
+}
+
 // ---------------------------------------------------------------------------
 // Capacity vs. demand (DEC-0009 §3) — kept strictly separate.
 // ---------------------------------------------------------------------------

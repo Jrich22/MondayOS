@@ -6,6 +6,7 @@ import {
   capacityDemand,
   readiness,
   currentMember,
+  withRiskChange,
   type EventPlan,
   type Milestone,
   type Responsibility,
@@ -233,6 +234,44 @@ describe("readiness — risks & blockers", () => {
   });
   it("a resolved blocker no longer blocks (with review confirmed)", () => {
     expect(cat(readiness(makeEvent(), [], basePlan({ risks: [risk({ blocker: true, status: "resolved" })], risksReviewed: true }), NOW), "risks").state).toBe("complete");
+  });
+});
+
+describe("risk-review invalidation (finding #2)", () => {
+  const risk = (over: Partial<Risk>): Risk => ({ id: `k-${Math.random()}`, title: "Weather", severity: "medium", status: "open", blocker: false, ...over });
+
+  it("withRiskChange always resets risksReviewed to false", () => {
+    const reviewed = basePlan({ risksReviewed: true });
+    expect(withRiskChange(reviewed, [risk({ status: "resolved" })]).risksReviewed).toBe(false);
+    expect(withRiskChange(reviewed, []).risksReviewed).toBe(false); // even a no-op removal re-opens review
+  });
+
+  it("a previously reviewed plan returns to Attention after its risk register changes", () => {
+    const reviewed = basePlan({ risks: [], risksReviewed: true });
+    expect(cat(readiness(makeEvent(), [], reviewed, NOW), "risks").state).toBe("complete");
+    // Any material change (here: add a risk) invalidates the acknowledgement.
+    const changed = withRiskChange(reviewed, [risk({ status: "resolved" })]);
+    expect(changed.risksReviewed).toBe(false);
+    expect(cat(readiness(makeEvent(), [], changed, NOW), "risks").state).toBe("attention");
+  });
+
+  it("resolving a newly added risk does NOT return to Complete until re-reviewed", () => {
+    // Add an open risk (Attention), then resolve it — still Attention because the
+    // register changed and the review acknowledgement was invalidated.
+    let plan = withRiskChange(basePlan({ risksReviewed: true }), [risk({ id: "k1", status: "open" })]);
+    expect(cat(readiness(makeEvent(), [], plan, NOW), "risks").state).toBe("attention");
+    plan = withRiskChange(plan, plan.risks.map((r) => ({ ...r, status: "resolved" as const })));
+    expect(plan.risksReviewed).toBe(false);
+    expect(cat(readiness(makeEvent(), [], plan, NOW), "risks").state).toBe("attention");
+    // Only an explicit re-review returns it to Complete.
+    const reReviewed = { ...plan, risksReviewed: true };
+    expect(cat(readiness(makeEvent(), [], reReviewed, NOW), "risks").state).toBe("complete");
+  });
+
+  it("an open blocker remains Blocked regardless of the acknowledgement value", () => {
+    const blocker = risk({ blocker: true, status: "open" });
+    expect(cat(readiness(makeEvent(), [], basePlan({ risks: [blocker], risksReviewed: true }), NOW), "risks").state).toBe("blocked");
+    expect(cat(readiness(makeEvent(), [], basePlan({ risks: [blocker], risksReviewed: false }), NOW), "risks").state).toBe("blocked");
   });
 });
 
