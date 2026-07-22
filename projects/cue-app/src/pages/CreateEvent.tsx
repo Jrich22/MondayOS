@@ -64,7 +64,9 @@ export function CreateEvent() {
       host: currentUser.name,
     });
     createEvent(event);
-    navigate(`/events?created=${event.id}`);
+    // Guided setup transitions into the ongoing planning workspace (DEC-0009 §6);
+    // a saved draft returns to the catalog.
+    navigate(mode === "create" ? `/events/${event.id}/planning` : `/events?created=${event.id}`);
   }
 
   return (

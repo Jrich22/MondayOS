@@ -120,6 +120,9 @@ export function EventDetail() {
             </p>
           </div>
           <div className="flex items-center gap-2">
+            <Link to={`/events/${event.id}/planning`}>
+              <Button variant="outline">Planning</Button>
+            </Link>
             <Button variant="ghost" aria-label="Share">
               <ShareIcon width={18} height={18} />
             </Button>
