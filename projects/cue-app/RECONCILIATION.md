@@ -10,8 +10,10 @@ evidence. No product features were built; no completed modules were redesigned.
 
 ## 1. Confirmed implemented capabilities
 
-All seven target capabilities are implemented and merged to `main`, evidenced by
-source modules, tests (231 passing), and merged PRs.
+The **seven requested capability areas plus Multi-Organization Architecture**
+(eight rows below) are implemented and merged to `main`, evidenced by source
+modules, tests (231 passing), and merged PRs. Multi-Org was delivered alongside
+the requested set and is included here for completeness.
 
 | Capability | Source (under `projects/cue-app/src`) | Task | Evidence |
 |---|---|---|---|

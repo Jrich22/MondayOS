@@ -81,10 +81,10 @@ mappings, and the next-increment analysis.
 
 ---
 
-> ⚠️ **Regeneration caution:** the historical instruction below runs
-> `setup_workspace.py --force`. Its overwrite behavior has **not** been verified
-> against the now-reconciled ledger; running it could clobber corrected statuses
-> and restored records. Inspect the script and prove it is non-destructive before
-> using `--force`.
-
-*Regenerate this workspace with* `python projects/cue-app/setup_workspace.py --force`.
+> 🛑 **Regeneration is UNSAFE — do not run `--force`.** The script was inspected
+> (TASK-0046) and confirmed to use `overwrite=True` and to **re-mint task IDs** on
+> every run. Against the now-reconciled ledger this is **known to be destructive**:
+> it would clobber corrected statuses and restored records and re-introduce the
+> historical ID-reuse defect. `python projects/cue-app/setup_workspace.py --force`
+> **must not be run until the script is redesigned** to be idempotent (stable IDs,
+> no overwrite of existing records).
