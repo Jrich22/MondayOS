@@ -94,7 +94,8 @@ describe("emptyPlan / eventDayCount", () => {
   });
 
   it("seeds one PlanningDay per calendar day for a multi-day event", () => {
-    const ev = makeEvent({ startsAt: "2026-09-01T18:00:00Z", endsAt: "2026-09-03T02:00:00Z" });
+    // Both 11:00 local (PDT); the local calendar spans 09-01..09-03 = 3 days.
+    const ev = makeEvent({ startsAt: "2026-09-01T18:00:00Z", endsAt: "2026-09-03T18:00:00Z" });
     expect(eventDayCount(ev)).toBe(3);
     const plan = emptyPlan(ev, NOW);
     expect(plan.days.map((d) => d.date)).toEqual(["2026-09-01", "2026-09-02", "2026-09-03"]);
@@ -219,11 +220,19 @@ describe("readiness — risks & blockers", () => {
   it("attention with an open non-blocking risk", () => {
     expect(cat(readiness(makeEvent(), [], basePlan({ risks: [risk({ status: "open" })] }), NOW), "risks").state).toBe("attention");
   });
-  it("complete when no open risks", () => {
-    expect(cat(readiness(makeEvent(), [], basePlan({ risks: [risk({ status: "resolved" })] }), NOW), "risks").state).toBe("complete");
+  it("an empty, UNREVIEWED register is Attention (absence is not proof of safety)", () => {
+    const r = readiness(makeEvent(), [], basePlan({ risks: [], risksReviewed: false }), NOW);
+    expect(cat(r, "risks").state).toBe("attention");
+    expect(cat(r, "risks").evidence).toMatch(/no risk review/i);
   });
-  it("a resolved blocker no longer blocks", () => {
-    expect(cat(readiness(makeEvent(), [], basePlan({ risks: [risk({ blocker: true, status: "resolved" })] }), NOW), "risks").state).toBe("complete");
+  it("complete only once the risk review is confirmed and no risks are open", () => {
+    expect(cat(readiness(makeEvent(), [], basePlan({ risks: [risk({ status: "resolved" })], risksReviewed: true }), NOW), "risks").state).toBe("complete");
+  });
+  it("an empty register becomes Complete after an explicit review", () => {
+    expect(cat(readiness(makeEvent(), [], basePlan({ risks: [], risksReviewed: true }), NOW), "risks").state).toBe("complete");
+  });
+  it("a resolved blocker no longer blocks (with review confirmed)", () => {
+    expect(cat(readiness(makeEvent(), [], basePlan({ risks: [risk({ blocker: true, status: "resolved" })], risksReviewed: true }), NOW), "risks").state).toBe("complete");
   });
 });
 
@@ -248,7 +257,57 @@ describe("readiness — overall", () => {
     const plan = basePlan({
       responsibilities: [{ id: "r1", area: "AV", ownerId: "wm-current" }],
       milestones: [{ id: "m1", title: "Venue", status: "done" }],
+      risksReviewed: true,
     });
     expect(readiness(ev, confirmed(10), plan, NOW).overall).toBe("complete");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Timezone-correct multi-day structure (finding #2)
+// ---------------------------------------------------------------------------
+
+describe("timezone-correct planning days", () => {
+  it("uses the event's LOCAL date when the UTC date is the next day", () => {
+    // 02:00Z on 09-02 is 19:00 on 09-01 in Los Angeles (PDT, UTC-7).
+    const ev = makeEvent({
+      timezone: "America/Los_Angeles",
+      startsAt: "2026-09-02T02:00:00Z",
+      endsAt: "2026-09-02T05:00:00Z",
+    });
+    expect(eventDayCount(ev)).toBe(1);
+    expect(emptyPlan(ev, NOW).days.map((d) => d.date)).toEqual(["2026-09-01"]);
+  });
+
+  it("enumerates local calendar dates for a multi-day New York event", () => {
+    const ev = makeEvent({
+      timezone: "America/New_York",
+      startsAt: "2026-09-01T14:00:00Z", // 10:00 EDT, 09-01
+      endsAt: "2026-09-03T14:00:00Z", // 10:00 EDT, 09-03
+    });
+    expect(eventDayCount(ev)).toBe(3);
+    expect(emptyPlan(ev, NOW).days.map((d) => d.date)).toEqual(["2026-09-01", "2026-09-02", "2026-09-03"]);
+  });
+
+  it("spans a DST boundary correctly (New York fall-back, Nov 1 2026)", () => {
+    // 10-31 (EDT) → 11-02 (EST); the local calendar still counts 3 days.
+    const ev = makeEvent({
+      timezone: "America/New_York",
+      startsAt: "2026-10-31T18:00:00Z", // 14:00 EDT, 10-31
+      endsAt: "2026-11-02T18:00:00Z", // 13:00 EST, 11-02
+    });
+    expect(eventDayCount(ev)).toBe(3);
+    expect(emptyPlan(ev, NOW).days.map((d) => d.date)).toEqual(["2026-10-31", "2026-11-01", "2026-11-02"]);
+  });
+
+  it("is a single day when the event crosses UTC midnight but not local midnight", () => {
+    // 23:00Z 09-01 → 03:00Z 09-02 is 16:00–20:00 on 09-01 in Los Angeles.
+    const ev = makeEvent({
+      timezone: "America/Los_Angeles",
+      startsAt: "2026-09-01T23:00:00Z",
+      endsAt: "2026-09-02T03:00:00Z",
+    });
+    expect(eventDayCount(ev)).toBe(1);
+    expect(emptyPlan(ev, NOW).days.map((d) => d.date)).toEqual(["2026-09-01"]);
   });
 });

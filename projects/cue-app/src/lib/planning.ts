@@ -102,37 +102,69 @@ export interface EventPlan {
   milestones: Milestone[];
   responsibilities: Responsibility[];
   risks: Risk[];
+  /**
+   * Explicit acknowledgement that the operator has reviewed the risk register.
+   * Absence of risks does NOT imply a review occurred, so readiness stays
+   * evidence-based: an unreviewed register reads as Attention Needed.
+   */
+  risksReviewed: boolean;
   updatedAt: string;
 }
 
-/** Calendar days (inclusive, date-only) spanned by an event's window. */
-export function eventDayCount(event: CueEvent): number {
-  const start = event.startsAt.slice(0, 10);
-  const end = (event.endsAt ?? event.startsAt).slice(0, 10);
-  const ms = Date.parse(`${end}T00:00:00Z`) - Date.parse(`${start}T00:00:00Z`);
+/**
+ * The yyyy-mm-dd *local calendar date* of an ISO instant in a given IANA
+ * timezone. Uses the project's `Intl.DateTimeFormat` convention (en-CA yields
+ * ISO-ordered parts) so planning days reflect the event's own local calendar —
+ * including events whose UTC date differs from their local date, and DST
+ * transitions. This is the single place instant→local-date conversion happens.
+ */
+export function localDate(iso: string, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(iso));
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+/** Inclusive count of calendar days between two yyyy-mm-dd dates (DST-safe). */
+function daysBetween(startDate: string, endDate: string): number {
+  const ms = Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`);
   return Math.max(1, Math.floor(ms / 86_400_000) + 1);
 }
 
-/** Add `n` days to a yyyy-mm-dd date (UTC), returning yyyy-mm-dd. */
-function addDays(date: string, n: number): string {
+/**
+ * Add `n` calendar days to a yyyy-mm-dd date. Pure date-only arithmetic in UTC,
+ * so it is DST-safe: it steps calendar dates, never wall-clock instants.
+ */
+export function addCalendarDays(date: string, n: number): string {
   return new Date(Date.parse(`${date}T00:00:00Z`) + n * 86_400_000)
     .toISOString()
     .slice(0, 10);
 }
 
+/** Calendar days (inclusive) an event spans in ITS OWN timezone. */
+export function eventDayCount(event: CueEvent): number {
+  const start = localDate(event.startsAt, event.timezone);
+  const end = localDate(event.endsAt ?? event.startsAt, event.timezone);
+  return daysBetween(start, end);
+}
+
 /**
- * A fresh plan seeded from the canonical event: one PlanningDay per calendar day
- * of the event window, owned by the current member. Deterministic (ids derived
- * from eventId + index) so it is testable and stable across reloads.
+ * A fresh plan seeded from the canonical event: one PlanningDay per LOCAL
+ * calendar day of the event window, owned by the current member. Deterministic
+ * (ids derived from eventId + index) so it is testable and stable across reloads.
  */
 export function emptyPlan(event: CueEvent, now: number): EventPlan {
   const me = currentMember();
-  const startDate = event.startsAt.slice(0, 10);
+  const startDate = localDate(event.startsAt, event.timezone);
   const days: PlanningDay[] = Array.from(
     { length: eventDayCount(event) },
     (_, i) => ({
       id: `day-${event.id}-${i + 1}`,
-      date: addDays(startDate, i),
+      date: addCalendarDays(startDate, i),
       label: `Day ${i + 1}`,
     }),
   );
@@ -144,6 +176,7 @@ export function emptyPlan(event: CueEvent, now: number): EventPlan {
     milestones: [],
     responsibilities: [],
     risks: [],
+    risksReviewed: false,
     updatedAt: new Date(now).toISOString(),
   };
 }
@@ -237,10 +270,6 @@ function worst(states: ReadinessState[]): ReadinessState {
   return applicable.reduce((a, b) => (STATE_RANK[b] > STATE_RANK[a] ? b : a));
 }
 
-function todayIso(now: number): string {
-  return new Date(now).toISOString().slice(0, 10);
-}
-
 /**
  * Derive explainable readiness across categories from the canonical event, its
  * canonical guest roster, and the planning collection. Every category returns
@@ -253,7 +282,8 @@ export function readiness(
   plan: EventPlan,
   now: number,
 ): ReadinessReport {
-  const today = todayIso(now);
+  // "Today" in the event's own timezone, so overdue is judged on local dates.
+  const today = localDate(new Date(now).toISOString(), event.timezone);
   const categories: ReadinessCategory[] = [];
 
   // 1. Schedule — multi-day structure.
@@ -306,7 +336,9 @@ export function readiness(
       nextAction: "Advance the remaining milestones on schedule." });
   }
 
-  // 4. Risks & blockers — an open blocker gates readiness.
+  // 4. Risks & blockers — an open blocker gates readiness; an empty/unreviewed
+  //    register is NOT proof of safety, so it reads as Attention until the
+  //    operator explicitly confirms a risk review (evidence-based, no weighting).
   const openBlockers = plan.risks.filter((r) => r.blocker && r.status !== "resolved");
   const openRisks = plan.risks.filter((r) => !r.blocker && r.status === "open");
   if (openBlockers.length > 0) {
@@ -316,10 +348,18 @@ export function readiness(
   } else if (openRisks.length > 0) {
     categories.push({ key: "risks", label: "Risks & blockers", state: "attention",
       evidence: `${openRisks.length} open risk${openRisks.length === 1 ? "" : "s"}, no blockers.`,
-      nextAction: "Add a mitigation for each open risk." });
+      nextAction: "Add a mitigation for each open risk, then confirm the review." });
+  } else if (!plan.risksReviewed) {
+    categories.push({ key: "risks", label: "Risks & blockers", state: "attention",
+      evidence: plan.risks.length === 0
+        ? "No risks logged and no risk review recorded yet."
+        : "All logged risks are handled, but the review is not confirmed.",
+      nextAction: "Review the risk register and mark it reviewed." });
   } else {
     categories.push({ key: "risks", label: "Risks & blockers", state: "complete",
-      evidence: plan.risks.length === 0 ? "No risks logged." : "All risks mitigated or resolved.",
+      evidence: plan.risks.length === 0
+        ? "Risk review confirmed; no risks identified."
+        : "Risk review confirmed; no open risks.",
       nextAction: "Keep watching for new risks as planning progresses." });
   }
 
