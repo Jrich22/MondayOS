@@ -5,6 +5,7 @@ import { MissionControl } from "@/pages/MissionControl";
 import { Dashboard } from "@/pages/Dashboard";
 import { CreateEvent } from "@/pages/CreateEvent";
 import { EventDetail } from "@/pages/EventDetail";
+import Planning from "@/pages/Planning";
 import { RollCall } from "@/pages/RollCall";
 import { CheckIn } from "@/pages/CheckIn";
 import { People } from "@/pages/People";
@@ -49,6 +50,7 @@ function ShellLayout() {
           <Routes>
             <Route path="/" element={<MissionControl />} />
             <Route path="/events/new" element={<CreateEvent />} />
+            <Route path="/events/:id/planning" element={<Planning />} />
             <Route path="/events/:id" element={<EventDetail />} />
             <Route path="/events" element={<Dashboard />} />
             <Route path="/people" element={<People />} />
