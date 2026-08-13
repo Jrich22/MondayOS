@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -261,10 +262,48 @@ class TaskManager:
         )
 
     def _next_id(self) -> EntityId:
-        next_seq = self._sequences.get(_TASK_PREFIX, 0) + 1
+        """
+        Allocate the next task ID, healing a stale counter.
+
+        The counter is the fast path, but it only reflects allocations made
+        through this process. Tasks written on another branch or checkout are
+        invisible to it, so a counter that lags behind disk would reissue a
+        live ID — main's counter read 50 while TASK-0051 and TASK-0052
+        existed, so the next task would have been issued TASK-0051. Taking
+        the max of the two makes the counter an optimisation rather than the
+        sole authority. Mirrors KnowledgeStore._next_id.
+        """
+        counter = self._sequences.get(_TASK_PREFIX, 0)
+        next_seq = max(counter, self._highest_id_on_disk()) + 1
         self._sequences[_TASK_PREFIX] = next_seq
         self._save_sequences()
         return f"{_TASK_PREFIX}-{next_seq:04d}"
+
+    def _highest_id_on_disk(self) -> int:
+        """
+        Highest sequence number among task files on disk.
+
+        Reads filenames rather than file contents: _write names every task
+        {ID}.md, so the filename is the record of which IDs are taken, and a
+        task whose body is malformed or unreadable still reserves its ID.
+        Scans tasks/ recursively, so both active/ and completed/ are counted
+        along with any other directory tasks come to be filed under.
+        """
+        if not self._tasks_dir.exists():
+            return 0
+
+        pattern = re.compile(rf"^{re.escape(_TASK_PREFIX)}-(\d+)$")
+        highest = 0
+        try:
+            paths = self._tasks_dir.rglob(f"{_TASK_PREFIX}-*.md")
+        except OSError:
+            return 0
+
+        for path in paths:
+            match = pattern.match(path.stem)
+            if match:
+                highest = max(highest, int(match.group(1)))
+        return highest
 
     def _write(self, task: Task, *, directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
