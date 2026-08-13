@@ -356,6 +356,11 @@ class ExecutionOrchestrator:
                 entry_type="research",
                 tags=["execution", provider.name],
                 components=[task.get("task_type", "")] if task.get("task_type") else [],
+                # This is model output, not curated knowledge. Saying so routes
+                # it to the gitignored runtime store instead of the
+                # source-controlled tree, so a run no longer dirties the working
+                # tree it is about to be judged on.
+                authored_by="agent",
             )
             if learn_resp.accepted:
                 return [learn_resp.entry_id]

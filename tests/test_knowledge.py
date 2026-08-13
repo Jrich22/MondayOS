@@ -518,6 +518,84 @@ class TestKnowledgeStore:
 
 
 # ===========================================================================
+# TestProvenanceRouting
+# ===========================================================================
+
+class TestProvenanceRouting:
+    """
+    Storage is decided by provenance, then type.
+
+    Curated knowledge is source-controlled; machine-generated knowledge goes to
+    the gitignored runtime store so an agent run does not dirty the working tree
+    it is about to be judged on. Both are loaded identically — the loader rglobs
+    knowledge/ — so this is a storage split, not a visibility one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path: Path) -> None:
+        self.store = KnowledgeStore(project_root=tmp_path)
+        self.tmp_path = tmp_path
+
+    def _entry(self, authored_by: str = "human") -> KnowledgeEntry:
+        return KnowledgeEntry(
+            id="", entry_type=KnowledgeType.RESEARCH, title="Probe",
+            status=LifecycleStatus.ACTIVE, created_at=_now(),
+            components=["core"], tags=["test"], body="Body.", summary="Summary.",
+            authored_by=authored_by,
+        )
+
+    def _path_of(self, entry_id: str) -> Path:
+        return next(self.tmp_path.rglob(f"{entry_id}.md"))
+
+    def test_curated_entry_is_source_controlled(self):
+        eid = self.store.add(self._entry("human"))
+        assert self._path_of(eid).parent == self.tmp_path / "knowledge" / "research"
+
+    def test_generated_entry_goes_to_runtime_store(self):
+        eid = self.store.add(self._entry("agent"))
+        assert self._path_of(eid).parent == self.tmp_path / "knowledge" / "runtime" / "research"
+
+    def test_default_authorship_is_treated_as_curated(self):
+        """Absent provenance must not silently hide an entry from version control."""
+        eid = self.store.add(self._entry())
+        assert "runtime" not in str(self._path_of(eid))
+
+    def test_authorship_check_is_case_insensitive(self):
+        eid = self.store.add(self._entry("HUMAN"))
+        assert "runtime" not in str(self._path_of(eid))
+
+    def test_generated_entry_is_still_loaded_after_reboot(self):
+        eid = self.store.add(self._entry("agent"))
+        reloaded = KnowledgeStore(project_root=self.tmp_path)
+        assert reloaded.get(eid).id == eid
+        assert reloaded.get(eid).authored_by == "agent"
+
+    def test_generated_entry_is_searchable(self):
+        self.store.add(self._entry("agent"))
+        reloaded = KnowledgeStore(project_root=self.tmp_path)
+        assert reloaded.search("Probe", limit=5)
+
+    def test_generated_entry_is_removable(self):
+        """remove() must resolve through the same routing, or it silently no-ops."""
+        eid = self.store.add(self._entry("agent"))
+        self.store.remove(eid)
+        assert not list(self.tmp_path.rglob(f"{eid}.md"))
+
+    def test_both_kinds_coexist_and_share_the_id_sequence(self):
+        gen = self.store.add(self._entry("agent"))
+        cur = self.store.add(self._entry("human"))
+        assert gen != cur
+        assert int(cur.split("-")[1]) == int(gen.split("-")[1]) + 1
+        assert len(KnowledgeStore(project_root=self.tmp_path).list_all()) == 2
+
+    def test_runtime_entries_still_reserve_their_ids(self):
+        """A generated entry must not have its ID reissued to a curated one."""
+        gen = self.store.add(self._entry("agent"))
+        (self.tmp_path / "knowledge" / ".sequences.json").write_text(json.dumps({"RES": 0}))
+        assert KnowledgeStore(project_root=self.tmp_path).add(self._entry("human")) != gen
+
+
+# ===========================================================================
 # TestKnowledgeIdAllocation
 # ===========================================================================
 

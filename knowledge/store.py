@@ -47,6 +47,18 @@ _TYPE_PREFIXES: dict[KnowledgeType, str] = {
 
 _SEQUENCES_FILENAME = ".sequences.json"
 
+# Subdirectory holding machine-generated knowledge. Gitignored; still loaded,
+# because KnowledgeLoader rglobs the knowledge directory.
+_RUNTIME_DIR = "runtime"
+
+# Anything not authored by a human is generated runtime output.
+_CURATED_AUTHOR = "human"
+
+
+def _is_generated(entry: KnowledgeEntry) -> bool:
+    """True when an entry is machine-generated rather than human-curated."""
+    return (entry.authored_by or _CURATED_AUTHOR).strip().lower() != _CURATED_AUTHOR
+
 
 class KnowledgeStore:
     """
@@ -189,8 +201,9 @@ class KnowledgeStore:
         if entry_id does not exist.
         """
         entry = self.get(entry_id)
-        type_dir = self._knowledge_dir / _TYPE_DIRS[entry.entry_type]
-        file_path = type_dir / f"{entry_id}.md"
+        # Resolve through the same provenance-aware routing used to write it,
+        # or a generated entry would be un-deletable.
+        file_path = self._type_dir_for(entry) / f"{entry_id}.md"
         if file_path.exists():
             file_path.unlink()
         # Rebuild the index from remaining files on disk
@@ -272,10 +285,32 @@ class KnowledgeStore:
         return highest
 
     def _write_file(self, entry: KnowledgeEntry) -> None:
-        type_dir = self._knowledge_dir / _TYPE_DIRS[entry.entry_type]
+        type_dir = self._type_dir_for(entry)
         type_dir.mkdir(parents=True, exist_ok=True)
         file_path = type_dir / f"{entry.id}.md"
         file_path.write_text(self._parser.serialize(entry), encoding="utf-8")
+
+    def _type_dir_for(self, entry: KnowledgeEntry) -> Path:
+        """
+        Where an entry is stored, decided by PROVENANCE and then type.
+
+        Curated knowledge (``authored_by == "human"``) lives in
+        ``knowledge/{type}/`` and is source-controlled. Machine-generated
+        knowledge — orchestrator execution captures — lives in
+        ``knowledge/runtime/{type}/``, which is gitignored.
+
+        Both are loaded, searched, and counted identically: KnowledgeLoader
+        rglobs ``knowledge/``, so this is purely a storage split. The point is
+        that an agent run no longer dirties the working tree it is about to be
+        judged on — every run used to write a research record into the
+        source-controlled tree, inflating the "uncommitted changes" count that
+        Doctor reports, Advise escalates, and the planner feeds back to the
+        agents as a top engineering risk.
+        """
+        type_name = _TYPE_DIRS[entry.entry_type]
+        if _is_generated(entry):
+            return self._knowledge_dir / _RUNTIME_DIR / type_name
+        return self._knowledge_dir / type_name
 
 
 def _score_entry(entry: KnowledgeEntry, terms: list[str]) -> float:
