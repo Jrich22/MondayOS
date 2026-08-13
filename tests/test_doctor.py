@@ -223,6 +223,96 @@ class TestRepositoryInspector:
 # TestGitAnalyzer
 # ===========================================================================
 
+class TestGitDirtinessClassification:
+    """
+    Runtime state must not be reported as source dirtiness.
+
+    MondayOS writes generated knowledge, sequence counters, and run logs as a
+    normal part of executing a task. Counting those as "uncommitted changes"
+    made the system fail itself: Doctor reported them, Advise escalated them to
+    a HIGH engineering risk, the planner fed that into the next run's prompt,
+    and QA failed the task for the mess its own pipeline had just made — with
+    the number growing on every rerun.
+    """
+
+    def _split(self, lines):
+        from doctor.analyzers.git import _split_source_and_runtime
+        return _split_source_and_runtime(lines)
+
+    def test_generated_knowledge_is_runtime_not_source(self):
+        source, runtime = self._split([
+            "?? knowledge/runtime/research/RES-0123.md",
+            "?? knowledge/runtime/research/RES-0124.md",
+        ])
+        assert source == []
+        assert len(runtime) == 2
+
+    def test_sequence_counters_are_runtime(self):
+        source, runtime = self._split([
+            " M knowledge/.sequences.json",
+            " M tasks/.sequences.json",
+        ])
+        assert source == []
+        assert len(runtime) == 2
+
+    def test_run_logs_are_runtime(self):
+        source, runtime = self._split([
+            "?? logs/agents/team-e444918cdb19.json",
+            "?? logs/executions/exec-abc.json",
+        ])
+        assert source == []
+        assert len(runtime) == 2
+
+    def test_real_source_changes_are_still_source(self):
+        source, runtime = self._split([
+            " M agents/verdicts.py",
+            " M projects/sourcingbot/src/lib/req.ts",
+            "?? docs/KNOWLEDGE_RUNTIME_POLICY.md",
+        ])
+        assert len(source) == 3
+        assert runtime == []
+
+    def test_curated_knowledge_is_source_not_runtime(self):
+        """Human-authored research stays version-controlled and still counts."""
+        source, runtime = self._split(["?? knowledge/research/RES-0200.md"])
+        assert len(source) == 1
+        assert runtime == []
+
+    def test_mixed_tree_separates_cleanly(self):
+        source, runtime = self._split([
+            " M agents/team.py",
+            "?? knowledge/runtime/research/RES-0123.md",
+            " M tasks/.sequences.json",
+            "?? logs/agents/run-abc.json",
+        ])
+        assert len(source) == 1
+        assert len(runtime) == 3
+
+    def test_rename_lines_are_parsed_by_destination(self):
+        from doctor.analyzers.git import _porcelain_path
+        assert _porcelain_path(
+            "R  tasks/active/TASK-0001.md -> tasks/archived/weatherbot/TASK-0001.md"
+        ) == "tasks/archived/weatherbot/TASK-0001.md"
+
+    def test_runtime_description_groups_by_kind(self):
+        from doctor.analyzers.git import _describe_runtime
+        text = _describe_runtime([
+            "?? knowledge/runtime/research/RES-0123.md",
+            "?? knowledge/runtime/research/RES-0124.md",
+            " M tasks/.sequences.json",
+            "?? logs/agents/run-abc.json",
+        ])
+        assert "2 generated knowledge record(s)" in text
+        assert "1 sequence counter(s) changed" in text
+        assert "1 agent/team run log(s)" in text
+
+    def test_unknown_paths_default_to_source(self):
+        """Conservative: never quietly reclassify a real change as noise."""
+        source, runtime = self._split(["?? something/unexpected.py"])
+        assert len(source) == 1
+        assert runtime == []
+
+
 class TestGitAnalyzer:
     def _analyzer(self, tmp_path):
         from doctor.analyzers.git import GitAnalyzer

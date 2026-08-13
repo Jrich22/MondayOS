@@ -148,6 +148,7 @@ class Monday:
         entry_type: str = "pattern",
         tags: list[str] | None = None,
         components: list[str] | None = None,
+        authored_by: str = "human",
     ) -> LearnResponse:
         """
         Teach MondayOS something new by adding a knowledge entry.
@@ -163,6 +164,14 @@ class Monday:
                         See KnowledgeType for all valid values.
             tags:       Searchable tags for this entry.
             components: MondayOS components or domain areas this entry covers.
+            authored_by: Provenance. "human" (default) for curated knowledge;
+                        "agent" for machine-generated output such as an
+                        orchestrator execution capture. This decides where the
+                        entry is stored — see KnowledgeStore._write_file — so
+                        generated output stays out of the source-controlled
+                        tree. Recording it accurately matters: entries captured
+                        by the orchestrator previously claimed "human", which
+                        left no way to tell curated knowledge from model output.
 
         Returns:
             LearnResponse with entry_id, accepted=True, and a status message.
@@ -193,9 +202,10 @@ class Monday:
             tags=list(tags or []),
             body=content,
             summary=summary,
-            created_by=f"human:{self._session_id}",
+            authored_by=authored_by,
+            created_by=f"{authored_by}:{self._session_id}",
             updated_at=now,
-            updated_by=f"human:{self._session_id}",
+            updated_by=f"{authored_by}:{self._session_id}",
         )
 
         entry_id = self.__knowledge.add(entry)

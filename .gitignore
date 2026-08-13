@@ -54,6 +54,14 @@ logs/*.jsonl
 # Execution reports — runtime output of the orchestrator
 logs/executions/
 
+# Generated knowledge — runtime output of the orchestrator, same rule as above.
+# Provenance decides, not type: entries stamped "Captured by the Execution
+# Orchestrator" live here and stay out of the source diff; human-authored
+# research remains in knowledge/research/ and IS version-controlled.
+# The loader rglobs knowledge/, so these are still fully loaded, searchable,
+# and counted — they are simply not source-controlled.
+knowledge/runtime/
+
 # Agent runtime — run logs and the seeded agent registry (runtime state)
 logs/agents/
 agents/active/
