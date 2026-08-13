@@ -83,6 +83,8 @@ duration/elapsed-time tracking, and bulk stage changes from the session surface.
 
 - **SB-2 — Candidate enrichment, review-before-apply (carried from Increment 3).**
   See Carried limitations. Governed by ADR-013.
+- **SB-3 — User-created saved views (carried from the Candidate Workspace).**
+  See Carried limitations.
 
 The payoff of the persistent-person model.
 
@@ -112,6 +114,29 @@ coupling. The store seam exists so this is a one-file change, not a rewrite.
 Known behaviour that is not acceptable long-term, tracked here rather than left
 as a code comment so it has a home and cannot be shipped as permanent by
 default.
+
+### SB-3 — Saved views are fixed; recruiters cannot create their own
+
+**Raised by:** Candidate Workspace (TASK-0058) · **Resolve in:** Increment 4 ·
+**Severity:** low — a convenience gap, no data or correctness risk
+
+The talent pool ships five fixed saved views: Everyone, Reusable, Scored, Not yet
+on a req, and From sourcing. They cover the questions the workspace was designed
+around, and they need no persistence, no new entity, and nothing that can go
+stale — which is why they were the right call for this increment.
+
+They will not stay sufficient. Recruiters filter by the shape of their own desk:
+"my reqs", "Boston staff-level", "everyone I skipped as a close call last
+quarter". A fixed list cannot express that, and the requests will arrive quickly
+once the workspace is in daily use.
+
+**Deliberately not built yet.** A user-created view is the first thing in
+sourcingBOT that must persist per-recruiter, which presupposes the identity and
+storage layer Increment 5 introduces. Building it against `localStorage` now
+would mean designing it twice, and would strand every saved view on one browser.
+
+**Definition of done:** a recruiter can name, save, edit and delete their own
+filter over the talent pool, and it follows them across devices.
 
 ### SB-2 — Candidate enrichment is discarded, pending review-before-apply
 

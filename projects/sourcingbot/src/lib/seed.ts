@@ -1,9 +1,14 @@
 /**
  * Demo workspace data.
  *
- * Synthetic throughout — invented people at invented companies. Nothing here is
- * derived from a real profile, and no seeded candidate carries a LinkedIn URL,
- * so the demo cannot imply data was captured without supervision.
+ * Synthetic throughout — invented people at invented companies, and sourcing
+ * sessions that never took place. Nothing here is derived from a real profile,
+ * no seeded candidate carries a LinkedIn URL, and every seeded session is
+ * labelled "Demo data" in its own notes, so the demo can never imply that data
+ * was captured without supervision or that work was done that was not.
+ *
+ * The seed loads only when no workspace has been stored yet; the first real
+ * save replaces it entirely.
  *
  * The seed deliberately includes ONE person (Priya Raman) attached to TWO
  * requisitions with different stages and different fit scores. That is the
@@ -15,6 +20,7 @@ import type {
   Req,
   ReqCandidate,
   SourcingBrief,
+  SourcingSession,
 } from "./types";
 import type { WorkspaceState } from "./store";
 
@@ -256,5 +262,53 @@ export function seedState(): WorkspaceState {
     },
   ];
 
-  return { reqs, briefs, candidates, reqCandidates, sessions: [] };
+  // Two completed sessions so the workspace demonstrates intelligence — capture
+  // rates, close calls, skip history — rather than rendering empty modules.
+  //
+  // SYNTHETIC. These describe sourcing work that never happened, by operators
+  // who do not exist, reviewing people who do not exist. Their notes say so in
+  // plain text so a session record can never be mistaken for real activity, and
+  // the whole seed is discarded the moment a real workspace is stored (see
+  // `load()` in store.ts). Nothing here should ever be read as a record of what
+  // a recruiter actually did.
+  const sessions: SourcingSession[] = [
+    {
+      id: "sess_infra_1",
+      reqId: "req_infra",
+      operator: "Dana Whitfield",
+      status: "ended",
+      acknowledgedPolicy: true,
+      startedAt: T1,
+      endedAt: T1,
+      candidatesAdded: 2,
+      notes: "Demo data — synthetic session. First pass on multi-tenant platform profiles.",
+      briefVersion: 3,
+      capturedCandidateIds: ["cand_priya", "cand_tomas"],
+      pauseCount: 1,
+      skipped: [
+        { id: "skip_1", name: "Marcus Devlin", reason: "Strong, but infra-adjacent rather than infra", closeCall: true, at: T1 },
+        { id: "skip_2", name: "Ines Fournier", reason: "Wrong seniority band", closeCall: false, at: T1 },
+        { id: "skip_3", name: "Ravi Chandra", reason: "Great systems depth, no multi-tenant", closeCall: true, at: T1 },
+      ],
+    },
+    {
+      id: "sess_ml_1",
+      reqId: "req_ml",
+      operator: "Marcus Ilo",
+      status: "ended",
+      acknowledgedPolicy: true,
+      startedAt: T1,
+      endedAt: T1,
+      candidatesAdded: 1,
+      notes: "Demo data — synthetic session. Inference-focused search.",
+      briefVersion: 1,
+      capturedCandidateIds: ["cand_lena"],
+      pauseCount: 0,
+      skipped: [
+        { id: "skip_4", name: "Owen Hartley", reason: "Research-only background", closeCall: false, at: T1 },
+      ],
+    },
+  ];
+
+  return { reqs, briefs, candidates, reqCandidates, sessions };
 }

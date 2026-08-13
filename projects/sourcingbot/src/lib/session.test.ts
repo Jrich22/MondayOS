@@ -254,3 +254,19 @@ describe("finding the active session", () => {
     expect(sessionsForReq("req_1", [older, newer])[0].startedAt).toBe("2099-01-01T00:00:00Z");
   });
 });
+
+describe("demo seed data is unmistakably synthetic", () => {
+  it("labels every seeded session in its own notes", async () => {
+    const { seedState } = await import("./seed");
+    const { sessions } = seedState();
+    expect(sessions.length).toBeGreaterThan(0);
+    for (const s of sessions) {
+      expect(s.notes).toMatch(/^Demo data — synthetic session\./);
+    }
+  });
+
+  it("seeds no LinkedIn URLs, so no capture is implied", async () => {
+    const { seedState } = await import("./seed");
+    expect(seedState().candidates.every((c) => !c.linkedInUrl)).toBe(true);
+  });
+});

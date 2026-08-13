@@ -5,7 +5,7 @@ import Workspace from "@/pages/Workspace";
 import ReqDetail from "@/pages/ReqDetail";
 import ReqAuthoring from "@/pages/ReqAuthoring";
 import SourcingSession from "@/pages/SourcingSession";
-import Candidates from "@/pages/Candidates";
+import CandidateWorkspace from "@/pages/CandidateWorkspace";
 import CandidateProfile from "@/pages/CandidateProfile";
 
 /**
@@ -16,11 +16,13 @@ import CandidateProfile from "@/pages/CandidateProfile";
 const App: FC = () => (
   <Routes>
     <Route element={<AppShell />}>
-      <Route path="/" element={<Workspace />} />
+      {/* The Candidate Workspace is home: a recruiter lands on what to do
+          next, not on a list of requisitions. See ADR-014. */}
+      <Route path="/" element={<CandidateWorkspace />} />
+      <Route path="/reqs" element={<Workspace />} />
       <Route path="/reqs/:reqId/edit" element={<ReqAuthoring />} />
       <Route path="/reqs/:reqId/session" element={<SourcingSession />} />
       <Route path="/reqs/:reqId" element={<ReqDetail />} />
-      <Route path="/candidates" element={<Candidates />} />
       <Route path="/candidates/:candidateId" element={<CandidateProfile />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Route>

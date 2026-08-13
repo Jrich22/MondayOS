@@ -4,6 +4,82 @@ Newest first. Each records the decision, why, and what it costs.
 
 ---
 
+## ADR-014 — The Candidate Workspace is home, and leads with conclusions
+
+**Status:** accepted · Candidate Workspace
+
+**Context.** The talent surface was a candidate list at `/candidates`, and `/`
+was the requisition list. Both are, structurally, tables. A recruiter opening
+the product landed on records and had to derive their own next action.
+
+**Decision.** The Candidate Workspace becomes `/`; the Req Workspace moves to
+`/reqs`. The page is ordered **conclusions first, records last**:
+
+1. **Pulse** — six counts, one dense strip
+2. **Recommended focus** — a ranked, reasoned worklist
+3. **Talent intelligence** — concentration that filters the pool
+4. **Activity** — one merged feed
+5. **Talent pool** — the table, last, 8 rows by default
+
+Two rules hold the design together:
+
+- **Every number is a doorway.** No statistic renders without a link to the work
+  it counts. That is the line between a command center and a vanity dashboard.
+- **Every focus row states why it surfaced.** A worklist without reasons is just
+  a differently-shaped list, and a recruiter cannot triage it.
+
+**Alternatives rejected.** *Keep the table as the landing view and add widgets
+above it* — the table still dominates by sheer height, and the widgets become
+decoration. *Charts for concentration* — a chart answers "where is our talent"
+and then abandons the user; a clickable bar answers it and takes them there.
+*Six large stat cards* — vertical space spent on orientation is space taken from
+the worklist, which is the actual product.
+
+**Consequences.** The home route changed, so bookmarks to `/candidates` break
+(now `/candidates/:id` for profiles only) and `Candidates.tsx` was retired —
+its table lives on inside `TalentPool`. Focus ranking is heuristic and will need
+tuning against real recruiter behaviour; the thresholds (fit ≥ 70, pipeline < 3,
+capture rate < 25% over ≥ 5 reviewed) are first guesses, documented here so they
+are visibly assumptions rather than physics.
+
+Intelligence lives in `lib/intel.ts`, which — like `readiness.ts` (ADR-008) —
+stores nothing and composes existing domain functions. `concentration("company")`
+delegates to the tested `talentConcentration` rather than reimplementing it.
+
+### Appendix — focus thresholds and their review trigger
+
+The Recommended Focus worklist uses five numeric thresholds. **They are unchanged
+by this appendix.** It exists so they are revisited on a schedule rather than
+quietly becoming permanent.
+
+| Threshold | Current value | Surfaces |
+|---|---|---|
+| Strong candidate | fit score **≥ 70** | An unactioned candidate worth chasing |
+| Unactioned stages | `identified`, `reviewing` | Which stages count as "not acted on" |
+| Thin pipeline | **< 3** live candidates | An open req needing sourcing |
+| Low capture rate | **< 25%** | A session worth examining |
+| Minimum sample | **≥ 5** reviewed | Below this, too little signal to judge a session |
+
+**Review trigger — approved 2026-08-13.** Revisit all five after **30 days of
+real recruiter usage OR 100 candidates reviewed across sessions, whichever comes
+first.**
+
+Why a trigger rather than a note. These numbers were chosen with no usage data
+at all; they are a starting position, not a finding. Documenting them as
+"tunable" makes that honest but changes nothing on its own — thresholds like
+these become permanent by default, and the recruiter never learns that a
+number, rather than their pipeline, decided what they saw first.
+
+What the review should ask: are strong candidates being surfaced that recruiters
+ignore (threshold too low), or are they finding good candidates the worklist
+never raised (too high)? Is "thin pipeline" firing on reqs that are healthy for
+their market? Is a 25% capture rate actually unusual, or normal for a scarce
+skill set?
+
+Until that review, the values above stand.
+
+---
+
 ## ADR-013 — Candidate enrichment is review-before-apply
 
 **Status:** **accepted as a product rule; NOT implemented.** Approved
