@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -34,6 +35,11 @@ def _git_init(path: Path) -> None:
 
 def _finding(category: str, severity: Severity, title: str) -> Finding:
     return Finding(category=category, severity=severity, title=title)
+
+
+def _future_iso() -> str:
+    """A run timestamp newer than any file the test just wrote."""
+    return (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
 
 
 # ===========================================================================
@@ -316,7 +322,7 @@ class TestTestAnalyzer:
                    for f in result.findings)
 
     def test_lastfailed_critical(self, tmp_path):
-        _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass")
+        _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass\ndef test_broken(): pass")
         cache_dir = tmp_path / ".pytest_cache" / "v" / "cache"
         cache_dir.mkdir(parents=True)
         (cache_dir / "lastfailed").write_text(
@@ -329,6 +335,122 @@ class TestTestAnalyzer:
 
     def test_clean_cache_ok(self, tmp_path):
         _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass")
+        cache_dir = tmp_path / ".pytest_cache" / "v" / "cache"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "lastfailed").write_text(json.dumps({}))
+        (cache_dir / "nodeids").write_text(json.dumps(["tests/test_x.py::test_x"]))
+        result = self._analyzer(tmp_path).analyze()
+        assert any(f.severity == Severity.OK and "passed" in f.title.lower()
+                   for f in result.findings)
+
+    # --- stale failure records ------------------------------------------
+
+    def test_lastfailed_entry_for_deleted_test_is_ignored(self, tmp_path):
+        """pytest can never clear a node id whose test was renamed or deleted."""
+        _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass")
+        cache_dir = tmp_path / ".pytest_cache" / "v" / "cache"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "lastfailed").write_text(
+            json.dumps({"tests/test_x.py::test_not_yet_implemented": True})
+        )
+        (cache_dir / "nodeids").write_text(json.dumps(["tests/test_x.py::test_x"]))
+        result = self._analyzer(tmp_path).analyze()
+        assert not any(f.severity == Severity.CRITICAL for f in result.findings)
+        assert any("stale failure record" in f.title.lower() for f in result.findings)
+
+    def test_lastfailed_entry_for_deleted_file_is_ignored(self, tmp_path):
+        _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass")
+        cache_dir = tmp_path / ".pytest_cache" / "v" / "cache"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "lastfailed").write_text(
+            json.dumps({"tests/test_gone.py::test_gone": True})
+        )
+        (cache_dir / "nodeids").write_text(json.dumps(["tests/test_x.py::test_x"]))
+        result = self._analyzer(tmp_path).analyze()
+        assert not any(f.severity == Severity.CRITICAL for f in result.findings)
+
+    def test_parametrized_lastfailed_entry_is_kept(self, tmp_path):
+        _write(tmp_path / "tests" / "test_x.py", "def test_p(v): assert v")
+        cache_dir = tmp_path / ".pytest_cache" / "v" / "cache"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "lastfailed").write_text(json.dumps({"tests/test_x.py::test_p[0]": True}))
+        (cache_dir / "nodeids").write_text(json.dumps(["tests/test_x.py::test_p[0]"]))
+        result = self._analyzer(tmp_path).analyze()
+        assert any(f.severity == Severity.CRITICAL and "failed" in f.title.lower()
+                   for f in result.findings)
+
+    # --- verified run record --------------------------------------------
+
+    def _write_record(self, tmp_path, **fields):
+        record = {
+            "finished_at": _future_iso(),
+            "exit_status": 0,
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "failed_nodeids": [],
+            "full_run": True,
+        }
+        record.update(fields)
+        _write(tmp_path / ".pytest_cache" / "v" / "mondayos" / "last_run",
+               json.dumps(record))
+
+    def test_run_record_green_is_ok(self, tmp_path):
+        _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass")
+        self._write_record(tmp_path, passed=1082, skipped=12)
+        result = self._analyzer(tmp_path).analyze()
+        assert any(f.severity == Severity.OK and "1082" in f.title
+                   for f in result.findings)
+        assert not any(f.severity == Severity.CRITICAL for f in result.findings)
+
+    def test_run_record_overrides_stale_lastfailed(self, tmp_path):
+        """A green verified run wins over leftover entries in the retry cache."""
+        _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass")
+        cache_dir = tmp_path / ".pytest_cache" / "v" / "cache"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "lastfailed").write_text(json.dumps({"tests/test_x.py::test_x": True}))
+        self._write_record(tmp_path, passed=1)
+        result = self._analyzer(tmp_path).analyze()
+        assert not any(f.severity == Severity.CRITICAL for f in result.findings)
+
+    def test_run_record_failures_are_critical(self, tmp_path):
+        _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass")
+        self._write_record(tmp_path, passed=5, failed=2,
+                           failed_nodeids=["tests/test_x.py::test_x"])
+        result = self._analyzer(tmp_path).analyze()
+        assert any(f.severity == Severity.CRITICAL and "2 test(s) failed" in f.title
+                   for f in result.findings)
+
+    def test_run_record_errors_count_as_failures(self, tmp_path):
+        _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass")
+        self._write_record(tmp_path, passed=5, errors=1)
+        result = self._analyzer(tmp_path).analyze()
+        assert any(f.severity == Severity.CRITICAL for f in result.findings)
+
+    def test_partial_run_is_flagged(self, tmp_path):
+        _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass")
+        self._write_record(tmp_path, passed=1, full_run=False)
+        result = self._analyzer(tmp_path).analyze()
+        assert any("part of the suite" in f.title.lower() for f in result.findings)
+
+    def test_source_changed_since_run_is_flagged(self, tmp_path):
+        _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass")
+        self._write_record(tmp_path, passed=1, finished_at="2000-01-01T00:00:00+00:00")
+        result = self._analyzer(tmp_path).analyze()
+        assert any("changed since the last test run" in f.title.lower()
+                   for f in result.findings)
+
+    def test_fresh_run_is_not_flagged_as_stale(self, tmp_path):
+        _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass")
+        self._write_record(tmp_path, passed=1)
+        result = self._analyzer(tmp_path).analyze()
+        assert not any("changed since the last test run" in f.title.lower()
+                       for f in result.findings)
+
+    def test_corrupt_run_record_falls_back_to_cache(self, tmp_path):
+        _write(tmp_path / "tests" / "test_x.py", "def test_x(): pass")
+        _write(tmp_path / ".pytest_cache" / "v" / "mondayos" / "last_run", "{not json")
         cache_dir = tmp_path / ".pytest_cache" / "v" / "cache"
         cache_dir.mkdir(parents=True)
         (cache_dir / "lastfailed").write_text(json.dumps({}))
