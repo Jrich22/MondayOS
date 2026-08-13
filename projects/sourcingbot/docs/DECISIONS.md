@@ -4,6 +4,133 @@ Newest first. Each records the decision, why, and what it costs.
 
 ---
 
+## ADR-013 — Candidate enrichment is review-before-apply
+
+**Status:** **accepted as a product rule; NOT implemented.** Approved
+2026-08-13. Binding on any future increment that touches this.
+
+**Context.** Reusing an existing Candidate during capture deliberately does not
+update their record (ADR-012, approved). If the operator learns a new email or a
+job change while sourcing, that information is currently discarded.
+
+Discarding it is right in the sense that matters — a hasty later capture must
+not clobber facts established by a more careful earlier one — but it is
+obviously not the end state. Real information is being thrown away.
+
+**Decision.** When sourcingBOT eventually handles this, enrichment must be
+**review-before-apply**:
+
+1. A reused Candidate encountered with new information produces a **proposed
+   change**, not a write.
+2. Proposals surface to the recruiter showing the current value, the proposed
+   value, and where the proposal came from.
+3. The persistent record changes **only** on explicit recruiter approval.
+4. Silent overwrite of a persistent Candidate fact is not acceptable in any
+   increment.
+
+**Rationale.** The persistent-person model (ADR-002) is only worth having if the
+person record is trustworthy. A record that can be silently rewritten by whoever
+sourced most recently is not a durable fact — it is a cache of the last
+operator's typing speed. Requiring approval keeps the pool authoritative and
+gives the recruiter the one thing an automatic merge cannot: the chance to say
+"no, that's a different Priya Raman."
+
+This is the same principle as ADR-011 (skips do not create people) and the
+LinkedIn boundary itself: **the system proposes, a human disposes.**
+
+**Not implemented.** No proposal entity, queue, or UI exists yet. Capture
+currently discards the new information, which is the safe default until this
+lands. Scheduled against Increment 4 — see ROADMAP `SB-2`.
+
+---
+
+## ADR-012 — Reuse from the pool is exempt from the capture origin check
+
+**Status:** accepted · TASK-0057 · **refines the supervision boundary**
+
+**Context.** `recordManualCapture` refused any candidate whose
+`origin !== "supervised-linkedin"`. That guard exists so a bulk import cannot be
+laundered through a session to look human-reviewed.
+
+Increment 3 made it fire on a legitimate case. Someone who entered the pool as a
+`referral` two years ago and is sourced for a new req today **was** genuinely
+reviewed by the operator during this session — but `Candidate.origin` records
+how a person *first entered the pool*, which is a different fact from whether
+*this capture* was supervised. Tests caught it: five reuse cases failed.
+
+**Decision.** `recordManualCapture` takes an explicit
+`{ reusedFromPool: true }` option. The origin check applies to **newly created**
+candidates only; reuse is permitted but must be declared by the caller.
+
+**Alternatives rejected.** *Rewrite `origin` to `supervised-linkedin` on reuse* —
+destroys real provenance about how someone entered the pool, to satisfy a check
+about something else. *Drop the origin check* — removes the laundering guard
+entirely. *Infer reuse from whether the candidate id already exists* — makes the
+exemption implicit and therefore reachable by accident.
+
+**Consequences.** One more parameter at the boundary, and reuse is now a named,
+auditable case rather than a silent one. A test asserts a new non-supervised
+candidate is still refused, that reuse does not rewrite origin, and that reuse
+is still refused when the session is not in progress.
+
+---
+
+## ADR-011 — Skips are session-scoped and never create a Candidate
+
+**Status:** accepted · TASK-0057
+
+**Context.** Operators review far more people than they capture. Tracking the
+rejects is valuable — especially the near-misses, which are the first place to
+look when a pipeline thins out. The obvious implementation is a `Candidate` with
+a `rejected` status.
+
+**Decision.** A skip is a `SkippedCandidate` recorded **on the session**: name as
+typed, reason, a `closeCall` flag, timestamp. No `Candidate` is created and no
+profile data is stored.
+
+**Rationale.** A skip is a judgement made inside one search, not a durable fact
+about a human. Minting a persistent record for everyone glanced at would fill
+the talent pool with people nobody evaluated, corrupting the concentration
+analytics that ADR-002's persistent-person model exists to enable. It would also
+store data about people who were explicitly *not* selected, which is a
+proportionality problem as much as a modelling one.
+
+**Consequences.** A skipped person is not searchable in the talent pool, and
+skipping the same person in two sessions records two entries. Both are accepted:
+`closeCallsFor()` surfaces near-misses per req, which is the actual use case. If
+a skipped person later deserves a real record, the operator captures them
+properly.
+
+---
+
+## ADR-010 — Session state extends the existing SourcingSession
+
+**Status:** accepted · TASK-0057
+
+**Context.** Increment 3 needs pause/resume, per-session capture attribution,
+skip tracking, and counts. `SourcingSession` shipped in Increment 1 as a
+boundary record with five fields.
+
+**Decision.** Extend it in place — `pausedAt`, `resumedAt`, `pauseCount`,
+`capturedCandidateIds`, `skipped`, `briefVersion` — all optional, so sessions
+written by Increment 1 keep loading. `SessionStatus` gains `"paused"`.
+
+**Why pause exists at all.** Sourcing is interrupted constantly. Without pause an
+operator either leaves a session open — making its duration meaningless — or
+ends it and starts another, fragmenting one search into several. Both corrupt
+the counts the record exists to keep. A paused session is still *active*: what a
+pause suspends is capture, not existence.
+
+**`briefVersion` on the session.** Counts are only interpretable against the bar
+that was in force. A session that reviewed 40 people against brief v2 is not
+comparable to one run after the must-haves changed.
+
+**Consequences.** `SourcingSession` grew from 8 fields to 14. Accepted: it is the
+record of what a human did, and each field answers a question an operator
+actually asks.
+
+---
+
 ## ADR-009 — Unsaved-changes is tracked by revision, not timestamp
 
 **Status:** accepted · TASK-0056

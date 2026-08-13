@@ -63,16 +63,32 @@ I will record only candidates I have personally reviewed.
 I will respect LinkedIn's rate limits and terms; no bypass or evasion.
 ```
 
-## The deferred workflow
+## The workflow (shipped, Increment 3)
 
-The human-driven LinkedIn workflow — the UI a recruiter uses while sourcing —
-lands in a later increment ([ROADMAP](ROADMAP.md), Increment 3). The **gate it
-must pass through shipped first, deliberately**: the boundary exists before the
-feature that will be tempted to cross it.
+The human-driven sourcing workflow landed in TASK-0057. The **gate it passes
+through shipped first, deliberately**: the boundary existed before the feature
+that would be tempted to cross it.
 
-When that workflow arrives it will be a *manual capture surface* — the recruiter
-browses LinkedIn themselves, in their own browser, and records what they found.
-sourcingBOT will never hold the session.
+It is a *manual capture surface*. The recruiter browses LinkedIn themselves, in
+their own browser, and records what they found. sourcingBOT never holds the
+session, and `lib/capture.ts` fetches, parses, and derives nothing — every field
+is typed by the operator.
+
+### One refinement the workflow forced
+
+`recordManualCapture` originally refused any candidate whose `origin` was not
+`supervised-linkedin`. That guard stops a bulk import being laundered through a
+session to look human-reviewed, and it stays.
+
+But it fired on a legitimate case: a person who entered the pool as a `referral`
+years ago, and who the operator genuinely reviewed during today's session.
+`origin` records how someone *first entered the pool* — a different fact from
+whether *this capture* was supervised. Rewriting it would have destroyed real
+provenance to satisfy a check about something else.
+
+Reuse from the pool is therefore permitted, but only when the caller declares it
+explicitly (`{ reusedFromPool: true }`), so it cannot happen by accident. New
+candidates are still held to the original rule. See ADR-012.
 
 ## Data handling
 

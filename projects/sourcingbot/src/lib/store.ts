@@ -21,6 +21,8 @@ import type {
 import { isAlreadyOnReq } from "./req-candidate";
 import { markSaved, newDraftReq, suggestReqCode } from "./req";
 import { newDraftBrief } from "./brief";
+import { activeSessionFor, sessionsForReq } from "./linkedin";
+import type { CaptureResult } from "./capture";
 import { seedState } from "./seed";
 
 const STORAGE_KEY = "sourcingbot.workspace.v1";
@@ -257,6 +259,41 @@ export function reqWorkspace(
   const req = state.reqs.find((r) => r.id === reqId);
   if (!req) return null;
   return { req, brief: state.briefs.find((b) => b.reqId === reqId) };
+}
+
+// ---------------------------------------------------------------------------
+// Increment 3 — supervised sessions
+// ---------------------------------------------------------------------------
+
+/**
+ * Commit a capture: candidate, evaluation, and session in ONE state update.
+ *
+ * Single write on purpose. Persisting these separately allows a half-applied
+ * capture — a session that counts a candidate the pool does not contain, or an
+ * evaluation pointing at a person who was never saved. Committing together
+ * means the four records are consistent at every observable point.
+ */
+export function commitCapture(result: CaptureResult): void {
+  const { candidate, reqCandidate, session, reusedExistingCandidate } = result;
+  state = {
+    ...state,
+    candidates: reusedExistingCandidate
+      ? state.candidates
+      : [...state.candidates, candidate],
+    reqCandidates: [...state.reqCandidates, reqCandidate],
+    sessions: state.sessions.map((s) => (s.id === session.id ? session : s)),
+  };
+  emit();
+}
+
+/** The live session for a req, if one is open. */
+export function activeSession(reqId: string): SourcingSession | null {
+  return activeSessionFor(reqId, state.sessions);
+}
+
+/** A req's sessions, newest first. */
+export function sessionHistory(reqId: string): SourcingSession[] {
+  return sessionsForReq(reqId, state.sessions);
 }
 
 // ---------------------------------------------------------------------------
