@@ -15,14 +15,18 @@ import {
   pulse,
   recentActivity,
   recommendedFocus,
+  reqDashboard,
+  reusableTalent,
+  sourcingPerformance,
   toCsv,
+  STRONG_FIT,
   type IntelInput,
 } from "./intel";
 import { newCandidate } from "./candidate";
 import { newReq, transition } from "./req";
 import { newBrief, reviseBrief } from "./brief";
 import { advance, newReqCandidate } from "./req-candidate";
-import { recordSkip, startSession } from "./linkedin";
+import { recordManualCapture, recordSkip, startSession } from "./linkedin";
 import { __resetIdCounter } from "./ids";
 import type { ReqCandidate } from "./types";
 
@@ -139,7 +143,7 @@ describe("recommended focus", () => {
     const req = openReq();
     const item = recommendedFocus({ ...EMPTY, reqs: [req] }).find((i) => i.kind === "thin-pipeline");
     expect(item?.reason).toMatch(/nobody in the pipeline/);
-    expect(item?.actionLabel).toBe("Start sourcing");
+    expect(item?.action).toMatchObject({ type: "start-session" });
   });
 
   it("does not flag a healthy pipeline", () => {
@@ -205,7 +209,7 @@ describe("recommended focus", () => {
     const rc: ReqCandidate = { ...newReqCandidate({ reqId: req.id, candidateId: c.id, briefVersion: 1, by: "D" }), fitScore: 90 };
     for (const i of recommendedFocus({ ...EMPTY, reqs: [req], candidates: [c], reqCandidates: [rc] })) {
       expect(i.reason.length).toBeGreaterThan(0);
-      expect(i.actionLabel.length).toBeGreaterThan(0);
+      expect(i.action.label.length).toBeGreaterThan(0);
       expect(i.href.startsWith("/")).toBe(true);
     }
   });
@@ -335,5 +339,126 @@ describe("CSV export", () => {
 
   it("emits just the header for an empty pool", () => {
     expect(toCsv([]).split("\n")).toHaveLength(1);
+  });
+});
+
+describe("dashboard derived views", () => {
+  const req = openReq("REQ-100");
+  const brief = newBrief({
+    reqId: req.id, headline: "Platform engineers", seniority: "staff",
+    requirements: [{ label: "7+ years", kind: "required", weight: 5 }],
+  });
+  const c = person("Priya");
+
+  it("reqDashboard derives completeness, counts and last activity", () => {
+    const rc: ReqCandidate = {
+      ...newReqCandidate({ reqId: req.id, candidateId: c.id, briefVersion: 1, by: "D" }),
+      fitScore: 90,
+    };
+    const [row] = reqDashboard({
+      ...EMPTY, reqs: [req], briefs: [{ ...brief, reqId: req.id }],
+      candidates: [c], reqCandidates: [rc],
+    });
+    expect(row.req.id).toBe(req.id);
+    expect(row.live).toBe(1);
+    expect(row.strong).toBe(1);          // fit >= STRONG_FIT
+    expect(row.completeness).toBeGreaterThan(0);
+    expect(row.lastActivity).toBeTruthy();
+  });
+
+  it("counts a candidate below the strong threshold as live but not strong", () => {
+    const rc: ReqCandidate = {
+      ...newReqCandidate({ reqId: req.id, candidateId: c.id, briefVersion: 1, by: "D" }),
+      fitScore: STRONG_FIT - 1,
+    };
+    const [row] = reqDashboard({ ...EMPTY, reqs: [req], candidates: [c], reqCandidates: [rc] });
+    expect(row.live).toBe(1);
+    expect(row.strong).toBe(0);
+  });
+
+  it("surfaces the active session on its req", () => {
+    const s = startSession({
+      reqId: req.id, operator: "D", acknowledgedPolicy: true, reqAcceptsSourcing: true,
+    });
+    const [row] = reqDashboard({ ...EMPTY, reqs: [req], sessions: [s] });
+    expect(row.activeSession?.id).toBe(s.id);
+    expect(row.sessions).toBe(1);
+  });
+
+  it("sourcingPerformance ranks strongest and weakest with enough signal", () => {
+    let strong = startSession({ reqId: req.id, operator: "D", acknowledgedPolicy: true, reqAcceptsSourcing: true });
+    strong = recordManualCapture(strong, person("A"));
+    strong = recordManualCapture(strong, person("B"));
+    strong = recordSkip(strong, { name: "x", reason: "no" });
+
+    let weak = startSession({ reqId: req.id, operator: "D", acknowledgedPolicy: true, reqAcceptsSourcing: true });
+    for (const n of ["a", "b", "c", "d"]) weak = recordSkip(weak, { name: n, reason: "no" });
+    weak = recordManualCapture(weak, person("C"));
+
+    const perf = sourcingPerformance({ ...EMPTY, reqs: [req], sessions: [strong, weak] });
+    expect(perf.sessionCount).toBe(2);
+    expect(perf.strongest?.counts.captureRate).toBe(67);
+    expect(perf.weakest?.counts.captureRate).toBe(20);
+    expect(perf.totals.captured).toBe(3);
+  });
+
+  it("refuses to rank a session with too little signal", () => {
+    let tiny = startSession({ reqId: req.id, operator: "D", acknowledgedPolicy: true, reqAcceptsSourcing: true });
+    tiny = recordManualCapture(tiny, person("A"));
+    const perf = sourcingPerformance({ ...EMPTY, reqs: [req], sessions: [tiny] });
+    expect(perf.strongest).toBeNull();   // 1 reviewed < MIN_RANKABLE_REVIEWED
+    expect(perf.totals.captured).toBe(1); // still counted in totals
+  });
+
+  it("does not name a weakest when only one session is rankable", () => {
+    let only = startSession({ reqId: req.id, operator: "D", acknowledgedPolicy: true, reqAcceptsSourcing: true });
+    only = recordManualCapture(only, person("A"));
+    only = recordSkip(only, { name: "x", reason: "no" });
+    only = recordSkip(only, { name: "y", reason: "no" });
+    const perf = sourcingPerformance({ ...EMPTY, reqs: [req], sessions: [only] });
+    expect(perf.strongest).not.toBeNull();
+    expect(perf.weakest).toBeNull();
+  });
+
+  it("reusableTalent lists only people on more than one req, with their codes", () => {
+    const req2 = openReq("REQ-200");
+    const rows = reusableTalent({
+      ...EMPTY, reqs: [req, req2], candidates: [c],
+      reqCandidates: [
+        newReqCandidate({ reqId: req.id, candidateId: c.id, briefVersion: 1, by: "D" }),
+        newReqCandidate({ reqId: req2.id, candidateId: c.id, briefVersion: 1, by: "D" }),
+      ],
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].reqCount).toBe(2);
+    expect(rows[0].reqCodes.sort()).toEqual(["REQ-100", "REQ-200"]);
+  });
+
+  it("excludes people on a single req from reusable talent", () => {
+    const rows = reusableTalent({
+      ...EMPTY, reqs: [req], candidates: [c],
+      reqCandidates: [newReqCandidate({ reqId: req.id, candidateId: c.id, briefVersion: 1, by: "D" })],
+    });
+    expect(rows).toEqual([]);
+  });
+
+  it("pulse reports capture rate and average fit, counting rejections", () => {
+    let s = startSession({ reqId: req.id, operator: "D", acknowledgedPolicy: true, reqAcceptsSourcing: true });
+    s = recordManualCapture(s, person("A"));
+    s = recordSkip(s, { name: "x", reason: "no" });
+    const rcs: ReqCandidate[] = [
+      { ...newReqCandidate({ reqId: req.id, candidateId: "a", briefVersion: 1, by: "D" }), fitScore: 100 },
+      { ...newReqCandidate({ reqId: req.id, candidateId: "b", briefVersion: 1, by: "D" }), fitScore: 0 },
+    ];
+    const p = pulse({ ...EMPTY, reqs: [req], reqCandidates: rcs, sessions: [s] });
+    expect(p.captureRate).toBe(50);
+    expect(p.averageFit).toBe(50);       // rejections included, deliberately
+    expect(p.capturedTotal).toBe(2);
+  });
+
+  it("pulse reports null averages rather than a misleading zero", () => {
+    const p = pulse(EMPTY);
+    expect(p.averageFit).toBeNull();
+    expect(p.captureRate).toBeNull();
   });
 });

@@ -82,17 +82,19 @@ describe("Req detail", () => {
 
 describe("the persistent-person model, end to end", () => {
   it("shows one person across two reqs with independent stages", () => {
-    renderAt("/candidates/cand_priya");
+    renderAt("/candidates/c_priya");
 
     expect(screen.getByText("REQ-014")).toBeTruthy();
     expect(screen.getByText("REQ-018")).toBeTruthy();
-    expect(screen.getByText("responded")).toBeTruthy();
+    // One person, two independent verdicts: advanced on the platform req,
+    // rejected on the ML req.
+    expect(screen.getByText("advanced")).toBeTruthy();
     expect(screen.getByText("rejected")).toBeTruthy();
   });
 
   it("scores the same person differently per requisition", () => {
-    renderAt("/candidates/cand_priya");
-    expect(screen.getByText("79")).toBeTruthy();
+    renderAt("/candidates/c_priya");
+    expect(screen.getByText("88")).toBeTruthy();
     expect(screen.getByText("0")).toBeTruthy();
   });
 });

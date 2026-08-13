@@ -10,8 +10,9 @@ import { NavLink, Outlet } from "react-router-dom";
 import { cn } from "@/components/ui/Primitives";
 
 const NAV = [
-  { to: "/", label: "Talent", end: true, hint: "Your command center" },
+  { to: "/", label: "Dashboard", end: true, hint: "Your command center" },
   { to: "/reqs", label: "Requisitions", end: false, hint: "Searches and pipelines" },
+  { to: "/talent", label: "Talent", end: false, hint: "The persistent pool" },
 ];
 
 const NavItem: FC<{ to: string; label: string; end: boolean; hint: string }> = ({

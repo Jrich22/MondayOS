@@ -5,6 +5,7 @@ import Workspace from "@/pages/Workspace";
 import ReqDetail from "@/pages/ReqDetail";
 import ReqAuthoring from "@/pages/ReqAuthoring";
 import SourcingSession from "@/pages/SourcingSession";
+import Dashboard from "@/pages/Dashboard";
 import CandidateWorkspace from "@/pages/CandidateWorkspace";
 import CandidateProfile from "@/pages/CandidateProfile";
 
@@ -16,9 +17,11 @@ import CandidateProfile from "@/pages/CandidateProfile";
 const App: FC = () => (
   <Routes>
     <Route element={<AppShell />}>
-      {/* The Candidate Workspace is home: a recruiter lands on what to do
-          next, not on a list of requisitions. See ADR-014. */}
-      <Route path="/" element={<CandidateWorkspace />} />
+      {/* The Dashboard is home: a recruiter lands on what to do next, not on a
+          list of records. The Candidate Workspace remains available in full at
+          /talent. See ADR-014 and ADR-015. */}
+      <Route path="/" element={<Dashboard />} />
+      <Route path="/talent" element={<CandidateWorkspace />} />
       <Route path="/reqs" element={<Workspace />} />
       <Route path="/reqs/:reqId/edit" element={<ReqAuthoring />} />
       <Route path="/reqs/:reqId/session" element={<SourcingSession />} />

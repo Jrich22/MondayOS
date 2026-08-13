@@ -60,10 +60,10 @@ export const FocusList: FC<{ items: FocusItem[] }> = ({ items }) => {
                 </div>
               </div>
               <Link
-                to={item.href}
+                to={item.action.type === "navigate" ? item.action.href : item.href}
                 className="shrink-0 rounded-lg border border-line px-2.5 py-1.5 text-xs text-ink-muted transition-colors hover:border-brand-500/40 hover:text-brand-200"
               >
-                {item.actionLabel}
+                {item.action.label}
               </Link>
             </div>
           </Card>
