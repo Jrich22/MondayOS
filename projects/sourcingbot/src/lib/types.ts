@@ -216,7 +216,26 @@ export interface ReqCandidate {
 // Supervised LinkedIn sourcing session (boundary record only)
 // ---------------------------------------------------------------------------
 
-export type SessionStatus = "not-started" | "in-progress" | "ended";
+export type SessionStatus = "not-started" | "in-progress" | "paused" | "ended";
+
+/**
+ * Why the operator looked at someone and did not add them.
+ *
+ * Kept per session rather than as a Candidate record on purpose: a skip is a
+ * judgement made during one search, not a durable fact about a person. Creating
+ * a Candidate for everyone glanced at would fill the persistent pool with
+ * people nobody evaluated, and `closeCall` is exactly the signal a recruiter
+ * wants when the well runs dry — "who did I nearly take?"
+ */
+export interface SkippedCandidate {
+  id: string;
+  /** Name as the operator typed it. No profile is fetched or stored. */
+  name: string;
+  reason: string;
+  /** Worth revisiting if the pipeline thins out. */
+  closeCall: boolean;
+  at: string;
+}
 
 /**
  * A record that a human conducted a sourcing session. This increment records
@@ -236,4 +255,18 @@ export interface SourcingSession {
   /** Candidates the operator manually recorded during the session. */
   candidatesAdded: number;
   notes: string;
+
+  // ── Increment 3 ───────────────────────────────────────────────────────
+  // Optional so Increment 1/2 sessions keep loading. See ADR-010.
+
+  /** Brief version this session sourced against, so counts stay interpretable. */
+  briefVersion?: number;
+  /** Candidates captured in this session, in capture order. */
+  capturedCandidateIds?: string[];
+  /** People reviewed and not added, with the reason. */
+  skipped?: SkippedCandidate[];
+  pausedAt?: string;
+  resumedAt?: string;
+  /** How many times this session was paused — a proxy for interruption. */
+  pauseCount?: number;
 }

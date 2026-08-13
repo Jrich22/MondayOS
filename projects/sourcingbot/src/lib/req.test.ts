@@ -10,6 +10,8 @@ import {
 } from "./req";
 import {
   addRequirement,
+  setRequirementKind,
+  setRequirementWeight,
   briefReadinessIssues,
   clampWeight,
   isSourcingReady,
@@ -145,5 +147,60 @@ describe("Sourcing Brief", () => {
     const b = addRequirement(make(), { label: "Go", kind: "preferred", weight: 3 });
     expect(requiredRequirements(b)).toHaveLength(1);
     expect(b.requirements).toHaveLength(2);
+  });
+});
+
+describe("editable requirement weights (Increment 3)", () => {
+  const withReqs = () =>
+    addRequirement(
+      newBrief({
+        reqId: "r", headline: "Search", seniority: "staff",
+        requirements: [{ label: "Kubernetes", kind: "required", weight: 4 }],
+      }),
+      { label: "Go", kind: "preferred", weight: 3 },
+    );
+
+  it("changes a weight and bumps the brief version", () => {
+    const b = withReqs();
+    const updated = setRequirementWeight(b, b.requirements[1].id, 5);
+    expect(updated.requirements[1].weight).toBe(5);
+    expect(updated.version).toBe(b.version + 1);
+  });
+
+  it("clamps out-of-range weights", () => {
+    const b = withReqs();
+    expect(setRequirementWeight(b, b.requirements[0].id, 99).requirements[0].weight).toBe(5);
+    expect(setRequirementWeight(b, b.requirements[0].id, -3).requirements[0].weight).toBe(1);
+  });
+
+  it("is a no-op when the weight is unchanged — no spurious version bump", () => {
+    const b = withReqs();
+    expect(setRequirementWeight(b, b.requirements[0].id, 4)).toBe(b);
+  });
+
+  it("is a no-op for an unknown requirement", () => {
+    const b = withReqs();
+    expect(setRequirementWeight(b, "nope", 3)).toBe(b);
+  });
+
+  it("moves a requirement between must-have and nice-to-have", () => {
+    const b = withReqs();
+    const moved = setRequirementKind(b, b.requirements[0].id, "preferred");
+    expect(moved.requirements[0].kind).toBe("preferred");
+    expect(requiredRequirements(moved)).toHaveLength(0);
+    expect(moved.version).toBe(b.version + 1);
+  });
+
+  it("changing kind is a no-op when already that kind", () => {
+    const b = withReqs();
+    expect(setRequirementKind(b, b.requirements[0].id, "required")).toBe(b);
+  });
+
+  it("a weight change flags existing evaluations for reassessment", () => {
+    // Version bump is what makes needsReassessment() fire — evaluations made
+    // against the old weighting are not silently rescored.
+    const b = withReqs();
+    const updated = setRequirementWeight(b, b.requirements[1].id, 5);
+    expect(isStaleAgainst(updated, b.version)).toBe(true);
   });
 });

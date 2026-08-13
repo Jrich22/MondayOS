@@ -4,6 +4,7 @@ import { AppShell } from "@/components/shell/AppShell";
 import Workspace from "@/pages/Workspace";
 import ReqDetail from "@/pages/ReqDetail";
 import ReqAuthoring from "@/pages/ReqAuthoring";
+import SourcingSession from "@/pages/SourcingSession";
 import Candidates from "@/pages/Candidates";
 import CandidateProfile from "@/pages/CandidateProfile";
 
@@ -17,6 +18,7 @@ const App: FC = () => (
     <Route element={<AppShell />}>
       <Route path="/" element={<Workspace />} />
       <Route path="/reqs/:reqId/edit" element={<ReqAuthoring />} />
+      <Route path="/reqs/:reqId/session" element={<SourcingSession />} />
       <Route path="/reqs/:reqId" element={<ReqDetail />} />
       <Route path="/candidates" element={<Candidates />} />
       <Route path="/candidates/:candidateId" element={<CandidateProfile />} />

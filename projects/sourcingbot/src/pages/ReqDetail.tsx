@@ -60,12 +60,20 @@ const ReqDetail: FC = () => {
             {req.team} · {req.location} · {req.workModel} · Hiring manager: {req.hiringManager || "—"}
           </p>
         </div>
-        <Link
-          to={`/reqs/${req.id}/edit`}
-          className="rounded-lg border border-line px-3 py-2 text-sm text-ink-muted transition-colors hover:border-line-strong hover:text-ink"
-        >
-          Edit requisition
-        </Link>
+        <div className="flex flex-wrap gap-2">
+          <Link
+            to={`/reqs/${req.id}/edit`}
+            className="rounded-lg border border-line px-3 py-2 text-sm text-ink-muted transition-colors hover:border-line-strong hover:text-ink"
+          >
+            Edit requisition
+          </Link>
+          <Link
+            to={`/reqs/${req.id}/session`}
+            className="rounded-lg bg-brand-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-brand-500"
+          >
+            Sourcing session
+          </Link>
+        </div>
       </header>
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">

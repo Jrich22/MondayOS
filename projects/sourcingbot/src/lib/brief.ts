@@ -147,6 +147,47 @@ export function removeRequirement(brief: SourcingBrief, requirementId: string): 
   });
 }
 
+/**
+ * Change a requirement's weight.
+ *
+ * Weight only affects ranking among *preferred* requirements — `computeFitScore`
+ * treats every required item as pass/fail regardless of weight (ADR-006). The
+ * authoring surface still allows setting it on a must-have so the number does
+ * not appear to be ignored arbitrarily, and so it carries meaning if that
+ * requirement is later switched to preferred.
+ *
+ * Routes through `reviseBrief`, so the version bumps and existing evaluations
+ * are correctly flagged for reassessment rather than silently rescored.
+ */
+export function setRequirementWeight(
+  brief: SourcingBrief,
+  requirementId: string,
+  weight: number,
+): SourcingBrief {
+  const target = brief.requirements.find((r) => r.id === requirementId);
+  if (!target || target.weight === clampWeight(weight)) return brief;
+  return reviseBrief(brief, {
+    requirements: brief.requirements.map((r) =>
+      r.id === requirementId ? { ...r, weight: clampWeight(weight) } : r,
+    ),
+  });
+}
+
+/** Move a requirement between must-have and nice-to-have. */
+export function setRequirementKind(
+  brief: SourcingBrief,
+  requirementId: string,
+  kind: BriefRequirement["kind"],
+): SourcingBrief {
+  const target = brief.requirements.find((r) => r.id === requirementId);
+  if (!target || target.kind === kind) return brief;
+  return reviseBrief(brief, {
+    requirements: brief.requirements.map((r) =>
+      r.id === requirementId ? { ...r, kind } : r,
+    ),
+  });
+}
+
 export function requiredRequirements(brief: SourcingBrief): BriefRequirement[] {
   return brief.requirements.filter((r) => r.kind === "required");
 }

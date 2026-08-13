@@ -10,6 +10,7 @@ import {
   PROHIBITED_CAPABILITIES,
   SUPERVISION_POLICY,
   SupervisionRequiredError,
+  completeSession,
   endSession,
   recordManualCapture,
   sessionsForReq,
@@ -72,18 +73,27 @@ describe("manual capture only", () => {
   });
 
   it("refuses capture after the session ended", () => {
-    const ended = endSession(startSession(OK));
+    const ended = completeSession(startSession(OK));
     const c = newCandidate({ fullName: "X", origin: "supervised-linkedin" });
     expect(() => recordManualCapture(ended, c)).toThrow(/not in progress/);
   });
 
   it("refuses to end a session twice", () => {
-    const ended = endSession(startSession(OK));
-    expect(() => endSession(ended)).toThrow(SupervisionRequiredError);
+    const ended = completeSession(startSession(OK));
+    expect(() => completeSession(ended)).toThrow(SupervisionRequiredError);
+  });
+
+  it("endSession is a deprecated alias that forwards to completeSession", () => {
+    // Kept so Increment 1 callers keep working. It must stay a forwarder, not
+    // a second implementation — that duplication is what this replaced.
+    const viaAlias = endSession(startSession(OK), "note");
+    expect(viaAlias.status).toBe("ended");
+    expect(viaAlias.notes).toBe("note");
+    expect(() => endSession(viaAlias)).toThrow(SupervisionRequiredError);
   });
 
   it("stamps an end time", () => {
-    const ended = endSession(startSession(OK), "Reviewed 12 profiles");
+    const ended = completeSession(startSession(OK), "Reviewed 12 profiles");
     expect(ended.status).toBe("ended");
     expect(ended.endedAt).toBeTruthy();
     expect(ended.notes).toBe("Reviewed 12 profiles");

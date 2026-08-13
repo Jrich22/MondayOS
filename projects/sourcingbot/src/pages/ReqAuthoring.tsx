@@ -25,6 +25,8 @@ import {
   removeFromList,
   removeRequirement,
   reviseBrief,
+  setRequirementKind,
+  setRequirementWeight,
   type BriefListField,
 } from "@/lib/brief";
 import { canOpenForSourcing, evaluateReadiness, type SectionId } from "@/lib/readiness";
@@ -403,6 +405,8 @@ const ReqAuthoring: FC = () => {
                 hint="Disqualifying if absent. A req with none cannot discriminate between candidates."
                 onAdd={(label) => brief && stage(updateReq(req, {}), addRequirement(brief, { label, kind: "required", weight: 5 }))}
                 onRemove={(id) => brief && stage(updateReq(req, {}), removeRequirement(brief, id))}
+                onWeight={(id, w) => brief && stage(updateReq(req, {}), setRequirementWeight(brief, id, w))}
+                onKind={(id, k) => brief && stage(updateReq(req, {}), setRequirementKind(brief, id, k))}
               />
               <RequirementEditor
                 brief={brief}
@@ -411,6 +415,8 @@ const ReqAuthoring: FC = () => {
                 hint="Weighted, never blocking. These are what rank candidates against each other."
                 onAdd={(label) => brief && stage(updateReq(req, {}), addRequirement(brief, { label, kind: "preferred", weight: 3 }))}
                 onRemove={(id) => brief && stage(updateReq(req, {}), removeRequirement(brief, id))}
+                onWeight={(id, w) => brief && stage(updateReq(req, {}), setRequirementWeight(brief, id, w))}
+                onKind={(id, k) => brief && stage(updateReq(req, {}), setRequirementKind(brief, id, k))}
               />
             </div>
 
@@ -492,7 +498,9 @@ const RequirementEditor: FC<{
   hint: string;
   onAdd: (label: string) => void;
   onRemove: (id: string) => void;
-}> = ({ brief, kind, label, hint, onAdd, onRemove }) => {
+  onWeight: (id: string, weight: number) => void;
+  onKind: (id: string, kind: "required" | "preferred") => void;
+}> = ({ brief, kind, label, hint, onAdd, onRemove, onWeight, onKind }) => {
   const [draft, setDraft] = useState("");
   const items = (brief?.requirements ?? []).filter((r) => r.kind === kind);
   const inputId = `f-req-${kind}`;
@@ -529,9 +537,9 @@ const RequirementEditor: FC<{
           {items.map((r) => (
             <li
               key={r.id}
-              className="flex items-center justify-between gap-3 rounded-lg border border-line bg-canvas-overlay px-3 py-2"
+              className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-line bg-canvas-overlay px-3 py-2"
             >
-              <span className="flex items-start gap-2 text-sm text-ink-muted">
+              <span className="flex min-w-0 flex-1 items-start gap-2 text-sm text-ink-muted">
                 <span
                   aria-hidden
                   className={cn(
@@ -541,14 +549,37 @@ const RequirementEditor: FC<{
                 />
                 {r.label}
               </span>
-              <button
-                type="button"
-                aria-label={`Remove ${r.label}`}
-                onClick={() => onRemove(r.id)}
-                className="shrink-0 text-xs text-ink-faint transition-colors hover:text-stage-rejected"
-              >
-                Remove
-              </button>
+              <div className="flex shrink-0 items-center gap-2">
+                <label className="flex items-center gap-1 text-xs text-ink-faint">
+                  <span className="sr-only">{`Weight for ${r.label}`}</span>
+                  <span aria-hidden>weight</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={5}
+                    aria-label={`Weight for ${r.label}`}
+                    value={r.weight}
+                    onChange={(e) => onWeight(r.id, Number(e.target.value))}
+                    className="w-14 rounded-md border border-line bg-canvas px-1.5 py-0.5 text-xs text-ink focus:border-brand-500 focus:outline-none"
+                  />
+                </label>
+                <button
+                  type="button"
+                  aria-label={`Move ${r.label} to ${kind === "required" ? "nice-to-haves" : "must-haves"}`}
+                  onClick={() => onKind(r.id, kind === "required" ? "preferred" : "required")}
+                  className="text-xs text-ink-faint transition-colors hover:text-brand-200"
+                >
+                  {kind === "required" ? "→ nice" : "→ must"}
+                </button>
+                <button
+                  type="button"
+                  aria-label={`Remove ${r.label}`}
+                  onClick={() => onRemove(r.id)}
+                  className="text-xs text-ink-faint transition-colors hover:text-stage-rejected"
+                >
+                  Remove
+                </button>
+              </div>
             </li>
           ))}
         </ul>

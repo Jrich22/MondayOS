@@ -28,7 +28,7 @@ increment progressively more expensive to correct.
 
 ---
 
-## Increment 2 — Req Workspace Authoring ✅ *this increment*
+## Increment 2 — Req Workspace Authoring ✅
 
 **TASK-0056.** Turn the foundation into a usable recruiter workflow.
 
@@ -52,23 +52,37 @@ weights; the surface writes sensible defaults), and rich-text job descriptions.
 **Carried limitation:** autosave is last-write-wins across browser tabs — see
 [SB-1](#sb-1--authoring-autosave-is-last-write-wins), resolved in Increment 5.
 
-## Increment 3 — Supervised LinkedIn Sourcing Workflow
+## Increment 3 — Supervised Sourcing Sessions ✅ *this increment*
 
-The human-driven workflow, passing through the gate shipped in Increment 1.
+**TASK-0057.** The human-driven workflow, passing through the gate shipped in
+Increment 1.
 
-- Session start UI with per-session policy acknowledgement
-- Manual capture form — the recruiter pastes what they reviewed themselves
-- Session history per req, with counts and notes
-- Duplicate check against the existing talent pool at capture time
+- Start a named supervised session with per-session policy acknowledgement
+- Pause / resume / complete, with interruption counts
+- Manual candidate capture — the operator records what they reviewed themselves
+- Duplicate detection against the persistent pool, with **reuse** offered
+- ReqCandidate creation for the active req, with fit rationale and assessments
+- Recruiter notes split: durable notes on the person, req-scoped on the evaluation
+- Skipped and close-call tracking, session-scoped (ADR-011)
+- Live session counts and capture rate; per-req session history
+- **Editable requirement weights** and must-have ↔ nice-to-have switching
+  (carried forward from Increment 2's known gaps)
+- 241 tests, strict typecheck, clean production build
 
-**Explicitly still prohibited:** unattended scraping, scheduled crawling,
-rate-limit bypass, automation evasion, bulk export, credential storage. These are
-not later increments — they are outside the product. See
-[LINKEDIN_POLICY](LINKEDIN_POLICY.md).
+**Still prohibited, and still not implemented:** unattended scraping, scheduled
+crawling, rate-limit bypass, automation evasion, bulk export, credential
+storage, automated LinkedIn navigation, outreach. These are not later increments
+— they are outside the product. See [LINKEDIN_POLICY](LINKEDIN_POLICY.md).
 
----
+**Deferred within this increment:** Candidate enrichment on reuse (approved as
+review-before-apply, ADR-013 / SB-2 — not implemented), editing or deleting a
+capture after the fact, promoting a close call into a full capture in one action, session
+duration/elapsed-time tracking, and bulk stage changes from the session surface.
 
 ## Increment 4 — Sourcing Intelligence
+
+- **SB-2 — Candidate enrichment, review-before-apply (carried from Increment 3).**
+  See Carried limitations. Governed by ADR-013.
 
 The payoff of the persistent-person model.
 
@@ -98,6 +112,28 @@ coupling. The store seam exists so this is a one-file change, not a rewrite.
 Known behaviour that is not acceptable long-term, tracked here rather than left
 as a code comment so it has a home and cannot be shipped as permanent by
 default.
+
+### SB-2 — Candidate enrichment is discarded, pending review-before-apply
+
+**Raised by:** Increment 3 (TASK-0057) · **Resolve in:** Increment 4 ·
+**Severity:** low — no data loss from the record, but real information is dropped
+
+Reusing an existing Candidate during capture does not update their record
+(ADR-012). If the operator learns a new email or a job change while sourcing,
+that information is discarded.
+
+Discarding is the correct *default* — a hasty later capture must not clobber
+facts established by a more careful earlier one — but it is not the end state.
+
+**Approved product rule (ADR-013): enrichment must be review-before-apply.** New
+information produces a **proposed change**, surfaced to the recruiter with the
+current value, the proposed value, and its source. The persistent record changes
+only on explicit approval. **Silent overwrite of a persistent Candidate fact is
+not acceptable in any increment.**
+
+**Definition of done:** an operator capturing a reused Candidate with new
+details sees a proposal they can accept or reject, and the pool is never
+modified without that decision.
 
 ### SB-1 — Authoring autosave is last-write-wins
 
