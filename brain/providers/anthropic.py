@@ -169,11 +169,19 @@ class AnthropicProvider(AIProvider):
             tokens = 0
             if response.usage:
                 tokens = response.usage.input_tokens + response.usage.output_tokens
+            # stop_reason == "max_tokens" means the model was cut off mid-answer.
+            # Callers need this: a truncated response may be missing its trailing
+            # structured verdict, which must never be read as approval.
+            stop_reason = str(getattr(response, "stop_reason", "") or "")
             return ProviderResponse(
                 content=content,
                 model=response.model,
                 provider=_PROVIDER_NAME,
                 tokens_used=tokens,
+                metadata={
+                    "stop_reason": stop_reason,
+                    "truncated": stop_reason == "max_tokens",
+                },
             )
 
         except _anthropic.AuthenticationError as exc:

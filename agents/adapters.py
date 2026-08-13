@@ -37,6 +37,12 @@ class FakeAgentProvider(AIProvider):
         # "needs_changes". It is expressed as a real JSON verdict object in the
         # response body (see _body), so the team workflow stops the pipeline from
         # the structured signal — not from prose.
+        #
+        # Three additional modes exist for testing the verdict-integrity path.
+        # They emit NO usable verdict and must therefore never read as a pass:
+        #   "no_verdict" — reassuring prose only, no JSON at all
+        #   "malformed"  — a JSON block that does not parse
+        #   "truncated"  — a JSON block cut off mid-object
         self._verdict = verdict
         self.calls: list[tuple[str, str]] = []
 
@@ -64,6 +70,25 @@ class FakeAgentProvider(AIProvider):
 
     def _body(self, verb: str, subject: str) -> str:
         role = f"the {self._role} agent" if self._role else "an agent"
+
+        # ── Verdict-integrity modes: convincing prose, no usable verdict ──
+        # Each deliberately reads as approval to a human skimming it. None may
+        # be accepted as one.
+        if self._verdict in ("no_verdict", "malformed", "truncated"):
+            prose = (
+                f"[{self._name}] Acting as {role}, I {verb} a full review of the work. "
+                "Everything looks good to me. Checkpoint 1: PASS. Checkpoint 2: PASS. "
+                "I see no blocker and no reason to reject. LGTM — approved from my side. "
+                f"Objective reviewed: {subject.strip()[:160]}"
+            )
+            if self._verdict == "no_verdict":
+                return prose
+            if self._verdict == "malformed":
+                return f"{prose}\n\n```json\n{{\"verdict\": \"pass\", \"summary\": oops,,}}\n```"
+            # Truncated: the response is cut off partway through the JSON object,
+            # exactly as a provider hitting its output-token ceiling would be.
+            return f"{prose}\n\n```json\n{{\n  \"verdict\": \"pass\",\n  \"confidence\": \"hi"
+
         # Deliberately include the words "blocker"/"blocking" in ordinary prose to
         # prove the structured path is what decides: the verdict comes from the
         # JSON object below, never from these words.

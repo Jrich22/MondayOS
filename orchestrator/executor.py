@@ -141,6 +141,11 @@ class ExecutionOrchestrator:
         autonomous_enabled:  Must be True for AUTONOMOUS mode to act.
         manual_provider:     Explicit provider name override (optional).
         max_tokens:          Max output tokens for the provider execution call.
+                             Raised from 2048 to 4096: thorough review responses
+                             were routinely hitting the old ceiling. The verdict
+                             is now requested first (agents.team) so it survives
+                             truncation regardless, but a budget that fits the
+                             whole answer keeps the prose useful to humans too.
     """
 
     def __init__(
@@ -153,7 +158,7 @@ class ExecutionOrchestrator:
         bus: "EventBus | None" = None,
         autonomous_enabled: bool = False,
         manual_provider: str = "",
-        max_tokens: int = 2048,
+        max_tokens: int = 4096,
         extra_context: str = "",
         update_task: bool = True,
     ) -> None:
@@ -286,6 +291,9 @@ class ExecutionOrchestrator:
 
         report.result_excerpt = response.content[:500]
         report.result_full = response.content or ""
+        meta = response.metadata or {}
+        report.stop_reason = str(meta.get("stop_reason", "") or "")
+        report.truncated = bool(meta.get("truncated", False))
 
         # ── 7. Result validation ─────────────────────────────────────────
         validation = self._validator.validate(plan, response, task)

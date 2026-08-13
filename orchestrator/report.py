@@ -96,6 +96,11 @@ class ExecutionReport:
     # Full, untruncated provider response, preserved for humans (structured
     # verdict parsing consumes this; result_excerpt remains a short preview).
     result_full: str = ""
+    # True when the provider stopped because it hit the output-token limit, so
+    # the response may be missing content it intended to emit. Verdict parsing
+    # uses this to explain an invalid verdict rather than silently passing.
+    truncated: bool = False
+    stop_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -9,6 +9,80 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### MondayOS v2.5 — Structured Verdict Integrity (2026-08-13)
+
+> **⚠️ BREAKING BEHAVIOUR CHANGE — read before upgrading.**
+> Agent runs that previously passed may now stop the pipeline. This is
+> intentional: they were passing without ever producing a verdict.
+
+**The defect.** The verdict pipeline failed *open*. A QA, Security, or Reviewer
+stage that produced no readable verdict was recorded as having **approved** the
+work. Five compounding causes:
+
+1. `agents/verdicts.py` — an absent verdict defaulted to `pass`
+   ("ambiguous prose never blocks"). Sound for avoiding false vetoes; backwards
+   for a quality gate, where "we could not read an answer" became "approved".
+2. `AgentVerdict.verdict` defaulted to `PASS`, so an **empty** provider response
+   passed.
+3. `normalize_verdict()` mapped an **unrecognised** token to `PASS`, so a
+   malformed structured verdict passed.
+4. `agents/team.py::_derive_verdict()` defaulted to `PASS` when a run carried no
+   verdict at all.
+5. `orchestrator/executor.py` capped output at 2048 tokens **and** the verdict
+   was requested *last*, so long reviews were cut off before emitting it — which
+   cause (1) then converted into a pass.
+
+Several real QA/Security/Reviewer runs recorded a `pass` this way. Verdicts
+recorded before this release should not be treated as evidence of review.
+
+**Fail closed.**
+- New `invalid` verdict state. Missing, malformed, truncated, or unrecognised
+  verdicts are `invalid` — **never** `pass`. `AgentVerdict` now defaults to
+  `invalid`, and carries a `reason` explaining why, plus an `is_valid` property.
+- **Only a well-formed JSON verdict object can grant a `pass`.** A labelled
+  `verdict: block` / `needs_changes` in prose is still honoured — a *stop*
+  signal is safe from any source — but a labelled `verdict: pass` is `invalid`.
+  Prose cannot approve, in any form: not "PASS", "Checkpoint PASS", "looks
+  good", nor the absence of veto language.
+- **Gating roles fail closed.** QA, Security, and Reviewer must each produce a
+  valid `pass` for the pipeline to advance. New team status `invalid-verdict`,
+  deliberately distinct from `blocked`, so operators can tell "vetoed" from
+  "never answered".
+
+**Truncation-safe by design.**
+- `VERDICT_INSTRUCTION` now demands the JSON block **first, before any prose**,
+  so the verdict structurally survives truncation — the prose is what is lost,
+  and prose is not what the workflow reads.
+- Provider `stop_reason` (Anthropic) / `finish_reason` (OpenAI) is captured into
+  `ProviderResponse.metadata`, carried through `ExecutionReport.truncated` and
+  `.stop_reason`, and passed to `parse_verdict(truncated=…)`.
+- `max_tokens` raised 2048 → 4096.
+
+**Preserved unchanged.** CPO and Lead Engineer remain productive roles, not
+gatekeepers — their verdict never halts the team, even a structured `block`.
+The human ApprovalGate, review-required team mode, audit logging, and the
+`FakeAgentProvider` harness all behave as before. Dry-run is exempt from verdict
+gating (it makes no provider call, so there is no response to carry a verdict).
+
+**Migration notes.**
+- Providers that do not emit the JSON object will now **fail** blocking stages
+  instead of passing. Update agent prompts or provider configuration before
+  upgrading, or expect previously-green pipelines to stop with
+  `invalid-verdict`.
+- `agents.team._derive_verdict` is **removed**, replaced by `_stage_verdict`
+  (what the stage returned, recorded for audit) and `_stops_pipeline` (whether
+  that halts the run). External callers must migrate.
+- `normalize_verdict()` returns `invalid` rather than `pass` for unknown input.
+- Stage verdicts for CPO / Lead Engineer may now read `invalid` where they
+  previously read `pass`. Audit fidelity improved; gating unchanged.
+- `max_tokens` 2048 → 4096 raises per-call provider cost.
+- Six existing tests changed semantics (rewritten, not deleted); the
+  no-false-veto guarantee they protected is still asserted.
+
+`FakeAgentProvider` gains three failure modes for testing this path —
+`no_verdict`, `malformed`, `truncated` — each emitting convincing
+approval-sounding prose with no usable verdict.
+
 ### MondayOS v2.3 — Confluence Publishing Integration (2026-07-07)
 Adds Confluence as an outbound documentation publishing target. **MondayOS
 remains the system of record** — content flows one way (MondayOS → Confluence),
