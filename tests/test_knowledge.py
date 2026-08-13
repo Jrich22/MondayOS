@@ -1,6 +1,8 @@
 """Tests for the knowledge module."""
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -513,3 +515,185 @@ class TestKnowledgeStore:
         store2 = KnowledgeStore(project_root=self.tmp_path)
         loaded = store2.get(entry_id)
         assert loaded.title == "Persisted entry"
+
+
+# ===========================================================================
+# TestKnowledgeIdAllocation
+# ===========================================================================
+
+class TestKnowledgeIdAllocation:
+    """
+    ID allocation must never reissue an ID that already exists on disk.
+
+    The counter in .sequences.json only records allocations made through this
+    process. Entries written on another branch or checkout are invisible to
+    it, so a lagging counter would reissue a live ID — the cause of the
+    RES-0100 duplicate. Allocation therefore takes
+    max(counter, highest_on_disk) + 1.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path: Path) -> None:
+        self.store = KnowledgeStore(project_root=tmp_path)
+        self.tmp_path = tmp_path
+
+    def _new_entry(self, entry_type: KnowledgeType = KnowledgeType.RESEARCH) -> KnowledgeEntry:
+        return KnowledgeEntry(
+            id="",
+            entry_type=entry_type,
+            title="Allocation probe",
+            status=LifecycleStatus.ACTIVE,
+            created_at=_now(),
+            components=["core"],
+            tags=["test"],
+            body="Body.",
+            summary="Summary.",
+        )
+
+    def _research_dir(self) -> Path:
+        d = self.tmp_path / "knowledge" / "research"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _write_raw(self, name: str, content: str = "not valid frontmatter") -> Path:
+        path = self._research_dir() / name
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def _set_counter(self, **counters: int) -> None:
+        path = self.tmp_path / "knowledge" / ".sequences.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(counters), encoding="utf-8")
+
+    def _reload(self) -> KnowledgeStore:
+        return KnowledgeStore(project_root=self.tmp_path)
+
+    # --- empty store ----------------------------------------------------
+
+    def test_empty_store_allocates_first_id(self) -> None:
+        assert self.store.add(self._new_entry()) == "RES-0001"
+
+    def test_empty_store_with_no_knowledge_dir(self) -> None:
+        """A store booted against an empty project must still allocate."""
+        fresh = KnowledgeStore(project_root=self.tmp_path / "nonexistent")
+        assert fresh.add(self._new_entry()) == "RES-0001"
+
+    # --- normal counter path --------------------------------------------
+
+    def test_normal_counter_path_increments(self) -> None:
+        first = self.store.add(self._new_entry())
+        second = self.store.add(self._new_entry())
+        assert (first, second) == ("RES-0001", "RES-0002")
+
+    def test_counter_ahead_of_disk_is_respected(self) -> None:
+        """A counter above disk wins — IDs are never reused after deletion."""
+        self._set_counter(RES=50)
+        assert self._reload().add(self._new_entry()) == "RES-0051"
+
+    # --- stale counter below highest on-disk id -------------------------
+
+    def test_stale_counter_below_disk_heals(self) -> None:
+        """The RES-0100 scenario: counter says 99, RES-0104 exists on disk."""
+        self._write_raw("RES-0104.md")
+        self._set_counter(RES=99)
+        assert self._reload().add(self._new_entry()) == "RES-0105"
+
+    def test_stale_counter_does_not_overwrite_existing_file(self) -> None:
+        existing = self._write_raw("RES-0104.md", "original content")
+        self._set_counter(RES=99)
+        self._reload().add(self._new_entry())
+        assert existing.read_text(encoding="utf-8") == "original content"
+
+    def test_missing_counter_heals_from_disk(self) -> None:
+        """The first ledger incident: records existed with no counter at all."""
+        self._write_raw("RES-0042.md")
+        assert self._reload().add(self._new_entry()) == "RES-0043"
+
+    def test_healed_counter_is_persisted(self) -> None:
+        self._write_raw("RES-0104.md")
+        self._set_counter(RES=99)
+        self._reload().add(self._new_entry())
+        seq = json.loads((self.tmp_path / "knowledge" / ".sequences.json").read_text())
+        assert seq["RES"] == 105
+
+    # --- no duplicate allocation ----------------------------------------
+
+    def test_no_duplicate_allocation_across_many_adds(self) -> None:
+        ids = [self.store.add(self._new_entry()) for _ in range(25)]
+        assert len(set(ids)) == 25
+
+    def test_no_duplicate_when_counter_reset_between_instances(self) -> None:
+        """Simulates a branch switch reverting .sequences.json under live files."""
+        issued = [self.store.add(self._new_entry()) for _ in range(3)]
+        self._set_counter(RES=0)  # counter rolled back; files remain
+        issued.append(self._reload().add(self._new_entry()))
+        assert len(set(issued)) == 4
+        assert issued[-1] == "RES-0004"
+
+    def test_allocation_is_per_type(self) -> None:
+        self._write_raw("RES-0090.md")
+        store = self._reload()
+        assert store.add(self._new_entry(KnowledgeType.RESEARCH)) == "RES-0091"
+        assert store.add(self._new_entry(KnowledgeType.PATTERN)) == "PAT-0001"
+
+    # --- malformed / unreadable entries ---------------------------------
+
+    def test_malformed_entry_still_reserves_its_id(self) -> None:
+        """
+        A file that cannot be parsed is invisible to the index but its
+        filename still claims the ID, so allocation must skip past it.
+        """
+        self._write_raw("RES-0007.md", "{{{ not parseable at all")
+        assert self._reload().add(self._new_entry()) == "RES-0008"
+
+    def test_empty_file_reserves_its_id(self) -> None:
+        self._write_raw("RES-0011.md", "")
+        assert self._reload().add(self._new_entry()) == "RES-0012"
+
+    def test_non_entry_filenames_are_ignored(self) -> None:
+        for name in ("README.md", "RES-notanumber.md", "RES-0009-backup.md", "notes.txt"):
+            self._write_raw(name)
+        assert self._reload().add(self._new_entry()) == "RES-0001"
+
+    def test_unrelated_prefix_does_not_affect_allocation(self) -> None:
+        (self.tmp_path / "knowledge" / "decisions").mkdir(parents=True, exist_ok=True)
+        (self.tmp_path / "knowledge" / "decisions" / "DEC-0077.md").write_text("x")
+        assert self._reload().add(self._new_entry()) == "RES-0001"
+
+    def test_entry_in_unexpected_directory_is_counted(self) -> None:
+        """Recursive scan — forward-compatible with a future runtime/ path."""
+        nested = self.tmp_path / "knowledge" / "runtime" / "research"
+        nested.mkdir(parents=True, exist_ok=True)
+        (nested / "RES-0200.md").write_text("x", encoding="utf-8")
+        assert self._reload().add(self._new_entry()) == "RES-0201"
+
+    # --- monotonicity ---------------------------------------------------
+
+    def test_next_id_is_monotonic_across_instances(self) -> None:
+        seen: list[int] = []
+        for _ in range(5):
+            entry_id = self._reload().add(self._new_entry())
+            seen.append(int(entry_id.split("-")[1]))
+        assert seen == sorted(seen)
+        assert len(set(seen)) == len(seen)
+
+    def test_monotonic_despite_repeated_counter_rollback(self) -> None:
+        seen: list[int] = []
+        for _ in range(5):
+            self._set_counter(RES=0)  # counter clobbered before every add
+            entry_id = self._reload().add(self._new_entry())
+            seen.append(int(entry_id.split("-")[1]))
+        assert seen == [1, 2, 3, 4, 5]
+
+    def test_deleted_entry_id_is_not_reissued(self) -> None:
+        """Counter still guards IDs whose files were removed."""
+        first = self.store.add(self._new_entry())
+        self.store.remove(first)
+        assert self._reload().add(self._new_entry()) != first
+
+    # --- id format preserved --------------------------------------------
+
+    def test_healed_id_keeps_four_digit_format(self) -> None:
+        self._write_raw("RES-0104.md")
+        self._set_counter(RES=99)
+        assert re.match(r"^RES-\d{4}$", self._reload().add(self._new_entry()))

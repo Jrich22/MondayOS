@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -226,11 +227,49 @@ class KnowledgeStore:
         )
 
     def _next_id(self, entry_type: KnowledgeType) -> EntityId:
+        """
+        Allocate the next ID for a type, healing a stale counter.
+
+        The counter is the fast path, but it only reflects allocations made
+        through this process. Entries written on another branch or checkout
+        are invisible to it, so a counter that lags behind disk would reissue
+        a live ID — this has produced two duplicate-ID incidents (see
+        knowledge/KNOWLEDGE_LEDGER_REPAIR.md and RES-0100). Taking the max of
+        the two makes the counter an optimisation rather than the sole
+        authority.
+        """
         prefix = _TYPE_PREFIXES[entry_type]
-        next_seq = self._sequences.get(prefix, 0) + 1
+        counter = self._sequences.get(prefix, 0)
+        next_seq = max(counter, self._highest_id_on_disk(prefix)) + 1
         self._sequences[prefix] = next_seq
         self._save_sequences()
         return f"{prefix}-{next_seq:04d}"
+
+    def _highest_id_on_disk(self, prefix: str) -> int:
+        """
+        Highest sequence number for `prefix` among entry files on disk.
+
+        Reads filenames rather than file contents: _write_file names every
+        entry {ID}.md, so the filename is the record of which IDs are taken,
+        and an entry whose body is malformed or unreadable still reserves its
+        ID. Scans recursively so entries filed under an unexpected directory
+        are still counted.
+        """
+        if not self._knowledge_dir.exists():
+            return 0
+
+        pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
+        highest = 0
+        try:
+            paths = self._knowledge_dir.rglob(f"{prefix}-*.md")
+        except OSError:
+            return 0
+
+        for path in paths:
+            match = pattern.match(path.stem)
+            if match:
+                highest = max(highest, int(match.group(1)))
+        return highest
 
     def _write_file(self, entry: KnowledgeEntry) -> None:
         type_dir = self._knowledge_dir / _TYPE_DIRS[entry.entry_type]
