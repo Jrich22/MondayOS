@@ -60,6 +60,12 @@ const ReqDetail: FC = () => {
             {req.team} · {req.location} · {req.workModel} · Hiring manager: {req.hiringManager || "—"}
           </p>
         </div>
+        <Link
+          to={`/reqs/${req.id}/edit`}
+          className="rounded-lg border border-line px-3 py-2 text-sm text-ink-muted transition-colors hover:border-line-strong hover:text-ink"
+        >
+          Edit requisition
+        </Link>
       </header>
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">

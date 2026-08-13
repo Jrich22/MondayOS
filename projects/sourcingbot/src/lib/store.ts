@@ -19,6 +19,8 @@ import type {
   SourcingSession,
 } from "./types";
 import { isAlreadyOnReq } from "./req-candidate";
+import { markSaved, newDraftReq, suggestReqCode } from "./req";
+import { newDraftBrief } from "./brief";
 import { seedState } from "./seed";
 
 const STORAGE_KEY = "sourcingbot.workspace.v1";
@@ -201,6 +203,60 @@ export function updateSession(session: SourcingSession): void {
     sessions: state.sessions.map((s) => (s.id === session.id ? session : s)),
   };
   emit();
+}
+
+// ---------------------------------------------------------------------------
+// Increment 2 — authoring
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a new draft requisition with its empty brief, in one operation.
+ *
+ * A req and its brief are created together deliberately: every authoring
+ * surface reads both, and a req without a brief would force every consumer to
+ * handle a half-existing state that has no product meaning.
+ */
+export function createDraftReq(): { req: Req; brief: SourcingBrief } {
+  const req = newDraftReq(suggestReqCode(state.reqs));
+  const brief = newDraftBrief(req.id);
+  state = {
+    ...state,
+    reqs: [...state.reqs, req],
+    briefs: [...state.briefs, brief],
+  };
+  emit();
+  return { req, brief };
+}
+
+/**
+ * Persist an authoring edit and stamp the save time.
+ *
+ * The single write path for the authoring surface: taking req and brief
+ * together keeps `lastSavedAt` honest, since a save that wrote one but not the
+ * other would report the req as saved while brief edits were still pending.
+ */
+export function saveReqDraft(req: Req, brief?: SourcingBrief): Req {
+  const saved = markSaved(req);
+  state = {
+    ...state,
+    reqs: state.reqs.map((r) => (r.id === saved.id ? saved : r)),
+    briefs: brief
+      ? state.briefs.some((b) => b.id === brief.id)
+        ? state.briefs.map((b) => (b.id === brief.id ? brief : b))
+        : [...state.briefs, brief]
+      : state.briefs,
+  };
+  emit();
+  return saved;
+}
+
+/** Everything the authoring surface needs for one req, or null if unknown. */
+export function reqWorkspace(
+  reqId: string,
+): { req: Req; brief: SourcingBrief | undefined } | null {
+  const req = state.reqs.find((r) => r.id === reqId);
+  if (!req) return null;
+  return { req, brief: state.briefs.find((b) => b.reqId === reqId) };
 }
 
 // ---------------------------------------------------------------------------

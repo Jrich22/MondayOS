@@ -44,6 +44,45 @@ export interface Req {
   createdAt: string;
   updatedAt: string;
   closedAt?: string;
+
+  // ── Increment 2: authoring ────────────────────────────────────────────
+  // All optional so requisitions written by Increment 1 keep loading. See
+  // docs/DECISIONS.md ADR-007.
+
+  /** Full job description, as the hiring team would publish it. */
+  jobDescription?: string;
+  /** Notes from the hiring-manager intake conversation. */
+  intakeNotes?: string;
+  /** What this search is trying to achieve — the recruiter's own targets. */
+  sourcingGoals?: SourcingGoals;
+  /**
+   * Last time this req was persisted by the authoring surface. Distinct from
+   * `updatedAt`, which any mutation touches: this is what the draft indicator
+   * displays, so "saved 12s ago" means what the recruiter thinks it means.
+   */
+  lastSavedAt?: string;
+  /**
+   * Monotonic edit counter, incremented by every `updateReq`.
+   *
+   * The unsaved-changes indicator compares this against `savedRev` rather than
+   * comparing timestamps. Timestamps have millisecond resolution, so an edit
+   * made in the same millisecond as a save compared equal and the surface
+   * reported "all changes saved" over a pending edit. Whether an edit is
+   * persisted is not a question clock resolution should be able to answer.
+   */
+  rev?: number;
+  /** The `rev` that was last written to the store. */
+  savedRev?: number;
+}
+
+/** Recruiter-set targets for a search. Advisory — nothing enforces them. */
+export interface SourcingGoals {
+  /** Candidates the recruiter intends to source into the pipeline. */
+  targetCandidates?: number;
+  /** Candidates they intend to contact. */
+  targetContacts?: number;
+  /** Free-text framing: "two strong staff-level profiles by end of month". */
+  notes?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +119,20 @@ export interface SourcingBrief {
   outreachAngle: string;
   createdAt: string;
   updatedAt: string;
+
+  // ── Increment 2: targeting ────────────────────────────────────────────
+  // Optional for backward compatibility with Increment 1 briefs.
+
+  /** Industries to source from. */
+  targetIndustries?: string[];
+  /** Industries to avoid — conflicts, non-transferable domains. */
+  excludedIndustries?: string[];
+  /**
+   * Narrative experience guidance. `seniority` is the coarse band used for
+   * filtering; this is the nuance a band cannot carry ("depth over breadth —
+   * eight years on one hard problem beats fifteen across five teams").
+   */
+  experienceGuidance?: string;
 }
 
 // ---------------------------------------------------------------------------

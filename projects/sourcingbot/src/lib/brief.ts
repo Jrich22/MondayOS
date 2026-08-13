@@ -20,6 +20,9 @@ export interface NewBriefInput {
   keywords?: string[];
   locations?: string[];
   outreachAngle?: string;
+  targetIndustries?: string[];
+  excludedIndustries?: string[];
+  experienceGuidance?: string;
 }
 
 const MIN_WEIGHT = 1;
@@ -53,9 +56,49 @@ export function newBrief(input: NewBriefInput): SourcingBrief {
     keywords: dedupeTrimmed(input.keywords),
     locations: dedupeTrimmed(input.locations),
     outreachAngle: input.outreachAngle?.trim() ?? "",
+    targetIndustries: dedupeTrimmed(input.targetIndustries),
+    excludedIndustries: dedupeTrimmed(input.excludedIndustries),
+    experienceGuidance: input.experienceGuidance?.trim() ?? "",
     createdAt: at,
     updatedAt: at,
   };
+}
+
+/** A blank brief for a newly created req, ready to author into. */
+export function newDraftBrief(reqId: string): SourcingBrief {
+  return newBrief({ reqId, headline: "", seniority: "mid" });
+}
+
+/** List fields the authoring surface edits as tag inputs. */
+export type BriefListField =
+  | "targetCompanies"
+  | "excludedCompanies"
+  | "targetIndustries"
+  | "excludedIndustries"
+  | "keywords"
+  | "locations";
+
+/** Add a value to one of the brief's list fields, deduped and version-bumped. */
+export function addToList(
+  brief: SourcingBrief,
+  field: BriefListField,
+  value: string,
+): SourcingBrief {
+  const clean = value.trim();
+  if (!clean) return brief;
+  const current = brief[field] ?? [];
+  if (current.some((v) => v.toLowerCase() === clean.toLowerCase())) return brief;
+  return reviseBrief(brief, { [field]: [...current, clean] });
+}
+
+/** Remove a value from one of the brief's list fields. */
+export function removeFromList(
+  brief: SourcingBrief,
+  field: BriefListField,
+  value: string,
+): SourcingBrief {
+  const current = brief[field] ?? [];
+  return reviseBrief(brief, { [field]: current.filter((v) => v !== value) });
 }
 
 /**
@@ -77,6 +120,9 @@ export function reviseBrief(
       | "keywords"
       | "locations"
       | "outreachAngle"
+      | "targetIndustries"
+      | "excludedIndustries"
+      | "experienceGuidance"
     >
   >,
 ): SourcingBrief {
