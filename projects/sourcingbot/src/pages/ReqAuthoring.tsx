@@ -153,7 +153,7 @@ const ReqAuthoring: FC = () => {
         />
         <div className="mt-4 text-center">
           <Link to="/" className="text-sm text-brand-400 hover:underline">
-            Back to workspace
+            Back to requisitions
           </Link>
         </div>
       </div>
@@ -195,8 +195,8 @@ const ReqAuthoring: FC = () => {
     <div className="mx-auto max-w-6xl">
       <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
-          <Link to="/" className="text-sm text-ink-muted hover:text-ink">
-            ← Workspace
+          <Link to="/reqs" className="text-sm text-ink-muted hover:text-ink">
+            ← Requisitions
           </Link>
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <span className="font-mono text-xs text-ink-faint">{req.code || "unassigned"}</span>

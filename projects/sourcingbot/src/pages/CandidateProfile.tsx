@@ -24,7 +24,7 @@ const CandidateProfile: FC = () => {
       <div className="mx-auto max-w-3xl">
         <EmptyState title="Person not found" body="This record may have been removed." />
         <div className="mt-4 text-center">
-          <Link to="/candidates" className="text-sm text-brand-400 hover:underline">
+          <Link to="/" className="text-sm text-brand-400 hover:underline">
             Back to Talent
           </Link>
         </div>
@@ -37,7 +37,7 @@ const CandidateProfile: FC = () => {
 
   return (
     <div className="mx-auto max-w-4xl">
-      <Link to="/candidates" className="text-sm text-ink-muted hover:text-ink">
+      <Link to="/" className="text-sm text-ink-muted hover:text-ink">
         ← Talent
       </Link>
 

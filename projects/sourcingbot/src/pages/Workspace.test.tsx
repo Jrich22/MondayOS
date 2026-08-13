@@ -6,12 +6,11 @@
  * is the model rule made visible in the UI.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
+import { render, screen, cleanup, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { AppShell } from "@/components/shell/AppShell";
 import Workspace from "./Workspace";
 import ReqDetail from "./ReqDetail";
-import Candidates from "./Candidates";
 import CandidateProfile from "./CandidateProfile";
 import { __seedStore, __resetStore } from "@/lib/store";
 
@@ -20,9 +19,8 @@ function renderAt(path: string) {
     <MemoryRouter initialEntries={[path]}>
       <Routes>
         <Route element={<AppShell />}>
-          <Route path="/" element={<Workspace />} />
+          <Route path="/reqs" element={<Workspace />} />
           <Route path="/reqs/:reqId" element={<ReqDetail />} />
-          <Route path="/candidates" element={<Candidates />} />
           <Route path="/candidates/:candidateId" element={<CandidateProfile />} />
         </Route>
       </Routes>
@@ -38,14 +36,16 @@ afterEach(cleanup);
 
 describe("application shell", () => {
   it("renders the product identity and navigation", () => {
-    renderAt("/");
+    renderAt("/reqs");
     expect(screen.getAllByText("sourcingBOT").length).toBeGreaterThan(0);
-    expect(screen.getByText("Workspace")).toBeTruthy();
-    expect(screen.getByText("Talent")).toBeTruthy();
+    // Scoped to the nav: "Requisitions" also appears as a section title.
+    const nav = screen.getByRole("navigation");
+    expect(within(nav).getByText("Talent")).toBeTruthy();
+    expect(within(nav).getByText("Requisitions")).toBeTruthy();
   });
 
   it("always shows the supervision boundary", () => {
-    renderAt("/");
+    renderAt("/reqs");
     expect(screen.getByText(/human-initiated/i)).toBeTruthy();
     expect(screen.getByText(/no unattended scraping/i)).toBeTruthy();
   });
@@ -53,7 +53,7 @@ describe("application shell", () => {
 
 describe("Req Workspace", () => {
   it("lists requisitions with codes", () => {
-    renderAt("/");
+    renderAt("/reqs");
     expect(screen.getByText("Req Workspace")).toBeTruthy();
     expect(screen.getByText("REQ-014")).toBeTruthy();
     expect(screen.getByText("Staff Platform Engineer")).toBeTruthy();
@@ -61,7 +61,7 @@ describe("Req Workspace", () => {
 
   it("shows an empty state when there is no work", () => {
     __resetStore();
-    renderAt("/");
+    renderAt("/reqs");
     expect(screen.getByText(/No requisitions yet/i)).toBeTruthy();
   });
 });
@@ -77,19 +77,6 @@ describe("Req detail", () => {
   it("handles an unknown requisition without crashing", () => {
     renderAt("/reqs/does-not-exist");
     expect(screen.getByText(/Requisition not found/i)).toBeTruthy();
-  });
-});
-
-describe("Talent directory", () => {
-  it("lists each person once with a requisition count", () => {
-    renderAt("/candidates");
-    expect(screen.getAllByText("Priya Raman")).toHaveLength(1);
-    expect(screen.getByText("2 requisitions")).toBeTruthy();
-  });
-
-  it("surfaces talent concentration", () => {
-    renderAt("/candidates");
-    expect(screen.getByText(/Talent concentration/i)).toBeTruthy();
   });
 });
 

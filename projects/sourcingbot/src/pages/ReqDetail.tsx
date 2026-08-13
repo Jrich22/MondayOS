@@ -33,7 +33,7 @@ const ReqDetail: FC = () => {
         <EmptyState title="Requisition not found" body="This requisition may have been removed." />
         <div className="mt-4 text-center">
           <Link to="/" className="text-sm text-brand-400 hover:underline">
-            Back to workspace
+            Back to requisitions
           </Link>
         </div>
       </div>
@@ -45,8 +45,8 @@ const ReqDetail: FC = () => {
 
   return (
     <div className="mx-auto max-w-6xl">
-      <Link to="/" className="text-sm text-ink-muted hover:text-ink">
-        ← Workspace
+      <Link to="/reqs" className="text-sm text-ink-muted hover:text-ink">
+        ← Requisitions
       </Link>
 
       <header className="mb-6 mt-3 flex flex-wrap items-start justify-between gap-4">
