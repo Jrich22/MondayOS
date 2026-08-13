@@ -139,8 +139,30 @@ export interface SourcingBrief {
 // Candidate — the persistent person
 // ---------------------------------------------------------------------------
 
-/** How this person first entered the system. Audit-relevant. */
-export type CandidateOrigin = "manual-entry" | "referral" | "inbound" | "supervised-linkedin";
+/**
+ * How this person first entered the system. Audit-relevant.
+ *
+ * `supervised-session` records that a human reviewed this person during a
+ * supervised sourcing session. WHICH channel that session used is recorded on
+ * the session's `providerId`, not here — a person sourced through LinkedIn in
+ * 2026 and through a licensed integration in 2027 is the same fact about the
+ * same human, and stamping a channel onto them permanently would make the
+ * record wrong the moment the channel changed.
+ */
+export type CandidateOrigin =
+  | "manual-entry"
+  | "referral"
+  | "inbound"
+  | "supervised-session"
+  /**
+   * @deprecated Renamed to `supervised-session`. Retained in the union so
+   * workspaces written before the provider boundary still typecheck on load;
+   * `migrateWorkspace` in store.ts maps it forward. Never write this value.
+   */
+  | "supervised-linkedin";
+
+/** The origin recorded for a person first captured in a supervised session. */
+export const SUPERVISED_ORIGIN = "supervised-session" as const;
 
 export interface CandidateRole {
   title: string;
@@ -180,12 +202,28 @@ export type PipelineStage =
   | "advanced"
   | "rejected";
 
+/**
+ * Who put an option forward, as distinct from who decided it.
+ *
+ * `operator` means a human both proposed and decided. `agent` means something
+ * suggested it and a human still decided — the two are never collapsed, because
+ * "Claude found them, I chose them" and "I found them" are different facts and
+ * an audit needs to tell them apart years later.
+ */
+export type ProposedBy = "operator" | "agent";
+
 export interface StageEvent {
   from: PipelineStage | null;
   to: PipelineStage;
   at: string;
+  /**
+   * The human accountable for this decision. Always a named person — this IS
+   * the decider, which is why no separate `decidedBy` field exists here.
+   */
   by: string;
   reason: string;
+  /** Who proposed it. Absent on historical events, which were all `operator`. */
+  proposedBy?: ProposedBy;
 }
 
 /** Per-requirement assessment, referencing the brief version it was made against. */
@@ -216,7 +254,41 @@ export interface ReqCandidate {
 // Supervised LinkedIn sourcing session (boundary record only)
 // ---------------------------------------------------------------------------
 
-export type SessionStatus = "not-started" | "in-progress" | "paused" | "ended";
+/**
+ * `paused` and `halted` are deliberately separate states.
+ *
+ * A pause is the operator's own choice — a meeting, the end of a day. A halt is
+ * the platform telling you something: a warning, a restriction, a checkpoint, an
+ * unexpected page. Collapsing them would make the most important event in a
+ * session indistinguishable from stepping out for coffee, and would erase the
+ * one signal that should stop the work immediately. See ADR-017.
+ */
+export type SessionStatus = "not-started" | "in-progress" | "paused" | "halted" | "ended";
+
+/** What caused a session to stop for safety reasons. */
+export type HaltReason =
+  | "platform-warning"
+  | "rate-limit-notice"
+  | "checkpoint"
+  | "unexpected-page"
+  | "operator-stop";
+
+/**
+ * A record that a session was stopped by something other than ordinary work.
+ *
+ * Kept as a list rather than a single field: a session can be halted, resumed
+ * after the operator investigates, and halted again, and the sequence is the
+ * interesting part. One overwritten field would hide a pattern of repeated
+ * warnings — exactly the pattern that should end a session for good.
+ */
+export interface SessionHalt {
+  id: string;
+  at: string;
+  /** Whoever saw it first. An agent noticing a warning is a valid source. */
+  raisedBy: ProposedBy;
+  reason: HaltReason;
+  detail: string;
+}
 
 /**
  * Why the operator looked at someone and did not add them.
@@ -235,6 +307,15 @@ export interface SkippedCandidate {
   /** Worth revisiting if the pipeline thins out. */
   closeCall: boolean;
   at: string;
+
+  // ── Provider boundary ─────────────────────────────────────────────────
+  // Optional so Increment 1-3 skips keep loading; both default to the
+  // operator, which is what every historical skip was.
+
+  /** The named human who made this call. */
+  decidedBy?: string;
+  /** Who put the person forward for the decision. */
+  proposedBy?: ProposedBy;
 }
 
 /**
@@ -269,4 +350,25 @@ export interface SourcingSession {
   resumedAt?: string;
   /** How many times this session was paused — a proxy for interruption. */
   pauseCount?: number;
+
+  // ── Increment 4: provider boundary, halts, presence ───────────────────
+  // All optional so every earlier session keeps loading. See ADR-016/ADR-017.
+
+  /**
+   * The channel this session was conducted through — the durable provider
+   * attribution. Absent on sessions written before providers existed; those
+   * default to `manual`, which is what they necessarily were.
+   */
+  providerId?: string;
+  /** Safety stops, in order. See `SessionHalt`. */
+  halts?: SessionHalt[];
+  /**
+   * When the operator last confirmed they are present and watching.
+   *
+   * Recorded in this increment; NOT enforced by it. Enforcement — refusing
+   * agent writes outside the window and auto-pausing — arrives with the MCP
+   * surface in TASK-0061, because there is nothing to enforce against until
+   * something other than the operator can write. See ADR-017.
+   */
+  lastOperatorConfirmationAt?: string;
 }

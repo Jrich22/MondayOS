@@ -4,6 +4,246 @@ Newest first. Each records the decision, why, and what it costs.
 
 ---
 
+## ADR-017 — Attestations are human-only, and presence is enforced rather than promised
+
+**Status:** accepted · approved 2026-08-13 · TASK-0059, TASK-0061
+
+**Context.** Once Claude can write to sourcingBOT over MCP, the supervision
+record stops being self-evidently true. A `SourcingSession` asserts that a named
+human initiated and supervised a search. If the agent can create that record, the
+assertion is worth nothing — the system would be attesting to its own oversight.
+
+The first draft of the MCP surface included a `start_session` tool. That was
+wrong, and it is worth naming why: it is exactly the failure mode MondayOS
+TASK-0055 removed from reviewer verdicts, where a missing or malformed verdict
+defaulted to `pass`. A tool that lets the agent supply `operator` and
+`acknowledgedPolicy` is a fail-open default wearing a parameter list.
+
+**Decision.** Two rules, both mechanical.
+
+**1. Attestations are UI-only.** `start`, `resume`, and `complete` exist only in
+the interface, performed by a human. Over MCP, Claude may move a session toward
+*more* restriction — `pause` and `halt` — and never toward less. There is no
+`start_session` tool, and its absence is asserted by a test rather than left to
+reviewer vigilance.
+
+Claude may never assert operator identity or policy acknowledgement on the
+human's behalf. `resume` is included in the human-only set because resuming is
+re-attesting: it is the same claim, made again, about a session that stopped.
+`complete` is included because closing the record is what fixes its counts and
+its meaning.
+
+**2. Presence is enforced.** "No unattended sourcing" is unenforceable as
+written — a session left open overnight looks identical to a supervised one.
+`SourcingSession.lastOperatorConfirmationAt` and a **15-minute presence window**
+make it checkable. Every MCP write requires `operatorPresent(session, now)`;
+outside the window the write fails with `operator_absent` **and the session
+auto-pauses**. An explicit "I'm still here" control refreshes it, as do
+designated ordinary UI interactions.
+
+The auto-pause is the load-bearing half. Refusing the write alone would leave a
+session that still claims to be live while nobody is watching it; pausing makes
+the record match reality without a human having to notice.
+
+**Related: `halted` is not `paused`.** A pause is the operator's choice. A halt
+is the platform telling you something — a warning, a restriction, a checkpoint,
+an unexpected interstitial — and it is raised by whoever sees it first,
+operator or agent. They are separate states because collapsing them would let the
+most important event in a session be indistinguishable from stepping out for
+coffee. Resuming from `halted` requires a fresh acknowledgement; resuming from
+`paused` does not.
+
+**Alternatives rejected.** *Let Claude start sessions with the operator name
+passed through* — the name proves nothing about who typed it. *A heartbeat the
+agent sends* — the agent is not the thing whose presence is in question.
+*Continuous webcam or focus detection* — disproportionate, and it measures
+attention rather than the accountability the record actually needs. *Refuse
+writes on expiry without pausing* — leaves a live-looking session with nobody
+present, the exact misrepresentation this ADR exists to prevent.
+
+**Consequences.** A recruiter who steps away mid-session comes back to a paused
+session and one extra click; that friction is the feature, and 15 minutes is a
+first guess that should be revisited against real usage. Claude cannot clean up
+after itself by completing a finished session, so stale in-progress sessions are
+possible — the presence auto-pause is what keeps them from claiming to be live.
+`proposedBy` and `decidedBy` are recorded separately on every capture and skip,
+so "Claude suggested, I decided" stays legible in the record forever, which is
+the only form of this claim that survives an audit.
+
+---
+
+## ADR-016 — One local host owns persistence; the SPA and MCP are both clients
+
+**Status:** accepted · approved 2026-08-13 · TASK-0060, TASK-0061
+
+**Context.** sourcingBOT's workspace lives in `localStorage`. An MCP server is a
+Node process and cannot reach it. Any design where Claude reads a brief or writes
+a candidate needs the data somewhere both can see, and the SPA needs to update
+live as those writes land.
+
+**Decision.** A single local process, `sourcingbot-host`, owns
+`~/.sourcingbot/workspace.json` and is the only writer. It serves the SPA over
+127.0.0.1 HTTP plus SSE, and serves Claude Code over stdio MCP. Both are clients
+of the same process; neither owns the file.
+
+**Single-writer is the whole point.** Two processes appending to one JSON file
+lose updates — not rarely, but whenever two writes interleave. Making the host
+the sole writer removes that class of bug structurally instead of guarding
+against it. SSE follows from the same choice: the one writer already knows when
+state changed, so the SPA is pushed to rather than polling.
+
+**The host gets no privileged write path.** It calls the same
+`captureCandidate` → `commitCapture`, `recordSkip`, `pauseSession` the UI calls.
+This is the `QuickSession` rule again — no caller gets a shortcut, least of all
+the automated one — and it is what makes the MCP surface safe to extend: a new
+tool cannot invent a way to write that the domain would refuse. The existing
+`lib/*` modules are already React-free and pure, which is why the host can import
+them unchanged.
+
+**Degradation is explicit.** With no host running, the SPA falls back to
+`localStorage` and `ManualProvider` and says so on screen. A silent fallback
+would let a recruiter work for an hour in a store Claude cannot see.
+
+**Alternatives rejected.**
+
+*File System Access API, no process* — genuinely viable, and the fallback if the
+host proves heavy: the SPA holds a directory handle, Claude reads and writes
+files. Rejected because it is Chromium-only, needs a re-granted permission,
+polls, and enforces no schema at the boundary — and because MCP is the mechanism
+Claude Code actually supports.
+
+*Two writers with file locking* — advisory locks on a JSON blob are a lot of
+correctness risk to avoid one process.
+
+*A real database* — premature. One JSON document matches the current data volume,
+stays inspectable by hand, and the store seam makes it replaceable later.
+
+*Remote MCP server* — would reach claude.ai and Cowork too, but puts a recruiting
+workspace on a network for a workflow that is local by nature.
+
+**Consequences.** sourcingBOT stops being a pure browser app; there is now a
+process to start, and the README must say so. Writes are atomic (temp file +
+rename) and a corrupt file makes the host refuse to start rather than silently
+reseeding — losing real sourcing work to a parse error is the worst outcome
+available here. Concurrency is document-level and optimistic: stale writes are
+rejected, never merged. The loopback bind is the only access boundary; the host
+claims no authentication, and a future multi-user version needs a different
+design rather than a flag.
+
+---
+
+## ADR-015 — Agent-operated LinkedIn sourcing is accepted with known policy risk
+
+**Status:** **accepted with explicit, documented risk.** Approved by the product
+owner 2026-08-13, having been shown the finding below. Binding on every
+increment that touches agent-operated sourcing.
+
+**Context.** The target workflow has Claude, via the Claude-in-Chrome extension,
+operate an open LinkedIn Recruiter session alongside a supervising recruiter:
+proposing filters, reading visible results, opening profiles, and evaluating
+them against the approved brief.
+
+An investigation of the actual integration boundary (2026-08-13) established two
+things.
+
+**First, the mechanism is real and supported by Anthropic.** The Claude in Chrome
+extension exposes browser control to Claude Code as an MCP server
+(`claude-in-chrome`), documented at code.claude.com/docs/en/chrome. It runs in a
+visible window, reuses the human's existing login, and pauses for logins and
+CAPTCHAs. sourcingBOT can expose its own MCP server alongside it. No browser
+security boundary is crossed, no credential is handled by us, and — importantly —
+**no browser automation code enters this codebase.** Claude Code drives the
+browser; sourcingBOT only records decisions.
+
+**Second, LinkedIn prohibits it.** The
+[Prohibited software and extensions](https://www.linkedin.com/help/linkedin/answer/a1341387)
+page and [User Agreement §8.2](https://www.linkedin.com/legal/user-agreement) ban:
+
+> third party software, including "crawlers", bots, **browser plug-ins, or
+> browser extensions that scrape, modify the appearance of, or automate activity
+> on LinkedIn's website**
+
+**The policy contains no exception for human supervision.** This is the load-
+bearing sentence of this ADR. Every control this product has built — named
+operator, per-session acknowledgement, visible browser, human decision on every
+profile, immediate halt on warnings — is a genuine *ethical* control and none of
+them satisfies LinkedIn's rule, because LinkedIn is not prohibiting *unsupervised*
+automation. It is prohibiting *extension-driven activity*. A supervised extension
+is still an extension.
+
+The extension does not special-case LinkedIn: its bundle contains no blocklist
+covering it. Technical possibility is not permission, and this ADR exists so that
+distinction is never quietly lost.
+
+**Decision.** Build it, with the risk recorded here rather than absorbed
+silently, and under four constraints:
+
+1. **The domain model stays provider-neutral.** No LinkedIn-specific concept
+   enters `Candidate`, `ReqCandidate`, or `SourcingSession`. The channel is a
+   `providerId` on the session (ADR-016).
+2. **The acknowledgement must describe what actually happens** — see the
+   correction below.
+3. **A halt is a first-class session state.** Any platform warning, restriction,
+   checkpoint, or unexpected interstitial stops the session immediately and
+   requires a human to resume it.
+4. **The prohibitions hold unchanged.** No unattended or scheduled sourcing, no
+   rate-limit bypass, no CAPTCHA bypass, no automation-evasion, no bulk export of
+   profiles nobody opened. `supportsCapability()` still returns `false` for every
+   entry in `PROHIBITED_CAPABILITIES`.
+
+**The correction this forces.** The current `SUPERVISION_POLICY` has the operator
+attest:
+
+> "I will open and review each profile myself; sourcingBOT will not browse for me."
+
+Under an agent-operated session **that sentence becomes false.** Continuing to
+show it while Claude drives the browser would produce a signed record asserting
+human conduct that did not occur — precisely the misrepresentation the
+supervision boundary was built to prevent (ADR-004). The acknowledgement text is
+therefore **per provider**, and the agent-operated text must state plainly that
+Claude operates the browser, that the recruiter remains present throughout, that
+the recruiter makes every add/skip decision, and that the recruiter has been
+informed of the terms-of-service risk. Weakening the boundary is not the failure
+mode here; *keeping the old wording* would have been.
+
+**Alternatives rejected.**
+
+*Claude never touches LinkedIn (Tier 0)* — zero exposure, and it still removes
+the copy/paste problem, but it gives up search construction and result triage,
+which is most of the value.
+
+*Claude reads only the profile the human opened (Tier 1)* — materially lower
+exposure, since no navigation or pagination is automated, and it was the
+recommended option. Rejected in favour of the fuller workflow with the risk
+accepted knowingly.
+
+*Recruiter System Connect* — LinkedIn's sanctioned partner API for ATS
+write-back. This is the only path that makes the workflow *licensed* rather than
+tolerated, and it remains the correct destination. Rejected for now only because
+it requires a partner agreement that does not exist yet; ADR-016 exists to make
+that migration cheap when it does.
+
+*Do it and say nothing* — the option this ADR exists to foreclose.
+
+**Consequences, stated plainly.**
+
+- **LinkedIn may restrict or terminate the account** used for an agent-operated
+  session. Recruiter seats are contracted corporate licenses, so enforcement
+  lands on the client's account, not an anonymous one. This is the concrete cost
+  and it is not hypothetical.
+- The product cannot honestly market this as compliant. It is a supervised,
+  disclosed, human-present workflow that runs against LinkedIn's stated terms.
+- Any customer-facing deployment needs the customer to make this decision for
+  themselves, informed, in writing. A risk the vendor accepted does not transfer
+  to a client who was never told.
+- `ManualProvider` must remain fully functional and never become a degraded
+  path, because it is the fallback if LinkedIn enforces or the policy position
+  changes (ADR-016).
+- This ADR is reviewed if LinkedIn's terms change, if enforcement is observed, or
+  if RSC access is obtained — whichever comes first.
+
+---
+
 ## ADR-014 — The Candidate Workspace is home, and leads with conclusions
 
 **Status:** accepted · Candidate Workspace

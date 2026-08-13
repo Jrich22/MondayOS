@@ -21,7 +21,9 @@ import type {
 import { isAlreadyOnReq } from "./req-candidate";
 import { markSaved, newDraftReq, suggestReqCode } from "./req";
 import { newDraftBrief } from "./brief";
-import { activeSessionFor, sessionsForReq } from "./linkedin";
+import { activeSessionFor, sessionsForReq } from "./sourcing-session";
+import { DEFAULT_PROVIDER_ID } from "./provider";
+import { SUPERVISED_ORIGIN } from "./types";
 import type { CaptureResult } from "./capture";
 import { seedState } from "./seed";
 
@@ -47,6 +49,38 @@ let state: WorkspaceState = load();
 let snapshot: WorkspaceState = state;
 const listeners = new Set<() => void>();
 
+/**
+ * Bring a stored workspace forward to the current model.
+ *
+ * Two renames happened when the provider boundary landed (ADR-016), and both
+ * are handled here rather than at every read site:
+ *
+ *   `origin: "supervised-linkedin"` → `"supervised-session"`
+ *   sessions with no `providerId`   → `"manual"`
+ *
+ * Neither is a guess. A person captured in a supervised session was supervised
+ * regardless of which channel it ran through, and every session written before
+ * providers existed was a recruiter browsing on their own, because no other
+ * option existed. The migration is a spelling change over data whose meaning is
+ * unchanged.
+ *
+ * Exported so a test can prove an Increment-1-shaped workspace survives the
+ * round trip, rather than that claim resting on the loader being called.
+ */
+export function migrateWorkspace(parsed: Partial<WorkspaceState>): WorkspaceState {
+  return {
+    reqs: parsed.reqs ?? [],
+    briefs: parsed.briefs ?? [],
+    candidates: (parsed.candidates ?? []).map((c) =>
+      c.origin === "supervised-linkedin" ? { ...c, origin: SUPERVISED_ORIGIN } : c,
+    ),
+    reqCandidates: parsed.reqCandidates ?? [],
+    sessions: (parsed.sessions ?? []).map((s) =>
+      s.providerId ? s : { ...s, providerId: DEFAULT_PROVIDER_ID },
+    ),
+  };
+}
+
 function load(): WorkspaceState {
   if (typeof localStorage === "undefined") return seedState();
   try {
@@ -54,13 +88,7 @@ function load(): WorkspaceState {
     if (!raw) return seedState();
     const parsed = JSON.parse(raw) as Partial<WorkspaceState>;
     if (!parsed || typeof parsed !== "object") return seedState();
-    return {
-      reqs: parsed.reqs ?? [],
-      briefs: parsed.briefs ?? [],
-      candidates: parsed.candidates ?? [],
-      reqCandidates: parsed.reqCandidates ?? [],
-      sessions: parsed.sessions ?? [],
-    };
+    return migrateWorkspace(parsed);
   } catch {
     return seedState();
   }

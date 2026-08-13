@@ -27,7 +27,7 @@ import type {
 } from "./types";
 import { findPossibleDuplicates, newCandidate } from "./candidate";
 import { isAlreadyOnReq, newReqCandidate, withFitScore, assess } from "./req-candidate";
-import { recordManualCapture, SupervisionRequiredError } from "./linkedin";
+import { recordManualCapture, SupervisionRequiredError } from "./sourcing-session";
 
 /** What the operator types in, having reviewed the profile themselves. */
 export interface CaptureInput {
@@ -93,7 +93,7 @@ export function draftCandidateFrom(input: CaptureInput): Candidate {
     linkedInUrl: input.linkedInUrl,
     roles,
     skills: input.skills,
-    origin: "supervised-linkedin",
+    origin: "supervised-session",
     notes: input.personNotes,
   });
 }

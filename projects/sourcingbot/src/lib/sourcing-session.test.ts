@@ -8,7 +8,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
   PROHIBITED_CAPABILITIES,
-  SUPERVISION_POLICY,
   SupervisionRequiredError,
   completeSession,
   endSession,
@@ -16,7 +15,8 @@ import {
   sessionsForReq,
   startSession,
   supportsCapability,
-} from "./linkedin";
+} from "./sourcing-session";
+import { ManualProvider } from "./providers/manual";
 import { newCandidate } from "./candidate";
 import { __resetIdCounter } from "./ids";
 
@@ -54,27 +54,27 @@ describe("supervision is required to start a session", () => {
   });
 
   it("states a policy the operator must accept", () => {
-    expect(SUPERVISION_POLICY.length).toBeGreaterThan(0);
-    expect(SUPERVISION_POLICY.join(" ")).toMatch(/personally/i);
+    expect(ManualProvider.supervisionPolicy.length).toBeGreaterThan(0);
+    expect(ManualProvider.supervisionPolicy.join(" ")).toMatch(/personally/i);
   });
 });
 
 describe("manual capture only", () => {
   it("records a candidate the operator captured under supervision", () => {
     const s = startSession(OK);
-    const c = newCandidate({ fullName: "Priya Raman", origin: "supervised-linkedin" });
+    const c = newCandidate({ fullName: "Priya Raman", origin: "supervised-session" });
     expect(recordManualCapture(s, c).candidatesAdded).toBe(1);
   });
 
   it("refuses a candidate not marked as supervised capture", () => {
     const s = startSession(OK);
     const c = newCandidate({ fullName: "Priya Raman", origin: "inbound" });
-    expect(() => recordManualCapture(s, c)).toThrow(/origin must be "supervised-linkedin"/);
+    expect(() => recordManualCapture(s, c)).toThrow(/origin must be "supervised-session"/);
   });
 
   it("refuses capture after the session ended", () => {
     const ended = completeSession(startSession(OK));
-    const c = newCandidate({ fullName: "X", origin: "supervised-linkedin" });
+    const c = newCandidate({ fullName: "X", origin: "supervised-session" });
     expect(() => recordManualCapture(ended, c)).toThrow(/not in progress/);
   });
 

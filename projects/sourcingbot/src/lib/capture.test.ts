@@ -18,7 +18,7 @@ import {
   type CaptureContext,
   type CaptureInput,
 } from "./capture";
-import { SupervisionRequiredError, pauseSession, startSession } from "./linkedin";
+import { SupervisionRequiredError, pauseSession, startSession } from "./sourcing-session";
 import { newCandidate } from "./candidate";
 import { newBrief } from "./brief";
 import { reqHistoryFor } from "./req-candidate";
@@ -72,7 +72,7 @@ const ctx = (over: Partial<CaptureContext> = {}): CaptureContext => ({
 
 describe("drafting a candidate from operator input", () => {
   it("marks the person as supervised capture", () => {
-    expect(draftCandidateFrom(input()).origin).toBe("supervised-linkedin");
+    expect(draftCandidateFrom(input()).origin).toBe("supervised-session");
   });
 
   it("builds a current role from title and company", () => {
