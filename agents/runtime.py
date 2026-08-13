@@ -213,7 +213,14 @@ class AgentRuntime:
         # before any workflow consumes it. Prefer the full response; the excerpt
         # is a safe fallback for older/partial reports.
         verdict_text = resp.data.get("result_full") or resp.data.get("result_excerpt") or ""
-        run.verdict = parse_verdict(verdict_text, role=role_slug).to_dict()
+        run.verdict = parse_verdict(
+            verdict_text,
+            role=role_slug,
+            # A response cut off at the token limit may be missing its verdict.
+            # Passing this through lets the parser say so instead of the run
+            # silently reading as approved.
+            truncated=bool(resp.data.get("truncated", False)),
+        ).to_dict()
         self._persist(run)
         return run
 

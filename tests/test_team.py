@@ -9,7 +9,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from agents.adapters import FakeAgentProvider
-from agents.team import BLOCKING_ROLES, STOPPING_VERDICTS, TEAM_SEQUENCE, TeamWorkflow, _derive_verdict
+from agents.team import (
+    BLOCKING_ROLES,
+    STOPPING_VERDICTS,
+    TEAM_SEQUENCE,
+    TeamWorkflow,
+    _stage_verdict,
+    _stops_pipeline,
+)
+from agents.verdicts import INVALID
 from agents.types import AgentRun
 from monday import Monday, MondayConfig
 from monday.cli import main
@@ -30,7 +38,14 @@ class TestTeamConstants(unittest.TestCase):
 
 
 class TestDeriveVerdict(unittest.TestCase):
-    """The team stage verdict comes from the structured AgentVerdict only (v2.4)."""
+    """
+    The team stage verdict comes from the structured AgentVerdict only (v2.4).
+
+    Split in TASK-0055 into two functions: ``_stage_verdict`` records what the
+    stage actually returned (for audit), and ``_stops_pipeline`` decides whether
+    that halts the run. The split is what lets a non-gating role's real verdict
+    be logged honestly without it affecting flow.
+    """
 
     def _run(self, role, *, success=True, status="executed", verdict=None, excerpt="", message=""):
         return AgentRun(
@@ -40,21 +55,19 @@ class TestDeriveVerdict(unittest.TestCase):
         )
 
     def test_pass_normal(self):
-        self.assertEqual(
-            _derive_verdict("qa", self._run("qa", verdict={"verdict": "pass"})), "pass"
-        )
+        run = self._run("qa", verdict={"verdict": "pass"})
+        self.assertEqual(_stage_verdict(run), "pass")
+        self.assertFalse(_stops_pipeline("qa", "pass"))
 
     def test_structured_block_blocks(self):
-        self.assertEqual(
-            _derive_verdict("security", self._run("security", verdict={"verdict": "block"})),
-            "block",
-        )
+        run = self._run("security", verdict={"verdict": "block"})
+        self.assertEqual(_stage_verdict(run), "block")
+        self.assertTrue(_stops_pipeline("security", "block"))
 
     def test_structured_needs_changes_stops(self):
-        self.assertEqual(
-            _derive_verdict("qa", self._run("qa", verdict={"verdict": "needs_changes"})),
-            "needs_changes",
-        )
+        run = self._run("qa", verdict={"verdict": "needs_changes"})
+        self.assertEqual(_stage_verdict(run), "needs_changes")
+        self.assertTrue(_stops_pipeline("qa", "needs_changes"))
         self.assertIn("needs_changes", STOPPING_VERDICTS)
 
     def test_prose_blocker_does_not_block(self):
@@ -64,26 +77,38 @@ class TestDeriveVerdict(unittest.TestCase):
             verdict={"verdict": "pass"},
             excerpt="I found a potential blocker earlier but it is a blocking issue no longer.",
         )
-        self.assertEqual(_derive_verdict("security", run), "pass")
+        self.assertEqual(_stage_verdict(run), "pass")
+        self.assertFalse(_stops_pipeline("security", "pass"))
 
-    def test_no_structured_verdict_defaults_pass(self):
-        # A blocking role with no structured verdict at all → pass (never block).
-        self.assertEqual(_derive_verdict("security", self._run("security")), "pass")
+    def test_no_structured_verdict_is_invalid_and_stops(self):
+        # TASK-0055: this previously returned "pass" — a blocking role that
+        # produced no verdict at all advanced the pipeline as though it had
+        # approved the work. It is now `invalid`, and it stops the run.
+        self.assertEqual(_stage_verdict(self._run("security")), INVALID)
+        self.assertTrue(_stops_pipeline("security", INVALID))
+        self.assertIn(INVALID, STOPPING_VERDICTS)
+
+    def test_unrecognised_verdict_value_is_invalid(self):
+        run = self._run("qa", verdict={"verdict": "probably fine"})
+        self.assertEqual(_stage_verdict(run), INVALID)
+        self.assertTrue(_stops_pipeline("qa", INVALID))
 
     def test_non_blocking_role_ignores_block_verdict(self):
         # cpo / lead-engineer are productive, not gatekeepers — even a structured
-        # block from them does not halt the pipeline.
-        self.assertEqual(
-            _derive_verdict("cpo", self._run("cpo", verdict={"verdict": "block"})), "pass"
-        )
+        # block from them does not halt the pipeline. Preserved unchanged.
+        run = self._run("cpo", verdict={"verdict": "block"})
+        self.assertEqual(_stage_verdict(run), "block")   # recorded honestly...
+        self.assertFalse(_stops_pipeline("cpo", "block"))  # ...but does not halt
+
+    def test_non_blocking_role_invalid_verdict_does_not_halt(self):
+        self.assertEqual(_stage_verdict(self._run("lead-engineer")), INVALID)
+        self.assertFalse(_stops_pipeline("lead-engineer", INVALID))
 
     def test_failed_run_blocks(self):
-        self.assertEqual(_derive_verdict("qa", self._run("qa", success=False)), "block")
+        self.assertEqual(_stage_verdict(self._run("qa", success=False)), "block")
 
     def test_gate_blocked_status_blocks(self):
-        self.assertEqual(
-            _derive_verdict("reviewer", self._run("reviewer", status="blocked")), "block"
-        )
+        self.assertEqual(_stage_verdict(self._run("reviewer", status="blocked")), "block")
 
 
 # ---------------------------------------------------------------------------

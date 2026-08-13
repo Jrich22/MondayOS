@@ -183,11 +183,19 @@ class OpenAIProvider(AIProvider):
             tokens = 0
             if response.usage:
                 tokens = response.usage.total_tokens
+            # finish_reason == "length" means the model was cut off mid-answer.
+            # Callers need this: a truncated response may be missing its trailing
+            # structured verdict, which must never be read as approval.
+            finish_reason = str(getattr(choice, "finish_reason", "") or "") if choice else ""
             return ProviderResponse(
                 content=content,
                 model=response.model,
                 provider=_PROVIDER_NAME,
                 tokens_used=tokens,
+                metadata={
+                    "stop_reason": finish_reason,
+                    "truncated": finish_reason == "length",
+                },
             )
 
         except _openai.AuthenticationError as exc:

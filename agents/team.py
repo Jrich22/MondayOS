@@ -18,6 +18,12 @@ Verdicts are **structured** (MondayOS v2.4). Each stage run carries an
 workflow inspects only that field and never scans the model's prose. This
 replaced the old substring matching, which falsely vetoed on words like
 "blocker" appearing in explanatory text.
+
+A blocking role must produce a **valid** ``pass`` to advance. A missing,
+malformed, or truncated verdict is ``invalid`` and stops the run — it is not
+treated as approval. Earlier revisions defaulted an absent verdict to ``pass``,
+so a QA, Security, or Reviewer stage that returned nothing readable advanced the
+pipeline as though it had signed off.
 """
 from __future__ import annotations
 
@@ -31,30 +37,45 @@ from typing import Any
 from agents.roles import get_role
 from agents.runtime import AgentRuntime
 from agents.types import AgentRun
-from agents.verdicts import BLOCK, NEEDS_CHANGES, PASS
+from agents.verdicts import ALL_VERDICTS, BLOCK, INVALID, NEEDS_CHANGES, PASS
 
 # The collaboration order. Human Approval is the terminal gate, not an agent run.
 TEAM_SEQUENCE: tuple[str, ...] = ("cpo", "lead-engineer", "qa", "security", "reviewer")
 
-# Roles whose non-pass verdict stops the pipeline early.
+# Roles that must produce a valid `pass` for the pipeline to advance.
 BLOCKING_ROLES: frozenset[str] = frozenset({"qa", "security", "reviewer"})
 
 # Verdicts (from a blocking role) that stop the pipeline. `block` is a hard veto;
-# `needs_changes` sends the work back for rework before human approval.
-STOPPING_VERDICTS: frozenset[str] = frozenset({BLOCK, NEEDS_CHANGES})
+# `needs_changes` sends the work back for rework; `invalid` means the stage never
+# produced a readable verdict at all and therefore cannot have approved anything.
+STOPPING_VERDICTS: frozenset[str] = frozenset({BLOCK, NEEDS_CHANGES, INVALID})
 
-# Appended to every stage's context so providers emit a structured verdict. The
-# parser (agents.verdicts) still handles responses that ignore this, but asking
-# for it makes real providers return the machine-readable object directly.
+# Team status recorded when a blocking role stops the run.
+_STATUS_FOR_VERDICT: dict[str, str] = {
+    BLOCK: "blocked",
+    NEEDS_CHANGES: "changes-requested",
+    INVALID: "invalid-verdict",
+}
+
+# Appended to every stage's context so providers emit a structured verdict.
+#
+# The JSON is requested FIRST, before any prose. Providers are called with a
+# finite output-token budget, and a thorough reviewer will happily spend all of
+# it on narrative; a verdict requested last is the part that gets cut off. Asking
+# for it first makes the verdict structurally survive truncation — the prose is
+# what gets lost instead, and the prose is not what the workflow reads.
 VERDICT_INSTRUCTION: str = (
-    "When you finish, end your response with a single JSON object on its own, "
-    "in a ```json code block, of exactly this shape:\n"
+    "IMPORTANT — begin your response with a single JSON object in a ```json code "
+    "block, before any other text, of exactly this shape:\n"
     '{"verdict": "pass" | "needs_changes" | "block", '
     '"confidence": "high" | "medium" | "low", '
     '"summary": "one sentence", '
     '"findings": ["..."], "recommendations": ["..."]}\n'
-    "Use \"block\" only for a genuine blocking defect. This JSON is the only "
-    "signal the workflow reads — do not rely on wording elsewhere in your reply."
+    "After the closing fence, write whatever explanation you wish.\n"
+    "Use \"block\" only for a genuine blocking defect. This JSON is the ONLY "
+    "signal the workflow reads: wording elsewhere in your reply is ignored, and "
+    "a reply without this object is treated as no verdict at all — which stops "
+    "the pipeline rather than passing it."
 )
 
 
@@ -207,7 +228,7 @@ class TeamWorkflow:
                 provider_instance=(stage_providers or {}).get(role),
             )
             summary = _summary(run)
-            verdict = _derive_verdict(role, run)
+            verdict = _stage_verdict(run)
             team.stages.append(TeamStage(
                 role=role,
                 run_id=run.run_id,
@@ -228,12 +249,16 @@ class TeamWorkflow:
                 team.stopped_reason = run.message or "stage did not succeed"
                 stopped = True
                 break
-            if verdict in STOPPING_VERDICTS:
+            # Verdict gating applies to real runs only. A dry run plans the
+            # stages without calling a provider, so there is no response to
+            # carry a verdict — requiring one would make dry-run impossible.
+            if norm_mode == "review" and _stops_pipeline(role, verdict):
                 # `block` is a hard veto; `needs_changes` sends the work back for
-                # rework. Both stop the pipeline short of human approval.
-                team.status = "blocked" if verdict == BLOCK else "changes-requested"
+                # rework; `invalid` means the stage never produced a readable
+                # verdict. All stop the pipeline short of human approval.
+                team.status = _STATUS_FOR_VERDICT.get(verdict, "blocked")
                 team.stopped_at = role
-                team.stopped_reason = summary or f"{role} returned verdict '{verdict}'"
+                team.stopped_reason = _stop_reason(role, verdict, summary)
                 stopped = True
                 break
 
@@ -301,24 +326,45 @@ class TeamWorkflow:
             pass  # persistence failure must not mask the run result
 
 
-def _derive_verdict(role: str, run: AgentRun) -> str:
+def _stage_verdict(run: AgentRun) -> str:
     """
-    Return the stage verdict — ``pass`` | ``needs_changes`` | ``block`` — from
-    the structured AgentVerdict only. Never inspects prose.
+    The stage's actual structured verdict, recorded verbatim for audit.
 
-    Structural failures always block, regardless of role: a run that did not
-    succeed, or was gate-blocked, cannot advance the pipeline. Otherwise only a
-    blocking role (QA / Security / Reviewer) can stop the pipeline, and only via
-    its structured verdict. Non-blocking roles (CPO, Lead Engineer) are
-    productive, not gatekeepers — their verdict never halts the team.
+    Reads only the structured AgentVerdict — never prose. A run that did not
+    succeed, or was gate-blocked, is a structural failure and reported as
+    ``block``. A run with no readable verdict is ``invalid``; it is NOT assumed
+    to be a pass, which is the defect this function previously carried.
     """
     if not run.success or run.status == "blocked":
         return BLOCK
-    if role in BLOCKING_ROLES:
-        verdict = str((run.verdict or {}).get("verdict") or PASS)
-        if verdict in STOPPING_VERDICTS:
-            return verdict
-    return PASS
+    verdict = str((run.verdict or {}).get("verdict") or "")
+    return verdict if verdict in ALL_VERDICTS else INVALID
+
+
+def _stops_pipeline(role: str, verdict: str) -> bool:
+    """
+    Whether this stage's verdict halts the team run.
+
+    A blocking role (QA / Security / Reviewer) must produce a valid ``pass`` to
+    advance — anything else, including a missing or unreadable verdict, stops.
+
+    Non-blocking roles (CPO, Lead Engineer) are productive rather than
+    gatekeepers: their verdict never halts the team, unchanged from before. A
+    structural failure still stops any role, but that is handled by the caller
+    before this function is consulted, so it is deliberately not repeated here.
+    """
+    if role not in BLOCKING_ROLES:
+        return False
+    return verdict != PASS
+
+
+def _stop_reason(role: str, verdict: str, summary: str) -> str:
+    if verdict == INVALID:
+        return (
+            f"{role} produced no valid structured verdict "
+            "(missing, malformed, or truncated) — the stage cannot be treated as a pass"
+        )
+    return summary or f"{role} returned verdict '{verdict}'"
 
 
 def _summary(run: AgentRun) -> str:
