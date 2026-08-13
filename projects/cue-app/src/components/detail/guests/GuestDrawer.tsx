@@ -4,6 +4,7 @@ import type { CueEvent, Guest, GuestRole, RsvpStatus } from "@/lib/types";
 import { ALL_ROLES, ROLE_META, RSVP_META, RSVP_ORDER, initials, withCheckIn } from "@/lib/guests-select";
 import { addGuest, removeGuest, updateGuest } from "@/lib/guests";
 import { personIdForGuest } from "@/lib/people";
+import { InvitationSection } from "./InvitationSection";
 import { Field, TextInput, TextArea, Select } from "@/components/ui/Field";
 import { Switch } from "@/components/ui/Switch";
 import { Button } from "@/components/ui/Button";
@@ -320,6 +321,12 @@ export function GuestDrawer({
               onChange={(v) => setAtt({ noShow: v })}
             />
           </Section>
+
+          {mode === "edit" && (
+            <Section title="Invitation & RSVP link">
+              <InvitationSection guest={guest} event={event} />
+            </Section>
+          )}
 
           <Section title="Preferences">
             <Field label="Dietary restrictions" htmlFor="g-diet" optional>

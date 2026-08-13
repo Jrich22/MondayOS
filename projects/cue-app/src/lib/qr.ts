@@ -20,8 +20,9 @@ import type { CueEvent, Guest } from "./types";
 export const QR_PREFIX = "CUE1";
 const SEP = "|";
 
-/** djb2 → unsigned base36 — the same stable hash style used for person ids. */
-function hash36(s: string): string {
+/** djb2 → unsigned base36 — the same stable hash style used for person ids.
+ *  Exported so the Invite & RSVP token (lib/invitation) reuses the one hash. */
+export function hash36(s: string): string {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = (Math.imul(h, 33) + s.charCodeAt(i)) | 0;
   return (h >>> 0).toString(36);

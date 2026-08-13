@@ -45,10 +45,26 @@ const timeFmt = new Intl.DateTimeFormat("en-US", {
   minute: "2-digit",
 });
 
-/** "Wed, Jul 15 · 6:00 PM" */
+/** "Wed, Jul 15 · 6:00 PM" (browser timezone). */
 export function formatEventDate(iso: string): string {
   const d = new Date(iso);
   return `${dateFmt.format(d)} · ${timeFmt.format(d)}`;
+}
+
+/**
+ * Event date/time rendered in the EVENT's own IANA timezone (not the browser's),
+ * with the zone abbreviation — e.g. "Tue, Sep 1, 2026 · 7:00 PM PDT". Used on the
+ * guest RSVP surface so a guest sees the event's local time regardless of device.
+ */
+export function formatEventDateTz(iso: string, timeZone: string): string {
+  const d = new Date(iso);
+  const date = new Intl.DateTimeFormat("en-US", {
+    timeZone, weekday: "short", month: "short", day: "numeric", year: "numeric",
+  }).format(d);
+  const time = new Intl.DateTimeFormat("en-US", {
+    timeZone, hour: "numeric", minute: "2-digit", timeZoneName: "short",
+  }).format(d);
+  return `${date} · ${time}`;
 }
 
 /** "6:00 PM – 9:00 PM" (or just the start time if there is no end). */

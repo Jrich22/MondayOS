@@ -8,6 +8,7 @@ import { EventDetail } from "@/pages/EventDetail";
 import Planning from "@/pages/Planning";
 import { RollCall } from "@/pages/RollCall";
 import { CheckIn } from "@/pages/CheckIn";
+import Rsvp from "@/pages/Rsvp";
 import { People } from "@/pages/People";
 import { PersonProfile } from "@/pages/PersonProfile";
 import { Communications } from "@/pages/Communications";
@@ -33,6 +34,7 @@ export default function App() {
       <Routes>
         <Route path="/events/:id/rollcall" element={<RollCall />} />
         <Route path="/events/:id/checkin" element={<CheckIn />} />
+        <Route path="/rsvp/:token" element={<Rsvp />} />
         <Route path="/*" element={<ShellLayout />} />
       </Routes>
     </HashRouter>

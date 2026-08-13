@@ -71,3 +71,21 @@ describe("STATUS_META", () => {
     }
   });
 });
+
+import { formatEventDateTz } from "./format";
+
+describe("formatEventDateTz (finding #4)", () => {
+  it("renders the event's LOCAL date even when the UTC/browser date differs", () => {
+    // 02:00Z on 09-02 is 19:00 on 09-01 in Los Angeles (PDT) → the guest must see Sep 1.
+    const s = formatEventDateTz("2026-09-02T02:00:00Z", "America/Los_Angeles");
+    expect(s).toMatch(/Sep 1, 2026/);
+    expect(s).not.toMatch(/Sep 2/);
+    expect(s).toMatch(/PDT/); // includes the zone label
+  });
+  it("uses the event timezone, not a fixed one", () => {
+    const ny = formatEventDateTz("2026-01-15T18:00:00Z", "America/New_York"); // 1:00 PM EST
+    expect(ny).toMatch(/EST/);
+    const la = formatEventDateTz("2026-01-15T18:00:00Z", "America/Los_Angeles"); // 10:00 AM PST
+    expect(la).toMatch(/PST/);
+  });
+});
