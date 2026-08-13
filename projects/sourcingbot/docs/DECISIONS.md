@@ -4,6 +4,132 @@ Newest first. Each records the decision, why, and what it costs.
 
 ---
 
+## ADR-009 — Unsaved-changes is tracked by revision, not timestamp
+
+**Status:** accepted · TASK-0056
+
+**Context.** The draft indicator first compared `lastSavedAt` against
+`updatedAt`. Both are ISO timestamps with millisecond resolution, so an edit
+made in the same millisecond as a save compared equal and the surface reported
+"all changes saved" over a pending edit. A component test caught it.
+
+**Decision.** `Req` carries a monotonic `rev`, incremented by every
+`updateReq`, and `savedRev`, stamped by `markSaved`. `hasUnsavedChanges` is
+`rev !== savedRev`.
+
+**Rationale.** Whether a recruiter's work is persisted must not depend on clock
+resolution. Widening the comparison to `<=` would have inverted the bug —
+reporting unsaved forever after a save. Because both fields are persisted, an
+unsaved draft is still detectable after a reload, which an in-memory dirty flag
+would not survive.
+
+**Consequences.** Two small optional fields on `Req`. `lastSavedAt` is retained
+for display ("saved 12s ago") but no longer decides correctness.
+
+---
+
+## ADR-008 — Readiness is derived, and separate from completeness
+
+**Status:** accepted · TASK-0056
+
+**Context.** Increment 2 needs a completeness indicator. The obvious approach is
+a stored percentage updated on save, and a single number covering "how done is
+this".
+
+**Decision.** `lib/readiness.ts` computes everything on read from the existing
+`Req` and `SourcingBrief`. It stores nothing and owns no entity. It reports two
+distinct values:
+
+- **completeness** (0–100%) — how much has been authored. A progress signal.
+  Nothing blocks on it.
+- **readiness** (boolean) — can this req discriminate between candidates? A hard
+  gate on opening for sourcing.
+
+Within a section, the items that *block* sourcing are tracked separately from
+everything merely missing. A section can be essential without every field in it
+being essential: `requirements` gates sourcing because a req with no must-have
+filters nobody out, but a missing nice-to-have only costs ranking.
+
+### The approved blocker specification
+
+These six items — and only these — prevent a req being opened for sourcing.
+Approved by the product owner 2026-08-13. This list is the specification;
+`canOpenForSourcing` implements it. Changing it is a product decision, not a
+refactor.
+
+| # | Blocker | Why it gates |
+|---|---|---|
+| 1 | Requisition code | The req cannot be identified without one |
+| 2 | Role title | Nothing to source *for* |
+| 3 | Owning team | No accountable owner for the search |
+| 4 | Primary location | The search has no geographic anchor |
+| 5 | Search headline | No stated definition of who this search is for |
+| 6 | At least one must-have | **The load-bearing one.** With no must-have the req filters nobody out, so every candidate trivially matches — worse than having no req at all |
+
+**Explicitly advisory, NOT blocking** (each appears in `suggestions`, never in
+`blockers`):
+
+- **Target locations** — approved as advisory 2026-08-13. A recruiter may
+  legitimately open a remote or location-agnostic search, and blocking on it
+  would force a meaningless value to be entered.
+- Nice-to-haves — cost ranking quality, not the ability to source.
+- Job description, intake notes, hiring manager, target/excluded industries and
+  companies, keywords, experience guidance, sourcing goals.
+
+The distinction throughout: **a blocker is something whose absence makes
+sourcing produce a wrong result. Everything else makes it produce a
+less-good one.**
+
+**Rationale.** A stored percentage is a third source of truth that can disagree
+with the two records it summarises — it goes stale the moment a brief is edited
+through any path that forgets to recompute it.
+
+Keeping the two values apart matters more. A req can be 90% complete and unable
+to source, or 60% complete and ready. Collapsing them hides exactly the case
+that matters. The first implementation derived blockers from section progress,
+which silently made every optional field mandatory — a nice-to-have became
+required to open a req. Tests caught it; the split above is the fix.
+
+**Consequences.** Readiness is recomputed on every render. It is pure arithmetic
+over two small objects, so this is cheaper than the staleness bugs a cached
+value would cause.
+
+---
+
+## ADR-007 — Increment 2 extends the existing models; no authoring entity
+
+**Status:** accepted · TASK-0056
+
+**Context.** Authoring adds ~10 fields: full job description, intake notes,
+target and excluded industries, experience guidance, sourcing goals, draft
+state. A separate `ReqDraft` entity — or an authoring-shaped DTO — would have
+kept the "clean" foundation models untouched.
+
+**Decision.** Extend `Req` and `SourcingBrief` in place. Every new field is
+optional, so requisitions written by Increment 1 keep loading unchanged. No new
+collection was added to `WorkspaceState`; a test asserts the five collections
+are unchanged.
+
+Field placement follows ownership rather than convenience:
+
+| Field | Home | Why |
+|---|---|---|
+| Job description, intake notes, sourcing goals | `Req` | Facts about the *role and the search*, true regardless of how it is searched |
+| Target/excluded industries, experience guidance | `SourcingBrief` | Search *targeting*, revised as the search is tuned |
+| Must-haves / nice-to-haves | `SourcingBrief.requirements` | Already existed as `required` / `preferred` |
+
+**Alternatives rejected.** A separate draft entity means two records that can
+disagree about the same requisition, plus a promotion step where they are
+reconciled — the exact fragmentation ADR-002 exists to prevent, applied to reqs
+instead of people.
+
+**Consequences.** `Req` and `SourcingBrief` are larger. Accepted: they are the
+domain, and the alternative was a synchronisation problem. `Candidate` and
+`ReqCandidate` are untouched by this increment, and a test asserts authoring
+never writes to them.
+
+---
+
 ## ADR-001 — Build inside MondayOS as `projects/sourcingbot/`, mirroring Cue
 
 **Status:** accepted · TASK-0054

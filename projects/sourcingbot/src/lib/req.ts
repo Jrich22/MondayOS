@@ -93,3 +93,87 @@ export function sortForWorkspace(reqs: Req[]): Req[] {
     (a, b) => rank[a.status] - rank[b.status] || b.updatedAt.localeCompare(a.updatedAt),
   );
 }
+
+// ---------------------------------------------------------------------------
+// Increment 2 — authoring
+// ---------------------------------------------------------------------------
+
+/** Fields the authoring surface may edit. Status moves via `transition` only. */
+export type ReqEdits = Partial<
+  Pick<
+    Req,
+    | "code"
+    | "title"
+    | "team"
+    | "location"
+    | "workModel"
+    | "hiringManager"
+    | "openings"
+    | "jobDescription"
+    | "intakeNotes"
+    | "sourcingGoals"
+  >
+>;
+
+/**
+ * Apply an edit.
+ *
+ * `status` is deliberately not editable here: lifecycle changes go through
+ * `transition`, which validates the graph. Letting an authoring form assign a
+ * status directly would route around that and let a closed req silently reopen.
+ */
+export function updateReq(req: Req, edits: ReqEdits): Req {
+  const next: Req = {
+    ...req,
+    ...edits,
+    updatedAt: nowIso(),
+    rev: (req.rev ?? 0) + 1,
+  };
+  if (edits.openings !== undefined) next.openings = Math.max(1, edits.openings);
+  for (const key of ["code", "title", "team", "location", "hiringManager"] as const) {
+    if (edits[key] !== undefined) next[key] = String(edits[key]).trim();
+  }
+  return next;
+}
+
+/** Mark the req as persisted by the authoring surface. */
+export function markSaved(req: Req): Req {
+  return { ...req, lastSavedAt: nowIso(), savedRev: req.rev ?? 0 };
+}
+
+/**
+ * True when the recruiter has made edits that are not written yet.
+ *
+ * Compares edit revisions, not timestamps. Timestamps resolve to the
+ * millisecond, so an edit made in the same millisecond as a save compared equal
+ * and the surface reported "all changes saved" over a pending edit — whether
+ * work is persisted should not depend on clock resolution. Because `rev` is
+ * stored, an unsaved draft is still detectable after a reload.
+ */
+export function hasUnsavedChanges(req: Req): boolean {
+  if (req.savedRev === undefined) return true;
+  return (req.rev ?? 0) !== req.savedRev;
+}
+
+/** A blank draft, ready for the authoring surface to fill in. */
+export function newDraftReq(code = ""): Req {
+  return newReq({ code, title: "", team: "", location: "" });
+}
+
+/** Reqs the recruiter has started but not opened for sourcing. */
+export function draftReqs(reqs: Req[]): Req[] {
+  return sortForWorkspace(reqs.filter((r) => r.status === "draft"));
+}
+
+/**
+ * Suggest the next requisition code, continuing the highest REQ-NNN seen.
+ * Falls back to REQ-001 when nothing matches, and never reuses a code.
+ */
+export function suggestReqCode(reqs: Req[]): string {
+  let highest = 0;
+  for (const r of reqs) {
+    const m = /^REQ-(\d+)$/i.exec(r.code.trim());
+    if (m) highest = Math.max(highest, parseInt(m[1], 10));
+  }
+  return `REQ-${String(highest + 1).padStart(3, "0")}`;
+}
