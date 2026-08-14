@@ -23,6 +23,7 @@ import type {
   SourcingSession,
 } from "./types";
 import type { WorkspaceState } from "./store";
+import { DEFAULT_PROVIDER_ID } from "./provider";
 
 const T0 = "2026-08-01T09:00:00.000Z";
 const T1 = "2026-08-06T14:30:00.000Z";
@@ -310,5 +311,10 @@ export function seedState(): WorkspaceState {
     },
   ];
 
-  return { reqs, briefs, candidates, reqCandidates, sessions };
+  // Every demo session was a recruiter browsing on their own — stamped in one
+  // place rather than repeated on each literal.
+  return {
+    reqs, briefs, candidates, reqCandidates,
+    sessions: sessions.map((s) => ({ ...s, providerId: DEFAULT_PROVIDER_ID })),
+  };
 }
