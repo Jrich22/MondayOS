@@ -12,7 +12,7 @@ import CandidateProfile from "@/pages/CandidateProfile";
 /**
  * Routes for the foundation increment. No LinkedIn workflow route exists yet —
  * that surface lands in a later increment behind the supervision gate in
- * lib/linkedin.ts (docs/ROADMAP.md).
+ * lib/sourcing-session.ts (docs/ROADMAP.md).
  */
 const App: FC = () => (
   <Routes>

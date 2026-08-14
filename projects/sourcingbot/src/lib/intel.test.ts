@@ -26,7 +26,7 @@ import { newCandidate } from "./candidate";
 import { newReq, transition } from "./req";
 import { newBrief, reviseBrief } from "./brief";
 import { advance, newReqCandidate } from "./req-candidate";
-import { recordManualCapture, recordSkip, startSession } from "./linkedin";
+import { recordManualCapture, recordSkip, startSession } from "./sourcing-session";
 import { __resetIdCounter } from "./ids";
 import type { ReqCandidate } from "./types";
 
@@ -40,7 +40,7 @@ function person(name: string, company = "Northwind", skills: string[] = ["Go"], 
     location,
     skills,
     roles: [{ title: "Staff Engineer", company, startedAt: "2022-01" }],
-    origin: "supervised-linkedin",
+    origin: "supervised-session",
   });
 }
 

@@ -13,7 +13,8 @@ import { __resetStore, addCandidate, addSession, getState } from "@/lib/store";
 import { newReq, transition } from "@/lib/req";
 import { addRequirement, newBrief } from "@/lib/brief";
 import { newCandidate } from "@/lib/candidate";
-import { startSession } from "@/lib/linkedin";
+import { startSession } from "@/lib/sourcing-session";
+import { registerProvider } from "@/lib/provider";
 import { __resetIdCounter } from "@/lib/ids";
 
 function renderAt(path: string) {
@@ -246,5 +247,75 @@ describe("session history", () => {
 
     expect(screen.getByText(/session history/i)).toBeTruthy();
     expect(screen.getByText(/1 captured/i)).toBeTruthy();
+  });
+});
+
+/**
+ * The supervision policy on display must come from the session's OWN provider.
+ *
+ * This is the regression guard for the reviewer finding on TASK-0059. The page
+ * previously read the policy from `DEFAULT_PROVIDER_ID`, which is correct only
+ * while exactly one provider exists. The failure it would cause is not cosmetic:
+ * per ADR-015 the acknowledgement is an attestation, so a Claude-operated
+ * session showing ManualProvider's "I will open and review each profile myself"
+ * would assert human conduct that did not happen — the precise
+ * misrepresentation the supervision boundary exists to prevent.
+ *
+ * A second provider is registered here rather than waiting for
+ * ClaudeChromeProvider, so the divergence is proven now instead of being
+ * discovered by the increment that introduces it.
+ */
+describe("supervision policy is resolved from the session's provider", () => {
+  const AGENT_LINE = "An agent operates the browser while I supervise.";
+
+  beforeEach(() => {
+    registerProvider({
+      id: "claude-chrome",
+      label: "Test agent provider",
+      summary: "Registered by this test only.",
+      agentOperatesBrowser: true,
+      supervisionPolicy: [AGENT_LINE],
+    });
+  });
+
+  it("renders the session provider's policy, not the default provider's", () => {
+    const req = openReq();
+    addSession(
+      startSession({
+        reqId: req.id, operator: "Dana Whitfield", acknowledgedPolicy: true,
+        reqAcceptsSourcing: true, providerId: "claude-chrome",
+      }),
+    );
+    renderAt(`/reqs/${req.id}/session`);
+
+    expect(screen.getByText(new RegExp(AGENT_LINE, "i"))).toBeTruthy();
+    // ManualProvider's attestation must NOT appear over an agent-operated session.
+    expect(screen.queryByText(/open and review each profile myself/i)).toBeNull();
+  });
+
+  it("still renders ManualProvider's policy for a manual session", () => {
+    const req = openReq();
+    live(req.id);
+    renderAt(`/reqs/${req.id}/session`);
+
+    expect(screen.getByText(/open and review each profile myself/i)).toBeTruthy();
+    expect(screen.queryByText(new RegExp(AGENT_LINE, "i"))).toBeNull();
+  });
+
+  it("falls back to the pending provider at the gate, where no session exists yet", () => {
+    const req = openReq();
+    renderAt(`/reqs/${req.id}/session`);
+    // Unchanged gate behaviour: ManualProvider text, byte for byte.
+    expect(screen.getByText(/open and review each profile myself/i)).toBeTruthy();
+  });
+
+  it("records the provider it displayed when the session starts", () => {
+    const req = openReq();
+    renderAt(`/reqs/${req.id}/session`);
+    fireEvent.change(screen.getByLabelText(/your name/i), { target: { value: "Dana Whitfield" } });
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: /start session/i }));
+
+    expect(getState().sessions[0].providerId).toBe("manual");
   });
 });

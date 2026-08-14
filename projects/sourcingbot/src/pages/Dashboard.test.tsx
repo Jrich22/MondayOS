@@ -15,7 +15,7 @@ import { newReq, transition } from "@/lib/req";
 import { newBrief } from "@/lib/brief";
 import { newCandidate } from "@/lib/candidate";
 import { newReqCandidate } from "@/lib/req-candidate";
-import { startSession } from "@/lib/linkedin";
+import { startSession } from "@/lib/sourcing-session";
 import { __resetIdCounter } from "@/lib/ids";
 
 function renderHome() {
@@ -237,7 +237,7 @@ describe("the homepage is an operating surface, not a report", () => {
       "open",
     );
     const brief = newBrief({ reqId: req.id, headline: "Platform", seniority: "staff" });
-    const c = newCandidate({ fullName: "Wei Zhang", origin: "supervised-linkedin" });
+    const c = newCandidate({ fullName: "Wei Zhang", origin: "supervised-session" });
     const rc = {
       ...newReqCandidate({ reqId: req.id, candidateId: c.id, briefVersion: 1, by: "D" }),
       fitScore: 92,

@@ -17,7 +17,7 @@ import { newCandidate } from "@/lib/candidate";
 import { newReq, transition } from "@/lib/req";
 import { newBrief } from "@/lib/brief";
 import { newReqCandidate } from "@/lib/req-candidate";
-import { recordSkip, startSession } from "@/lib/linkedin";
+import { recordSkip, startSession } from "@/lib/sourcing-session";
 import { __resetIdCounter } from "@/lib/ids";
 
 function renderHome() {

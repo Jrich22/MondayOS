@@ -14,7 +14,8 @@
 import { useState, type FC } from "react";
 import { useNavigate } from "react-router-dom";
 import type { Req, SourcingBrief } from "@/lib/types";
-import { SUPERVISION_POLICY, SupervisionRequiredError, startSession } from "@/lib/linkedin";
+import { SupervisionRequiredError, startSession } from "@/lib/sourcing-session";
+import { DEFAULT_PROVIDER_ID, providerFor } from "@/lib/provider";
 import { acceptsSourcing } from "@/lib/req";
 import { addSession } from "@/lib/store";
 import { Card, cn } from "@/components/ui/Primitives";
@@ -30,6 +31,10 @@ export const QuickSession: FC<{
   const [error, setError] = useState("");
 
   const open = acceptsSourcing(req);
+  // The gate runs before a session exists, so the policy comes from the
+  // provider the session is about to use. Mirrors pages/SourcingSession.tsx.
+  const pendingProviderId = DEFAULT_PROVIDER_ID;
+  const provider = providerFor(pendingProviderId);
   const ready = operator.trim() !== "" && acknowledged && open;
 
   const begin = () => {
@@ -40,6 +45,7 @@ export const QuickSession: FC<{
         operator,
         acknowledgedPolicy: acknowledged,
         reqAcceptsSourcing: open,
+        providerId: pendingProviderId,
         briefVersion: brief?.version,
       });
       addSession(session);
@@ -107,7 +113,7 @@ export const QuickSession: FC<{
           Supervision policy
         </legend>
         <ul className="space-y-0.5">
-          {SUPERVISION_POLICY.map((line) => (
+          {provider.supervisionPolicy.map((line) => (
             <li key={line} className="text-[11px] text-ink-muted">
               · {line}
             </li>

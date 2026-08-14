@@ -30,10 +30,11 @@ import {
   activeSessionFor,
   closeCallsFor,
   isActive,
+  isSupervisedOrigin,
   sessionCounts,
   sessionsForReq,
   type SessionCounts,
-} from "./linkedin";
+} from "./sourcing-session";
 
 /** Everything the workspace reads. Mirrors WorkspaceState, passed explicitly. */
 export interface IntelInput {
@@ -497,7 +498,10 @@ export function applyView(rows: PoolRow[], view: SavedView): PoolRow[] {
     case "unevaluated":
       return rows.filter((r) => r.reqCount === 0);
     case "supervised":
-      return rows.filter((r) => r.candidate.origin === "supervised-linkedin");
+      // Uses the predicate rather than an equality check so a workspace held in
+      // memory before migration — a fixture, or state handed in by a caller —
+      // does not silently drop people who genuinely were supervised.
+      return rows.filter((r) => isSupervisedOrigin(r.candidate.origin));
     default:
       return rows;
   }

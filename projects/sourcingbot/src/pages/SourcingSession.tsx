@@ -6,7 +6,7 @@
  *   in-progress  → capture form, live counts, session log
  *   paused       → everything visible, capture suspended
  *
- * The gate is not a formality. `startSession` in lib/linkedin.ts throws without
+ * The gate is not a formality. `startSession` in lib/sourcing-session.ts throws without
  * a named operator, a per-session acknowledgement, and an open req — this
  * surface cannot bypass it, and does not try to. Nothing here browses,
  * fetches, or parses anything: the operator reviews profiles themselves and
@@ -23,15 +23,16 @@ import {
   useWorkspace,
 } from "@/lib/store";
 import {
-  SUPERVISION_POLICY,
   SupervisionRequiredError,
+  supervisionPolicyFor,
   completeSession,
   pauseSession,
   recordSkip,
   resumeSession,
   sessionCounts,
   startSession,
-} from "@/lib/linkedin";
+} from "@/lib/sourcing-session";
+import { DEFAULT_PROVIDER_ID, providerFor } from "@/lib/provider";
 import { acceptsSourcing } from "@/lib/req";
 import { captureCandidate, CaptureError, type CaptureInput, type DuplicateResolution } from "@/lib/capture";
 import { CaptureForm } from "@/components/session/CaptureForm";
@@ -50,6 +51,27 @@ const SourcingSessionPage: FC = () => {
   const brief = briefs.find((b) => b.reqId === reqId);
   const session = activeSession(reqId);
   const history = sessionHistory(reqId);
+
+  /**
+   * The supervision policy on display, resolved from the session that is
+   * actually being conducted.
+   *
+   * Reading it from a fixed default was wrong in a way that only bites later:
+   * the acknowledgement is an ATTESTATION (ADR-015), so a live session must show
+   * the policy ITS provider defines, not whichever provider happens to be the
+   * default. With one provider registered the two are identical; the moment
+   * ClaudeChromeProvider ships they diverge, and the divergence would have
+   * displayed "I will open and review each profile myself" over a session where
+   * an agent drives the browser.
+   *
+   * Before a session exists there is nothing to read it from, so the gate falls
+   * back to the provider the session is about to use. TASK-0061 replaces that
+   * constant with the operator's choice; the resolution below does not change.
+   */
+  const pendingProviderId = DEFAULT_PROVIDER_ID;
+  const supervisionPolicy = session
+    ? supervisionPolicyFor(session)
+    : providerFor(pendingProviderId).supervisionPolicy;
 
   if (!req) {
     return (
@@ -85,6 +107,7 @@ const SourcingSessionPage: FC = () => {
           operator,
           acknowledgedPolicy: acknowledged,
           reqAcceptsSourcing: acceptsSourcing(req),
+          providerId: pendingProviderId,
           briefVersion: brief?.version,
         }),
       );
@@ -181,7 +204,7 @@ const SourcingSessionPage: FC = () => {
                     Supervision policy
                   </legend>
                   <ul className="space-y-1">
-                    {SUPERVISION_POLICY.map((line) => (
+                    {supervisionPolicy.map((line) => (
                       <li key={line} className="text-xs text-ink-muted">
                         · {line}
                       </li>
@@ -248,6 +271,26 @@ const SourcingSessionPage: FC = () => {
                   </button>
                 </div>
               </div>
+
+              {/*
+                The policy this session is running under, from ITS provider.
+                Additive: the acknowledgement previously vanished the moment the
+                session started, leaving the operator working under terms they
+                could no longer see. It is also what makes the session-resolved
+                lookup above reachable rather than theoretical.
+              */}
+              <details className="mb-4 rounded-lg border border-line px-3 py-2">
+                <summary className="cursor-pointer text-xs font-medium text-ink-muted">
+                  Supervision policy in force
+                </summary>
+                <ul className="mt-2 space-y-0.5">
+                  {supervisionPolicy.map((line) => (
+                    <li key={line} className="text-[11px] text-ink-muted">
+                      · {line}
+                    </li>
+                  ))}
+                </ul>
+              </details>
 
               {session.status === "paused" ? (
                 <p className="text-sm text-ink-muted">

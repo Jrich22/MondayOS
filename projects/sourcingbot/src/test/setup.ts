@@ -1,3 +1,8 @@
+// Registers the sourcing providers, mirroring main.tsx. Tests render surfaces
+// that read policy text from the registry, so registration has to happen before
+// any of them run — the same composition-root job, done for the test process.
+import "../lib/providers";
+
 /**
  * Test setup — in-memory localStorage polyfill.
  *

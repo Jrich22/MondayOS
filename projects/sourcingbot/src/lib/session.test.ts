@@ -7,7 +7,6 @@
  */
 import { describe, it, expect, beforeEach } from "vitest";
 import {
-  SUPERVISION_POLICY,
   SupervisionRequiredError,
   activeSessionFor,
   aggregateCounts,
@@ -21,7 +20,8 @@ import {
   sessionCounts,
   sessionsForReq,
   startSession,
-} from "./linkedin";
+} from "./sourcing-session";
+import { ManualProvider } from "./providers/manual";
 import { newCandidate } from "./candidate";
 import { __resetIdCounter } from "./ids";
 
@@ -36,7 +36,7 @@ const OK = {
 
 const started = () => startSession(OK);
 const person = (name = "Priya Raman") =>
-  newCandidate({ fullName: name, origin: "supervised-linkedin" });
+  newCandidate({ fullName: name, origin: "supervised-session" });
 
 describe("starting a session", () => {
   it("initialises the Increment 3 fields", () => {
@@ -55,7 +55,7 @@ describe("starting a session", () => {
   });
 
   it("states a policy the operator must accept", () => {
-    expect(SUPERVISION_POLICY.join(" ")).toMatch(/personally/i);
+    expect(ManualProvider.supervisionPolicy.join(" ")).toMatch(/personally/i);
   });
 });
 
@@ -88,7 +88,7 @@ describe("pause and resume", () => {
   });
 
   it("refuses to resume a session that is not paused", () => {
-    expect(() => resumeSession(started())).toThrow(/only a paused session/);
+    expect(() => resumeSession(started())).toThrow(/only a paused or halted session/);
   });
 
   it("refuses to resume without the policy acknowledgement", () => {
@@ -141,7 +141,7 @@ describe("capture attribution", () => {
     // The laundering guard: a bulk import cannot be passed through a session to
     // look human-reviewed.
     const inbound = newCandidate({ fullName: "X", origin: "inbound" });
-    expect(() => recordManualCapture(started(), inbound)).toThrow(/supervised-linkedin/);
+    expect(() => recordManualCapture(started(), inbound)).toThrow(/supervised-session/);
   });
 
   it("permits reuse of an existing person only when declared explicitly", () => {
@@ -149,7 +149,7 @@ describe("capture attribution", () => {
     // their origin correctly records how they first entered the pool. Rewriting
     // it to satisfy the guard would destroy real provenance.
     const referral = newCandidate({ fullName: "Priya Raman", origin: "referral" });
-    expect(() => recordManualCapture(started(), referral)).toThrow(/supervised-linkedin/);
+    expect(() => recordManualCapture(started(), referral)).toThrow(/supervised-session/);
     const s = recordManualCapture(started(), referral, { reusedFromPool: true });
     expect(s.candidatesAdded).toBe(1);
     expect(s.capturedCandidateIds).toEqual([referral.id]);

@@ -30,6 +30,7 @@ import type {
   StageEvent,
 } from "./types";
 import type { WorkspaceState } from "./store";
+import { DEFAULT_PROVIDER_ID } from "./provider";
 
 /** Marker every seeded session carries, so demo data is always identifiable. */
 export const DEMO_NOTE_PREFIX = "Demo data — synthetic";
@@ -222,35 +223,35 @@ const PEOPLE: PersonSpec[] = [
     notes: "Solid, but shy of the staff bar today.", added: 16 },
   { id: "c_wei", name: "Wei Zhang", headline: "Staff Engineer, Platform", location: "Boston, MA",
     company: "Basalt Infra", title: "Staff Engineer", since: "2019-11",
-    skills: ["Kubernetes", "Go", "Multi-tenant SaaS", "Observability"], origin: "supervised-linkedin",
+    skills: ["Kubernetes", "Go", "Multi-tenant SaaS", "Observability"], origin: "supervised-session",
     notes: "Led the multi-tenant migration at Basalt. Strongest profile seen so far.", added: 12 },
   { id: "c_fatima", name: "Fatima Nasser", headline: "Senior Platform Engineer", location: "Remote (US)",
     company: "Arcadia Data", title: "Senior Platform Engineer", since: "2021-02",
-    skills: ["Kubernetes", "Terraform", "Go"], origin: "supervised-linkedin",
+    skills: ["Kubernetes", "Terraform", "Go"], origin: "supervised-session",
     notes: "Deep Terraform work; interested in a step up to staff.", added: 12 },
   { id: "c_jonah", name: "Jonah Pierce", headline: "Infrastructure Engineer", location: "Boston, MA",
     company: "Lumen Portfolio Co", title: "Infrastructure Engineer", since: "2022-08",
-    skills: ["Kubernetes", "Python"], origin: "supervised-linkedin",
+    skills: ["Kubernetes", "Python"], origin: "supervised-session",
     notes: "At an excluded company — flagged, kept for future reference.", added: 11 },
   { id: "c_sana", name: "Sana Kapoor", headline: "ML Systems Engineer", location: "Remote (US)",
     company: "Meridian Labs", title: "ML Systems Engineer", since: "2020-06",
-    skills: ["PyTorch", "CUDA", "Model serving", "Python"], origin: "supervised-linkedin",
+    skills: ["PyTorch", "CUDA", "Model serving", "Python"], origin: "supervised-session",
     email: "sana.k@example.com", notes: "Owns Meridian's inference path. Very strong.", added: 10 },
   { id: "c_diego", name: "Diego Marquez", headline: "Senior ML Engineer", location: "Remote (US)",
     company: "Arcadia Data", title: "Senior ML Engineer", since: "2021-04",
-    skills: ["Python", "PyTorch", "Latency optimization"], origin: "supervised-linkedin",
+    skills: ["Python", "PyTorch", "Latency optimization"], origin: "supervised-session",
     notes: "Colleague of Lena's. Similar profile.", added: 9 },
   { id: "c_hannah", name: "Hannah Wolfe", headline: "Application Security Engineer", location: "New York, NY",
     company: "Helix Systems", title: "Application Security Engineer", since: "2021-01",
-    skills: ["AppSec", "Threat modelling", "Go"], origin: "supervised-linkedin",
+    skills: ["AppSec", "Threat modelling", "Go"], origin: "supervised-session",
     notes: "Embedded in Helix's platform team — exactly the partnership model Dana wants.", added: 6 },
   { id: "c_ravi", name: "Ravi Chandra", headline: "Staff Systems Engineer", location: "Boston, MA",
     company: "Helix Systems", title: "Staff Systems Engineer", since: "2018-09",
-    skills: ["C++", "Kubernetes", "Distributed systems"], origin: "supervised-linkedin",
+    skills: ["C++", "Kubernetes", "Distributed systems"], origin: "supervised-session",
     notes: "Great systems depth. No multi-tenant exposure.", added: 12 },
   { id: "c_marcus_d", name: "Marcus Devlin", headline: "Senior Site Reliability Engineer", location: "Remote (US)",
     company: "Northwind Cloud", title: "Senior SRE", since: "2020-03",
-    skills: ["Kubernetes", "Terraform", "Incident response"], origin: "supervised-linkedin",
+    skills: ["Kubernetes", "Terraform", "Incident response"], origin: "supervised-session",
     notes: "Infra-adjacent rather than infra. Worth revisiting if the pipeline thins.", added: 12 },
   { id: "c_elena", name: "Elena Vargas", headline: "Engineering Manager, Platform", location: "Boston, MA",
     company: "Basalt Infra", title: "Engineering Manager", since: "2021-07",
@@ -434,6 +435,8 @@ export function seedState(): WorkspaceState {
     briefs: buildBriefs(),
     candidates: buildCandidates(),
     reqCandidates: buildEvals(),
-    sessions: buildSessions(),
+    // Every demo session was a recruiter browsing on their own — stamped in one
+    // place rather than repeated on each literal.
+    sessions: buildSessions().map((s) => ({ ...s, providerId: DEFAULT_PROVIDER_ID })),
   };
 }
