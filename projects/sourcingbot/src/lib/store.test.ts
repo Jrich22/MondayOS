@@ -124,7 +124,7 @@ describe("seeded demo workspace", () => {
   });
 
   it("demonstrates one person on two requisitions", () => {
-    const history = reqHistoryFor("cand_priya", getState().reqCandidates);
+    const history = reqHistoryFor("c_priya", getState().reqCandidates);
     expect(history).toHaveLength(2);
     expect(new Set(history.map((h) => h.reqId)).size).toBe(2);
     expect(new Set(history.map((h) => h.stage)).size).toBe(2);
@@ -135,7 +135,7 @@ describe("seeded demo workspace", () => {
   });
 
   it("attaches a brief to the open infra req", () => {
-    expect(briefForReq("req_infra")?.version).toBe(3);
+    expect(briefForReq("req_infra")?.version).toBe(4);
   });
 
   it("has an open req that accepts sourcing", () => {

@@ -22,13 +22,18 @@ import type {
   SkippedCandidate,
 } from "./types";
 import { currentCompany, currentRole, findPossibleDuplicates, talentConcentration } from "./candidate";
+import { sortForWorkspace } from "./req";
+import { evaluateReadiness } from "./readiness";
 import { reqHistoryFor, stageCounts } from "./req-candidate";
 import {
   aggregateCounts,
+  activeSessionFor,
   closeCallsFor,
   isActive,
   isSupervisedOrigin,
   sessionCounts,
+  sessionsForReq,
+  type SessionCounts,
 } from "./sourcing-session";
 
 /** Everything the workspace reads. Mirrors WorkspaceState, passed explicitly. */
@@ -48,9 +53,15 @@ export interface Pulse {
   activeReqs: number;
   activeSessions: number;
   capturedToday: number;
+  /** Every candidate ever captured into a requisition. */
+  capturedTotal: number;
   closeCalls: number;
   reusedCandidates: number;
   needsReview: number;
+  /** Share of reviewed people who were captured, across all sessions. */
+  captureRate: number | null;
+  /** Mean fit across scored evaluations. Null when nothing is scored. */
+  averageFit: number | null;
 }
 
 /** Local-day boundary, so "today" means the recruiter's today. */
@@ -71,10 +82,14 @@ function isToday(iso: string): boolean {
  */
 export function pulse(input: IntelInput): Pulse {
   const briefByReq = new Map(input.briefs.map((b) => [b.reqId, b]));
+  const scored = input.reqCandidates
+    .map((rc) => rc.fitScore)
+    .filter((f): f is number => f !== null);
   return {
     activeReqs: input.reqs.filter((r) => r.status === "open").length,
     activeSessions: input.sessions.filter(isActive).length,
     capturedToday: input.reqCandidates.filter((rc) => isToday(rc.addedAt)).length,
+    capturedTotal: input.reqCandidates.length,
     closeCalls: input.sessions.flatMap((s) => s.skipped ?? []).filter((s) => s.closeCall).length,
     reusedCandidates: input.candidates.filter(
       (c) => reqHistoryFor(c.id, input.reqCandidates).length > 1,
@@ -83,6 +98,12 @@ export function pulse(input: IntelInput): Pulse {
       const b = briefByReq.get(rc.reqId);
       return b !== undefined && rc.briefVersion < b.version;
     }).length,
+    captureRate: aggregateCounts(input.sessions).captureRate,
+    // Rejections score 0 and are included deliberately: an average that quietly
+    // dropped them would flatter every pipeline.
+    averageFit: scored.length
+      ? Math.round(scored.reduce((a, b) => a + b, 0) / scored.length)
+      : null,
   };
 }
 
@@ -98,18 +119,49 @@ export type FocusKind =
   | "weak-session"
   | "stale-evaluation";
 
+/**
+ * What acting on a focus item actually does.
+ *
+ * Described here, performed by the surface. `intel.ts` stays pure — it decides
+ * WHAT the next action is, and the component routes it through the existing
+ * domain functions (`advance`, `startSession`). Encoding the action as data is
+ * what lets the homepage be an operating surface rather than a set of links:
+ * most items are worked in place, and `navigate` is the exception for the few
+ * that genuinely need another screen.
+ */
+export type FocusAction =
+  /** Move a candidate one stage forward, in place. */
+  | { type: "advance"; reqCandidateId: string; to: PipelineStage; label: string }
+  /** Reject a candidate for this req, in place. */
+  | { type: "reject"; reqCandidateId: string; label: string }
+  /** Open the supervised session gate inline on the homepage. */
+  | { type: "start-session"; reqId: string; label: string }
+  /** Genuinely needs another surface — a capture form, a brief editor. */
+  | { type: "navigate"; href: string; label: string };
+
 export interface FocusItem {
   id: string;
   kind: FocusKind;
   title: string;
   /** Why this surfaced. Shown verbatim — a worklist without reasons is noise. */
   reason: string;
-  /** Single next action. */
-  actionLabel: string;
+  /** The action worked in place, or navigation when the work needs a surface. */
+  action: FocusAction;
+  /** Optional secondary action, e.g. rejecting instead of advancing. */
+  secondary?: FocusAction;
+  /** Where to look at the item in full, always available. */
   href: string;
   /** Higher sorts first. */
   priority: number;
 }
+
+/** The stage a candidate moves to when advanced from the queue. */
+const NEXT_STAGE: Partial<Record<PipelineStage, PipelineStage>> = {
+  identified: "reviewing",
+  reviewing: "contacted",
+  contacted: "responded",
+  responded: "advanced",
+};
 
 const STAGE_UNACTIONED: PipelineStage[] = ["identified", "reviewing"];
 
@@ -133,12 +185,16 @@ export function recommendedFocus(input: IntelInput, limit = 8): FocusItem[] {
     const c = candidateById.get(rc.candidateId);
     const req = reqById.get(rc.reqId);
     if (!c || !req) continue;
+    const next = NEXT_STAGE[rc.stage];
     items.push({
       id: `strong-${rc.id}`,
       kind: "strong-candidate",
       title: c.fullName,
       reason: `${rc.fitScore}% fit for ${req.code} — still ${rc.stage}`,
-      actionLabel: "Open pipeline",
+      action: next
+        ? { type: "advance", reqCandidateId: rc.id, to: next, label: `Move to ${next}` }
+        : { type: "navigate", href: `/reqs/${req.id}`, label: "Open pipeline" },
+      secondary: { type: "reject", reqCandidateId: rc.id, label: "Not a fit" },
       href: `/reqs/${req.id}`,
       priority: 100 + (rc.fitScore ?? 0),
     });
@@ -153,7 +209,8 @@ export function recommendedFocus(input: IntelInput, limit = 8): FocusItem[] {
         kind: "close-call",
         title: s.name,
         reason: `Close call on ${req.code}${s.reason ? ` — ${s.reason}` : ""}`,
-        actionLabel: "Revisit in session",
+        // Capturing needs the full form, so this one genuinely leaves home.
+        action: { type: "navigate", href: `/reqs/${req.id}/session`, label: "Revisit in session" },
         href: `/reqs/${req.id}/session`,
         priority: 80,
       });
@@ -172,7 +229,7 @@ export function recommendedFocus(input: IntelInput, limit = 8): FocusItem[] {
         kind: "reuse-opportunity",
         title: `${c.fullName} · possible duplicate`,
         reason: `Matches ${dup.fullName} already in the pool — merge or keep separate`,
-        actionLabel: "Compare",
+        action: { type: "navigate", href: `/candidates/${c.id}`, label: "Compare" },
         href: `/candidates/${c.id}`,
         priority: 75,
       });
@@ -193,7 +250,7 @@ export function recommendedFocus(input: IntelInput, limit = 8): FocusItem[] {
         live === 0
           ? `${req.code} has nobody in the pipeline`
           : `${req.code} has only ${live} live ${live === 1 ? "candidate" : "candidates"}`,
-      actionLabel: "Start sourcing",
+      action: { type: "start-session", reqId: req.id, label: "Start sourcing" },
       href: `/reqs/${req.id}/session`,
       priority: 90 - live * 5,
     });
@@ -220,7 +277,7 @@ export function recommendedFocus(input: IntelInput, limit = 8): FocusItem[] {
       reason:
         `${c.captured} of ${c.reviewed} reviewed were added. ` +
         `Review the brief, search criteria, or sourcing approach.`,
-      actionLabel: "Review brief",
+      action: { type: "navigate", href: `/reqs/${req.id}/edit`, label: "Review brief" },
       href: `/reqs/${req.id}/edit`,
       priority: 70,
     });
@@ -237,7 +294,8 @@ export function recommendedFocus(input: IntelInput, limit = 8): FocusItem[] {
       kind: "stale-evaluation",
       title: c.fullName,
       reason: `Assessed against ${req.code} brief v${rc.briefVersion}, now v${b.version}`,
-      actionLabel: "Reassess",
+      // Reassessment is a judgement against the new bar — it needs the pipeline.
+      action: { type: "navigate", href: `/reqs/${req.id}`, label: "Reassess" },
       href: `/reqs/${req.id}`,
       priority: 60,
     });
@@ -397,6 +455,8 @@ export interface PoolRow {
   reqCount: number;
   /** Best fit score across their evaluations, if any were scored. */
   bestFit: number | null;
+  /** Stage on their most recently touched evaluation. Null if never on a req. */
+  latestStage: PipelineStage | null;
   lastActivity: string;
 }
 
@@ -411,6 +471,7 @@ export function poolRows(input: IntelInput): PoolRow[] {
         title: currentRole(candidate)?.title ?? "",
         reqCount: history.length,
         bestFit: scored.length ? Math.max(...scored) : null,
+        latestStage: history[0]?.stage ?? null,
         lastActivity: history[0]?.updatedAt ?? candidate.updatedAt,
       };
     })
@@ -479,4 +540,147 @@ export function allCloseCalls(input: IntelInput): SkippedCandidate[] {
   return input.reqs
     .flatMap((r) => closeCallsFor(r.id, input.sessions))
     .sort((a, b) => b.at.localeCompare(a.at));
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard — requisition rows and sourcing performance
+// ---------------------------------------------------------------------------
+
+export interface ReqDashboardRow {
+  req: Req;
+  /** 0-100 authoring completeness, from the existing readiness model. */
+  completeness: number;
+  sourcingReady: boolean;
+  /** Candidates still moving: identified through responded. */
+  live: number;
+  /** Live candidates scoring >= the strong threshold. */
+  strong: number;
+  advanced: number;
+  rejected: number;
+  sessions: number;
+  activeSession: SourcingSession | null;
+  captureRate: number | null;
+  lastActivity: string;
+}
+
+/** Fit at or above this counts as a strong candidate. See ADR-014 appendix. */
+export const STRONG_FIT = 70;
+
+const LIVE_STAGES: PipelineStage[] = ["identified", "reviewing", "contacted", "responded"];
+
+/**
+ * One row per requisition for the dashboard.
+ *
+ * Every field is derived: completeness from `evaluateReadiness`, counts from
+ * `stageCounts`, sourcing figures from `aggregateCounts` over that req's
+ * sessions. Nothing is stored, so a row can never disagree with the records it
+ * summarises.
+ */
+export function reqDashboard(input: IntelInput): ReqDashboardRow[] {
+  const briefByReq = new Map(input.briefs.map((b) => [b.reqId, b]));
+
+  return sortForWorkspace(input.reqs).map((req) => {
+    const brief = briefByReq.get(req.id);
+    const readiness = evaluateReadiness(req, brief);
+    const counts = stageCounts(req.id, input.reqCandidates);
+    const mine = input.reqCandidates.filter((rc) => rc.reqId === req.id);
+    const sessions = sessionsForReq(req.id, input.sessions);
+
+    const lastActivity = [
+      req.updatedAt,
+      ...mine.map((rc) => rc.updatedAt),
+      ...sessions.map((s) => s.endedAt ?? s.startedAt),
+    ].sort().reverse()[0] ?? req.updatedAt;
+
+    return {
+      req,
+      completeness: readiness.completeness,
+      sourcingReady: readiness.sourcingReady,
+      live: LIVE_STAGES.reduce((sum, st) => sum + counts[st], 0),
+      strong: mine.filter(
+        (rc) => LIVE_STAGES.includes(rc.stage) && (rc.fitScore ?? 0) >= STRONG_FIT,
+      ).length,
+      advanced: counts.advanced,
+      rejected: counts.rejected,
+      sessions: sessions.length,
+      activeSession: activeSessionFor(req.id, input.sessions),
+      captureRate: aggregateCounts(sessions).captureRate,
+      lastActivity,
+    };
+  });
+}
+
+export interface SessionPerformanceRow {
+  session: SourcingSession;
+  reqCode: string;
+  counts: SessionCounts;
+}
+
+export interface SourcingPerformance {
+  totals: SessionCounts;
+  sessionCount: number;
+  activeCount: number;
+  /** Sessions with enough signal to rank, best capture rate first. */
+  ranked: SessionPerformanceRow[];
+  strongest: SessionPerformanceRow | null;
+  weakest: SessionPerformanceRow | null;
+}
+
+/**
+ * Sourcing performance across every session.
+ *
+ * Strongest and weakest are drawn only from sessions that reviewed at least
+ * `MIN_RANKABLE_REVIEWED` people. A session that looked at two profiles and
+ * captured one is not a 50% performer — it is a session with no signal, and
+ * ranking it would put noise at the top of the board.
+ */
+export const MIN_RANKABLE_REVIEWED = 3;
+
+export function sourcingPerformance(input: IntelInput): SourcingPerformance {
+  const reqCode = new Map(input.reqs.map((r) => [r.id, r.code]));
+
+  const rows: SessionPerformanceRow[] = input.sessions.map((session) => ({
+    session,
+    reqCode: reqCode.get(session.reqId) ?? "—",
+    counts: sessionCounts(session),
+  }));
+
+  const rankable = rows
+    .filter((r) => r.counts.reviewed >= MIN_RANKABLE_REVIEWED && r.counts.captureRate !== null)
+    .sort((a, b) => (b.counts.captureRate ?? 0) - (a.counts.captureRate ?? 0));
+
+  return {
+    totals: aggregateCounts(input.sessions),
+    sessionCount: input.sessions.length,
+    activeCount: input.sessions.filter(isActive).length,
+    ranked: rankable,
+    strongest: rankable[0] ?? null,
+    weakest: rankable.length > 1 ? rankable[rankable.length - 1] : null,
+  };
+}
+
+/** People evaluated for more than one requisition, most-evaluated first. */
+export interface ReusableCandidate {
+  candidate: Candidate;
+  reqCount: number;
+  reqCodes: string[];
+  bestFit: number | null;
+}
+
+export function reusableTalent(input: IntelInput, limit = 6): ReusableCandidate[] {
+  const reqCode = new Map(input.reqs.map((r) => [r.id, r.code]));
+  return input.candidates
+    .map((candidate) => {
+      const history = reqHistoryFor(candidate.id, input.reqCandidates);
+      const scored = history.map((h) => h.fitScore).filter((f): f is number => f !== null);
+      return {
+        candidate,
+        reqCount: history.length,
+        reqCodes: history.map((h) => reqCode.get(h.reqId) ?? "—"),
+        bestFit: scored.length ? Math.max(...scored) : null,
+      };
+    })
+    .filter((r) => r.reqCount > 1)
+    .sort((a, b) => b.reqCount - a.reqCount || (b.bestFit ?? -1) - (a.bestFit ?? -1))
+    .slice(0, limit);
 }
