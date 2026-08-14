@@ -4,6 +4,159 @@ Newest first. Each records the decision, why, and what it costs.
 
 ---
 
+## ADR-019 — Fit score authority stays in the sourcingBOT domain
+
+**Status:** accepted · approved 2026-08-14 · TASK-0061
+
+**Context.** In agent-operated sourcing, Claude evaluates every profile against
+the brief. The obvious shape is for it to return a fit score alongside its
+reasoning, and for sourcingBOT to store what it was given.
+
+**Decision.** It does not. **Claude supplies evidence; sourcingBOT computes the
+number.**
+
+| Claude supplies | sourcingBOT computes |
+|---|---|
+| per-requirement assessments (`yes` / `no` / `unknown`) | `fitScore`, via `withFitScore()` |
+| rationale for this req | rank position |
+| relevant experience | whether ADR-006's cap applies |
+| concerns and gaps | |
+
+`upsert_working_shortlist_entry` has **no `fitScore` parameter**. A score sent
+anyway is ignored, and a test asserts the parameter's absence.
+
+**Why.** A score is not an observation, it is the output of a rule — the brief's
+weights, and ADR-006's rule that an unmet required requirement caps fit at 0.
+Accepting the number from outside moves that rule out of the domain, where three
+things follow. It stops being checkable: nobody can re-derive 78 from the
+evidence. It stops being consistent: two profiles with identical assessments can
+score differently depending on how the sentence was phrased. And it drifts under
+pressure — a long session hunting the twentieth candidate is exactly the
+condition under which "good enough" quietly becomes 72.
+
+Keeping the computation inside also means re-ranking is free and always correct.
+Editing a requirement weight re-scores every working entry with no round trip.
+
+**Alternatives rejected.** *Accept Claude's score and store both* — two numbers
+that disagree, and no rule for which wins. *Accept the score and validate it
+against the assessments* — that is computing it, with extra steps and a
+disagreement to resolve. *Let Claude propose and a human confirm* — makes the
+recruiter arbiter of arithmetic they cannot see.
+
+**Consequences.** Claude must return assessments covering the brief's
+requirements; a sparse assessment set yields a low or null score rather than an
+optimistic one, which is the correct failure direction. Entries assessed against
+an older `briefVersion` keep being scored against **that** version (ADR-003) —
+re-scoring old evidence against a new brief would fabricate judgements nobody
+made. Finalization surfaces such entries rather than silently recomputing them.
+
+---
+
+## ADR-018 — Shortlist-first sourcing: five states, one promotion
+
+**Status:** accepted · approved 2026-08-14 · TASK-0061, TASK-0062
+
+**Context.** Manual capture assumed the recruiter records each person they
+review, so "reviewed" and "recorded" were the same act. Agent-operated sourcing
+breaks that: Claude may review 137 profiles to find 20. Persisting each one as a
+`Candidate` would fill a permanent talent pool with people nobody selected, and
+would make the pool a by-product of search volume rather than of judgement.
+
+**Decision.** A profile moves through five states, and only the last is
+permanent:
+
+```
+reviewed ──▶ potential ──▶ working shortlist ──▶ finalized ──▶ Candidate
+(counter)   (session,      (session-scoped      (human       (+ReqCandidate)
+             capped 25)     entry, ranked)       action)
+```
+
+| State | Stored | Personal data | Lifetime |
+|---|---|---|---|
+| **reviewed** | aggregate counter | **none** | session |
+| **potential** | `SkippedCandidate`, cap **25** | name + reason | session |
+| **working shortlist** | `WorkingShortlistEntry` | full evidence | session |
+| **finalized** | `Candidate` + `ReqCandidate` | full record | permanent |
+
+**The working shortlist is session-scoped, and that is the load-bearing choice.**
+Claude may hold more contenders than the target, swap a weaker entry for a
+stronger one, and change its mind repeatedly — none of which touches the
+permanent pool. Finding candidate #21 neither creates a `Candidate` nor deletes
+one; it reorders a list that lives on the session. The talent pool only ever
+grows by a human act.
+
+**Finalize Shortlist is a human action, and cannot be an MCP tool.** There is no
+`finalize_shortlist` tool, and a test asserts its absence. Three reasons, in
+order of weight:
+
+1. **It creates permanent records about real people.** Every other write in this
+   system is provisional and session-scoped; this one is not, and the boundary
+   between provisional and permanent is exactly where a human belongs.
+2. **It is the acceptance of a recommendation.** Claude proposing twenty people
+   and Claude accepting its own twenty people are different acts, and collapsing
+   them leaves nobody having chosen.
+3. **It is where duplicate resolution lands.** Merging two records for one human
+   is the failure mode ADR-012 exists to prevent, and it is a judgement, not a
+   match score.
+
+Claude may call `report_target_reached`. That is a report, not a state change.
+
+**Finalization operates on the top N *or* on a recruiter-selected subset.**
+Both run the identical transaction — freeze, validate, resolve duplicates,
+build, single atomic commit — and the only difference is which entries are
+frozen. Selection is a UI act; there is no MCP path to either form.
+
+The subset exists because the top-N-only rule was wrong in practice. A recruiter
+who runs a search, finds two excellent people and concludes the market is thin
+had exactly two options: promote a shortlist of twenty they did not believe in,
+or promote nothing and lose the two. Both are bad, and the second is worse — it
+punishes honest judgement about a weak market. A search that yields three good
+people is a legitimate outcome, not a failed run, and the model should be able
+to say so.
+
+What subset selection explicitly is **not** is a per-person promote button.
+There is no path that takes one entry straight to the pool, because that is
+finalization with the duplicate check skipped — the exact shortcut ADR-012 was
+written to prevent. Selecting one entry and finalizing is fine; it runs the
+whole transaction. **Finalize Shortlist remains the one canonical way a person
+becomes permanent**, and its guarantees do not vary with how many were chosen.
+
+Unselected entries are untouched: they stay session-scoped evidence, are neither
+deleted nor rewritten, and remain available if the recruiter finalizes again
+later. Sessions record how many were finalized against the target, so a session
+that promoted 3 of 20 reads as a deliberate outcome rather than an unfinished
+one.
+
+**Rejected profiles are counted, never named.** No `Candidate`, no
+`ReqCandidate`, no stored name or profile reference. Recording a name and a
+rejection reason for several hundred people who never entered the pipeline builds
+a profiling dataset about individuals who never applied — in a product whose
+posture is human oversight. Counting them costs nothing and answers every
+question the recruiter actually asks. The 25-cap on near-misses holds the same
+line: "who did I nearly take?" stays answerable without becoming a dossier.
+
+**Alternatives rejected.** *Persist every strong profile as a Candidate and rank
+a view over them* (the first proposal) — makes pool size a function of search
+volume, and leaves the recruiter deleting people to tidy up. *Hard-cap the
+working shortlist at N with eviction* — an entry is evidence a profile was
+evaluated; evicting silently discards work Claude did. Capping the **final**
+promotion is the right place. *Let Claude finalize once the target is met* — see
+above. *Store rejected profiles for later mining* — the value is speculative, the
+data-protection surface is not.
+
+**Consequences.** A session carries real weight now: up to 25 near-misses and a
+working shortlist of ~25 entries with full evidence. Sessions become the largest
+records in the store, which is a persistence consideration for ADR-016 but not a
+model problem. An abandoned session leaves its working shortlist unpromoted —
+correct, since nobody accepted it, and it remains readable as evidence of what
+was searched. Reviewed counts come from a counter rather than from summing
+records, so a legacy session's counts derive from its captures as before. And
+because entries are session-scoped, a recruiter who wants one of them
+permanently must finalize — there is deliberately no "promote just this person"
+side door, because that is finalization with the duplicate check skipped.
+
+---
+
 ## ADR-017 — Attestations are human-only, and presence is enforced rather than promised
 
 **Status:** accepted · approved 2026-08-13 · TASK-0059, TASK-0061
