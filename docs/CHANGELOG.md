@@ -9,6 +9,40 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### MondayOS v2.9 — Growth Bot: performance events and analytics (2026-08-27)
+
+Increment 5 (TASK-0065). Adds the measurement layer every future Growth Brain recommendation will
+be computed from. Deterministic throughout: no AI reasoning, no recommendations, no experiments.
+
+#### Added
+- `growth/events.py` — `PerformanceEvent` across eleven observation types, append-only JSONL per
+  workspace, with an explicit `source` of platform / imported / synthetic.
+- `growth/metrics.py` — every formula as a pure function with the formula in its docstring.
+- `growth/analytics.py` — content, campaign, platform and workspace aggregation; time series;
+  trends; conversion funnel; snapshots; and the portfolio aggregate.
+- Fourteen analytics actions on `Monday.growth()` and matching `monday growth` commands, with a
+  visible synthetic-data banner on every metrics screen.
+
+#### Integrity
+- `record()` refuses `source=platform`: `REAL_ADAPTERS` is empty, so no platform has reported
+  anything and a fabricated platform event would make every downstream metric a lie that looks
+  measured. A test asserts no production path can write one.
+- Rates return `None` with a reason where the denominator is empty, never `0.0`. A genuine measured
+  zero still reports as zero, and a test distinguishes the two.
+- `approval_rate` and `publishing_success_rate` are counted from each item's own `status_history`
+  and `publication` record rather than a parallel counter, so they cannot drift from the audit trail.
+- The portfolio aggregate carries counts, rates and deltas only. A test plants confidential copy,
+  media paths, an audience definition, an account id and a secret name in a workspace and asserts
+  none reach the aggregate.
+- Event ordinals and snapshots are per workspace; a test asserts project A's analytics read none of
+  project B's events.
+
+#### Known gaps
+- `audience_growth` needs two snapshots carrying a follower count; follower count is a platform
+  gauge, so until adapters exist a caller supplies it.
+- No Growth Brain, recommendations, or experiments — increment 6.
+
+
 ### MondayOS v2.8 — Growth Bot: campaigns, content library, onboarding (2026-08-27)
 
 Increment 4 of the Growth Bot product roadmap (TASK-0064). Adds the planning object between a
