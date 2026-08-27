@@ -9,13 +9,16 @@ plain dictionaries for the API layer to wrap.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from agents.gates import GATED_ACTIONS
 from growth.content import ContentItem, ContentStatus
+from growth.dispatch import PublishDispatcher
 from growth.store import GrowthStore, WorkspaceHandle
+from integrations.publishing.connector import PublishingConnector
 from monday.project import ProjectRegistry
 
 # The gated action a publishing connector must declare (ADR-012). Registered in
@@ -28,10 +31,31 @@ class GrowthService:
     """Growth operations for one MondayOS project root."""
 
     def __init__(
-        self, project_root: Path = Path("."), registry: ProjectRegistry | None = None
+        self,
+        project_root: Path = Path("."),
+        registry: ProjectRegistry | None = None,
+        connector: PublishingConnector | None = None,
+        now: Callable[[], datetime] | None = None,
+        jitter: float = 0.0,
     ) -> None:
         self._root = Path(project_root)
         self._store = GrowthStore(self._root, registry=registry)
+        # Injected for tests and the CLI smoke path; None resolves through the
+        # connector factory, which returns the fake until real adapters exist.
+        self._connector = connector
+        self._now = now
+        self._jitter = jitter
+
+    def _dispatcher(self, project: str, actor: str = "human:cli") -> PublishDispatcher:
+        """A dispatcher bound to exactly one workspace."""
+        return PublishDispatcher(
+            handle=self._store.open(project),
+            project_root=self._root,
+            connector=self._connector,
+            now=self._now,
+            jitter=self._jitter,
+            actor=actor,
+        )
 
     # ------------------------------------------------------------------
     # Workspace
@@ -204,6 +228,48 @@ class GrowthService:
         return self._describe(item)
 
     # ------------------------------------------------------------------
+    # Publishing (increment 3)
+    # ------------------------------------------------------------------
+
+    def schedule_content(
+        self, project: str, content_id: str, actor: str = "human:cli"
+    ) -> dict[str, Any]:
+        """Move an approved, future-dated item to Scheduled."""
+        return self._dispatcher(project, actor).schedule(content_id).to_dict()
+
+    def publish_content_now(
+        self, project: str, content_id: str, actor: str = "human:cli", force: bool = False
+    ) -> dict[str, Any]:
+        """Publish an approved item, or reconcile if this version already landed."""
+        return self._dispatcher(project, actor).publish(content_id, force_due=force).to_dict()
+
+    def retry_publication(
+        self, project: str, content_id: str, actor: str = "human:cli"
+    ) -> dict[str, Any]:
+        """Re-attempt a failed item once its backoff window has elapsed."""
+        return self._dispatcher(project, actor).retry(content_id).to_dict()
+
+    def publication_status(self, project: str, content_id: str) -> dict[str, Any]:
+        """Publication state, attempt history, pause state, and audit trail."""
+        return self._dispatcher(project).publication_status(content_id)
+
+    def set_pause(
+        self,
+        project: str,
+        scope: str,
+        active: bool,
+        target: str = "",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Engage or clear one pause scope."""
+        controller = self._store.open(project).pause_controller(self._root)
+        return controller.set_pause(scope, active, target=target, reason=reason).to_dict()
+
+    def list_pauses(self, project: str) -> dict[str, Any]:
+        """Active pauses visible to this workspace, including the global stop."""
+        return self._store.open(project).pause_controller(self._root).list_pauses()
+
+    # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
@@ -215,9 +281,14 @@ class GrowthService:
         payload["is_approved"] = item.is_approved
         payload["approval_is_stale"] = item.approval_is_stale()
         payload["missing_required_fields"] = item.missing_required_fields()
-        payload["publishable"] = False
+        payload["publishable"] = item.is_approved and item.status in (
+            ContentStatus.APPROVED,
+            ContentStatus.SCHEDULED,
+        )
         payload["publishable_reason"] = (
-            "Publishing is not implemented in this increment; no connector exists."
+            "Approved and admissible for publishing."
+            if payload["publishable"]
+            else f"Not publishable from {item.status.value} with is_approved={item.is_approved}."
         )
         return payload
 
