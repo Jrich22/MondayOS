@@ -403,6 +403,35 @@ class PublishResponse:
 
 
 @dataclass
+class GrowthResponse:
+    """
+    Response from Monday.growth().
+
+    One shape across every growth action. The action-specific payload lives in
+    ``data``; the flat fields surface what the CLI needs without digging.
+
+    Attributes:
+        action:       The growth action performed.
+        success:      True if the action succeeded.
+        message:      Human-readable status or error message.
+        project:      Workspace slug the action addressed ("" for list actions).
+        content_id:   Content item involved, if any.
+        status:       Content lifecycle status after the action ("" if not applicable).
+        is_approved:  True only while a human approval still covers this exact content.
+        data:         Full action payload (workspace, item, listing, ...).
+    """
+
+    action: str
+    success: bool
+    message: str = ""
+    project: str = ""
+    content_id: str = ""
+    status: str = ""
+    is_approved: bool = False
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ModuleStatus:
     """Status of a single internal MondayOS module."""
 

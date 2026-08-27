@@ -27,7 +27,7 @@ monday = "monday.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["advisor*", "agents*", "dashboard_api*", "brain*", "core*", "doctor*", "events*", "integrations*", "knowledge*", "memory*", "migrate*", "monday*", "orchestrator*", "search*", "tasks*", "workflows*"]
+include = ["advisor*", "agents*", "dashboard_api*", "brain*", "core*", "doctor*", "events*", "growth*", "integrations*", "knowledge*", "memory*", "migrate*", "monday*", "orchestrator*", "search*", "tasks*", "workflows*"]
 
 [tool.ruff]
 target-version = "py311"
@@ -47,7 +47,7 @@ testpaths = ["tests"]
 addopts = "--tb=short -q"
 
 [tool.coverage.run]
-source = ["advisor", "agents", "dashboard_api", "brain", "core", "doctor", "events", "integrations", "knowledge", "memory", "migrate", "monday", "orchestrator", "search", "tasks", "workflows"]
+source = ["advisor", "agents", "dashboard_api", "brain", "core", "doctor", "events", "growth", "integrations", "knowledge", "memory", "migrate", "monday", "orchestrator", "search", "tasks", "workflows"]
 omit = ["tests/*"]
 
 [tool.coverage.report]
