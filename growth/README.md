@@ -24,6 +24,10 @@ The boundary that matters now is narrower and more important than "nothing can p
 - Holding platform credentials **by reference** — a secret's name, never its value.
 - Modelling the Content Item, its lifecycle, and the legal transitions between states.
 - Computing and comparing approval fingerprints, so an edited item cannot stay approved (ADR-013).
+- Campaigns: the planning object between a project and its content, with its own lifecycle.
+- The Content Library: a query layer over content that already exists, never a second copy.
+- Growth onboarding, which marks a project ready to be *planned for* and explicitly not ready to
+  publish for real.
 - Running the deterministic publish gate sequence: pause scopes, status, fingerprint, isolation,
   scheduled time, idempotency, then the connector.
 - Bounded retries with exponential backoff and jitter, and clock-free idempotency keys.
@@ -53,6 +57,11 @@ The boundary that matters now is narrower and more important than "nothing can p
 | `ContentItem` / `ContentStatus` / `ContentTransition` | The unit of approval |
 | `compute_fingerprint` / `FINGERPRINTED_FIELDS` | The approval contract |
 | `normalize_project_slug` / `resolve_project` | The isolation gate |
+| `Campaign` / `CampaignStatus` | The planning object and its lifecycle |
+| `ContentLibrary` / `LibraryEntry` | Query and projection over stored content |
+| `ContentType` | What kind of artifact an item is (library metadata) |
+| `Onboarding` / `PlatformIntent` / `WeeklyReview` | Growth onboarding; account LABELS only |
+| `seed_workspace` / `is_synthetic` | Deterministic demo data, marked synthetic at rest |
 | `PublishDispatcher` / `DispatchResult` | The deterministic publish gate sequence |
 | `PublicationRecord` / `PublicationAttempt` | Durable publishing outcome and attempt history |
 | `idempotency_key` / `backoff_seconds` | Clock-free dedupe key; bounded retry curve |
@@ -77,6 +86,7 @@ growth/
 ├── emergency_stop.json           portfolio-wide stop: a flag and a reason, no project data
 └── workspaces/<slug>/
     ├── workspace.md              business, brand, audience, marketing, bindings
+    ├── campaigns/CAMPAIGN-NNNN.md one Campaign
     ├── content/CONTENT-NNNN.md   one Content Item, including its publication record
     ├── pauses.json               project / platform / post pauses for THIS project
     └── .sequences.json           CONTENT- id allocation, scoped to THIS workspace
@@ -86,6 +96,19 @@ logs/growth/<slug>/audit.jsonl    append-only audit trail (gitignored runtime st
 
 The publication record lives on the content item, not in a side table, so an item marked Published
 always carries the external id that proves it — even in a fresh clone where the logs are absent.
+
+Two rules keep the library and the approval contract from interfering with each other:
+
+- **Library metadata is never fingerprinted.** `content_type`, `title`, `themes`, `audience`,
+  `variant_group_id`, `reuse_eligible` and `last_reused_at` sit outside `canonical_payload`, so
+  cataloguing an item can never invalidate a standing approval. A test asserts the hash is
+  byte-identical before and after all of them are populated.
+- **Per-platform variants are separate items** sharing a `variant_group_id`, never one item with
+  many captions. Approval binds one platform, one account and one copy (ADR-013), so approving the
+  LinkedIn variant must not approve the Instagram one — and a test asserts it does not.
+
+`Marketing.campaigns` on the workspace remains a descriptive list of campaign *labels*. Real
+`Campaign` records are authoritative; that field is not a foreign key and is not read as one.
 
 The sequence file is per workspace on purpose. A shared counter would let one project infer
 another's publishing volume from the gaps in its own ids.

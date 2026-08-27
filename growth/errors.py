@@ -96,3 +96,36 @@ class GrowthParseError(GrowthError):
     def __init__(self, message: str, source_path: str = "<string>") -> None:
         self.source_path = source_path
         super().__init__(f"{source_path}: {message}")
+
+
+class CampaignNotFoundError(GrowthError):
+    """Raised when a campaign id cannot be resolved within a workspace."""
+
+    def __init__(self, campaign_id: str, slug: str) -> None:
+        self.campaign_id = campaign_id
+        self.slug = slug
+        super().__init__(f"No campaign {campaign_id!r} in growth workspace {slug!r}.")
+
+
+class CrossCampaignError(GrowthError):
+    """Raised when content is assigned to a campaign outside its own workspace."""
+
+    def __init__(self, content_id: str, campaign_id: str, slug: str) -> None:
+        self.content_id = content_id
+        self.campaign_id = campaign_id
+        self.slug = slug
+        super().__init__(
+            f"Cannot assign {content_id!r} to campaign {campaign_id!r}: the campaign is not in "
+            f"workspace {slug!r}. Content never moves between projects or across workspaces."
+        )
+
+
+class OnboardingIncompleteError(GrowthError):
+    """Raised when an operation requires onboarding that has not been completed."""
+
+    def __init__(self, slug: str, missing: list[str]) -> None:
+        self.slug = slug
+        self.missing = missing
+        super().__init__(
+            f"Growth onboarding for {slug!r} is incomplete. Missing: {', '.join(missing)}."
+        )

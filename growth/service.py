@@ -15,8 +15,16 @@ from pathlib import Path
 from typing import Any
 
 from agents.gates import GATED_ACTIONS
-from growth.content import ContentItem, ContentStatus
+from growth.campaign import Campaign, CampaignStatus
+from growth.content import ContentItem, ContentStatus, ContentType
 from growth.dispatch import PublishDispatcher
+from growth.library import ContentLibrary
+from growth.onboarding import (
+    PlatformIntent,
+    WeeklyReview,
+    evaluate_readiness,
+    supported_platform_names,
+)
 from growth.store import GrowthStore, WorkspaceHandle
 from integrations.publishing.connector import PublishingConnector
 from monday.project import ProjectRegistry
@@ -228,6 +236,177 @@ class GrowthService:
         return self._describe(item)
 
     # ------------------------------------------------------------------
+    # Campaigns (increment 4)
+    # ------------------------------------------------------------------
+
+    def create_campaign(self, project: str, name: str, **fields: Any) -> dict[str, Any]:
+        """Create a Draft campaign in a project's workspace."""
+        return self._store.open(project).create_campaign(name=name, **fields).to_dict()
+
+    def get_campaign(self, project: str, campaign_id: str) -> dict[str, Any]:
+        """Read one campaign with its derived content counts."""
+        handle = self._store.open(project)
+        campaign = handle.get_campaign(campaign_id)
+        return self._describe_campaign(handle, campaign)
+
+    def list_campaigns(self, project: str, status: str = "") -> list[dict[str, Any]]:
+        """Campaigns in a project, optionally filtered by status."""
+        handle = self._store.open(project)
+        parsed = CampaignStatus(status) if status else None
+        return [self._describe_campaign(handle, c) for c in handle.list_campaigns(parsed)]
+
+    def transition_campaign(
+        self,
+        project: str,
+        campaign_id: str,
+        status: str,
+        changed_by: str = "human:cli",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Move a campaign along its lifecycle."""
+        handle = self._store.open(project)
+        campaign = handle.transition_campaign(
+            campaign_id, CampaignStatus(status), changed_by=changed_by, reason=reason
+        )
+        return self._describe_campaign(handle, campaign)
+
+    def assign_campaign(
+        self, project: str, content_id: str, campaign_id: str, changed_by: str = "human:cli"
+    ) -> dict[str, Any]:
+        """Attach content to a campaign in the same workspace, or detach it."""
+        handle = self._store.open(project)
+        return self._describe(handle.assign_campaign(content_id, campaign_id, changed_by))
+
+    # ------------------------------------------------------------------
+    # Content library (increment 4)
+    # ------------------------------------------------------------------
+
+    def library_search(self, project: str, **filters: Any) -> list[dict[str, Any]]:
+        """Query the content library for one project."""
+        library = ContentLibrary(self._store.open(project))
+        content_type = filters.get("content_type")
+        status = filters.get("status")
+        entries = library.search(
+            text=str(filters.get("text", "")),
+            theme=str(filters.get("theme", "")),
+            campaign=str(filters.get("campaign", "")),
+            platform=str(filters.get("platform", "")),
+            content_type=ContentType(content_type) if content_type else None,
+            status=ContentStatus(status) if status else None,
+            tag=str(filters.get("tag", "")),
+            reusable_only=bool(filters.get("reusable_only", False)),
+        )
+        return [e.to_dict() for e in entries]
+
+    def library_summary(self, project: str) -> dict[str, Any]:
+        """Counts by type, platform, status and theme for one project."""
+        return ContentLibrary(self._store.open(project)).summary()
+
+    def library_top(self, project: str, limit: int = 10) -> dict[str, Any]:
+        """Highest-performing content, with the basis for the ranking."""
+        entries, basis = ContentLibrary(self._store.open(project)).highest_performing(limit)
+        return {"entries": [e.to_dict() for e in entries], "basis": basis}
+
+    def library_reusable(self, project: str, days: int = 0) -> list[dict[str, Any]]:
+        """Reusable content, optionally only what has not been reused recently."""
+        library = ContentLibrary(self._store.open(project))
+        entries = library.not_reused_since(days) if days else library.reusable()
+        return [e.to_dict() for e in entries]
+
+    def library_variants(self, project: str, variant_group_id: str) -> list[dict[str, Any]]:
+        """Every per-platform variant of one idea."""
+        return [
+            e.to_dict()
+            for e in ContentLibrary(self._store.open(project)).variants(variant_group_id)
+        ]
+
+    # ------------------------------------------------------------------
+    # Onboarding (increment 4)
+    # ------------------------------------------------------------------
+
+    def onboard(self, project: str, **fields: Any) -> dict[str, Any]:
+        """
+        Record growth onboarding for a project.
+
+        Accepts platform intents as {platform, account_label} pairs. It records no
+        credential of any kind: account connection is a later increment.
+        """
+        handle = self._store.open(project)
+        workspace = handle.read()
+        onboarding = workspace.onboarding
+
+        if "platforms" in fields:
+            onboarding.platform_intents = [
+                PlatformIntent(
+                    platform=str(p.get("platform", "")),
+                    account_label=str(p.get("account_label", "")),
+                )
+                for p in (fields.get("platforms") or [])
+            ]
+        if "cadence_per_week" in fields:
+            onboarding.cadence_per_week = int(fields["cadence_per_week"])
+        if "prohibited_content" in fields:
+            onboarding.prohibited_content = [str(x) for x in (fields["prohibited_content"] or [])]
+        if "weekly_review_day" in fields or "weekly_review_hour_utc" in fields:
+            onboarding.weekly_review = WeeklyReview(
+                weekday=str(fields.get("weekly_review_day", "sunday")),
+                hour_utc=int(fields.get("weekly_review_hour_utc", 17)),
+            )
+        if "objectives" in fields:
+            workspace.marketing.objectives = [str(o) for o in (fields["objectives"] or [])]
+        if "brand_voice" in fields:
+            workspace.brand.voice = str(fields["brand_voice"])
+        if "brand_assets" in fields:
+            workspace.brand.approved_imagery = [str(a) for a in (fields["brand_assets"] or [])]
+        if "audience_personas" in fields:
+            workspace.audience.personas = [str(a) for a in (fields["audience_personas"] or [])]
+        if "audience_icps" in fields:
+            workspace.audience.icps = [str(a) for a in (fields["audience_icps"] or [])]
+
+        satisfied, missing = evaluate_readiness(workspace)
+        onboarding.completed_steps = satisfied
+        onboarding.growth_ready_for_planning = not missing
+        if not missing and onboarding.completed_at is None:
+            onboarding.completed_at = datetime.now(tz=UTC)
+        # Never set here. Account connection is a later increment and nothing in
+        # growth/ has the authority to declare real publishing ready.
+        onboarding.growth_ready_for_real_publishing = False
+
+        handle.write(workspace)
+        return self.onboarding_status(project)
+
+    def onboarding_status(self, project: str) -> dict[str, Any]:
+        """Readiness, satisfied steps, and what is still missing."""
+        workspace = self._store.open(project).read()
+        satisfied, missing = evaluate_readiness(workspace)
+        return {
+            "project": workspace.slug,
+            "growth_ready_for_planning": workspace.onboarding.growth_ready_for_planning,
+            "growth_ready_for_real_publishing": (
+                workspace.onboarding.growth_ready_for_real_publishing
+            ),
+            "completed_steps": satisfied,
+            "missing_steps": missing,
+            "platform_intents": [p.to_dict() for p in workspace.onboarding.platform_intents],
+            "supported_platforms": list(supported_platform_names()),
+            "weekly_review": (
+                workspace.onboarding.weekly_review.to_dict()
+                if workspace.onboarding.weekly_review
+                else None
+            ),
+            "note": (
+                "Real publishing readiness requires an account connection, which does "
+                "not exist yet. Publishing runs against the fake connector only."
+            ),
+        }
+
+    def seed_demo(self, project: str) -> dict[str, Any]:
+        """Populate a workspace with clearly-marked synthetic demo data."""
+        from growth.demo import seed_workspace
+
+        return seed_workspace(self._store.open(project))
+
+    # ------------------------------------------------------------------
     # Publishing (increment 3)
     # ------------------------------------------------------------------
 
@@ -272,6 +451,17 @@ class GrowthService:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _describe_campaign(handle: WorkspaceHandle, campaign: Campaign) -> dict[str, Any]:
+        """Campaign payload plus counts derived from its attached content."""
+        payload = campaign.to_dict()
+        items = [i for i in handle.list_content() if i.campaign == campaign.id]
+        payload["content_count"] = len(items)
+        payload["approved_count"] = sum(1 for i in items if i.is_approved)
+        payload["published_count"] = sum(1 for i in items if i.status is ContentStatus.PUBLISHED)
+        payload["accepts_content"] = campaign.accepts_content()
+        return payload
 
     @staticmethod
     def _describe(item: ContentItem) -> dict[str, Any]:

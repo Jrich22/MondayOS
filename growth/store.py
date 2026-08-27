@@ -29,15 +29,19 @@ import yaml
 
 from core.types import EntityId
 from growth.binding import PlatformBinding, normalize_platform
+from growth.campaign import Campaign, CampaignStatus, CampaignTransition
 from growth.content import (
     PUBLISHING_STATES,
     ContentItem,
     ContentStatus,
     ContentTransition,
+    ContentType,
 )
 from growth.errors import (
     BindingNotFoundError,
+    CampaignNotFoundError,
     ContentNotFoundError,
+    CrossCampaignError,
     GrowthParseError,
     InvalidTransitionError,
     WorkspaceExistsError,
@@ -51,9 +55,16 @@ if TYPE_CHECKING:
     from growth.pause import PauseController
 
 _CONTENT_PREFIX = "CONTENT"
+_CAMPAIGN_PREFIX = "CAMPAIGN"
 _SEQUENCES_FILENAME = ".sequences.json"
 _WORKSPACE_FILENAME = "workspace.md"
 _CONTENT_DIRNAME = "content"
+_CAMPAIGN_DIRNAME = "campaigns"
+
+# A CAMPAIGN-shaped value on a content item must resolve to a campaign in THIS
+# workspace. Any other string stays a free-text label, which keeps the existing
+# descriptive use of ContentItem.campaign working unchanged.
+_CAMPAIGN_ID_RE = re.compile(rf"^{_CAMPAIGN_PREFIX}-\d+$")
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 
 
@@ -76,6 +87,7 @@ class WorkspaceHandle:
         self._project = project
         self._dir = directory
         self._content_dir = directory / _CONTENT_DIRNAME
+        self._campaign_dir = directory / _CAMPAIGN_DIRNAME
         self._sequences_path = directory / _SEQUENCES_FILENAME
 
     @property
@@ -136,6 +148,131 @@ class WorkspaceHandle:
         return found
 
     # ------------------------------------------------------------------
+    # Campaigns
+    # ------------------------------------------------------------------
+
+    def create_campaign(self, name: str, created_by: str = "human:cli", **fields: Any) -> Campaign:
+        """Create a Draft campaign in this workspace."""
+        campaign = Campaign(
+            id=self._next_id(_CAMPAIGN_PREFIX, self._campaign_dir),
+            project=self.slug,
+            name=name,
+            description=str(fields.get("description", "")),
+            objective=str(fields.get("objective", "")),
+            target_audience=str(fields.get("target_audience", "")),
+            primary_conversion_goal=str(fields.get("primary_conversion_goal", "")),
+            start_date=fields.get("start_date"),
+            end_date=fields.get("end_date"),
+            theme=str(fields.get("theme", "")),
+            channels=[normalize_platform(c) for c in (fields.get("channels") or [])],
+            cta=str(fields.get("cta", "")),
+            destination=str(fields.get("destination", "")),
+            kpis=[str(k) for k in (fields.get("kpis") or [])],
+        )
+        campaign.status_history.append(
+            CampaignTransition(
+                from_status=None,
+                to_status=CampaignStatus.DRAFT,
+                changed_by=created_by,
+                changed_at=datetime.now(tz=UTC),
+                reason="created",
+            )
+        )
+        self._write_campaign(campaign)
+        return campaign
+
+    def get_campaign(self, campaign_id: EntityId) -> Campaign:
+        """Load one campaign. Raises CampaignNotFoundError."""
+        path = self._campaign_dir / f"{campaign_id}.md"
+        if not path.exists():
+            raise CampaignNotFoundError(campaign_id, self.slug)
+        return Campaign.from_dict(_read_frontmatter(path))
+
+    def list_campaigns(self, status: CampaignStatus | None = None) -> list[Campaign]:
+        """All campaigns in this workspace, optionally filtered by status."""
+        if not self._campaign_dir.exists():
+            return []
+        campaigns: list[Campaign] = []
+        for path in sorted(self._campaign_dir.glob(f"{_CAMPAIGN_PREFIX}-*.md")):
+            try:
+                campaigns.append(Campaign.from_dict(_read_frontmatter(path)))
+            except (GrowthParseError, ValueError, KeyError) as exc:
+                _warnings.warn(f"Skipping {path.name}: {exc}", stacklevel=2)
+        if status is not None:
+            campaigns = [c for c in campaigns if c.status is status]
+        return sorted(campaigns, key=lambda c: c.id)
+
+    def save_campaign(self, campaign: Campaign) -> Campaign:
+        """Persist a campaign exactly as given."""
+        self._write_campaign(campaign)
+        return campaign
+
+    def transition_campaign(
+        self,
+        campaign_id: EntityId,
+        new_status: CampaignStatus,
+        changed_by: str = "human:cli",
+        reason: str = "",
+    ) -> Campaign:
+        """Move a campaign along its lifecycle. Raises InvalidTransitionError."""
+        campaign = self.get_campaign(campaign_id)
+        campaign.apply_transition(new_status, changed_by=changed_by, reason=reason)
+        self._write_campaign(campaign)
+        return campaign
+
+    def assign_campaign(
+        self, content_id: EntityId, campaign_id: str, changed_by: str = "human:cli"
+    ) -> ContentItem:
+        """
+        Attach a content item to a campaign in THIS workspace.
+
+        Refuses a campaign that does not exist here, which is what stops content
+        drifting between campaigns or across projects. Passing an empty campaign
+        id detaches the item from whichever campaign currently holds it.
+        """
+        item = self.get_content(content_id)
+        if item.status in PUBLISHING_STATES:
+            raise InvalidTransitionError(item.status.value, "recampaigned")
+
+        previous = item.campaign
+        if campaign_id:
+            try:
+                campaign = self.get_campaign(campaign_id)
+            except CampaignNotFoundError as exc:
+                raise CrossCampaignError(content_id, campaign_id, self.slug) from exc
+            if campaign.project != self.slug:
+                raise CrossCampaignError(content_id, campaign_id, self.slug)
+            if not campaign.accepts_content():
+                raise InvalidTransitionError(campaign.status.value, "accepting content")
+            campaign.attach_content(item.id)
+            self._write_campaign(campaign)
+
+        if previous and _CAMPAIGN_ID_RE.match(previous) and previous != campaign_id:
+            try:
+                old = self.get_campaign(previous)
+            except CampaignNotFoundError:
+                old = None
+            if old is not None:
+                old.detach_content(item.id)
+                self._write_campaign(old)
+
+        item.campaign = campaign_id
+        item.updated = datetime.now(tz=UTC)
+        self._write_content(item)
+        return item
+
+    def _validate_campaign_ref(self, content_id: str, campaign_id: str) -> None:
+        """A CAMPAIGN-shaped reference must resolve in this workspace."""
+        if not campaign_id or not _CAMPAIGN_ID_RE.match(campaign_id):
+            return
+        try:
+            campaign = self.get_campaign(campaign_id)
+        except CampaignNotFoundError as exc:
+            raise CrossCampaignError(content_id, campaign_id, self.slug) from exc
+        if campaign.project != self.slug:
+            raise CrossCampaignError(content_id, campaign_id, self.slug)
+
+    # ------------------------------------------------------------------
     # Content
     # ------------------------------------------------------------------
 
@@ -152,10 +289,18 @@ class WorkspaceHandle:
         expected_goal: str = "",
         expected_audience: str = "",
         created_by: str = "human:cli",
+        content_type: ContentType = ContentType.SOCIAL_POST,
+        title: str = "",
+        themes: list[str] | None = None,
+        audience: str = "",
+        variant_group_id: str = "",
+        reuse_eligible: bool = False,
+        tags: list[str] | None = None,
     ) -> ContentItem:
         """Create a Draft content item in this workspace."""
         if platform:
             platform = normalize_platform(platform)
+        self._validate_campaign_ref("(new)", campaign)
         item = ContentItem(
             id=self._next_content_id(),
             project=self.slug,
@@ -169,6 +314,13 @@ class WorkspaceHandle:
             campaign=campaign,
             expected_goal=expected_goal,
             expected_audience=expected_audience,
+            content_type=content_type,
+            title=title,
+            themes=list(themes or []),
+            audience=audience,
+            variant_group_id=variant_group_id,
+            reuse_eligible=reuse_eligible,
+            tags=list(tags or []),
         )
         item.status_history.append(
             ContentTransition(
@@ -180,6 +332,10 @@ class WorkspaceHandle:
             )
         )
         self._write_content(item)
+        if campaign and _CAMPAIGN_ID_RE.match(campaign):
+            linked = self.get_campaign(campaign)
+            linked.attach_content(item.id)
+            self._write_campaign(linked)
         return item
 
     def save_content(self, item: ContentItem) -> ContentItem:
@@ -238,6 +394,13 @@ class WorkspaceHandle:
         notes: str | _Unset = _UNSET,
         tags: list[str] | _Unset = _UNSET,
         warnings: list[str] | _Unset = _UNSET,
+        content_type: ContentType | _Unset = _UNSET,
+        title: str | _Unset = _UNSET,
+        themes: list[str] | _Unset = _UNSET,
+        audience: str | _Unset = _UNSET,
+        variant_group_id: str | _Unset = _UNSET,
+        reuse_eligible: bool | _Unset = _UNSET,
+        last_reused_at: datetime | None | _Unset = _UNSET,
     ) -> ContentItem:
         """
         Apply field updates, resetting a stale approval automatically (ADR-013).
@@ -267,6 +430,7 @@ class WorkspaceHandle:
         if not isinstance(scheduled_at, _Unset):
             item.scheduled_at = scheduled_at
         if not isinstance(campaign, _Unset):
+            self._validate_campaign_ref(item.id, campaign)
             item.campaign = campaign
         if not isinstance(expected_goal, _Unset):
             item.expected_goal = expected_goal
@@ -278,6 +442,22 @@ class WorkspaceHandle:
             item.tags = list(tags)
         if not isinstance(warnings, _Unset):
             item.warnings = list(warnings)
+        # Library metadata. None of this is fingerprinted, so none of it can
+        # disturb a standing approval.
+        if not isinstance(content_type, _Unset):
+            item.content_type = content_type
+        if not isinstance(title, _Unset):
+            item.title = title
+        if not isinstance(themes, _Unset):
+            item.themes = list(themes)
+        if not isinstance(audience, _Unset):
+            item.audience = audience
+        if not isinstance(variant_group_id, _Unset):
+            item.variant_group_id = variant_group_id
+        if not isinstance(reuse_eligible, _Unset):
+            item.reuse_eligible = reuse_eligible
+        if not isinstance(last_reused_at, _Unset):
+            item.last_reused_at = last_reused_at
 
         item.updated = datetime.now(tz=UTC)
 
@@ -342,28 +522,41 @@ class WorkspaceHandle:
         self._content_dir.mkdir(parents=True, exist_ok=True)
         _write_frontmatter(self._content_dir / f"{item.id}.md", item.to_dict())
 
-    def _next_content_id(self) -> EntityId:
-        sequences = self._load_sequences()
-        counter = max(sequences.get(_CONTENT_PREFIX, 0), self._highest_id_on_disk())
-        next_seq = counter + 1
-        sequences[_CONTENT_PREFIX] = next_seq
-        self._save_sequences(sequences)
-        return f"{_CONTENT_PREFIX}-{next_seq:04d}"
+    def _write_campaign(self, campaign: Campaign) -> None:
+        self._campaign_dir.mkdir(parents=True, exist_ok=True)
+        _write_frontmatter(self._campaign_dir / f"{campaign.id}.md", campaign.to_dict())
 
-    def _highest_id_on_disk(self) -> int:
+    def _next_content_id(self) -> EntityId:
+        return self._next_id(_CONTENT_PREFIX, self._content_dir)
+
+    def _next_id(self, prefix: str, directory: Path) -> EntityId:
         """
-        Highest content sequence number on disk in this workspace.
+        Allocate the next id for a prefix within THIS workspace.
+
+        Per-workspace, never global: a shared counter would let one project infer
+        another's volume from the gaps in its own ids.
+        """
+        sequences = self._load_sequences()
+        counter = max(sequences.get(prefix, 0), self._highest_id_on_disk(prefix, directory))
+        next_seq = counter + 1
+        sequences[prefix] = next_seq
+        self._save_sequences(sequences)
+        return f"{prefix}-{next_seq:04d}"
+
+    def _highest_id_on_disk(self, prefix: str, directory: Path) -> int:
+        """
+        Highest sequence number on disk for a prefix in this workspace.
 
         Reads filenames rather than contents, so an item whose body is unreadable
         still reserves its id. Guards against a lost or truncated sequence file
         silently reissuing an id that is already taken.
         """
-        if not self._content_dir.exists():
+        if not directory.exists():
             return 0
-        pattern = re.compile(rf"^{re.escape(_CONTENT_PREFIX)}-(\d+)$")
+        pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
         highest = 0
         try:
-            paths = list(self._content_dir.glob(f"{_CONTENT_PREFIX}-*.md"))
+            paths = list(directory.glob(f"{prefix}-*.md"))
         except OSError:
             return 0
         for path in paths:

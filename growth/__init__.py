@@ -34,6 +34,12 @@ from growth.binding import (
     UnsupportedPlatformError,
     normalize_platform,
 )
+from growth.campaign import (
+    OPEN_STATES,
+    Campaign,
+    CampaignStatus,
+    CampaignTransition,
+)
 from growth.content import (
     CANCELLABLE_STATES,
     PUBLISHING_STATES,
@@ -41,12 +47,16 @@ from growth.content import (
     ContentItem,
     ContentStatus,
     ContentTransition,
+    ContentType,
 )
+from growth.demo import SYNTHETIC_FLAG, is_synthetic, seed_workspace, synthetic_metadata
 from growth.dispatch import DispatchResult, PublishDispatcher
 from growth.errors import (
     AmbiguousProjectError,
     BindingNotFoundError,
+    CampaignNotFoundError,
     ContentNotFoundError,
+    CrossCampaignError,
     GrowthError,
     GrowthParseError,
     InvalidProjectSlugError,
@@ -59,6 +69,15 @@ from growth.fingerprint import (
     FINGERPRINT_SCHEME,
     FINGERPRINTED_FIELDS,
     compute_fingerprint,
+)
+from growth.library import ContentLibrary, LibraryEntry
+from growth.onboarding import (
+    REQUIRED_STEPS,
+    AccountLabelError,
+    Onboarding,
+    PlatformIntent,
+    WeeklyReview,
+    evaluate_readiness,
 )
 from growth.pause import SCOPES, PauseController, PauseState
 from growth.project import (
@@ -79,6 +98,25 @@ from growth.store import GrowthStore, WorkspaceHandle
 from growth.workspace import Audience, Brand, Business, Marketing, Workspace
 
 __all__ = [
+    "synthetic_metadata",
+    "seed_workspace",
+    "is_synthetic",
+    "evaluate_readiness",
+    "WeeklyReview",
+    "PlatformIntent",
+    "Onboarding",
+    "LibraryEntry",
+    "CrossCampaignError",
+    "ContentType",
+    "ContentLibrary",
+    "CampaignTransition",
+    "CampaignStatus",
+    "CampaignNotFoundError",
+    "Campaign",
+    "AccountLabelError",
+    "SYNTHETIC_FLAG",
+    "REQUIRED_STEPS",
+    "OPEN_STATES",
     "idempotency_key",
     "backoff_seconds",
     "SCOPES",
