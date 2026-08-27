@@ -1891,6 +1891,132 @@ class Monday:
                     ),
                 )
 
+            if action == "campaign-create":
+                data = service.create_campaign(
+                    project, str(kwargs.get("name", "")),
+                    **{k: v for k, v in fields.items() if k != "name"},
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    status=data["status"], data={"campaign": data},
+                    message=f"Created {data['id']} ({data['name']}).",
+                )
+
+            if action == "campaign-get":
+                data = service.get_campaign(project, str(kwargs.get("campaign_id", "")))
+                return GrowthResponse(
+                    action=action, success=True, project=project, status=data["status"],
+                    data={"campaign": data}, message=f"{data['id']} ({data['status']}).",
+                )
+
+            if action == "campaign-list":
+                rows = service.list_campaigns(project, str(kwargs.get("status", "")))
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"campaigns": rows, "count": len(rows)},
+                    message=f"{len(rows)} campaign(s).",
+                )
+
+            if action == "campaign-status":
+                data = service.transition_campaign(
+                    project, str(kwargs.get("campaign_id", "")),
+                    str(kwargs.get("status", "")),
+                    changed_by=str(kwargs.get("changed_by", "human:cli")),
+                    reason=str(kwargs.get("reason", "")),
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project, status=data["status"],
+                    data={"campaign": data},
+                    message=f"{data['id']} is now {data['status']}.",
+                )
+
+            if action == "campaign-assign":
+                item = service.assign_campaign(
+                    project, str(kwargs.get("content_id", "")),
+                    str(kwargs.get("campaign_id", "")),
+                    changed_by=str(kwargs.get("changed_by", "human:cli")),
+                )
+                target = kwargs.get("campaign_id") or "(none)"
+                return _growth_content_response(
+                    action, project, item, f"Assigned to {target}"
+                )
+
+            if action == "library-search":
+                rows = service.library_search(project, **fields)
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"entries": rows, "count": len(rows)},
+                    message=f"{len(rows)} library entr(ies).",
+                )
+
+            if action == "library-summary":
+                data = service.library_summary(project)
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"summary": data},
+                    message=f"{data['total']} item(s) in the {project} library.",
+                )
+
+            if action == "library-top":
+                data = service.library_top(project, int(kwargs.get("limit", 10)))
+                return GrowthResponse(
+                    action=action, success=True, project=project, data=data,
+                    message=(
+                        f"{len(data['entries'])} item(s), ranked by {data['basis']}."
+                    ),
+                )
+
+            if action == "library-reusable":
+                rows = service.library_reusable(project, int(kwargs.get("days", 0)))
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"entries": rows, "count": len(rows)},
+                    message=f"{len(rows)} reusable item(s).",
+                )
+
+            if action == "library-variants":
+                rows = service.library_variants(
+                    project, str(kwargs.get("variant_group_id", ""))
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"entries": rows, "count": len(rows)},
+                    message=f"{len(rows)} variant(s).",
+                )
+
+            if action == "onboard":
+                data = service.onboard(project, **fields)
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"onboarding": data},
+                    message=(
+                        "Onboarding complete; project is ready for planning."
+                        if data["growth_ready_for_planning"]
+                        else f"Onboarding incomplete. Missing: {', '.join(data['missing_steps'])}."
+                    ),
+                )
+
+            if action == "onboarding-status":
+                data = service.onboarding_status(project)
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"onboarding": data},
+                    message=(
+                        f"planning={data['growth_ready_for_planning']} "
+                        f"real_publishing={data['growth_ready_for_real_publishing']}"
+                    ),
+                )
+
+            if action == "seed-demo":
+                data = service.seed_demo(project)
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"demo": data},
+                    message=(
+                        f"Seeded {len(data['campaigns'])} campaign(s) and "
+                        f"{len(data['content'])} content item(s). All marked SYNTHETIC."
+                    ),
+                )
+
             if action == "pauses":
                 pause_rows = service.list_pauses(project)
                 return GrowthResponse(
@@ -1906,7 +2032,11 @@ class Monday:
                     "workspace-get, workspace-list, bind, bindings, credentials, "
                     "content-create, content-get, content-list, content-update, "
                     "review, approve, request-changes, cancel, schedule, publish, "
-                    "retry, publication-status, pause, resume, pauses"
+                    "retry, publication-status, pause, resume, pauses, "
+                    "campaign-create, campaign-get, campaign-list, campaign-status, "
+                    "campaign-assign, library-search, library-summary, library-top, "
+                    "library-reusable, library-variants, onboard, onboarding-status, "
+                    "seed-demo"
                 ),
             )
         except (GrowthError, ValueError, LookupError) as exc:

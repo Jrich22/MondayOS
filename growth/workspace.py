@@ -15,6 +15,7 @@ from typing import Any
 
 from core.types import Timestamp
 from growth.binding import PlatformBinding
+from growth.onboarding import Onboarding
 
 
 @dataclass
@@ -87,6 +88,7 @@ class Workspace:
     audience: Audience = field(default_factory=Audience)
     marketing: Marketing = field(default_factory=Marketing)
     bindings: list[PlatformBinding] = field(default_factory=list)
+    onboarding: Onboarding = field(default_factory=Onboarding)
     created: Timestamp = field(default_factory=lambda: datetime.now(tz=UTC))
     updated: Timestamp = field(default_factory=lambda: datetime.now(tz=UTC))
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -111,6 +113,7 @@ class Workspace:
             "audience": asdict(self.audience),
             "marketing": asdict(self.marketing),
             "bindings": [b.to_dict() for b in self.bindings],
+            "onboarding": self.onboarding.to_dict(),
             "created": _fmt_dt(self.created),
             "updated": _fmt_dt(self.updated),
             "metadata": dict(self.metadata),
@@ -126,6 +129,7 @@ class Workspace:
             audience=Audience(**_section(data, "audience", Audience)),
             marketing=Marketing(**_section(data, "marketing", Marketing)),
             bindings=[PlatformBinding.from_dict(b) for b in (data.get("bindings") or [])],
+            onboarding=Onboarding.from_dict(data.get("onboarding") or {}),
             created=_parse_dt(data.get("created")),
             updated=_parse_dt(data.get("updated")),
             metadata=dict(data.get("metadata") or {}),

@@ -25,6 +25,24 @@ from growth.fingerprint import compute_fingerprint
 from growth.publication import PublicationRecord
 
 
+class ContentType(Enum):
+    """What kind of artifact a content item is. Library metadata, not fingerprinted."""
+
+    SOCIAL_POST = "social-post"
+    CAROUSEL = "carousel"
+    IMAGE_POST = "image-post"
+    VIDEO_SCRIPT = "video-script"
+    VIDEO_REFERENCE = "video-reference"
+    BLOG_ARTICLE = "blog-article"
+    NEWSLETTER = "newsletter"
+    PRODUCT_ANNOUNCEMENT = "product-announcement"
+    EDUCATIONAL_POST = "educational-post"
+    COMMUNITY_POST = "community-post"
+    PARTNER_OUTREACH = "partner-outreach"
+    CAMPAIGN_ASSET = "campaign-asset"
+    SEO_ARTICLE = "seo-article"
+
+
 class ContentStatus(Enum):
     """Lifecycle states available in this increment. See docs/GROWTH_BOT.md."""
 
@@ -179,6 +197,23 @@ class ContentItem:
     expected_goal: str = ""
     expected_audience: str = ""
 
+    # ---- Library metadata (increment 4) --------------------------------
+    # None of these are fingerprinted. Cataloguing an item must never invalidate
+    # a standing approval, so the approval contract in growth/fingerprint.py is
+    # untouched by everything below and a test asserts the hash is unchanged.
+    #
+    # variant_group_id ties per-platform variants of one idea together. The
+    # variants stay SEPARATE items because approval binds one platform, one
+    # account and one copy (ADR-013) - approving the LinkedIn variant must not
+    # approve the Instagram one.
+    content_type: ContentType = ContentType.SOCIAL_POST
+    title: str = ""
+    themes: list[str] = field(default_factory=list)
+    audience: str = ""
+    variant_group_id: str = ""
+    reuse_eligible: bool = False
+    last_reused_at: Timestamp | None = None
+
     status: ContentStatus = ContentStatus.DRAFT
     status_history: list[ContentTransition] = field(default_factory=list)
 
@@ -301,6 +336,13 @@ class ContentItem:
             "campaign": self.campaign,
             "expected_goal": self.expected_goal,
             "expected_audience": self.expected_audience,
+            "content_type": self.content_type.value,
+            "title": self.title,
+            "themes": list(self.themes),
+            "audience": self.audience,
+            "variant_group_id": self.variant_group_id,
+            "reuse_eligible": self.reuse_eligible,
+            "last_reused_at": _fmt_dt(self.last_reused_at) if self.last_reused_at else "",
             "status": self.status.value,
             "status_history": [t.to_dict() for t in self.status_history],
             "approved_fingerprint": self.approved_fingerprint,
@@ -333,6 +375,15 @@ class ContentItem:
             campaign=str(data.get("campaign", "")),
             expected_goal=str(data.get("expected_goal", "")),
             expected_audience=str(data.get("expected_audience", "")),
+            content_type=ContentType(str(data.get("content_type", ContentType.SOCIAL_POST.value))),
+            title=str(data.get("title", "")),
+            themes=[str(t) for t in (data.get("themes") or [])],
+            audience=str(data.get("audience", "")),
+            variant_group_id=str(data.get("variant_group_id", "")),
+            reuse_eligible=bool(data.get("reuse_eligible", False)),
+            last_reused_at=(
+                _parse_dt(data["last_reused_at"]) if data.get("last_reused_at") else None
+            ),
             status=ContentStatus(str(data.get("status", ContentStatus.DRAFT.value))),
             status_history=[
                 ContentTransition.from_dict(t) for t in (data.get("status_history") or [])

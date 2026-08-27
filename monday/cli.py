@@ -2082,6 +2082,97 @@ def _register_growth(subparsers: Any) -> None:
     _project_arg(pls)
     pls.set_defaults(func=_cmd_growth_pauses)
 
+    # ---- campaigns ----
+    cc = sub.add_parser("campaign-create", help="Create a Draft campaign.")
+    _project_arg(cc)
+    cc.add_argument("--name", required=True)
+    for flag in ("--description", "--objective", "--target-audience",
+                 "--primary-conversion-goal", "--theme", "--cta", "--destination"):
+        cc.add_argument(flag, default="")
+    cc.add_argument("--channels", nargs="*", default=None)
+    cc.add_argument("--kpis", nargs="*", default=None)
+    cc.set_defaults(func=_cmd_growth_campaign_create)
+
+    cg = sub.add_parser("campaign-get", help="Show one campaign.")
+    _project_arg(cg)
+    cg.add_argument("--campaign", required=True)
+    cg.set_defaults(func=_cmd_growth_campaign_get)
+
+    cls_ = sub.add_parser("campaign-list", help="List campaigns.")
+    _project_arg(cls_)
+    cls_.add_argument("--status", default="")
+    cls_.set_defaults(func=_cmd_growth_campaign_list)
+
+    cst = sub.add_parser("campaign-status", help="Move a campaign along its lifecycle.")
+    _project_arg(cst)
+    cst.add_argument("--campaign", required=True)
+    cst.add_argument(
+        "--status", required=True,
+        choices=["draft", "active", "paused", "completed", "cancelled"],
+    )
+    cst.add_argument("--reason", default="")
+    cst.set_defaults(func=_cmd_growth_campaign_status)
+
+    cas = sub.add_parser("campaign-assign", help="Attach content to a campaign.")
+    _project_arg(cas)
+    _content_arg(cas)
+    cas.add_argument("--campaign", default="", help="Empty detaches the item.")
+    cas.set_defaults(func=_cmd_growth_campaign_assign)
+
+    # ---- library ----
+    lse = sub.add_parser("library-search", help="Search the content library.")
+    _project_arg(lse)
+    for flag in ("--text", "--theme", "--campaign", "--platform", "--tag",
+                 "--content-type", "--status"):
+        lse.add_argument(flag, default="")
+    lse.add_argument("--reusable-only", action="store_true")
+    lse.set_defaults(func=_cmd_growth_library_search)
+
+    lsu = sub.add_parser("library-summary", help="Library counts by type/platform/status.")
+    _project_arg(lsu)
+    lsu.set_defaults(func=_cmd_growth_library_summary)
+
+    lto = sub.add_parser("library-top", help="Highest-performing content.")
+    _project_arg(lto)
+    lto.add_argument("--limit", type=int, default=10)
+    lto.set_defaults(func=_cmd_growth_library_top)
+
+    lre = sub.add_parser("library-reusable", help="Reusable / not-recently-reused content.")
+    _project_arg(lre)
+    lre.add_argument("--days", type=int, default=0, help="Only items unused for N days.")
+    lre.set_defaults(func=_cmd_growth_library_reusable)
+
+    lva = sub.add_parser("library-variants", help="Per-platform variants of one idea.")
+    _project_arg(lva)
+    lva.add_argument("--group", required=True)
+    lva.set_defaults(func=_cmd_growth_library_variants)
+
+    # ---- onboarding ----
+    onb = sub.add_parser("onboard", help="Record growth onboarding (no credentials).")
+    _project_arg(onb)
+    onb.add_argument("--brand-voice", default=None)
+    onb.add_argument("--objectives", nargs="*", default=None)
+    onb.add_argument("--audience-personas", nargs="*", default=None)
+    onb.add_argument("--audience-icps", nargs="*", default=None)
+    onb.add_argument("--brand-assets", nargs="*", default=None)
+    onb.add_argument("--prohibited", nargs="*", default=None)
+    onb.add_argument("--cadence", type=int, default=None, help="Posts per week.")
+    onb.add_argument(
+        "--platform", action="append", default=None, metavar="PLATFORM=LABEL",
+        help="Desired platform and account LABEL. Never a credential. Repeatable.",
+    )
+    onb.add_argument("--review-day", default=None)
+    onb.add_argument("--review-hour", type=int, default=None)
+    onb.set_defaults(func=_cmd_growth_onboard)
+
+    ost = sub.add_parser("onboarding-status", help="Show growth readiness.")
+    _project_arg(ost)
+    ost.set_defaults(func=_cmd_growth_onboarding_status)
+
+    dem = sub.add_parser("seed-demo", help="Seed clearly-marked synthetic demo data.")
+    _project_arg(dem)
+    dem.set_defaults(func=_cmd_growth_seed_demo)
+
 
 def _growth_call(args: argparse.Namespace, action: str, **kwargs: Any) -> int:
     """Invoke Monday.growth and render the result. All growth commands go through this."""
@@ -2355,3 +2446,186 @@ def _cmd_growth_pauses(args: argparse.Namespace) -> int:
         mark = "!!" if key == "global" else "  "
         print(f"  {mark} {key:<28} {reason}")
     return 0
+
+
+def _cmd_growth_campaign_create(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "campaign-create", project=args.project, name=args.name,
+        description=args.description, objective=args.objective,
+        target_audience=args.target_audience,
+        primary_conversion_goal=args.primary_conversion_goal, theme=args.theme,
+        cta=args.cta, destination=args.destination,
+        channels=args.channels, kpis=args.kpis,
+    )
+
+
+def _cmd_growth_campaign_get(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("campaign-get", project=args.project, campaign_id=args.campaign)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    c = r.data.get("campaign", {})
+    print(f"{c.get('id', '')}  [{c.get('status', '')}]  {c.get('name', '')}")
+    _hr()
+    print(f"  Objective  : {c.get('objective', '') or '—'}")
+    print(f"  Audience   : {c.get('target_audience', '') or '—'}")
+    print(f"  Conversion : {c.get('primary_conversion_goal', '') or '—'}")
+    print(f"  Theme      : {c.get('theme', '') or '—'}")
+    print(f"  Channels   : {', '.join(c.get('channels', [])) or '—'}")
+    print(f"  Window     : {c.get('start_date', '') or '—'} → {c.get('end_date', '') or '—'}")
+    print(f"  Content    : {c.get('content_count', 0)} "
+          f"({c.get('approved_count', 0)} approved, {c.get('published_count', 0)} published)")
+    print(f"  Accepting  : {c.get('accepts_content', False)}")
+    return 0
+
+
+def _cmd_growth_campaign_list(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("campaign-list", project=args.project, status=args.status)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    rows = r.data.get("campaigns", [])
+    if not rows:
+        print("No campaigns.")
+        return 0
+    print(f"Campaigns ({len(rows)})")
+    _hr()
+    for c in rows:
+        print(f"  {c['id']}  {c['status']:<11} {c.get('content_count', 0):>3} items  {c['name']}")
+    return 0
+
+
+def _cmd_growth_campaign_status(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "campaign-status", project=args.project, campaign_id=args.campaign,
+        status=args.status, reason=args.reason,
+    )
+
+
+def _cmd_growth_campaign_assign(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "campaign-assign", project=args.project, content_id=args.content,
+        campaign_id=args.campaign,
+    )
+
+
+def _print_entries(rows: list[dict[str, Any]], header: str) -> int:
+    if not rows:
+        print("No matching content.")
+        return 0
+    print(f"{header} ({len(rows)})")
+    _hr()
+    for e in rows:
+        mark = "✓" if e.get("approval_status") == "approved" else " "
+        title = e.get("title") or (e.get("body", "")[:40] + "…")
+        print(f"  {mark} {e['content_id']}  {e.get('content_type', ''):<20} "
+              f"{e.get('platform', '') or '—':<10} {title}")
+    return 0
+
+
+def _cmd_growth_library_search(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth(
+        "library-search", project=args.project, text=args.text, theme=args.theme,
+        campaign=args.campaign, platform=args.platform, tag=args.tag,
+        content_type=args.content_type, status=args.status,
+        reusable_only=args.reusable_only,
+    )
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    return _print_entries(r.data.get("entries", []), "Library")
+
+
+def _cmd_growth_library_summary(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("library-summary", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    s = r.data.get("summary", {})
+    print(f"Content library: {s.get('project', '')}")
+    _hr()
+    print(f"  Total     : {s.get('total', 0)}")
+    print(f"  Reusable  : {s.get('reusable', 0)}")
+    for label, key in (("By type", "by_type"), ("By platform", "by_platform"),
+                       ("By status", "by_status"), ("Themes", "themes")):
+        rows = s.get(key, {})
+        pretty = ", ".join(f"{k}={v}" for k, v in rows.items()) or "—"
+        print(f"  {label:<10}: {pretty}")
+    return 0
+
+
+def _cmd_growth_library_top(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("library-top", project=args.project, limit=args.limit)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    basis = r.data.get("basis", "")
+    if basis == "recency-fallback":
+        print("NOTE: no performance data yet — ranked by recency, not by results.")
+    return _print_entries(r.data.get("entries", []), f"Top content (by {basis})")
+
+
+def _cmd_growth_library_reusable(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("library-reusable", project=args.project, days=args.days)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    return _print_entries(r.data.get("entries", []), "Reusable content")
+
+
+def _cmd_growth_library_variants(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("library-variants", project=args.project, variant_group_id=args.group)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    return _print_entries(r.data.get("entries", []), f"Variants of {args.group}")
+
+
+def _cmd_growth_onboard(args: argparse.Namespace) -> int:
+    payload: dict[str, Any] = {"project": args.project}
+    if args.platform is not None:
+        intents = []
+        for raw in args.platform:
+            platform, _, label = raw.partition("=")
+            intents.append({"platform": platform.strip(), "account_label": label.strip()})
+        payload["platforms"] = intents
+    for key, value in (
+        ("brand_voice", args.brand_voice), ("objectives", args.objectives),
+        ("audience_personas", args.audience_personas), ("audience_icps", args.audience_icps),
+        ("brand_assets", args.brand_assets), ("prohibited_content", args.prohibited),
+        ("cadence_per_week", args.cadence),
+        ("weekly_review_day", args.review_day), ("weekly_review_hour_utc", args.review_hour),
+    ):
+        if value is not None:
+            payload[key] = value
+    return _growth_call(args, "onboard", **payload)
+
+
+def _cmd_growth_onboarding_status(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("onboarding-status", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    o = r.data.get("onboarding", {})
+    print(f"Growth onboarding: {o.get('project', '')}")
+    _hr()
+    print(f"  Ready for planning        : {o.get('growth_ready_for_planning', False)}")
+    print(f"  Ready for REAL publishing : {o.get('growth_ready_for_real_publishing', False)}")
+    print(f"  Completed : {', '.join(o.get('completed_steps', [])) or '—'}")
+    print(f"  Missing   : {', '.join(o.get('missing_steps', [])) or '—'}")
+    intents = o.get("platform_intents", [])
+    print(f"  Platforms : {', '.join(p['platform'] for p in intents) or '—'}  (labels only)")
+    print(f"  {o.get('note', '')}")
+    return 0
+
+
+def _cmd_growth_seed_demo(args: argparse.Namespace) -> int:
+    return _growth_call(args, "seed-demo", project=args.project)
