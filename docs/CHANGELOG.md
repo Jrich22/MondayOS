@@ -9,6 +9,36 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### MondayOS v2.8 — Growth Bot: campaigns, content library, onboarding (2026-08-27)
+
+Increment 4 of the Growth Bot product roadmap (TASK-0064). Adds the planning object between a
+project and its content, a searchable library over the content that already exists, and growth
+onboarding that is explicit about what a project is *not* yet ready for.
+
+#### Added
+- `growth/campaign.py` — Campaign with a draft/active/paused/completed/cancelled state machine,
+  stored per workspace at `campaigns/CAMPAIGN-NNNN.md` with its own id sequence.
+- `growth/library.py` — a query layer over existing content storage. It writes nothing; a test
+  asserts file mtimes are unchanged after a full sweep of queries.
+- `growth/onboarding.py` — audience, brand voice, platform intents, objectives, cadence, assets,
+  prohibited content and the weekly review slot.
+- `growth/demo.py` — deterministic synthetic demo data, marked `synthetic` at rest.
+- `ContentType` plus non-fingerprinted library metadata on `ContentItem`.
+- Campaign, library, onboarding and demo actions on `Monday.growth()` and `monday growth`.
+
+#### Security / integrity
+- Onboarding records account **labels** only. A credential-shaped label is refused, and
+  `growth_ready_for_real_publishing` is never set True — a test greps `growth/` to prove no code
+  path assigns it.
+- Library metadata is outside the approval fingerprint; a test asserts the hash is byte-identical
+  before and after every new field is populated.
+- Content cannot be attached to a campaign in another workspace, or to a closed campaign.
+
+#### Fixed
+- `create_content()` never accepted `tags`, though `ContentItem` has carried them since
+  increment 2. Tags are now settable at creation.
+
+
 ### MondayOS v2.7 — Growth Bot: publishing connector (2026-08-27)
 
 Adds the deterministic publishing layer for approved Growth content: a provider-neutral connector

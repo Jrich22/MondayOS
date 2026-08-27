@@ -7,16 +7,18 @@
 
 ---
 
-> **Status note.** Increments 1-3 are implemented: the Growth Workspace and its isolation
-> boundary, the Content Item with its lifecycle and approval fingerprinting, and the deterministic
-> publishing connector layer with pause controls, bounded retries, idempotency, and an audit trail.
+> **Status note.** Increments 1-4 are implemented: the Growth Workspace and its isolation
+> boundary; the Content Item with its lifecycle and approval fingerprinting; the deterministic
+> publishing connector layer with pause controls, retries, idempotency and an audit trail; and
+> Campaigns, the Content Library and growth onboarding.
 >
 > **Publishing runs against a deterministic fake connector only.** There is no OAuth, no real
-> platform adapter, and no browser automation — `integrations/publishing/factory.REAL_ADAPTERS` is
-> empty. Real adapters are the next increment.
+> platform adapter, and no browser automation. Onboarding records account *labels*, never
+> credentials, and no project can be marked ready for real publishing.
 >
-> Increments 4-6 are **not** built: no measurement, no Growth Brain, no portfolio view, no comment
-> assistant. Sections describing those are the intended contract rather than current behaviour. See
+> Increments 5-11 are **not** built: no measurement, no Growth Brain, no content generation, no
+> weekly package, no calendar, no reports, no comment handling and no Growth UI. Sections
+> describing those are the intended contract rather than current behaviour. See
 > [Delivery Increments](#delivery-increments).
 
 ## Purpose
@@ -376,7 +378,9 @@ Each increment leaves the service useful on its own. No increment ships a publis
 
 **Increment 3 — Publishing.** *(Implemented, fake connector only.)* The provider-neutral connector interface, the deterministic dispatcher and its ten-gate sequence, bounded retries with backoff and jitter, clock-free idempotency, the pause scopes, and the audit trail. Real platform adapters and the credential framework they need are deliberately deferred: MondayOS has no OAuth layer, and inventing a second credential system for social publishing was out of scope.
 
-**Increment 4 — Measurement.** Metric ingestion, objective attribution, the per-project dashboard, and per-project aggregates.
+**Increment 4 — Campaigns, library, onboarding.** *(Implemented.)* Campaign as the planning object with its own lifecycle, a query-layer Content Library over existing storage, per-platform variants as separate items sharing a `variant_group_id`, and onboarding that marks a project planning-ready but never real-publishing-ready.
+
+**Increment 5 — Measurement.** Metric ingestion, objective attribution, the per-project dashboard, and per-project aggregates.
 
 **Increment 5 — Growth Brain and experiments.** The six standing questions, evidence-carrying recommendations, the experiment engine, and promotion of confirmed findings to knowledge entries. Requires increment 4, because the Brain reasons over measured outcomes and has nothing to reason about before then.
 
