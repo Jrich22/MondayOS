@@ -9,6 +9,39 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### MondayOS v2.6 — Growth Bot: workspaces and content approval (2026-08-26)
+
+Adds the `growth/` service: project-isolated marketing workspaces, the Content Item and its
+lifecycle, and approval fingerprinting. Specified in [GROWTH_BOT.md](GROWTH_BOT.md); decisions in
+ADR-011, ADR-012, and ADR-013.
+
+**Nothing can publish.** There is no connector, no scheduler, and no lifecycle state beyond
+`approved`. That boundary is asserted by tests, not assumed.
+
+#### Added
+- `growth/` — Growth Workspace, platform bindings, Content Item, lifecycle, fingerprinting.
+- `Monday.growth(action, **kwargs) -> GrowthResponse` and the `monday growth` CLI.
+- `publish_content` in `agents.roles.GATED_ACTIONS`: an agent run declaring an intent to publish
+  content is blocked without an explicit human approval.
+- `tests/test_growth.py` — 54 tests covering isolation, credential handling, fingerprint
+  behaviour, the lifecycle, and the no-publish boundary.
+
+#### Security
+- Platform credentials are stored **by reference only** — a binding holds the *name* of an
+  environment variable, never a credential. A test walks every file under `growth/` asserting no
+  credential value appears.
+- Project isolation is structural: a project name is validated as a single safe path segment
+  before it is joined to a path, and must already exist in the MondayOS project registry.
+  Content id sequences are per workspace, so one project cannot infer another's volume.
+- Approval is a computed fingerprint comparison, never a stored boolean. Editing an approved
+  item's copy, media, destination, account, platform, or schedule revokes the approval
+  automatically and is recorded in the item's audit history.
+
+#### Known gaps
+- `Monday.publish()` (Confluence) still pushes to an external system without passing through
+  `ApprovalGate`. Pre-existing, out of scope here, tracked separately.
+
+
 ### MondayOS v2.5 — Structured Verdict Integrity (2026-08-13)
 
 > **⚠️ BREAKING BEHAVIOUR CHANGE — read before upgrading.**

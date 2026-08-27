@@ -18,8 +18,11 @@ from dataclasses import dataclass, field
 # The universe of actions that always require explicit human approval before an
 # agent may perform them. Kept here (imported by agents.gates) so the policy and
 # the role definitions share one source of truth. See docs/APPROVAL_GATES.md.
+# "publish_content" is the Growth Bot's outbound action (ADR-012). It is named for
+# content specifically because Monday.publish() already means Confluence *document*
+# publishing, which is a separate concern and separately gated.
 GATED_ACTIONS: frozenset[str] = frozenset(
-    {"commit", "push", "secrets", "live_trade", "destructive"}
+    {"commit", "push", "secrets", "live_trade", "destructive", "publish_content"}
 )
 
 

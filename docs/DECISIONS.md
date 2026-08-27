@@ -1,6 +1,6 @@
 # MondayOS — Architectural Decision Records
 
-**Last Updated:** 2026-06-28
+**Last Updated:** 2026-08-26
 
 This file is the canonical log of all architectural decisions made for MondayOS. Decisions are recorded in the format described in [DOCUMENTATION_STANDARDS.md](DOCUMENTATION_STANDARDS.md).
 
@@ -351,3 +351,171 @@ Template substitution in step inputs uses `{step_id.output_key}` and `{inputs.va
 - The `WorkflowDefinition.from_yaml()` class method is the single loading point; schema changes are isolated there.
 - Future phases can add new step types by extending `StepType` without changing the YAML format.
 - Version field in every definition means execution logs can reference the exact definition version that ran.
+
+---
+
+## ADR-011: The Growth Workspace Is the Isolation Boundary for Marketing State
+
+**Date:** 2026-08-26  
+**Status:** Accepted  
+**Deciders:** Lead Software Engineering
+
+### Context
+
+The [Growth Bot](GROWTH_BOT.md) is one service operating marketing for many MondayOS projects. Each project has its own brand, audience, campaigns, platform accounts, and metrics, and none of it may reach another project. The failure this must prevent is publishing one project's content to another project's audience — an error that is public, unrecoverable, and fatal to the product's credibility.
+
+The design question is whether project scoping is a property of the data model or a filter applied to shared storage.
+
+### Decision
+
+Marketing state is partitioned by **Growth Workspace**, one per project, and the workspace is the addressable unit. Reasoning about a project loads that project's workspace and has no way to name another. There is no shared content store, no shared audience table, and no shared metrics table with a `project_id` column.
+
+A workspace stores platform credentials by **reference**: platform, account handle, account ID, and the *name* of a secret. The secret resolves at publish time and appears in no workspace file, no log, and no agent prompt.
+
+Portfolio-level reporting reads **per-project aggregates** (`aggregates.json`) — counts, rates, and deltas — and never reads a workspace. An aggregate carries no copy, no media, no audience definition, and no account binding.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Shared storage with a `project_id` filter | One missing predicate leaks a client's content to another client's audience. The correctness of every read depends on every query author, forever. |
+| Shared storage with row-level enforcement | Stronger than a filter, but presumes a database. Phase 1 is file-based per [ADR-002](#adr-002-file-based-storage-for-phase-1-no-database), and the enforcement point would have to be rebuilt anyway. |
+| Separate service instance per project | Perfect isolation; abandons the reusable-service goal, and multiplies deployment and upgrade cost by the number of projects. |
+| Store credentials in the workspace file | Makes the workspace self-contained. It also puts OAuth tokens in Git with full version history, so a rotated token stays readable forever in the object store. |
+| Portfolio reads workspaces directly | Simplest to build; makes the portfolio view the one component that can read every project, which is precisely the component most likely to leak. |
+
+### Consequences
+
+- Cross-project leakage requires a deliberate act, not an omission. This is the property the whole design exists to buy.
+- Genuinely cross-project features are constrained by design. Portfolio comparison works because aggregates are enough; "reuse this post across projects" is deliberately not supported and would need a new ADR.
+- Credential handling deviates from [ADR-005](#adr-005-git-as-the-source-of-truth-for-all-persistent-state). Workspace state is Git-tracked and diffable; the secrets it names are not. The binding stays reviewable, which preserves the intent of ADR-005 without its cost here.
+- `aggregates.json` becomes a security-relevant interface. Any field added to it must be checked for whether it discloses workspace content, and that check belongs in review.
+- Isolation needs a test suite that asserts the negative — that project A's context cannot resolve project B's content. Cross-workspace access attempts are tracked as an incident metric with a target of zero.
+
+---
+
+## ADR-012: Publishing Is a Gated Action on the Existing Approval Gate
+
+**Date:** 2026-08-26  
+**Status:** Accepted  
+**Deciders:** Lead Software Engineering
+
+> **Amended 2026-08-26 during implementation.** The action is named `publish_content`, not
+> `publish`. `Monday.publish()` already means Confluence *document* publishing, so a bare
+> `publish` would be ambiguous about whether that path is covered — and it is not currently gated
+> at all. `publish_content` names the Growth Bot's outbound action unambiguously and leaves
+> `publish_document` available if the Confluence gap is closed later. That gap is real and is
+> tracked separately; it is not a Growth Bot regression.
+
+### Context
+
+The Growth Bot specification requires that nothing publishes without human approval, with per-item approval of project, platform, account, media, copy, CTA, URL, date, and time. The Multi-Agent Runtime already implements a human approval gate for sensitive actions — `agents/gates.py::ApprovalGate`, documented in [APPROVAL_GATES.md](APPROVAL_GATES.md) — covering `commit`, `push`, `secrets`, `live_trade`, and `destructive`.
+
+The question is whether the Growth Bot implements its own marketing-specific approval workflow or extends the existing gate.
+
+### Decision
+
+`publish_content` is registered as a gated action in `GATED_ACTIONS`. A Growth Bot run declaring an intent to publish is blocked unless a human approval is present, by the existing mechanism. The Growth Bot implements **no** approval logic of its own.
+
+The publishing connector is the single choke point for outbound content, and it is deliberately not an agent: it takes an approved item and calls a platform API, making no judgements. Every pause scope is enforced there.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| A dedicated marketing approval workflow | Marketing approval feels domain-specific, but the security property is identical: a human authorizes an irreversible external action. Two implementations of one property means two places to audit and two places to get it wrong, and the second one is always the one that is out of date. |
+| Approval as a Content Item status field only | A status field is data, not enforcement. Anything that can write the field can approve the content. |
+| A `human_approval` workflow step ([ADR-010](#adr-010-yaml-as-the-workflow-definition-format)) | Correct for orchestrating a sequence; it gates a workflow run, not the publish call, so it cannot stop a publish reached by any other path. |
+| Model the publishing connector as an agent role | Consistent with the specification's "Publishing Bot". It would put a language model on the one code path that must be deterministic and must reject anything unapproved. |
+
+### Consequences
+
+- The security-critical approval policy stays in one module with one test suite, and an audit of MondayOS approvals is one file.
+- Publishing inherits the runtime's existing guarantees: a blocked run does not act, and every run — allowed or blocked — is logged and reviewable.
+- The Growth Bot inherits the gate's ergonomics, including `--approve`. Whether marketing approval needs an interface beyond the CLI is a product question, not an enforcement question, and is deliberately left open.
+- `GATED_ACTIONS` now spans two domains. Adding `publish_content` is one entry; the runtime remains marketing-unaware, which is the point.
+- Approval delegation is unresolved: the gate models approval as present or absent, not as attributable to a named approver. Recorded as an open question against increment 2.
+
+---
+
+## ADR-013: An Approval Fingerprint Defines a Material Change
+
+**Date:** 2026-08-26  
+**Status:** Accepted  
+**Deciders:** Lead Software Engineering
+
+### Context
+
+The Growth Bot specification states that if anything about an approved item changes, approval resets. The intent is unambiguous and the literal rule is unimplementable: taken strictly, adding an internal tag or correcting a typo in a private note revokes an approval, and users learn to work around the system. Taken loosely, "material" is decided case by case in whatever code path performs the edit, and eventually one path decides wrongly.
+
+The system needs one mechanism that makes the boundary exact.
+
+### Decision
+
+Every approval records an **Approval Fingerprint**: a hash over the fields a human actually approved.
+
+```
+fingerprint = hash(project, platform, account, media, copy + CTA,
+                   destination_url, scheduled_datetime)
+```
+
+An item is approved if and only if its current fingerprint equals its approved fingerprint. Any divergence returns it to Ready for Review automatically. The publishing connector recomputes the fingerprint at publish time and refuses any mismatch.
+
+Fields outside the fingerprint — internal notes, tags, campaign labels, ordering hints — change freely without disturbing an approval.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Reset approval on any write to the item | Faithful to the specification's letter. It makes routine internal edits destructive and trains users to avoid the workflow, which is a worse security outcome than the precision it buys. |
+| A per-field `resets_approval` flag | Equivalent in effect, harder to read. The set of approval-relevant fields ends up scattered across a schema instead of stated in one line. |
+| An explicit `invalidate_approval()` call at each edit site | Correctness depends on every current and future edit path remembering to call it. The first one that forgets publishes unapproved content silently. |
+| Human re-confirmation prompt on edit | Puts the judgement of materiality on the user at the moment they are least likely to think carefully about it. |
+
+### Consequences
+
+- An approved-and-then-edited item cannot publish, and no code needs to remember to check. The check is a comparison at the one point that matters.
+- The fingerprint field list becomes a security-relevant contract. Adding a field to a Content Item requires an explicit decision about whether it is fingerprinted, and that belongs in the review checklist.
+- Rescheduling requires re-approval, because the scheduled time is fingerprinted. This is intended — a launch post approved for Tuesday morning is not approved for Friday evening — and it will be the rule users push back on first.
+- Transient publish failures retry under the same fingerprint, since nothing about the approved content changed. Non-transient failures route to Manual Review, where the assumption behind the approval is re-examined.
+- Approval integrity becomes measurable: items published with a non-matching fingerprint is a metric with a target of zero, and any non-zero value is an incident.
+
+---
+
+## ADR-014: The Growth Brain Is a Reasoning Layer, Not a Separate Bot
+
+**Date:** 2026-08-26  
+**Status:** Proposed  
+**Deciders:** Lead Software Engineering
+
+### Context
+
+The Growth Bot's value depends on continuously answering why — what to talk about next, why last week's content performed as it did, what competitors discuss, what is trending, what the library is missing, and what to build to drive leads. Without that, the service generates content on a schedule and cannot improve.
+
+The question is whether this reasoning is a sibling service alongside the Growth Bot or a layer inside it.
+
+### Decision
+
+The Growth Brain is a layer **inside** the Growth Bot, operating on a single Growth Workspace, subject to [ADR-011](#adr-011-the-growth-workspace-is-the-isolation-boundary-for-marketing-state). It coordinates the `research` and `analytics` roles for evidence gathering and owns the synthesis; it does not become a role or a service of its own.
+
+Two constraints govern its output:
+
+1. **Every recommendation carries its evidence** — observation, inference, confidence, and what would falsify it.
+2. **A performance explanation is a hypothesis until an experiment confirms it.** Confirmed findings are written to `knowledge/` as knowledge entries; unconfirmed ones expire.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| A separate Growth Brain service | Reasoning needs the full workspace — brand, audience, library, metrics, campaign history. A separate service either duplicates that state or needs cross-workspace read access, and ADR-011 exists to prevent exactly that access. |
+| A new `growth-strategy` agent role | Roles are stateless executors resolved to a provider. The Brain is stateful: it holds standing answers and revises them as evidence lands. That state has to live in the workspace. |
+| Generate recommendations on demand during weekly planning | Simpler. It also means the Brain only thinks on Sunday, while trends, competitor activity, and performance data arrive continuously — the most valuable signals would be stale or missed. |
+| Let the Brain state conclusions without evidence | Cheaper to build, and it produces confident narratives about small samples on opaque platform distribution. Unfalsifiable marketing advice at machine scale is the most expensive failure mode available to this service, because it costs human time to evaluate and is indistinguishable from insight. |
+
+### Consequences
+
+- Recommendation quality becomes auditable. A human can check the evidence rather than judging the assertion.
+- The Brain's confidence is calibratable: stated confidence compared against confirmed outcomes exposes systematic overconfidence, which is tracked as a success metric.
+- Confirmed findings compound in `knowledge/` and are available to the rest of MondayOS, consistent with [ADR-009](#adr-009-mondayos-knowledge-specification-mks-as-the-canonical-contract).
+- The Brain requires measured outcomes to reason over, so it lands after measurement — increment 5, not increment 1. The service is deliberately less intelligent until it has evidence, rather than confidently wrong sooner.
+- Cross-project pattern learning is foreclosed by ADR-011. A tactic proven on one project does not automatically inform another, which is a real cost accepted in exchange for isolation.

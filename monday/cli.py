@@ -94,6 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _register_agent(subparsers)
     _register_team(subparsers)
     _register_publish(subparsers)
+    _register_growth(subparsers)
 
     return parser
 
@@ -1896,3 +1897,324 @@ def _monday(args: argparse.Namespace) -> Any:
 def _hr() -> None:
     """Print a 60-character horizontal rule."""
     print("─" * 60)
+
+
+# ---------------------------------------------------------------------------
+# growth
+# ---------------------------------------------------------------------------
+
+def _register_growth(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "growth",
+        help="Manage project-isolated marketing workspaces and content approvals.",
+        description=(
+            "Growth Bot — plan, draft, review, and approve marketing content for a\n"
+            "MondayOS project.\n\n"
+            "Every workspace is isolated: no asset, credential, draft, audience, or\n"
+            "metric crosses a project boundary. Platform credentials are referenced\n"
+            "by environment-variable NAME and never stored.\n\n"
+            "Nothing here publishes. There is no connector and no lifecycle state\n"
+            "beyond 'approved' — see docs/GROWTH_BOT.md for the delivery increments.\n\n"
+            "examples:\n"
+            "  monday growth workspace-init --project sourcingbot\n"
+            "  monday growth bind --project sourcingbot --platform linkedin \\\n"
+            "      --account-id 12345 --secret-name LINKEDIN_TOKEN\n"
+            "  monday growth content-create --project sourcingbot --platform linkedin \\\n"
+            "      --account 12345 --copy \"...\" --cta \"Book a demo\"\n"
+            "  monday growth review --project sourcingbot --content CONTENT-0001\n"
+            "  monday growth approve --project sourcingbot --content CONTENT-0001 --by jrich\n"
+            "  monday growth content-list --project sourcingbot\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(title="growth actions", metavar="<action>")
+    sub.required = True
+
+    def _project_arg(parser: Any) -> None:
+        parser.add_argument("--project", required=True, help="Registered project name.")
+
+    def _content_arg(parser: Any) -> None:
+        parser.add_argument("--content", required=True, help="Content item id (CONTENT-XXXX).")
+
+    init = sub.add_parser("workspace-init", help="Create a growth workspace for a project.")
+    _project_arg(init)
+    init.set_defaults(func=_cmd_growth_workspace_init)
+
+    get = sub.add_parser("workspace-get", help="Show a project's growth workspace.")
+    _project_arg(get)
+    get.set_defaults(func=_cmd_growth_workspace_get)
+
+    ls = sub.add_parser("workspace-list", help="List initialized growth workspaces.")
+    ls.set_defaults(func=_cmd_growth_workspace_list)
+
+    bind = sub.add_parser("bind", help="Bind a publishing account (by secret name).")
+    _project_arg(bind)
+    bind.add_argument("--platform", required=True, help="linkedin, x, instagram, ...")
+    bind.add_argument("--account-id", required=True, help="Stable platform account id.")
+    bind.add_argument("--account-handle", default="", help="Display handle (not approved-on).")
+    bind.add_argument(
+        "--secret-name",
+        default="",
+        help="Environment variable holding the credential. Never the credential itself.",
+    )
+    bind.set_defaults(func=_cmd_growth_bind)
+
+    binds = sub.add_parser("bindings", help="List a workspace's platform bindings.")
+    _project_arg(binds)
+    binds.set_defaults(func=_cmd_growth_bindings)
+
+    creds = sub.add_parser("credentials", help="Check whether bound credentials are present.")
+    _project_arg(creds)
+    creds.set_defaults(func=_cmd_growth_credentials)
+
+    create = sub.add_parser("content-create", help="Create a Draft content item.")
+    _project_arg(create)
+    for flag, helptext in (
+        ("--platform", "Target platform."),
+        ("--account", "Platform account id this publishes as."),
+        ("--copy", "Post copy."),
+        ("--cta", "Call to action."),
+        ("--destination-url", "Destination URL."),
+        ("--campaign", "Campaign name."),
+        ("--expected-goal", "What this item is meant to achieve."),
+        ("--expected-audience", "Who this item targets."),
+        ("--scheduled-at", "Publish time, ISO 8601 UTC."),
+    ):
+        create.add_argument(flag, default="", help=helptext)
+    create.add_argument("--media", nargs="*", default=None, help="Media references, in order.")
+    create.set_defaults(func=_cmd_growth_content_create)
+
+    cget = sub.add_parser("content-get", help="Show one content item.")
+    _project_arg(cget)
+    _content_arg(cget)
+    cget.set_defaults(func=_cmd_growth_content_get)
+
+    clist = sub.add_parser("content-list", help="List content items.")
+    _project_arg(clist)
+    clist.add_argument("--status", default="", help="Filter by lifecycle status.")
+    clist.set_defaults(func=_cmd_growth_content_list)
+
+    upd = sub.add_parser("content-update", help="Edit an item (resets a stale approval).")
+    _project_arg(upd)
+    _content_arg(upd)
+    for flag in (
+        "--platform", "--account", "--copy", "--cta", "--destination-url",
+        "--campaign", "--expected-goal", "--expected-audience", "--scheduled-at", "--notes",
+    ):
+        upd.add_argument(flag, default=None)
+    upd.add_argument("--media", nargs="*", default=None)
+    upd.set_defaults(func=_cmd_growth_content_update)
+
+    rev = sub.add_parser("review", help="Submit an item for human review.")
+    _project_arg(rev)
+    _content_arg(rev)
+    rev.set_defaults(func=_cmd_growth_review)
+
+    app = sub.add_parser("approve", help="Record a human approval of an item.")
+    _project_arg(app)
+    _content_arg(app)
+    app.add_argument("--by", default="human:cli", help="Who approved.")
+    app.add_argument("--reason", default="", help="Optional note.")
+    app.set_defaults(func=_cmd_growth_approve)
+
+    chg = sub.add_parser("request-changes", help="Return an item to the author.")
+    _project_arg(chg)
+    _content_arg(chg)
+    chg.add_argument("--by", default="human:cli")
+    chg.add_argument("--reason", default="", help="What needs to change.")
+    chg.set_defaults(func=_cmd_growth_request_changes)
+
+    can = sub.add_parser("cancel", help="Terminally cancel an item.")
+    _project_arg(can)
+    _content_arg(can)
+    can.add_argument("--by", default="human:cli")
+    can.add_argument("--reason", default="")
+    can.set_defaults(func=_cmd_growth_cancel)
+
+
+def _growth_call(args: argparse.Namespace, action: str, **kwargs: Any) -> int:
+    """Invoke Monday.growth and render the result. All growth commands go through this."""
+    monday = _monday(args)
+    response = monday.growth(action, **kwargs)
+    if not response.success:
+        print(f"Error: {response.message}", file=sys.stderr)
+        return 1
+    print(response.message)
+    return 0
+
+
+def _cmd_growth_workspace_init(args: argparse.Namespace) -> int:
+    return _growth_call(args, "workspace-init", project=args.project)
+
+
+def _cmd_growth_workspace_get(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("workspace-get", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    ws = r.data.get("workspace", {})
+    print(f"Growth workspace: {ws.get('slug', '')}")
+    _hr()
+    print(f"  Project    : {ws.get('registered_name', '')}")
+    print(f"  Business   : {ws.get('business', {}).get('name', '') or '—'}")
+    print(f"  Voice      : {ws.get('brand', {}).get('voice', '') or '—'}")
+    print(f"  Bindings   : {len(ws.get('bindings', []))}")
+    print(f"  Updated    : {ws.get('updated', '')}")
+    return 0
+
+
+def _cmd_growth_workspace_list(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("workspace-list")
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    slugs = r.data.get("workspaces", [])
+    if not slugs:
+        print("No growth workspaces.")
+        return 0
+    print(f"Growth workspaces ({len(slugs)})")
+    _hr()
+    for slug in slugs:
+        print(f"  {slug}")
+    return 0
+
+
+def _cmd_growth_bind(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "bind",
+        project=args.project, platform=args.platform, account_id=args.account_id,
+        account_handle=args.account_handle, secret_name=args.secret_name,
+    )
+
+
+def _cmd_growth_bindings(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("bindings", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    rows = r.data.get("bindings", [])
+    if not rows:
+        print("No bindings.")
+        return 0
+    print(f"Bindings ({len(rows)})")
+    _hr()
+    for b in rows:
+        secret = b.get("secret_name") or "—"
+        print(f"  {b['platform']:<12} {b['account_id']:<20} secret:{secret}")
+    return 0
+
+
+def _cmd_growth_credentials(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("credentials", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    rows = r.data.get("credentials", [])
+    if not rows:
+        print("No bindings to check.")
+        return 0
+    print(f"Credentials ({r.data.get('ready', 0)}/{len(rows)} present)")
+    _hr()
+    for row in rows:
+        mark = "✓" if row["ready"] else "✗"
+        print(f"  {mark} {row['platform']:<12} {row['secret_name'] or '—'}")
+    return 0
+
+
+def _cmd_growth_content_create(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "content-create",
+        project=args.project, platform=args.platform, account=args.account,
+        media=args.media, copy=args.copy, cta=args.cta,
+        destination_url=args.destination_url, campaign=args.campaign,
+        expected_goal=args.expected_goal, expected_audience=args.expected_audience,
+        scheduled_at=args.scheduled_at,
+    )
+
+
+def _cmd_growth_content_get(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("content-get", project=args.project, content_id=args.content)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    item = r.data.get("content", {})
+    print(f"{item.get('id', '')}  [{item.get('status', '')}]")
+    _hr()
+    print(f"  Platform   : {item.get('platform', '') or '—'}")
+    print(f"  Account    : {item.get('account', '') or '—'}")
+    print(f"  CTA        : {item.get('cta', '') or '—'}")
+    print(f"  Scheduled  : {item.get('scheduled_at', '') or '—'}")
+    print(f"  Approved   : {item.get('is_approved', False)}")
+    if item.get("approval_is_stale"):
+        print("  ⚠ Approval is stale — approved fields changed since sign-off.")
+    missing = item.get("missing_required_fields", [])
+    if missing:
+        print(f"  Missing    : {', '.join(missing)}")
+    print(f"  Publishable: {item.get('publishable', False)} — {item.get('publishable_reason', '')}")
+    return 0
+
+
+def _cmd_growth_content_list(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("content-list", project=args.project, status=args.status)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    items = r.data.get("content", [])
+    if not items:
+        print("No content items.")
+        return 0
+    print(f"Content ({len(items)})")
+    _hr()
+    for i in items:
+        mark = "✓" if i.get("is_approved") else " "
+        print(f"  {mark} {i['id']}  {i.get('status', ''):<18} {i.get('platform', '') or '—'}")
+    return 0
+
+
+def _cmd_growth_content_update(args: argparse.Namespace) -> int:
+    supplied = {
+        key: value
+        for key, value in (
+            ("platform", args.platform), ("account", args.account), ("copy", args.copy),
+            ("cta", args.cta), ("destination_url", args.destination_url),
+            ("campaign", args.campaign), ("expected_goal", args.expected_goal),
+            ("expected_audience", args.expected_audience),
+            ("scheduled_at", args.scheduled_at), ("notes", args.notes),
+            ("media", args.media),
+        )
+        if value is not None
+    }
+    return _growth_call(
+        args, "content-update", project=args.project, content_id=args.content, **supplied
+    )
+
+
+def _cmd_growth_review(args: argparse.Namespace) -> int:
+    return _growth_call(args, "review", project=args.project, content_id=args.content)
+
+
+def _cmd_growth_approve(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "approve", project=args.project, content_id=args.content,
+        approved_by=args.by, reason=args.reason,
+    )
+
+
+def _cmd_growth_request_changes(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "request-changes", project=args.project, content_id=args.content,
+        changed_by=args.by, reason=args.reason,
+    )
+
+
+def _cmd_growth_cancel(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "cancel", project=args.project, content_id=args.content,
+        changed_by=args.by, reason=args.reason,
+    )

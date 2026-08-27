@@ -240,6 +240,7 @@ add tests, and ensure `pytest` is green before opening a PR.
 | [docs/BETA_ROADMAP.md](docs/BETA_ROADMAP.md) | What's in the beta and what comes next |
 | [docs/VISION.md](docs/VISION.md) | Long-term product vision |
 | [docs/CLI.md](docs/CLI.md) | Full CLI reference |
+| [docs/GROWTH_BOT.md](docs/GROWTH_BOT.md) | Growth Bot service specification |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | Complete version history |
 
 ---

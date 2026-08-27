@@ -26,6 +26,7 @@ from monday.types import (
     AskResponse,
     DoctorResponse,
     ExecuteResponse,
+    GrowthResponse,
     TeamResponse,
     LearnResponse,
     MigrateResponse,
@@ -1671,6 +1672,177 @@ class Monday:
         """Remove a knowledge entry by ID. Used by migration rollback."""
         self.__knowledge.remove(entry_id)
 
+    def growth(self, action: str, **kwargs: Any) -> GrowthResponse:
+        """
+        Manage project-isolated marketing workspaces and content approvals.
+
+        Every action addresses exactly one registered project, resolved through the
+        MondayOS project registry (see docs/GROWTH_BOT.md, ADR-011). Nothing here
+        publishes: no connector exists in this increment, and no lifecycle state
+        beyond ``approved`` is reachable.
+
+        Actions:
+            workspace-init  — create a workspace. Requires: project.
+            workspace-get   — read a workspace. Requires: project.
+            workspace-list  — list initialized workspace slugs.
+            bind            — bind a publishing account by secret NAME. Requires:
+                              project, platform, account_id. Optional:
+                              account_handle, secret_name.
+            bindings        — list a workspace's bindings (redacted).
+            credentials     — report whether each binding's secret is in the env.
+            content-create  — create a Draft item. Requires: project. Optional: any
+                              content field.
+            content-get     — read one item. Requires: project, content_id.
+            content-list    — list items. Requires: project. Optional: status.
+            content-update  — edit an item; resets a stale approval. Requires:
+                              project, content_id.
+            review          — Draft -> Ready for Review. Requires: project, content_id.
+            approve         — record a human approval. Requires: project, content_id,
+                              approved_by.
+            request-changes — return an item to the author. Requires: project,
+                              content_id. Optional: reason.
+            cancel          — terminally cancel an item.
+
+        Returns a GrowthResponse. Does not raise for expected failures.
+        """
+        from growth.errors import GrowthError
+        from growth.service import GrowthService
+
+        service = GrowthService(self._config.project_root)
+        project = str(kwargs.get("project", ""))
+        # The routing keys are passed positionally; splatting them again would collide.
+        fields = {k: v for k, v in kwargs.items() if k not in ("project", "content_id")}
+
+        try:
+            if action == "workspace-init":
+                data = service.init_workspace(project)
+                return GrowthResponse(
+                    action=action, success=True, project=data["slug"],
+                    data={"workspace": data},
+                    message=f"Growth workspace created for {data['slug']}.",
+                )
+
+            if action == "workspace-get":
+                data = service.get_workspace(project)
+                return GrowthResponse(
+                    action=action, success=True, project=data["slug"],
+                    data={"workspace": data},
+                    message=f"Growth workspace for {data['slug']}.",
+                )
+
+            if action == "workspace-list":
+                slugs = service.list_workspaces()
+                return GrowthResponse(
+                    action=action, success=True,
+                    data={"workspaces": slugs, "count": len(slugs)},
+                    message=f"{len(slugs)} growth workspace(s).",
+                )
+
+            if action == "bind":
+                binding = service.bind(
+                    project=project,
+                    platform=str(kwargs.get("platform", "")),
+                    account_id=str(kwargs.get("account_id", "")),
+                    account_handle=str(kwargs.get("account_handle", "")),
+                    secret_name=str(kwargs.get("secret_name", "")),
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"binding": binding},
+                    message=f"Bound {binding['platform']} for {project}.",
+                )
+
+            if action == "bindings":
+                rows = service.list_bindings(project)
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"bindings": rows, "count": len(rows)},
+                    message=f"{len(rows)} binding(s).",
+                )
+
+            if action == "credentials":
+                rows = service.credential_status(project, kwargs.get("environ"))
+                ready = sum(1 for r in rows if r["ready"])
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"credentials": rows, "ready": ready, "count": len(rows)},
+                    message=f"{ready}/{len(rows)} credential(s) present.",
+                )
+
+            if action == "content-create":
+                item = service.create_content(project, **fields)
+                return _growth_content_response(action, project, item, "Created")
+
+            if action == "content-get":
+                item = service.get_content(project, str(kwargs.get("content_id", "")))
+                return _growth_content_response(action, project, item, "Read")
+
+            if action == "content-list":
+                items = service.list_content(project, str(kwargs.get("status", "")))
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"content": items, "count": len(items)},
+                    message=f"{len(items)} content item(s).",
+                )
+
+            if action == "content-update":
+                item = service.update_content(
+                    project, str(kwargs.get("content_id", "")), **fields
+                )
+                note = "Updated"
+                if item["approval_is_stale"] or (
+                    item["status"] == "ready-for-review" and not item["approved_fingerprint"]
+                ):
+                    note = "Updated; approval reset"
+                return _growth_content_response(action, project, item, note)
+
+            if action == "review":
+                item = service.submit_for_review(
+                    project,
+                    str(kwargs.get("content_id", "")),
+                    changed_by=str(kwargs.get("changed_by", "human:cli")),
+                )
+                return _growth_content_response(action, project, item, "Ready for review")
+
+            if action == "approve":
+                item = service.approve_content(
+                    project,
+                    str(kwargs.get("content_id", "")),
+                    approved_by=str(kwargs.get("approved_by", "human:cli")),
+                    reason=str(kwargs.get("reason", "")),
+                )
+                return _growth_content_response(action, project, item, "Approved")
+
+            if action == "request-changes":
+                item = service.request_changes(
+                    project,
+                    str(kwargs.get("content_id", "")),
+                    changed_by=str(kwargs.get("changed_by", "human:cli")),
+                    reason=str(kwargs.get("reason", "")),
+                )
+                return _growth_content_response(action, project, item, "Changes requested")
+
+            if action == "cancel":
+                item = service.cancel_content(
+                    project,
+                    str(kwargs.get("content_id", "")),
+                    changed_by=str(kwargs.get("changed_by", "human:cli")),
+                    reason=str(kwargs.get("reason", "")),
+                )
+                return _growth_content_response(action, project, item, "Cancelled")
+
+            return GrowthResponse(
+                action=action, success=False, project=project,
+                message=(
+                    f"Unknown action {action!r}. Valid actions: workspace-init, "
+                    "workspace-get, workspace-list, bind, bindings, credentials, "
+                    "content-create, content-get, content-list, content-update, "
+                    "review, approve, request-changes, cancel"
+                ),
+            )
+        except (GrowthError, ValueError, LookupError) as exc:
+            return GrowthResponse(action=action, success=False, project=project, message=str(exc))
+
     def status(self) -> StatusResponse:
         """
         Return the current health and configuration status of this Monday instance.
@@ -1704,6 +1876,22 @@ class Monday:
 
     def __repr__(self) -> str:
         return f"Monday(version={self.VERSION!r}, session_id={self._session_id!r})"
+
+
+def _growth_content_response(
+    action: str, project: str, item: dict[str, Any], note: str
+) -> GrowthResponse:
+    """Build a GrowthResponse around one content item payload."""
+    return GrowthResponse(
+        action=action,
+        success=True,
+        project=project,
+        content_id=str(item.get("id", "")),
+        status=str(item.get("status", "")),
+        is_approved=bool(item.get("is_approved", False)),
+        data={"content": item},
+        message=f"{note}: {item.get('id', '')} ({item.get('status', '')}).",
+    )
 
 
 def _new_session_id() -> str:
