@@ -1701,7 +1701,20 @@ class Monday:
                               approved_by.
             request-changes — return an item to the author. Requires: project,
                               content_id. Optional: reason.
-            cancel          — terminally cancel an item.
+            cancel          — terminally cancel an item. Refused once an item is
+                              publishing or published.
+            schedule        — move an approved future-dated item to Scheduled.
+                              Requires: project, content_id.
+            publish         — publish an approved item now, or reconcile if this
+                              approved version already landed. Requires: project,
+                              content_id. Optional: force (skip the not-yet-due
+                              check only; every other gate still applies).
+            retry           — re-attempt a failed item after its backoff window.
+            publication-status — publication state, attempts, pause, audit trail.
+            pause / resume  — set or clear a pause. Requires: project, scope
+                              (global|project|platform|post). platform/post also
+                              require target. Optional: reason.
+            pauses          — list active pauses for a workspace.
 
         Returns a GrowthResponse. Does not raise for expected failures.
         """
@@ -1831,13 +1844,69 @@ class Monday:
                 )
                 return _growth_content_response(action, project, item, "Cancelled")
 
+            if action in ("schedule", "publish", "retry"):
+                content_id = str(kwargs.get("content_id", ""))
+                actor = str(kwargs.get("actor", "human:cli"))
+                if action == "schedule":
+                    result = service.schedule_content(project, content_id, actor=actor)
+                elif action == "publish":
+                    result = service.publish_content_now(
+                        project, content_id, actor=actor,
+                        force=bool(kwargs.get("force", False)),
+                    )
+                else:
+                    result = service.retry_publication(project, content_id, actor=actor)
+                return GrowthResponse(
+                    action=action, success=bool(result["ok"]), project=project,
+                    content_id=result["content_id"], status=result["status"],
+                    message=result["message"], data={"result": result},
+                )
+
+            if action == "publication-status":
+                status = service.publication_status(
+                    project, str(kwargs.get("content_id", ""))
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    content_id=status["content_id"], status=status["status"],
+                    is_approved=bool(status["is_approved"]),
+                    data={"publication_status": status},
+                    message=f"{status['content_id']} is {status['status']}.",
+                )
+
+            if action in ("pause", "resume"):
+                state = service.set_pause(
+                    project,
+                    scope=str(kwargs.get("scope", "")),
+                    active=(action == "pause"),
+                    target=str(kwargs.get("target", "")),
+                    reason=str(kwargs.get("reason", "")),
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"pause": state},
+                    message=(
+                        f"Paused ({state['scope']})." if state["paused"]
+                        else "Pause cleared."
+                    ),
+                )
+
+            if action == "pauses":
+                pause_rows = service.list_pauses(project)
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"pauses": pause_rows, "count": len(pause_rows)},
+                    message=f"{len(pause_rows)} active pause(s).",
+                )
+
             return GrowthResponse(
                 action=action, success=False, project=project,
                 message=(
                     f"Unknown action {action!r}. Valid actions: workspace-init, "
                     "workspace-get, workspace-list, bind, bindings, credentials, "
                     "content-create, content-get, content-list, content-update, "
-                    "review, approve, request-changes, cancel"
+                    "review, approve, request-changes, cancel, schedule, publish, "
+                    "retry, publication-status, pause, resume, pauses"
                 ),
             )
         except (GrowthError, ValueError, LookupError) as exc:

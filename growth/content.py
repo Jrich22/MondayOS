@@ -1,11 +1,12 @@
 """
 The Content Item — the unit of approval — and its lifecycle state machine.
 
-Only the states through Approved exist in this increment. Scheduled, Publishing,
-Published, Measured, Archived, Retry, and Manual Review arrive with the publishing
-connector. This is deliberate: a state that does not exist cannot be reached, so
-"nothing can publish yet" is a property of the type rather than a promise made in
-a docstring.
+The lifecycle runs Draft through Published. Measured and Archived arrive with
+measurement (increment 4) and do not exist yet, so an item cannot reach them.
+
+There is exactly one way into Publishing, and it starts at Approved. Nothing skips
+approval, and every edge into a publishing state is listed in _VALID_TRANSITIONS
+below rather than being decided at a call site.
 
 Approval is never a stored boolean. ``is_approved`` recomputes the fingerprint and
 compares, so a hand-edited file cannot claim an approval it does not have.
@@ -21,6 +22,7 @@ from typing import Any
 from core.types import EntityId, Timestamp
 from growth.errors import InvalidTransitionError
 from growth.fingerprint import compute_fingerprint
+from growth.publication import PublicationRecord
 
 
 class ContentStatus(Enum):
@@ -31,7 +33,17 @@ class ContentStatus(Enum):
     READY_FOR_REVIEW = "ready-for-review"
     CHANGES_REQUESTED = "changes-requested"
     APPROVED = "approved"
+    SCHEDULED = "scheduled"
+    PUBLISHING = "publishing"
+    PUBLISHED = "published"
+    FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+# States from which an item may still be cancelled. Publishing is absent on
+# purpose: the request is already with the platform and MondayOS cannot claim it
+# did not land. Published is absent because retracting a live post is a deletion,
+# which is a different operation with different authority.
 
 
 # Valid transitions as an adjacency map, mirroring tasks/task.py. A transition not
@@ -53,12 +65,39 @@ _VALID_TRANSITIONS: dict[ContentStatus, set[ContentStatus]] = {
     },
     ContentStatus.CHANGES_REQUESTED: {ContentStatus.DRAFT, ContentStatus.CANCELLED},
     ContentStatus.APPROVED: {
+        ContentStatus.SCHEDULED,
+        ContentStatus.PUBLISHING,
         ContentStatus.READY_FOR_REVIEW,
         ContentStatus.CHANGES_REQUESTED,
         ContentStatus.CANCELLED,
     },
+    ContentStatus.SCHEDULED: {
+        ContentStatus.PUBLISHING,
+        ContentStatus.READY_FOR_REVIEW,
+        ContentStatus.CANCELLED,
+    },
+    # In flight. The only exits are the two the connector can produce; an operator
+    # cannot cancel out of here because the platform may already have accepted it.
+    ContentStatus.PUBLISHING: {ContentStatus.PUBLISHED, ContentStatus.FAILED},
+    # Terminal until measurement lands (increment 4).
+    ContentStatus.PUBLISHED: set(),
+    ContentStatus.FAILED: {
+        ContentStatus.PUBLISHING,
+        ContentStatus.READY_FOR_REVIEW,
+        ContentStatus.CANCELLED,
+    },
     ContentStatus.CANCELLED: set(),
 }
+
+# Derived from the graph rather than restated, so the two can never disagree.
+CANCELLABLE_STATES = frozenset(
+    state for state, targets in _VALID_TRANSITIONS.items() if ContentStatus.CANCELLED in targets
+)
+
+# States in which an item is committed to publishing and must not be edited.
+PUBLISHING_STATES: frozenset[ContentStatus] = frozenset(
+    {ContentStatus.PUBLISHING, ContentStatus.PUBLISHED}
+)
 
 # Fields an item must carry before a human can be asked to review it. An item missing
 # any of these is not reviewable, and an unreviewable item cannot be approved.
@@ -129,6 +168,12 @@ class ContentItem:
     cta: str = ""
     destination_url: str = ""
     scheduled_at: Timestamp | None = None
+    # The zone the schedule was authored in, kept for display and audit. It is
+    # NOT fingerprinted: approval binds the publication *instant*, which
+    # scheduled_at already carries. Re-notating the same instant in another zone
+    # publishes at the same moment, so it is not a material change; moving the
+    # wall-clock time changes the instant and does reset approval.
+    scheduled_timezone: str = ""
 
     campaign: str = ""
     expected_goal: str = ""
@@ -140,6 +185,8 @@ class ContentItem:
     approved_fingerprint: str = ""
     approved_by: str = ""
     approved_at: Timestamp | None = None
+
+    publication: PublicationRecord | None = None
 
     warnings: list[str] = field(default_factory=list)
     notes: str = ""
@@ -166,6 +213,21 @@ class ContentItem:
             scheduled_at=self.scheduled_at,
         )
 
+    def approval_covers_current_content(self) -> bool:
+        """
+        True when a recorded approval still matches this item's approved fields.
+
+        Distinct from ``is_approved``, which additionally requires the item to be
+        sitting in APPROVED. Once an item moves on to Scheduled, Publishing, or
+        Failed, the human approval it carries is still the approval of exactly
+        this content - so the publishing gate asks this question, and leaves
+        "is this state admissible" to its own separate gate.
+        """
+        return (
+            bool(self.approved_fingerprint)
+            and self.approved_fingerprint == self.current_fingerprint()
+        )
+
     @property
     def is_approved(self) -> bool:
         """
@@ -174,11 +236,7 @@ class ContentItem:
         Computed, never stored: status alone is not evidence, because a file can be
         edited outside the API. Both the status and the fingerprint must agree.
         """
-        return (
-            self.status is ContentStatus.APPROVED
-            and bool(self.approved_fingerprint)
-            and self.approved_fingerprint == self.current_fingerprint()
-        )
+        return self.status is ContentStatus.APPROVED and self.approval_covers_current_content()
 
     def approval_is_stale(self) -> bool:
         """True when this item is marked Approved but its approved fields have changed."""
@@ -239,6 +297,7 @@ class ContentItem:
             "cta": self.cta,
             "destination_url": self.destination_url,
             "scheduled_at": _fmt_dt(self.scheduled_at) if self.scheduled_at else "",
+            "scheduled_timezone": self.scheduled_timezone,
             "campaign": self.campaign,
             "expected_goal": self.expected_goal,
             "expected_audience": self.expected_audience,
@@ -247,6 +306,7 @@ class ContentItem:
             "approved_fingerprint": self.approved_fingerprint,
             "approved_by": self.approved_by,
             "approved_at": _fmt_dt(self.approved_at) if self.approved_at else "",
+            "publication": self.publication.to_dict() if self.publication else None,
             "warnings": list(self.warnings),
             "notes": self.notes,
             "tags": list(self.tags),
@@ -269,6 +329,7 @@ class ContentItem:
             cta=str(data.get("cta", "")),
             destination_url=str(data.get("destination_url", "")),
             scheduled_at=_parse_dt(scheduled_raw) if scheduled_raw else None,
+            scheduled_timezone=str(data.get("scheduled_timezone", "")),
             campaign=str(data.get("campaign", "")),
             expected_goal=str(data.get("expected_goal", "")),
             expected_audience=str(data.get("expected_audience", "")),
@@ -279,6 +340,11 @@ class ContentItem:
             approved_fingerprint=str(data.get("approved_fingerprint", "")),
             approved_by=str(data.get("approved_by", "")),
             approved_at=_parse_dt(approved_raw) if approved_raw else None,
+            publication=(
+                PublicationRecord.from_dict(data["publication"])
+                if data.get("publication")
+                else None
+            ),
             warnings=[str(w) for w in (data.get("warnings") or [])],
             notes=str(data.get("notes", "")),
             tags=[str(t) for t in (data.get("tags") or [])],

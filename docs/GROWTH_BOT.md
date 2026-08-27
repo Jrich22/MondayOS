@@ -7,14 +7,17 @@
 
 ---
 
-> **Status note.** Increments 1 and 2 are implemented in [`growth/`](../growth/README.md):
-> the Growth Workspace and its isolation boundary, the Content Item and its lifecycle, and
-> approval fingerprinting, reachable via `Monday.growth()` and `monday growth`. Increments 3–6
-> are **not** built — there is no publishing connector, no measurement, no Growth Brain, and no
-> portfolio view, so every section describing those is the intended contract rather than current
-> behaviour. Sections describing publishing, scheduling, measurement, experiments, the comment
-> assistant, and the collaborating roles are therefore still forward-looking. See
-> [Delivery Increments](#delivery-increments) for what landed.
+> **Status note.** Increments 1-3 are implemented: the Growth Workspace and its isolation
+> boundary, the Content Item with its lifecycle and approval fingerprinting, and the deterministic
+> publishing connector layer with pause controls, bounded retries, idempotency, and an audit trail.
+>
+> **Publishing runs against a deterministic fake connector only.** There is no OAuth, no real
+> platform adapter, and no browser automation — `integrations/publishing/factory.REAL_ADAPTERS` is
+> empty. Real adapters are the next increment.
+>
+> Increments 4-6 are **not** built: no measurement, no Growth Brain, no portfolio view, no comment
+> assistant. Sections describing those are the intended contract rather than current behaviour. See
+> [Delivery Increments](#delivery-increments).
 
 ## Purpose
 
@@ -160,11 +163,15 @@ Draft ──▶ AI Review ──▶ Ready for Review ──▶ Approved ──�
 | **Scheduled** | Handed to the publishing connector with a fire time. |
 | **Publishing** | In flight at the platform. |
 | **Published** | Live, with a platform post ID recorded. |
-| **Measured** | Metrics collected and attributed to the objective it was published for. |
-| **Archived** | Terminal. Retained as evidence for the Growth Brain. |
-| **Retry** | Publishing failed transiently. Re-enters Publishing under the same approval. |
-| **Manual Review** | Publishing failed non-transiently. Requires a human decision. |
+| **Measured** | Metrics collected and attributed to the objective it was published for. *(Increment 4 — not implemented.)* |
+| **Archived** | Terminal. Retained as evidence for the Growth Brain. *(Increment 4 — not implemented.)* |
+| **Failed** | A publish attempt did not succeed. A transient failure carries a backoff window and can be retried under the same approval; a permanent one requires a human. |
 | **Cancelled** | Terminal. Will not publish. |
+
+Cancellation is allowed from every state up to and including Scheduled, and from Failed. It is
+refused once an item is Publishing — the request is already with the platform and MondayOS cannot
+claim it did not land — and once Published, where withdrawal is a deletion rather than a
+cancellation and carries different authority.
 
 Failure handling distinguishes the two cases deliberately. A transient failure — a rate limit, a timeout — retries under the existing approval, because nothing about the approved content changed. A non-transient failure — a rejected token, a policy refusal, a dead destination URL — routes to Manual Review, because something about the world changed and the approval may no longer mean what it meant.
 
@@ -367,7 +374,7 @@ Each increment leaves the service useful on its own. No increment ships a publis
 
 **Increment 2 — Content and approval.** Content Item schema, the lifecycle state machine, approval fingerprinting, and `publish_content` registered as a gated action. Items reach Approved and stop there. Nothing can publish, which makes this increment safe to ship.
 
-**Increment 3 — Publishing.** The connector interface, one real platform, retry and Manual Review handling, and the five pause scopes. The first increment where content goes live.
+**Increment 3 — Publishing.** *(Implemented, fake connector only.)* The provider-neutral connector interface, the deterministic dispatcher and its ten-gate sequence, bounded retries with backoff and jitter, clock-free idempotency, the pause scopes, and the audit trail. Real platform adapters and the credential framework they need are deliberately deferred: MondayOS has no OAuth layer, and inventing a second credential system for social publishing was out of scope.
 
 **Increment 4 — Measurement.** Metric ingestion, objective attribution, the per-project dashboard, and per-project aggregates.
 

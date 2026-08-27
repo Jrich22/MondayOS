@@ -463,39 +463,61 @@ class TestApprovalReset(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestNothingCanPublish(unittest.TestCase):
-    def test_no_published_state_exists(self):
-        values = {s.value for s in ContentStatus}
-        for forbidden in ("scheduled", "publishing", "published", "measured", "archived"):
-            self.assertNotIn(forbidden, values)
+class TestApprovalIsTheOnlyWayIn(unittest.TestCase):
+    """
+    Increment 3 opened the publishing states. The boundary that replaced
+    "nothing can publish" is narrower and more important: nothing reaches a
+    publishing state without passing through Approved.
+    """
 
-    def test_no_state_can_reach_a_publishing_state(self):
+    def test_publishing_is_reachable_only_from_approved_or_scheduled_or_failed(self):
         from growth.content import _VALID_TRANSITIONS
 
-        reachable = {t for targets in _VALID_TRANSITIONS.values() for t in targets}
-        self.assertTrue(reachable.issubset(set(ContentStatus)))
+        sources = {
+            state
+            for state, targets in _VALID_TRANSITIONS.items()
+            if ContentStatus.PUBLISHING in targets
+        }
+        self.assertEqual(
+            sources,
+            {ContentStatus.APPROVED, ContentStatus.SCHEDULED, ContentStatus.FAILED},
+        )
 
-    def test_the_package_exposes_no_publish_or_schedule_callable(self):
-        import growth
+    def test_published_is_reachable_only_from_publishing(self):
+        from growth.content import _VALID_TRANSITIONS
 
-        for name in dir(growth):
-            if name.startswith("_"):
-                continue
-            attr = getattr(growth, name)
-            if callable(attr) and ("publish" in name.lower() or "schedule" in name.lower()):
-                self.assertIn(
-                    name,
-                    {"publish_action_is_gated"},
-                    f"{name} looks like a publishing entry point",
-                )
+        sources = {
+            state
+            for state, targets in _VALID_TRANSITIONS.items()
+            if ContentStatus.PUBLISHED in targets
+        }
+        self.assertEqual(sources, {ContentStatus.PUBLISHING})
 
-    def test_service_reports_items_as_not_publishable(self):
-        with TemporaryDirectory() as tmp:
-            root = _make_root(tmp)
-            service = GrowthService(root)
-            service.init_workspace("acme")
-            item = service.create_content("acme", **_complete_content_kwargs())
-            self.assertFalse(item["publishable"])
+    def test_no_pre_approval_state_can_reach_publishing_or_published(self):
+        from growth.content import _VALID_TRANSITIONS
+
+        pre_approval = (
+            ContentStatus.DRAFT,
+            ContentStatus.AI_REVIEW,
+            ContentStatus.READY_FOR_REVIEW,
+            ContentStatus.CHANGES_REQUESTED,
+        )
+        for state in pre_approval:
+            with self.subTest(state=state.value):
+                targets = _VALID_TRANSITIONS[state]
+                self.assertNotIn(ContentStatus.PUBLISHING, targets)
+                self.assertNotIn(ContentStatus.PUBLISHED, targets)
+                self.assertNotIn(ContentStatus.SCHEDULED, targets)
+
+    def test_no_real_platform_adapter_is_registered(self):
+        from integrations.publishing.factory import REAL_ADAPTERS
+
+        self.assertEqual(REAL_ADAPTERS, {})
+
+    def test_measurement_states_do_not_exist_yet(self):
+        values = {s.value for s in ContentStatus}
+        for forbidden in ("measured", "archived"):
+            self.assertNotIn(forbidden, values)
 
 
 # ---------------------------------------------------------------------------

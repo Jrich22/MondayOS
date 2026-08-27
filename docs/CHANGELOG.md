@@ -9,6 +9,49 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### MondayOS v2.7 — Growth Bot: publishing connector (2026-08-27)
+
+Adds the deterministic publishing layer for approved Growth content: a provider-neutral connector
+interface, the `PublishDispatcher` gate sequence, pause controls, bounded retries, idempotency, and
+an append-only audit trail.
+
+**Fake connector only.** No OAuth, no real platform adapter, no browser automation.
+`integrations/publishing/factory.REAL_ADAPTERS` is empty and a test keeps it that way.
+
+#### Added
+- `integrations/publishing/` — `PublishingConnector` ABC, `PublishRequest` / `PublishOutcome`, the
+  transient/permanent failure taxonomy, `FakePublishingConnector`, and `build_connector`.
+- `growth/dispatch.py` — the ten-gate publish sequence. No model call, no content decision.
+- `growth/publication.py` — publication records, attempt history, clock-free idempotency keys,
+  bounded exponential backoff with injectable jitter.
+- `growth/pause.py` — post / platform / project pauses plus the portfolio-wide emergency stop.
+- `growth/audit.py` — append-only JSONL trail of every transition and connector attempt.
+- `core/redaction.py` — the secret-scrubbing backstop, promoted from `dashboard_api/security.py`
+  so the dispatcher and the API edge share one implementation.
+- Content states `scheduled`, `publishing`, `published`, `failed`; `scheduled_timezone` on items.
+- `Monday.growth()` actions: `schedule`, `publish`, `retry`, `publication-status`, `pause`,
+  `resume`, `pauses`, with matching `monday growth` commands.
+
+#### Security
+- Credentials resolve at call time from the environment and are never stored, logged, echoed in a
+  `PublishRequest.redacted()` view, or written to a publication record.
+- Connector exceptions pass through `core.redaction` before they reach a stored failure detail or
+  an audit line. A test injects a real secret into an exception and sweeps every file under
+  `growth/` and `logs/` to prove it does not land.
+
+#### Changed
+- `is_approved` still means "approved and unedited". The publish gate now asks the narrower
+  `approval_covers_current_content()`, because a Scheduled or Failed item carries a valid approval.
+- Editing an item is refused once it is Publishing or Published.
+- `dashboard_api.security` re-exports `redact_text` / `redact` from `core.redaction`; no behaviour
+  change at the API edge.
+
+#### Known gaps
+- No real platform adapters and no OAuth. Next increment.
+- No recurring scheduling orchestration; the dispatcher publishes when asked or when due.
+- `Monday.publish()` (Confluence) still bypasses `ApprovalGate`. Pre-existing, tracked separately.
+
+
 ### MondayOS v2.6 — Growth Bot: workspaces and content approval (2026-08-26)
 
 Adds the `growth/` service: project-isolated marketing workspaces, the Content Item and its

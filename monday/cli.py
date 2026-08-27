@@ -2031,6 +2031,57 @@ def _register_growth(subparsers: Any) -> None:
     can.add_argument("--reason", default="")
     can.set_defaults(func=_cmd_growth_cancel)
 
+    sch = sub.add_parser("schedule", help="Schedule an approved future-dated item.")
+    _project_arg(sch)
+    _content_arg(sch)
+    sch.add_argument("--by", default="human:cli")
+    sch.set_defaults(func=_cmd_growth_schedule)
+
+    pub = sub.add_parser("publish", help="Publish an approved item now.")
+    _project_arg(pub)
+    _content_arg(pub)
+    pub.add_argument("--by", default="human:cli")
+    pub.add_argument(
+        "--force",
+        action="store_true",
+        help="Publish a scheduled item before its due time. Skips ONLY the due-time "
+             "check; approval, isolation, and every pause still apply.",
+    )
+    pub.set_defaults(func=_cmd_growth_publish)
+
+    rty = sub.add_parser("retry", help="Re-attempt a failed publication.")
+    _project_arg(rty)
+    _content_arg(rty)
+    rty.add_argument("--by", default="human:cli")
+    rty.set_defaults(func=_cmd_growth_retry)
+
+    pst = sub.add_parser("publication-status", help="Show publication state and history.")
+    _project_arg(pst)
+    _content_arg(pst)
+    pst.set_defaults(func=_cmd_growth_publication_status)
+
+    pau = sub.add_parser("pause", help="Pause publishing at a scope.")
+    _project_arg(pau)
+    pau.add_argument(
+        "--scope", required=True, choices=["global", "project", "platform", "post"],
+        help="global is the portfolio-wide emergency stop and overrides everything.",
+    )
+    pau.add_argument("--target", default="", help="Platform slug or content id.")
+    pau.add_argument("--reason", default="", help="Why publishing is held.")
+    pau.set_defaults(func=_cmd_growth_pause)
+
+    res = sub.add_parser("resume", help="Clear a pause at a scope.")
+    _project_arg(res)
+    res.add_argument(
+        "--scope", required=True, choices=["global", "project", "platform", "post"]
+    )
+    res.add_argument("--target", default="")
+    res.set_defaults(func=_cmd_growth_resume)
+
+    pls = sub.add_parser("pauses", help="List active pauses.")
+    _project_arg(pls)
+    pls.set_defaults(func=_cmd_growth_pauses)
+
 
 def _growth_call(args: argparse.Namespace, action: str, **kwargs: Any) -> int:
     """Invoke Monday.growth and render the result. All growth commands go through this."""
@@ -2218,3 +2269,89 @@ def _cmd_growth_cancel(args: argparse.Namespace) -> int:
         args, "cancel", project=args.project, content_id=args.content,
         changed_by=args.by, reason=args.reason,
     )
+
+
+def _cmd_growth_schedule(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "schedule", project=args.project, content_id=args.content, actor=args.by
+    )
+
+
+def _cmd_growth_publish(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "publish", project=args.project, content_id=args.content,
+        actor=args.by, force=args.force,
+    )
+
+
+def _cmd_growth_retry(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "retry", project=args.project, content_id=args.content, actor=args.by
+    )
+
+
+def _cmd_growth_publication_status(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("publication-status", project=args.project, content_id=args.content)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    st = r.data.get("publication_status", {})
+    print(f"{st.get('content_id', '')}  [{st.get('status', '')}]")
+    _hr()
+    covers = st.get("approval_covers_content", False)
+    print(f"  Approval   : {'covers this exact content' if covers else 'DOES NOT COVER — stale'}")
+    print(f"  Scheduled  : {st.get('scheduled_at', '') or '—'}"
+          + (f"  ({st['scheduled_timezone']})" if st.get("scheduled_timezone") else ""))
+    pause = st.get("pause", {})
+    print(f"  Pause      : {pause.get('scope') or 'none'}")
+    pub = st.get("publication")
+    if not pub:
+        print("  Publication: never attempted")
+    else:
+        print(f"  Platform   : {pub.get('platform', '') or '—'}")
+        print(f"  Account    : {pub.get('account_ref', '') or '—'}")
+        print(f"  External   : {pub.get('external_id', '') or '—'}")
+        print(f"  URL        : {pub.get('external_url', '') or '—'}")
+        print(f"  Published  : {pub.get('published_at', '') or '—'}")
+        print(f"  Attempts   : {pub.get('retry_count', 0)}")
+        if pub.get("failure_code"):
+            print(f"  Failure    : {pub['failure_code']} — {pub.get('failure_detail', '')}")
+        if pub.get("next_attempt_at"):
+            print(f"  Retry after: {pub['next_attempt_at']}")
+        if pub.get("reconciled"):
+            print("  Reconciled : yes (adopted an existing platform post)")
+    print(f"  Audit      : {len(st.get('audit', []))} record(s)")
+    return 0
+
+
+def _cmd_growth_pause(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "pause", project=args.project, scope=args.scope,
+        target=args.target, reason=args.reason,
+    )
+
+
+def _cmd_growth_resume(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "resume", project=args.project, scope=args.scope, target=args.target
+    )
+
+
+def _cmd_growth_pauses(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("pauses", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    rows = r.data.get("pauses", {})
+    if not rows:
+        print("No active pauses.")
+        return 0
+    print(f"Active pauses ({len(rows)})")
+    _hr()
+    for key, meta in sorted(rows.items()):
+        reason = (meta or {}).get("reason") or "—"
+        mark = "!!" if key == "global" else "  "
+        print(f"  {mark} {key:<28} {reason}")
+    return 0

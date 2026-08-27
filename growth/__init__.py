@@ -25,6 +25,7 @@ Public surface:
 
 from __future__ import annotations
 
+from growth.audit import AuditRecord, AuditTrail
 from growth.binding import (
     SUPPORTED_PLATFORMS,
     CredentialCheck,
@@ -34,11 +35,14 @@ from growth.binding import (
     normalize_platform,
 )
 from growth.content import (
+    CANCELLABLE_STATES,
+    PUBLISHING_STATES,
     REQUIRED_FOR_REVIEW,
     ContentItem,
     ContentStatus,
     ContentTransition,
 )
+from growth.dispatch import DispatchResult, PublishDispatcher
 from growth.errors import (
     AmbiguousProjectError,
     BindingNotFoundError,
@@ -56,17 +60,39 @@ from growth.fingerprint import (
     FINGERPRINTED_FIELDS,
     compute_fingerprint,
 )
+from growth.pause import SCOPES, PauseController, PauseState
 from growth.project import (
     ResolvedProject,
     normalize_project_slug,
     resolve_project,
     workspace_path,
 )
+from growth.publication import (
+    MAX_ATTEMPTS,
+    PublicationAttempt,
+    PublicationRecord,
+    backoff_seconds,
+    idempotency_key,
+)
 from growth.service import PUBLISH_ACTION, GrowthService, publish_action_is_gated
 from growth.store import GrowthStore, WorkspaceHandle
 from growth.workspace import Audience, Brand, Business, Marketing, Workspace
 
 __all__ = [
+    "idempotency_key",
+    "backoff_seconds",
+    "SCOPES",
+    "PublishDispatcher",
+    "PublicationRecord",
+    "PublicationAttempt",
+    "PauseState",
+    "PauseController",
+    "PUBLISHING_STATES",
+    "MAX_ATTEMPTS",
+    "DispatchResult",
+    "CANCELLABLE_STATES",
+    "AuditTrail",
+    "AuditRecord",
     "FINGERPRINTED_FIELDS",
     "FINGERPRINT_SCHEME",
     "PUBLISH_ACTION",

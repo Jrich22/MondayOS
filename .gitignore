@@ -70,5 +70,8 @@ agents/.sequences.json
 # Confluence publish mapping/history — local runtime state (never secrets)
 logs/publish/
 
+# Growth publishing runtime state: audit trail + fake-connector store.
+logs/growth/
+
 # Project registry — runtime state with machine-specific absolute paths
 config/projects.json

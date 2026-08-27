@@ -23,23 +23,32 @@ import re
 import warnings as _warnings
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
 from core.types import EntityId
 from growth.binding import PlatformBinding, normalize_platform
-from growth.content import ContentItem, ContentStatus, ContentTransition
+from growth.content import (
+    PUBLISHING_STATES,
+    ContentItem,
+    ContentStatus,
+    ContentTransition,
+)
 from growth.errors import (
     BindingNotFoundError,
     ContentNotFoundError,
     GrowthParseError,
+    InvalidTransitionError,
     WorkspaceExistsError,
     WorkspaceNotFoundError,
 )
 from growth.project import ResolvedProject, resolve_project, workspace_path
 from growth.workspace import Workspace
 from monday.project import ProjectRegistry
+
+if TYPE_CHECKING:
+    from growth.pause import PauseController
 
 _CONTENT_PREFIX = "CONTENT"
 _SEQUENCES_FILENAME = ".sequences.json"
@@ -173,6 +182,23 @@ class WorkspaceHandle:
         self._write_content(item)
         return item
 
+    def save_content(self, item: ContentItem) -> ContentItem:
+        """
+        Persist an item exactly as given.
+
+        The publishing dispatcher owns its own transitions and needs to write the
+        result without re-running update_content's approval-reset rule, which
+        would fight it. Callers editing *fields* must use update_content.
+        """
+        self._write_content(item)
+        return item
+
+    def pause_controller(self, project_root: Path) -> PauseController:
+        """Pause controls scoped to this workspace, plus the global stop."""
+        from growth.pause import PauseController
+
+        return PauseController(project_root, self._dir)
+
     def get_content(self, content_id: EntityId) -> ContentItem:
         """Load one content item. Raises ContentNotFoundError."""
         path = self._content_dir / f"{content_id}.md"
@@ -222,6 +248,8 @@ class WorkspaceHandle:
         write, and ContentItem.is_approved independently recomputes the comparison.
         """
         item = self.get_content(content_id)
+        if item.status in PUBLISHING_STATES:
+            raise InvalidTransitionError(item.status.value, "edited")
         before = item.current_fingerprint()
 
         if not isinstance(platform, _Unset):
@@ -253,7 +281,10 @@ class WorkspaceHandle:
 
         item.updated = datetime.now(tz=UTC)
 
-        if item.status is ContentStatus.APPROVED and item.current_fingerprint() != before:
+        if (
+            item.status in (ContentStatus.APPROVED, ContentStatus.SCHEDULED)
+            and item.current_fingerprint() != before
+        ):
             item.apply_transition(
                 ContentStatus.READY_FOR_REVIEW,
                 changed_by="system",
