@@ -25,6 +25,7 @@ Public surface:
 
 from __future__ import annotations
 
+from growth.analytics import FUNNEL_STAGES, GrowthAnalytics, Snapshot, TrendResult
 from growth.audit import AuditRecord, AuditTrail
 from growth.binding import (
     SUPPORTED_PLATFORMS,
@@ -65,12 +66,27 @@ from growth.errors import (
     WorkspaceExistsError,
     WorkspaceNotFoundError,
 )
+from growth.events import (
+    CONVERSION_TYPES,
+    ENGAGEMENT_TYPES,
+    EventSource,
+    EventStore,
+    EventType,
+    PerformanceEvent,
+    PlatformSourceUnavailableError,
+)
 from growth.fingerprint import (
     FINGERPRINT_SCHEME,
     FINGERPRINTED_FIELDS,
     compute_fingerprint,
 )
 from growth.library import ContentLibrary, LibraryEntry
+from growth.metrics import (
+    EVENT_METRICS,
+    RATE_METRICS,
+    MetricValue,
+    compute_all,
+)
 from growth.onboarding import (
     REQUIRED_STEPS,
     AccountLabelError,
@@ -98,6 +114,21 @@ from growth.store import GrowthStore, WorkspaceHandle
 from growth.workspace import Audience, Brand, Business, Marketing, Workspace
 
 __all__ = [
+    "compute_all",
+    "TrendResult",
+    "Snapshot",
+    "PlatformSourceUnavailableError",
+    "PerformanceEvent",
+    "MetricValue",
+    "GrowthAnalytics",
+    "EventType",
+    "EventStore",
+    "EventSource",
+    "RATE_METRICS",
+    "FUNNEL_STAGES",
+    "EVENT_METRICS",
+    "ENGAGEMENT_TYPES",
+    "CONVERSION_TYPES",
     "synthetic_metadata",
     "seed_workspace",
     "is_synthetic",

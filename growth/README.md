@@ -28,6 +28,8 @@ The boundary that matters now is narrower and more important than "nothing can p
 - The Content Library: a query layer over content that already exists, never a second copy.
 - Growth onboarding, which marks a project ready to be *planned for* and explicitly not ready to
   publish for real.
+- Performance events and the deterministic analytics computed from them: per-content, per-campaign,
+  per-platform and whole-workspace aggregation, time series, trends, funnels and snapshots.
 - Running the deterministic publish gate sequence: pause scopes, status, fingerprint, isolation,
   scheduled time, idempotency, then the connector.
 - Bounded retries with exponential backoff and jitter, and clock-free idempotency keys.
@@ -62,6 +64,9 @@ The boundary that matters now is narrower and more important than "nothing can p
 | `ContentType` | What kind of artifact an item is (library metadata) |
 | `Onboarding` / `PlatformIntent` / `WeeklyReview` | Growth onboarding; account LABELS only |
 | `seed_workspace` / `is_synthetic` | Deterministic demo data, marked synthetic at rest |
+| `PerformanceEvent` / `EventStore` / `EventSource` | Measured observations, append-only per project |
+| `compute_all` / `MetricValue` | Metric formulas as pure functions |
+| `GrowthAnalytics` / `Snapshot` / `TrendResult` | Aggregation, time series, trends, funnels |
 | `PublishDispatcher` / `DispatchResult` | The deterministic publish gate sequence |
 | `PublicationRecord` / `PublicationAttempt` | Durable publishing outcome and attempt history |
 | `idempotency_key` / `backoff_seconds` | Clock-free dedupe key; bounded retry curve |
@@ -89,6 +94,9 @@ growth/
     ├── campaigns/CAMPAIGN-NNNN.md one Campaign
     ├── content/CONTENT-NNNN.md   one Content Item, including its publication record
     ├── pauses.json               project / platform / post pauses for THIS project
+    ├── events/events.jsonl       append-only performance observations
+    ├── snapshots/SNAPSHOT-N.json point-in-time metric captures
+    ├── aggregates.json           the ONLY file a portfolio view may read
     └── .sequences.json           CONTENT- id allocation, scoped to THIS workspace
 
 logs/growth/<slug>/audit.jsonl    append-only audit trail (gitignored runtime state)
@@ -109,6 +117,17 @@ Two rules keep the library and the approval contract from interfering with each 
 
 `Marketing.campaigns` on the workspace remains a descriptive list of campaign *labels*. Real
 `Campaign` records are authoritative; that field is not a foreign key and is not read as one.
+
+Three rules govern analytics, and every one of them exists because the Growth Brain will treat this
+layer as ground truth:
+
+- **No metric is stored, only computed.** Metrics are pure functions of the events in one workspace,
+  so a number can always be traced to the observations behind it and can never drift from them.
+- **A rate with no denominator is `None`, never `0.0`.** Zero is a measurement; reporting it for
+  "not measured" would let a project look like it is failing when nobody has looked.
+- **Provenance survives aggregation.** No platform adapter exists, so `record()` refuses
+  `source=platform` outright, and any metric touching a synthetic or imported event stays flagged
+  synthetic all the way out to the CLI.
 
 The sequence file is per workspace on purpose. A shared counter would let one project infer
 another's publishing volume from the gaps in its own ids.

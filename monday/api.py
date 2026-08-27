@@ -1891,6 +1891,128 @@ class Monday:
                     ),
                 )
 
+            if action == "event-record":
+                data = service.record_event(project, **fields)
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    content_id=data["content_id"], data={"event": data},
+                    message=(
+                        f"Recorded {data['event_type']} "
+                        f"({data['source']}, value={data['value']})."
+                    ),
+                )
+
+            if action == "event-import":
+                data = service.import_events(
+                    project, list(kwargs.get("events") or []),
+                    source=str(kwargs.get("source", "imported")),
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"import": data},
+                    message=f"Recorded {data['recorded']} {data['source']} event(s).",
+                )
+
+            if action == "event-list":
+                rows = service.list_events(project, **fields)
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"events": rows, "count": len(rows)},
+                    message=f"{len(rows)} event(s).",
+                )
+
+            if action == "analytics":
+                data = service.workspace_analytics(project)
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"analytics": data},
+                    message=(
+                        f"{data['event_count']} event(s) across {data['content_total']} item(s)."
+                        + (" SYNTHETIC DATA." if data["synthetic"] else "")
+                    ),
+                )
+
+            if action == "analytics-campaign":
+                data = service.campaign_analytics(
+                    project, str(kwargs.get("campaign_id", ""))
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project, status=data["status"],
+                    data={"analytics": data},
+                    message=(
+                        f"{data['campaign_id']}: {data['content_published']} published"
+                        + (" SYNTHETIC DATA." if data["synthetic"] else "")
+                    ),
+                )
+
+            if action == "analytics-content":
+                data = service.content_analytics(project, str(kwargs.get("content_id", "")))
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    content_id=data["content_id"], status=data["status"],
+                    data={"analytics": data},
+                    message=f"{data['content_id']}: {data['event_count']} event(s).",
+                )
+
+            if action == "analytics-platform":
+                rows = service.platform_analytics(project)
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"platforms": rows, "count": len(rows)},
+                    message=f"{len(rows)} platform(s) with data.",
+                )
+
+            if action == "analytics-series":
+                data = service.time_series(project, **fields)
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"series": data},
+                    message=f"{len(data['points'])} bucket(s) of {data['metric']}.",
+                )
+
+            if action == "analytics-trend":
+                trend_fields = {
+                    k: v for k, v in fields.items() if k not in ("metric", "period_days")
+                }
+                data = service.trend(
+                    project, str(kwargs.get("metric", "impressions")),
+                    int(kwargs.get("period_days", 7)), **trend_fields,
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"trend": data},
+                    message=f"{data['metric']}: {data['direction']}",
+                )
+
+            if action == "analytics-funnel":
+                data = service.funnel(
+                    project, str(kwargs.get("campaign", "")),
+                    str(kwargs.get("platform", "")),
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"funnel": data},
+                    message=f"{data['total_conversions']} conversion(s).",
+                )
+
+            if action == "snapshot-take":
+                data = service.take_snapshot(project, **fields)
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"snapshot": data},
+                    message=f"Captured {data['id']} at {data['taken_at']}.",
+                )
+
+            if action == "snapshot-list":
+                rows = service.list_snapshots(project)
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"snapshots": rows, "count": len(rows)},
+                    message=f"{len(rows)} snapshot(s).",
+                )
+
+            if action == "aggregate-write":
+                data = service.write_aggregate(project)
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"aggregate": data},
+                    message=f"Wrote the portfolio aggregate for {project}.",
+                )
+
             if action == "campaign-create":
                 data = service.create_campaign(
                     project, str(kwargs.get("name", "")),
@@ -2036,7 +2158,10 @@ class Monday:
                     "campaign-create, campaign-get, campaign-list, campaign-status, "
                     "campaign-assign, library-search, library-summary, library-top, "
                     "library-reusable, library-variants, onboard, onboarding-status, "
-                    "seed-demo"
+                    "seed-demo, event-record, event-import, event-list, analytics, "
+                    "analytics-campaign, analytics-content, analytics-platform, "
+                    "analytics-series, analytics-trend, analytics-funnel, "
+                    "snapshot-take, snapshot-list, aggregate-write"
                 ),
             )
         except (GrowthError, ValueError, LookupError) as exc:

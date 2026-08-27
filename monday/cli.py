@@ -2173,6 +2173,79 @@ def _register_growth(subparsers: Any) -> None:
     _project_arg(dem)
     dem.set_defaults(func=_cmd_growth_seed_demo)
 
+    # ---- performance events ----
+    ev = sub.add_parser("event-record", help="Record one performance observation.")
+    _project_arg(ev)
+    ev.add_argument(
+        "--type", required=True, dest="event_type",
+        choices=["impression", "reach", "engagement", "reaction", "comment", "share",
+                 "click", "website_visit", "signup", "purchase", "custom_conversion"],
+    )
+    ev.add_argument(
+        "--source", default="imported", choices=["imported", "synthetic"],
+        help="platform is unavailable: no adapter has reported anything.",
+    )
+    ev.add_argument("--content", default="", dest="content_id")
+    ev.add_argument("--campaign", default="")
+    ev.add_argument("--platform", default="")
+    ev.add_argument("--value", type=float, default=1.0)
+    ev.add_argument("--name", default="", help="Qualifier for custom_conversion.")
+    ev.add_argument("--at", default="", dest="occurred_at", help="ISO 8601 UTC.")
+    ev.set_defaults(func=_cmd_growth_event_record)
+
+    evl = sub.add_parser("event-list", help="List recorded performance events.")
+    _project_arg(evl)
+    evl.add_argument("--content", default="", dest="content_id")
+    evl.add_argument("--campaign", default="")
+    evl.add_argument("--platform", default="")
+    evl.set_defaults(func=_cmd_growth_event_list)
+
+    # ---- analytics ----
+    an = sub.add_parser("analytics", help="Whole-project analytics.")
+    _project_arg(an)
+    an.set_defaults(func=_cmd_growth_analytics)
+
+    anc = sub.add_parser("analytics-campaign", help="Analytics for one campaign.")
+    _project_arg(anc)
+    anc.add_argument("--campaign", required=True)
+    anc.set_defaults(func=_cmd_growth_analytics_campaign)
+
+    anp = sub.add_parser("analytics-platform", help="Analytics grouped by platform.")
+    _project_arg(anp)
+    anp.set_defaults(func=_cmd_growth_analytics_platform)
+
+    ans = sub.add_parser("analytics-series", help="One metric bucketed over time.")
+    _project_arg(ans)
+    ans.add_argument("--metric", default="impressions")
+    ans.add_argument("--granularity", default="day", choices=["day", "week"])
+    ans.add_argument("--campaign", default="")
+    ans.set_defaults(func=_cmd_growth_analytics_series)
+
+    ant = sub.add_parser("analytics-trend", help="Compare this period to the last.")
+    _project_arg(ant)
+    ant.add_argument("--metric", default="impressions")
+    ant.add_argument("--days", type=int, default=7, dest="period_days")
+    ant.set_defaults(func=_cmd_growth_analytics_trend)
+
+    anf = sub.add_parser("analytics-funnel", help="The conversion funnel.")
+    _project_arg(anf)
+    anf.add_argument("--campaign", default="")
+    anf.add_argument("--platform", default="")
+    anf.set_defaults(func=_cmd_growth_analytics_funnel)
+
+    snt = sub.add_parser("snapshot-take", help="Capture current metrics as a baseline.")
+    _project_arg(snt)
+    snt.add_argument("--note", default="")
+    snt.set_defaults(func=_cmd_growth_snapshot_take)
+
+    snl = sub.add_parser("snapshot-list", help="List metric snapshots.")
+    _project_arg(snl)
+    snl.set_defaults(func=_cmd_growth_snapshot_list)
+
+    agg = sub.add_parser("aggregate-write", help="Write the portfolio aggregate.")
+    _project_arg(agg)
+    agg.set_defaults(func=_cmd_growth_aggregate_write)
+
 
 def _growth_call(args: argparse.Namespace, action: str, **kwargs: Any) -> int:
     """Invoke Monday.growth and render the result. All growth commands go through this."""
@@ -2629,3 +2702,215 @@ def _cmd_growth_onboarding_status(args: argparse.Namespace) -> int:
 
 def _cmd_growth_seed_demo(args: argparse.Namespace) -> int:
     return _growth_call(args, "seed-demo", project=args.project)
+
+
+def _synthetic_banner(synthetic: bool) -> None:
+    """Make unverified data impossible to miss on a metrics screen."""
+    if synthetic:
+        print("  ⚠ SYNTHETIC / IMPORTED DATA — not measured by any platform.")
+
+
+def _print_metrics(metrics: dict[str, Any]) -> None:
+    for key in sorted(metrics):
+        m = metrics[key]
+        if m.get("value") is None:
+            shown = f"—  ({m.get('reason', 'undefined')})"
+        elif m.get("unit") == "ratio":
+            shown = f"{m['value'] * 100:.2f}%"
+        else:
+            shown = f"{m['value']:,.0f}"
+        flag = " [synthetic]" if m.get("synthetic") else ""
+        print(f"    {key:<26} {shown}{flag}")
+
+
+def _cmd_growth_event_record(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "event-record", project=args.project, event_type=args.event_type,
+        source=args.source, content_id=args.content_id, campaign=args.campaign,
+        platform=args.platform, value=args.value, name=args.name,
+        occurred_at=args.occurred_at,
+    )
+
+
+def _cmd_growth_event_list(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("event-list", project=args.project, content_id=args.content_id,
+                      campaign=args.campaign, platform=args.platform)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    rows = r.data.get("events", [])
+    if not rows:
+        print("No events.")
+        return 0
+    print(f"Events ({len(rows)})")
+    _hr()
+    for e in rows:
+        print(f"  {e['occurred_at']}  {e['event_type']:<18} {e['source']:<10} "
+              f"{e.get('platform', '') or '—':<10} {e['value']:>8,.0f}  {e.get('content_id', '')}")
+    return 0
+
+
+def _cmd_growth_analytics(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("analytics", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    a = r.data.get("analytics", {})
+    print(f"Growth analytics: {a.get('project', '')}")
+    _hr()
+    _synthetic_banner(bool(a.get("synthetic")))
+    print(f"  Events    : {a.get('event_count', 0):,}")
+    print(f"  Content   : {a.get('content_total', 0)} total, "
+          f"{a.get('content_approved', 0)} approved, {a.get('content_published', 0)} published, "
+          f"{a.get('content_failed', 0)} failed")
+    print(f"  Campaigns : {a.get('campaigns_total', 0)}")
+    print("  Metrics:")
+    _print_metrics(a.get("metrics", {}))
+    return 0
+
+
+def _cmd_growth_analytics_campaign(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("analytics-campaign", project=args.project, campaign_id=args.campaign)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    a = r.data.get("analytics", {})
+    print(f"{a.get('campaign_id', '')}  [{a.get('status', '')}]  {a.get('campaign_name', '')}")
+    _hr()
+    _synthetic_banner(bool(a.get("synthetic")))
+    print(f"  Objective : {a.get('objective', '') or '—'}")
+    print(f"  Content   : {a.get('content_created', 0)} created, "
+          f"{a.get('content_approved', 0)} approved, {a.get('content_published', 0)} published")
+    print(f"  Top platf.: {a.get('top_platform', '') or '—'}")
+    top, worst = a.get("top_content"), a.get("worst_content")
+    print(f"  Best      : {(top or {}).get('content_id', '—')} "
+          f"({(top or {}).get('conversions', 0):,.0f} conversions)")
+    if worst:
+        print(f"  Worst     : {worst.get('content_id', '—')} "
+              f"({worst.get('conversions', 0):,.0f} conversions)"
+              + ("" if worst.get("measured") else "  [never measured]"))
+    prog = a.get("objective_progress", {})
+    if prog.get("percent") is not None:
+        print(f"  Progress  : {prog['achieved']:,.0f} / {prog['target']:,.0f} "
+              f"({prog['percent']:.1f}%)")
+    else:
+        print(f"  Progress  : {prog.get('achieved', 0):,.0f} — {prog.get('reason', '')}")
+    print("  Metrics:")
+    _print_metrics(a.get("metrics", {}))
+    return 0
+
+
+def _cmd_growth_analytics_platform(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("analytics-platform", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    rows = r.data.get("platforms", [])
+    if not rows:
+        print("No platform data.")
+        return 0
+    print(f"Platform performance ({len(rows)})")
+    _hr()
+    for row in rows:
+        m = row.get("metrics", {})
+        reach = (m.get("reach") or {}).get("value") or 0
+        clicks = (m.get("clicks") or {}).get("value") or 0
+        conv = (m.get("conversions") or {}).get("value") or 0
+        flag = " [synthetic]" if row.get("synthetic") else ""
+        print(f"  {row['platform']:<12} reach={reach:>9,.0f}  clicks={clicks:>7,.0f}  "
+              f"conversions={conv:>6,.0f}{flag}")
+    return 0
+
+
+def _cmd_growth_analytics_series(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("analytics-series", project=args.project, metric=args.metric,
+                      granularity=args.granularity, campaign=args.campaign)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    s = r.data.get("series", {})
+    print(f"{s.get('metric', '')} by {s.get('granularity', '')} — {s.get('project', '')}")
+    _hr()
+    _synthetic_banner(bool(s.get("synthetic")))
+    for point in s.get("points", []):
+        value = point.get("value")
+        shown = "—" if value is None else f"{value:,.0f}"
+        print(f"  {point['bucket']}  {shown:>10}")
+    if not s.get("points"):
+        print("  No events in any bucket.")
+    return 0
+
+
+def _cmd_growth_analytics_trend(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("analytics-trend", project=args.project, metric=args.metric,
+                      period_days=args.period_days)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    t = r.data.get("trend", {})
+    arrow = {"up": "▲", "down": "▼", "flat": "=", "unknown": "?"}.get(t.get("direction"), "?")
+    print(f"{t.get('metric', '')} over {args.period_days}d — {t.get('direction', '')} {arrow}")
+    _hr()
+    _synthetic_banner(bool(t.get("synthetic")))
+    cur, prev = t.get("current"), t.get("previous")
+    print(f"  Current  : {'—' if cur is None else format(cur, ',.0f')}")
+    print(f"  Previous : {'—' if prev is None else format(prev, ',.0f')}")
+    if t.get("percent_change") is not None:
+        print(f"  Change   : {t['percent_change']:+.1f}%")
+    elif t.get("reason"):
+        print(f"  Change   : — ({t['reason']})")
+    return 0
+
+
+def _cmd_growth_analytics_funnel(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("analytics-funnel", project=args.project, campaign=args.campaign,
+                      platform=args.platform)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    f = r.data.get("funnel", {})
+    print(f"Conversion funnel — {f.get('project', '')}")
+    _hr()
+    _synthetic_banner(bool(f.get("synthetic")))
+    for stage in f.get("stages", []):
+        rate = stage.get("rate_from_previous")
+        shown = "—" if rate is None else f"{rate * 100:.1f}%"
+        note = f"  ({stage['reason']})" if stage.get("reason") and rate is None else ""
+        print(f"  {stage['stage']:<16} {stage['count']:>10,.0f}   from previous: {shown}{note}")
+    overall = f.get("overall_rate")
+    print(f"  {'overall':<16} {f.get('total_conversions', 0):>10,.0f}   "
+          f"rate: {'—' if overall is None else format(overall * 100, '.2f') + '%'}")
+    return 0
+
+
+def _cmd_growth_snapshot_take(args: argparse.Namespace) -> int:
+    return _growth_call(args, "snapshot-take", project=args.project, note=args.note)
+
+
+def _cmd_growth_snapshot_list(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("snapshot-list", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    rows = r.data.get("snapshots", [])
+    if not rows:
+        print("No snapshots.")
+        return 0
+    print(f"Snapshots ({len(rows)})")
+    _hr()
+    for s in rows:
+        flag = " [synthetic]" if s.get("synthetic") else ""
+        print(f"  {s['id']}  {s['taken_at']}  {s.get('note', '') or '—'}{flag}")
+    return 0
+
+
+def _cmd_growth_aggregate_write(args: argparse.Namespace) -> int:
+    return _growth_call(args, "aggregate-write", project=args.project)

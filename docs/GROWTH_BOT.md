@@ -7,16 +7,17 @@
 
 ---
 
-> **Status note.** Increments 1-4 are implemented: the Growth Workspace and its isolation
+> **Status note.** Increments 1-5 are implemented: the Growth Workspace and its isolation
 > boundary; the Content Item with its lifecycle and approval fingerprinting; the deterministic
-> publishing connector layer with pause controls, retries, idempotency and an audit trail; and
-> Campaigns, the Content Library and growth onboarding.
+> publishing connector layer with pause controls, retries, idempotency and an audit trail; Campaigns,
+> the Content Library and growth onboarding; and the deterministic analytics layer -
+> performance events, metric formulas, aggregation, time series, trends, funnels and snapshots.
 >
 > **Publishing runs against a deterministic fake connector only.** There is no OAuth, no real
 > platform adapter, and no browser automation. Onboarding records account *labels*, never
 > credentials, and no project can be marked ready for real publishing.
 >
-> Increments 5-11 are **not** built: no measurement, no Growth Brain, no content generation, no
+> Increments 6-11 are **not** built: no Growth Brain, no content generation, no
 > weekly package, no calendar, no reports, no comment handling and no Growth UI. Sections
 > describing those are the intended contract rather than current behaviour. See
 > [Delivery Increments](#delivery-increments).
@@ -380,7 +381,7 @@ Each increment leaves the service useful on its own. No increment ships a publis
 
 **Increment 4 — Campaigns, library, onboarding.** *(Implemented.)* Campaign as the planning object with its own lifecycle, a query-layer Content Library over existing storage, per-platform variants as separate items sharing a `variant_group_id`, and onboarding that marks a project planning-ready but never real-publishing-ready.
 
-**Increment 5 — Measurement.** Metric ingestion, objective attribution, the per-project dashboard, and per-project aggregates.
+**Increment 5 — Measurement.** *(Implemented, synthetic/imported data only.)* Performance events with explicit provenance, metric formulas as pure functions, content/campaign/platform/workspace aggregation, time series, trends, conversion funnels, snapshots, and the per-project aggregate the portfolio view will read. No platform adapter exists, so `source=platform` is refused and every metric derived from synthetic or imported data is labelled as such.
 
 **Increment 5 — Growth Brain and experiments.** The six standing questions, evidence-carrying recommendations, the experiment engine, and promotion of confirmed findings to knowledge entries. Requires increment 4, because the Brain reasons over measured outcomes and has nothing to reason about before then.
 
