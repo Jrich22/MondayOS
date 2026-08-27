@@ -52,14 +52,18 @@ from growth.workspace import Workspace
 from monday.project import ProjectRegistry
 
 if TYPE_CHECKING:
+    from growth.events import EventStore
     from growth.pause import PauseController
 
 _CONTENT_PREFIX = "CONTENT"
 _CAMPAIGN_PREFIX = "CAMPAIGN"
+_SNAPSHOT_PREFIX = "SNAPSHOT"
 _SEQUENCES_FILENAME = ".sequences.json"
 _WORKSPACE_FILENAME = "workspace.md"
 _CONTENT_DIRNAME = "content"
 _CAMPAIGN_DIRNAME = "campaigns"
+_SNAPSHOT_DIRNAME = "snapshots"
+_AGGREGATE_FILENAME = "aggregates.json"
 
 # A CAMPAIGN-shaped value on a content item must resolve to a campaign in THIS
 # workspace. Any other string stays a free-text label, which keeps the existing
@@ -88,6 +92,7 @@ class WorkspaceHandle:
         self._dir = directory
         self._content_dir = directory / _CONTENT_DIRNAME
         self._campaign_dir = directory / _CAMPAIGN_DIRNAME
+        self._snapshot_dir = directory / _SNAPSHOT_DIRNAME
         self._sequences_path = directory / _SEQUENCES_FILENAME
 
     @property
@@ -146,6 +151,64 @@ class WorkspaceHandle:
         if found is None:
             raise BindingNotFoundError(normalize_platform(platform), self.slug)
         return found
+
+    # ------------------------------------------------------------------
+    # Analytics storage (increment 5)
+    # ------------------------------------------------------------------
+
+    def event_store(self) -> EventStore:
+        """Append-only performance events for THIS workspace."""
+        from growth.events import EventStore
+
+        return EventStore(self._dir, self.slug)
+
+    def next_snapshot_id(self) -> EntityId:
+        """Allocate the next snapshot id in this workspace."""
+        return self._next_id(_SNAPSHOT_PREFIX, self._snapshot_dir)
+
+    def save_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Persist one metric snapshot."""
+        self._snapshot_dir.mkdir(parents=True, exist_ok=True)
+        path = self._snapshot_dir / f"{snapshot['id']}.json"
+        path.write_text(json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
+
+    def list_snapshots(self) -> list[dict[str, Any]]:
+        """Every snapshot in this workspace, oldest id first."""
+        if not self._snapshot_dir.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        for path in sorted(self._snapshot_dir.glob(f"{_SNAPSHOT_PREFIX}-*.json")):
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if isinstance(loaded, dict):
+                rows.append(loaded)
+        return rows
+
+    def write_aggregate(self, aggregate: dict[str, Any]) -> Path:
+        """
+        Write the portfolio-readable aggregate for this project.
+
+        The ONLY file in a workspace a portfolio view may open. Its contents are
+        the caller's responsibility to keep free of project detail; a test
+        asserts it carries no copy, media, audience, or account binding.
+        """
+        self._dir.mkdir(parents=True, exist_ok=True)
+        path = self._dir / _AGGREGATE_FILENAME
+        path.write_text(json.dumps(aggregate, indent=2, sort_keys=True), encoding="utf-8")
+        return path
+
+    def read_aggregate(self) -> dict[str, Any]:
+        """Read this project's aggregate, or an empty dict if never written."""
+        path = self._dir / _AGGREGATE_FILENAME
+        if not path.exists():
+            return {}
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
 
     # ------------------------------------------------------------------
     # Campaigns
