@@ -1,6 +1,6 @@
 # MondayOS — Architectural Decision Records
 
-**Last Updated:** 2026-08-26
+**Last Updated:** 2026-08-30
 
 This file is the canonical log of all architectural decisions made for MondayOS. Decisions are recorded in the format described in [DOCUMENTATION_STANDARDS.md](DOCUMENTATION_STANDARDS.md).
 
@@ -485,8 +485,24 @@ Fields outside the fingerprint — internal notes, tags, campaign labels, orderi
 ## ADR-014: The Growth Brain Is a Reasoning Layer, Not a Separate Bot
 
 **Date:** 2026-08-26  
-**Status:** Proposed  
+**Status:** Accepted  
 **Deciders:** Lead Software Engineering
+
+> **Accepted 2026-08-30 on implementation (TASK-0066).** This ADR sat Proposed for five
+> increments because of its own stated dependency: the Brain "requires measured outcomes to
+> reason over", and until increment 5 there were none. That layer now exists — performance
+> events with explicit provenance, metric formulas as pure functions, and aggregation across
+> content, campaign, platform and workspace — so the Brain has something to reason *from*
+> rather than *about*.
+>
+> One thing the implementation settled that the ADR left open: the Brain is **fully
+> deterministic**. It calls no model. Every recommendation is assembled from measured numbers
+> by explicit rules with stated thresholds, so the same workspace state yields byte-identical
+> output. The ADR's requirement that every recommendation carry evidence and a falsifier is
+> enforced by the type — a `Recommendation` constructed without either raises — and the
+> requirement that a performance explanation stay a hypothesis until an experiment confirms it
+> is enforced by returning a different class: below the minimum sample, the engine returns a
+> `Hypothesis` carrying an unconfirmed marker, never a `Recommendation`.
 
 ### Context
 
