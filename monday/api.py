@@ -1719,7 +1719,7 @@ class Monday:
         Returns a GrowthResponse. Does not raise for expected failures.
         """
         from growth.errors import GrowthError
-        from growth.service import GrowthService
+        from growth.service import GrowthService, _as_datetime
 
         service = GrowthService(self._config.project_root)
         project = str(kwargs.get("project", ""))
@@ -1889,6 +1889,106 @@ class Monday:
                         f"Paused ({state['scope']})." if state["paused"]
                         else "Pause cleared."
                     ),
+                )
+
+            if action == "brain-analyze":
+                data = service.brain_analyze(project, _as_datetime(kwargs.get("now")))
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"analysis": data},
+                    message=(
+                        f"{len(data['recommendations'])} recommendation(s), "
+                        f"{len(data['hypotheses'])} hypothesis(es), "
+                        f"{len(data['opportunities'])} opportunity(ies). Deterministic; "
+                        "no model was called."
+                    ),
+                )
+
+            if action == "brain-recommendations":
+                rows = service.brain_recommendations(project, _as_datetime(kwargs.get("now")))
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"recommendations": rows, "count": len(rows)},
+                    message=f"{len(rows)} recommendation(s).",
+                )
+
+            if action == "brain-hypotheses":
+                rows = service.brain_hypotheses(project, _as_datetime(kwargs.get("now")))
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"hypotheses": rows, "count": len(rows)},
+                    message=f"{len(rows)} UNCONFIRMED hypothesis(es).",
+                )
+
+            if action == "brain-opportunities":
+                rows = service.brain_opportunities(project, _as_datetime(kwargs.get("now")))
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"opportunities": rows, "count": len(rows)},
+                    message=f"{len(rows)} opportunity(ies).",
+                )
+
+            if action == "brain-scores":
+                data = service.brain_scores(project)
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"scores": data},
+                    message=(
+                        f"workspace health: "
+                        f"{data['workspace_health']['band']}"
+                    ),
+                )
+
+            if action == "brain-forecasts":
+                data = service.brain_forecasts(project, _as_datetime(kwargs.get("now")))
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"forecasts": data},
+                    message=f"Forecasts for {len(data['campaigns'])} campaign(s).",
+                )
+
+            if action == "brain-experiments":
+                rows = service.brain_experiments(project, _as_datetime(kwargs.get("now")))
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"experiments": rows, "count": len(rows)},
+                    message=(
+                        f"{len(rows)} proposed experiment(s). All require human approval "
+                        "before running."
+                    ),
+                )
+
+            if action == "memory-record":
+                data = service.memory_record(project, **fields)
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"memory": data},
+                    message=f"Remembered {data['id']} as TENTATIVE.",
+                )
+
+            if action == "memory-list":
+                rows = service.memory_list(project, str(kwargs.get("status", "")))
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"memory": rows, "count": len(rows)},
+                    message=f"{len(rows)} memory entr(ies).",
+                )
+
+            if action == "memory-validate":
+                data = service.memory_validate(
+                    project, str(kwargs.get("entry_id", "")),
+                    str(kwargs.get("by", "human:cli")), str(kwargs.get("reason", "")),
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"memory": data},
+                    message=f"{data['id']} is now VALIDATED.",
+                )
+
+            if action == "memory-invalidate":
+                data = service.memory_invalidate(
+                    project, str(kwargs.get("entry_id", "")),
+                    str(kwargs.get("by", "human:cli")), str(kwargs.get("reason", "")),
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"memory": data},
+                    message=f"{data['id']} is now INVALIDATED.",
                 )
 
             if action == "event-record":
@@ -2161,7 +2261,10 @@ class Monday:
                     "seed-demo, event-record, event-import, event-list, analytics, "
                     "analytics-campaign, analytics-content, analytics-platform, "
                     "analytics-series, analytics-trend, analytics-funnel, "
-                    "snapshot-take, snapshot-list, aggregate-write"
+                    "snapshot-take, snapshot-list, aggregate-write, brain-analyze, "
+                    "brain-recommendations, brain-hypotheses, brain-opportunities, "
+                    "brain-scores, brain-forecasts, brain-experiments, memory-record, "
+                    "memory-list, memory-validate, memory-invalidate"
                 ),
             )
         except (GrowthError, ValueError, LookupError) as exc:

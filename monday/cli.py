@@ -2246,6 +2246,68 @@ def _register_growth(subparsers: Any) -> None:
     _project_arg(agg)
     agg.set_defaults(func=_cmd_growth_aggregate_write)
 
+    # ---- growth brain ----
+    ba = sub.add_parser("brain", help="Deterministic analysis over measured outcomes.")
+    _project_arg(ba)
+    ba.set_defaults(func=_cmd_growth_brain)
+
+    br = sub.add_parser("brain-recommendations", help="Evidence-backed recommendations.")
+    _project_arg(br)
+    br.set_defaults(func=_cmd_growth_brain_recommendations)
+
+    bh = sub.add_parser("brain-hypotheses", help="Unconfirmed candidate explanations.")
+    _project_arg(bh)
+    bh.set_defaults(func=_cmd_growth_brain_hypotheses)
+
+    bo = sub.add_parser("brain-opportunities", help="Detected findings.")
+    _project_arg(bo)
+    bo.set_defaults(func=_cmd_growth_brain_opportunities)
+
+    bs = sub.add_parser("brain-scores", help="Workspace, campaign and channel health.")
+    _project_arg(bs)
+    bs.set_defaults(func=_cmd_growth_brain_scores)
+
+    bf = sub.add_parser("brain-forecasts", help="Rule-based projections.")
+    _project_arg(bf)
+    bf.set_defaults(func=_cmd_growth_brain_forecasts)
+
+    be = sub.add_parser("brain-experiments", help="Proposed experiments (approval required).")
+    _project_arg(be)
+    be.set_defaults(func=_cmd_growth_brain_experiments)
+
+    mr = sub.add_parser("memory-record", help="Remember a tentative claim.")
+    _project_arg(mr)
+    mr.add_argument("--statement", required=True)
+    mr.add_argument("--sample", type=int, required=True, dest="sample_size")
+    mr.add_argument(
+        "--category", default="recurring-pattern",
+        choices=["campaign-outcome", "content-outcome", "platform-outcome",
+                 "audience-outcome", "experiment-outcome", "seasonal-observation",
+                 "recurring-pattern", "historical-recommendation"],
+    )
+    mr.add_argument("--metric", default="", dest="metric_affected")
+    mr.set_defaults(func=_cmd_growth_memory_record)
+
+    ml = sub.add_parser("memory-list", help="List marketing memory.")
+    _project_arg(ml)
+    ml.add_argument("--status", default="",
+                    choices=["", "tentative", "validated", "invalidated"])
+    ml.set_defaults(func=_cmd_growth_memory_list)
+
+    mv = sub.add_parser("memory-validate", help="Promote a claim to validated.")
+    _project_arg(mv)
+    mv.add_argument("--entry", required=True, dest="entry_id")
+    mv.add_argument("--by", default="human:cli")
+    mv.add_argument("--reason", default="")
+    mv.set_defaults(func=_cmd_growth_memory_validate)
+
+    mi = sub.add_parser("memory-invalidate", help="Mark a claim contradicted.")
+    _project_arg(mi)
+    mi.add_argument("--entry", required=True, dest="entry_id")
+    mi.add_argument("--by", default="human:cli")
+    mi.add_argument("--reason", default="")
+    mi.set_defaults(func=_cmd_growth_memory_invalidate)
+
 
 def _growth_call(args: argparse.Namespace, action: str, **kwargs: Any) -> int:
     """Invoke Monday.growth and render the result. All growth commands go through this."""
@@ -2914,3 +2976,219 @@ def _cmd_growth_snapshot_list(args: argparse.Namespace) -> int:
 
 def _cmd_growth_aggregate_write(args: argparse.Namespace) -> int:
     return _growth_call(args, "aggregate-write", project=args.project)
+
+
+def _cmd_growth_brain(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("brain-analyze", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    a = r.data.get("analysis", {})
+    print(f"Growth Brain — {a.get('project', '')}")
+    _hr()
+    print("  Deterministic rule engine. No model was called.")
+    scores = a.get("scores", {}).get("workspace_health", {})
+    value = scores.get("value")
+    print(f"  Workspace health : {'—' if value is None else f'{value:.0f}'} "
+          f"({scores.get('band', 'unknown')})")
+    print(f"  Observations     : {len(a.get('observations', []))}")
+    print(f"  Opportunities    : {len(a.get('opportunities', []))}")
+    print(f"  Recommendations  : {len(a.get('recommendations', []))}")
+    print(f"  Hypotheses       : {len(a.get('hypotheses', []))}  (UNCONFIRMED)")
+    print(f"  Experiments       : {len(a.get('suggested_experiments', []))} proposed")
+    mem = a.get("memory", {})
+    print(f"  Memory           : {len(mem.get('validated', []))} validated, "
+          f"{len(mem.get('tentative', []))} tentative")
+    return 0
+
+
+def _print_recommendations(rows: list[dict[str, Any]]) -> int:
+    if not rows:
+        print("No recommendations. Nothing cleared the evidence threshold.")
+        return 0
+    print(f"Recommendations ({len(rows)})")
+    _hr()
+    for rec in rows:
+        print(f"  [{rec['priority']}] {rec['title']}")
+        print(f"        {rec['summary']}")
+        print(f"        Action     : {rec['suggested_action']}")
+        print(f"        Impact     : {rec['expected_impact']}")
+        print(f"        Metric     : {rec['success_metric']}")
+        print(f"        Falsifier  : {rec['falsifier']}")
+        ev = rec.get("evidence", {})
+        flag = " [synthetic]" if ev.get("synthetic") else ""
+        print(f"        Evidence   : {len(ev.get('metrics', []))} metric(s), "
+              f"n={ev.get('sample_size', 0)}{flag}")
+        print()
+    return 0
+
+
+def _cmd_growth_brain_recommendations(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("brain-recommendations", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    return _print_recommendations(r.data.get("recommendations", []))
+
+
+def _cmd_growth_brain_hypotheses(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("brain-hypotheses", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    rows = r.data.get("hypotheses", [])
+    if not rows:
+        print("No hypotheses.")
+        return 0
+    print(f"UNCONFIRMED HYPOTHESES ({len(rows)})")
+    _hr()
+    print("  These are candidate explanations, NOT findings. Confirm with an")
+    print("  experiment before acting on any of them as fact.")
+    print()
+    for h in rows:
+        print(f"  ? {h['statement']}")
+        print(f"      {h['rationale']}")
+        print(f"      Test with : {h.get('proposed_experiment') or '—'}")
+        print()
+    return 0
+
+
+def _cmd_growth_brain_opportunities(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("brain-opportunities", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    rows = r.data.get("opportunities", [])
+    if not rows:
+        print("No opportunities detected.")
+        return 0
+    print(f"Opportunities ({len(rows)})")
+    _hr()
+    for o in rows:
+        flag = " [synthetic]" if o.get("synthetic") else ""
+        upside = (
+            f"{o['expected_upside']:g} {o.get('upside_unit', '')}"
+            if o.get("expected_upside") is not None
+            else f"not quantified — {o.get('upside_reason', 'no data')}"
+        )
+        print(f"  [{o['severity']:<8}] {o['title']}{flag}")
+        print(f"             {o['detail']}")
+        print(f"             Upside: {upside}")
+        print(f"             Rule  : {o['rule']}  n={o['sample_size']}")
+        print()
+    return 0
+
+
+def _cmd_growth_brain_scores(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("brain-scores", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    s = r.data.get("scores", {})
+    def _line(label: str, score: dict[str, Any]) -> None:
+        value = score.get("value")
+        shown = "—" if value is None else f"{value:6.1f}"
+        note = f"  ({score.get('reason')})" if value is None and score.get("reason") else ""
+        print(f"  {label:<28} {shown}  {score.get('band', 'unknown')}{note}")
+    print(f"Health scores — {s.get('project', '')}")
+    _hr()
+    _line("workspace", s.get("workspace_health", {}))
+    for name, score in (s.get("campaign_health") or {}).items():
+        _line(f"campaign {name}", score)
+    for name, score in (s.get("channel_health") or {}).items():
+        _line(f"channel {name}", score)
+    return 0
+
+
+def _cmd_growth_brain_forecasts(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("brain-forecasts", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    f = r.data.get("forecasts", {})
+    print(f"Forecasts — {f.get('project', '')}  (linear run-rate; assumes nothing changes)")
+    _hr()
+    for cid, row in (f.get("campaigns") or {}).items():
+        fc = row.get("forecast", {})
+        value = fc.get("value")
+        shown = "—" if value is None else f"{value:,.1f}"
+        print(f"  {cid}  projected={shown:<12} target={row.get('target') or '—'}  "
+              f"verdict={row.get('verdict')}")
+        if value is None and fc.get("reason"):
+            print(f"      {fc['reason']}")
+    for key in ("expected_conversions", "expected_engagement"):
+        fc = f.get(key, {})
+        value = fc.get("value")
+        shown = "—" if value is None else f"{value:,.1f}"
+        print(f"  {key:<24} {shown}")
+        if value is None and fc.get("reason"):
+            print(f"      {fc['reason']}")
+    return 0
+
+
+def _cmd_growth_brain_experiments(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("brain-experiments", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    rows = r.data.get("experiments", [])
+    if not rows:
+        print("No experiments proposed.")
+        return 0
+    print(f"Proposed experiments ({len(rows)}) — ALL require human approval to run")
+    _hr()
+    for e in rows:
+        print(f"  {e['id']}  varies {e['variable']}")
+        print(f"      Hypothesis : {e['hypothesis']}")
+        print(f"      Metric     : {e['metric']}  (min sample {e['minimum_sample']}/arm, "
+              f"{e['measurement_days']}d)")
+        print(f"      A          : {e['variation_a']['description']}")
+        print(f"      B          : {e['variation_b']['description']}")
+        print()
+    return 0
+
+
+def _cmd_growth_memory_record(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "memory-record", project=args.project, statement=args.statement,
+        sample_size=args.sample_size, category=args.category,
+        metric_affected=args.metric_affected,
+    )
+
+
+def _cmd_growth_memory_list(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("memory-list", project=args.project, status=args.status)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    rows = r.data.get("memory", [])
+    if not rows:
+        print("No marketing memory.")
+        return 0
+    print(f"Marketing memory ({len(rows)})")
+    _hr()
+    for m in rows:
+        print(f"  {m['id']}  {m['rendered']}")
+    return 0
+
+
+def _cmd_growth_memory_validate(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "memory-validate", project=args.project, entry_id=args.entry_id,
+        by=args.by, reason=args.reason,
+    )
+
+
+def _cmd_growth_memory_invalidate(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "memory-invalidate", project=args.project, entry_id=args.entry_id,
+        by=args.by, reason=args.reason,
+    )
