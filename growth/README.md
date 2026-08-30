@@ -30,6 +30,9 @@ The boundary that matters now is narrower and more important than "nothing can p
   publish for real.
 - Performance events and the deterministic analytics computed from them: per-content, per-campaign,
   per-platform and whole-workspace aggregation, time series, trends, funnels and snapshots.
+- The Growth Brain (`growth/brain/`): deterministic reasoning over those measurements —
+  opportunities, evidence-backed recommendations, marketing memory, experiments, forecasts and
+  health scores.
 - Running the deterministic publish gate sequence: pause scopes, status, fingerprint, isolation,
   scheduled time, idempotency, then the connector.
 - Bounded retries with exponential backoff and jitter, and clock-free idempotency keys.
@@ -67,6 +70,11 @@ The boundary that matters now is narrower and more important than "nothing can p
 | `PerformanceEvent` / `EventStore` / `EventSource` | Measured observations, append-only per project |
 | `compute_all` / `MetricValue` | Metric formulas as pure functions |
 | `GrowthAnalytics` / `Snapshot` / `TrendResult` | Aggregation, time series, trends, funnels |
+| `GrowthBrain` | Deterministic reasoning over one workspace |
+| `Observation` / `Hypothesis` / `Recommendation` / `ConfirmedLearning` | The four record kinds |
+| `MarketingMemory` / `MemoryEntry` | Project-scoped learnings, tentative until confirmed |
+| `Experiment` / `evaluate_result` | The only route from hypothesis to fact |
+| `Forecast` / `Score` | Rule-based projections and reproducible health scores |
 | `PublishDispatcher` / `DispatchResult` | The deterministic publish gate sequence |
 | `PublicationRecord` / `PublicationAttempt` | Durable publishing outcome and attempt history |
 | `idempotency_key` / `backoff_seconds` | Clock-free dedupe key; bounded retry curve |
@@ -96,6 +104,7 @@ growth/
     ├── pauses.json               project / platform / post pauses for THIS project
     ├── events/events.jsonl       append-only performance observations
     ├── snapshots/SNAPSHOT-N.json point-in-time metric captures
+    ├── memory/memory.jsonl       marketing memory, append-only with revision history
     ├── aggregates.json           the ONLY file a portfolio view may read
     └── .sequences.json           CONTENT- id allocation, scoped to THIS workspace
 
@@ -128,6 +137,21 @@ layer as ground truth:
 - **Provenance survives aggregation.** No platform adapter exists, so `record()` refuses
   `source=platform` outright, and any metric touching a synthetic or imported event stays flagged
   synthetic all the way out to the CLI.
+
+The Brain adds three more, and they are the reason it can be trusted at all:
+
+- **Four record kinds, never conflated.** An `Observation` is a computed fact; a `Hypothesis` is a
+  candidate explanation that always renders with an unconfirmed marker; a `Recommendation` is an
+  action backed by evidence and a falsifier; a `ConfirmedLearning` is a hypothesis an experiment
+  upheld. Below the minimum sample the engine returns a `Hypothesis` — a different class, not a
+  softer wording.
+- **Evidence and a falsifier are enforced by the type.** A `Recommendation` constructed without
+  either raises. A recommendation without evidence is an opinion; one without a falsifier can
+  never be retired on the facts.
+- **Nothing is quantified without data.** An unmeasurable upside reports "not quantified" and the
+  reason, never a plausible number — an invented figure outlives everyone's memory of inventing it.
+
+`growth/brain/` calls no model, opens no socket, and reads only the workspace it was opened for.
 
 The sequence file is per workspace on purpose. A shared counter would let one project infer
 another's publishing volume from the gaps in its own ids.

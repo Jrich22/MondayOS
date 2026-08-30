@@ -9,6 +9,48 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### MondayOS v3.0 — Growth Bot: the Growth Brain (2026-08-30)
+
+Increment 6 (TASK-0066). Implements the deterministic reasoning layer ADR-014 described, now that
+increment 5 gave it measured outcomes to reason over. **ADR-014 moves from Proposed to Accepted.**
+
+No model is called. No content is generated. No network is touched. Every recommendation is
+assembled from measured numbers by explicit rules with stated thresholds, so the same workspace
+state yields byte-identical output — a test asserts exactly that.
+
+#### Added
+- `growth/brain/` — nine modules: `models`, `evidence`, `scoring`, `memory`, `forecasting`,
+  `opportunity`, `experiments`, `recommendations`, `engine`.
+- Four record kinds that are never conflated: Observation, Hypothesis, Recommendation,
+  ConfirmedLearning.
+- Marketing memory: project-scoped learnings across campaign, content, platform, audience,
+  experiment, seasonal, recurring-pattern and historical-recommendation categories.
+- Ten opportunity detectors across engagement trend, campaign pacing, platform comparison, theme
+  performance, reuse backlog and funnel drop-off.
+- Experiments across eight variables, forecasting by linear run-rate, and reproducible health
+  scores for workspace, campaign, channel and content.
+- Fourteen Brain and memory actions on `Monday.growth()` with matching `monday growth` commands.
+
+#### Integrity
+- Below `MIN_SAMPLE_FOR_RECOMMENDATION` the engine returns a `Hypothesis`, never a
+  `Recommendation` — a different class, not a softer wording. Hypotheses always serialize with an
+  `unconfirmed` marker and a caveat.
+- A `Recommendation` constructed without evidence, a falsifier, or a success metric raises.
+  Assumptions alone do not count as evidence.
+- Unquantifiable upside reports "not quantified" and the reason, never an invented number.
+- Memory is born tentative, refuses samples below 3 as anecdote, and cannot be validated below 10.
+  Invalidated memory is kept, never deleted, and is never cited.
+- An experiment resolves to inconclusive below its minimum sample or below the 10% minimum
+  detectable effect, and never names a winner. Starting one that changes published content
+  without human approval raises.
+- Synthetic evidence caps recommendation priority at P2, so demo data cannot produce a P0.
+- A test greps `growth/brain/` for provider and network imports and asserts none exist.
+
+#### Known gaps
+- Detector thresholds are stated conventions, not measured benchmarks.
+- Forecasts are linear run-rate only, and say so on every projection.
+
+
 ### MondayOS v2.9 — Growth Bot: performance events and analytics (2026-08-27)
 
 Increment 5 (TASK-0065). Adds the measurement layer every future Growth Brain recommendation will
