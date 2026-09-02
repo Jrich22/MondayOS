@@ -75,3 +75,7 @@ logs/growth/
 
 # Project registry — runtime state with machine-specific absolute paths
 config/projects.json
+
+# AI Workspace conversations — runtime state, and user content rather than
+# source. MondayOS owns the record (ADR-015); it is not version-controlled.
+workspace/conversations/

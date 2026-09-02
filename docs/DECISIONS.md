@@ -1,6 +1,6 @@
 # MondayOS — Architectural Decision Records
 
-**Last Updated:** 2026-08-30
+**Last Updated:** 2026-09-02
 
 This file is the canonical log of all architectural decisions made for MondayOS. Decisions are recorded in the format described in [DOCUMENTATION_STANDARDS.md](DOCUMENTATION_STANDARDS.md).
 
@@ -535,3 +535,169 @@ Two constraints govern its output:
 - Confirmed findings compound in `knowledge/` and are available to the rest of MondayOS, consistent with [ADR-009](#adr-009-mondayos-knowledge-specification-mks-as-the-canonical-contract).
 - The Brain requires measured outcomes to reason over, so it lands after measurement — increment 5, not increment 1. The service is deliberately less intelligent until it has evidence, rather than confidently wrong sooner.
 - Cross-project pattern learning is foreclosed by ADR-011. A tactic proven on one project does not automatically inform another, which is a real cost accepted in exchange for isolation.
+
+---
+
+## ADR-015: Conversations Are Project-Scoped Files, and MondayOS Owns the Record
+
+**Date:** 2026-09-02  
+**Status:** Accepted  
+**Deciders:** Lead Software Engineering
+
+### Context
+
+The AI Workspace makes MondayOS the primary interface for conversational work. Today that work happens in ChatGPT and Claude, where the conversation *is* the storage: close the tab and the reasoning is gone, and nothing in it is reachable from any other tool.
+
+Moving that into MondayOS raises the question of where a conversation actually lives. A browser-side store would be the fastest thing to build, and the dashboard already keeps client state. It would also mean MondayOS could not read its own conversations — no retention, no knowledge capture, no briefing, no agent that can see what was already discussed.
+
+### Decision
+
+A conversation is a **file in MondayOS**, stored under `workspace/conversations/{project}/CONV-NNNN.md` as Markdown with YAML frontmatter, per [ADR-002](#adr-002-file-based-storage-for-phase-1-no-database) and [ADR-003](#adr-003-structured-markdown-with-yaml-frontmatter-as-the-universal-data-format).
+
+Three properties follow, and they are the point of the decision:
+
+1. **The browser is a cache, never the record.** The dashboard may hold conversation state for responsiveness, but it is reconstructed from MondayOS on load. Losing the browser loses nothing.
+2. **Conversations are project-scoped by directory.** The project is a path segment, not a filter applied at read time, so a query cannot accidentally span projects.
+3. **Only user-visible content is persisted.** Message text, role, timestamps, and the provider/model that produced a response. Not hidden reasoning, not provider-private chain-of-thought, not raw provider payloads.
+
+Each project directory owns its own `.sequences.json`, following the same reasoning as [ADR-011](#adr-011-the-growth-workspace-is-the-isolation-boundary-for-marketing-state): a shared counter would let one project infer another's conversation volume from gaps in its own IDs.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Browser `localStorage` as the canonical store | The stated goal is that information stops living inside one chat session. A browser-owned store reproduces exactly the failure being solved, and makes conversations invisible to every other part of MondayOS. |
+| SQLite | A real option, and the right one eventually. It is premature here: ADR-002 chose files deliberately, conversations are naturally document-shaped, and the file format is diffable and greppable during the increments where the schema is still moving. |
+| One file per message | Better write concurrency, far worse readability. A conversation is read as a whole far more often than one message is written, and 200 files per conversation makes the store hostile to inspection. |
+| Persist provider reasoning traces | They are the highest-value debugging artifact and the highest-risk thing to store: provider-private, frequently containing verbatim context, and not something a human ever asked to keep. |
+
+### Consequences
+
+- Conversations survive browser refresh, dashboard restart, and process restart, because none of those own the data.
+- Retention, knowledge capture, and future briefing all read conversations through the ordinary knowledge and file interfaces rather than a bespoke API.
+- Conversation content is runtime state and is gitignored. It is user data, not source.
+- Very long conversations will eventually need pagination or rollup; a single file is fine at increment-1 scale and will not be at ten thousand messages.
+- Concurrent writes to one conversation are last-write-wins. Acceptable for a single-operator workstation, and a real constraint to revisit before multi-user.
+
+---
+
+## ADR-016: The Context Snapshot Is an Attributed, Budgeted Assembly
+
+**Date:** 2026-09-02  
+**Status:** Accepted  
+**Deciders:** Lead Software Engineering
+
+### Context
+
+For MondayOS to answer "what are we currently building?" it must put project reality in front of a model. The tempting implementation is to gather everything available — repository, docs, tasks, knowledge — and send it. That fails on cost, on latency, and most importantly on trust: when the answer is wrong, nobody can tell whether the model reasoned badly or simply never received the relevant fact.
+
+### Decision
+
+Context is assembled into an **immutable, attributed, budgeted `ContextSnapshot`**.
+
+- **Attributed.** The snapshot is a list of named `ContextSource`s, each recording what system it came from, how many items it contributed, its size, and whether it was truncated. The question "why did Monday know this?" is answerable from the stored snapshot alone, and so is "why did Monday *not* know this?"
+- **Budgeted deterministically.** Sources are gathered in a fixed priority order with explicit per-source and total character caps. The same project state produces the same snapshot. There is no model call in the assembly path — the Context Engine is deterministic, like the Growth Brain before it.
+- **Immutable and referenced.** A message records the snapshot id it was answered against, so a response can be explained months later against the context that actually produced it, not against what the project looks like now.
+- **Truncation is visible, never silent.** A truncated source says so, in the snapshot and in the UI.
+
+The Context Engine is an **OS-level service**, not a bot and not a project feature. It reads other subsystems through narrow adapters and owns no domain state of its own.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Send the whole repository | Cost and latency aside, it buries the relevant fact in noise and still misses anything outside the tree (tasks, knowledge, git history). Large context is not the same as good context. |
+| Semantic/vector retrieval now | Almost certainly right later, and it is a poor first move: it makes retrieval non-deterministic and unexplainable before there is any baseline to compare against. Increment 2 adds retrieval on top of an attributed baseline. |
+| Let each caller assemble its own context | Guarantees divergence. The isolation rules and the secret-redaction pass would be reimplemented per caller, and one of those copies would eventually be wrong. |
+| Assemble context with a model | Introduces a model call before the model call, non-deterministically, and makes the "why did Monday know this" question unanswerable. |
+
+### Consequences
+
+- Context assembly is unit-testable without a provider, and cross-project leakage is directly assertable.
+- Snapshot size is bounded and predictable, which makes provider cost predictable.
+- A stale snapshot is possible: the project may change after assembly. Snapshots are timestamped and surfaced in the UI so staleness is visible rather than assumed away.
+- Deterministic budgeting will sometimes drop the one fact that mattered. That is a real cost, accepted because the alternative — silently including everything — hides the same failure instead of exposing it.
+
+---
+
+## ADR-017: Project Context Isolation Is Enforced by the Engine, and Adapters Fail Closed
+
+**Date:** 2026-09-02  
+**Status:** Accepted  
+**Deciders:** Lead Software Engineering
+
+### Context
+
+The AI Workspace reads across sourcingBOT, Cue, WeatherBot, Growth and MondayOS itself, and sends what it reads to an external provider. These are different products with different confidentiality expectations. A context bug is not a display glitch: it puts one project's private material into a prompt about another, in a request that leaves the machine and cannot be recalled.
+
+[ADR-011](#adr-011-the-growth-workspace-is-the-isolation-boundary-for-marketing-state) established this boundary for marketing state. This ADR generalises it to OS-level context assembly.
+
+### Decision
+
+**One snapshot serves exactly one project, and isolation is enforced where context is built rather than where it is displayed.**
+
+1. Every adapter receives a resolved project and its root path, and has no argument that could name a second project.
+2. Adapters **fail closed**. An adapter that errors contributes an empty source carrying the error, and the snapshot is still built. It never falls back to unscoped data, and a failure to scope is never a reason to widen scope.
+3. **Secrets never enter a snapshot.** Every assembled string passes `core.redaction` before it can reach a prompt or be persisted, and `.env` files, key material and token-shaped values are excluded at the adapter level as well. This is defence in depth: the adapter is meant not to read them, and redaction assumes it did.
+4. Conversation storage is project-scoped by directory (ADR-015), so conversation history cannot cross projects either.
+5. Cross-project leakage has **explicit tests**, not merely careful code.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Filter context at the UI layer | The prompt is composed server-side. Filtering at the edge leaves the leak in the request that already left the machine. |
+| A shared cross-project context pool with tags | Every retrieval bug becomes a disclosure. Tag-based scoping fails open by default: forget the filter and you get everything. |
+| Trust adapters to be correct | Adapters read real filesystems and shell out to git. They will fail in ways not anticipated here; the question is whether failure defaults to empty or to unscoped. |
+| Redact only before sending to a provider | Snapshots are persisted and shown in the UI. A secret that reaches storage has already leaked, whether or not a provider saw it. |
+
+### Consequences
+
+- A project with unreadable or missing sources produces a thin snapshot rather than a broad one. That is the intended failure direction.
+- Fail-closed adapters can mask a real misconfiguration as "no context". Adapters therefore record the error in the source, so a thin snapshot is diagnosable rather than mysterious.
+- Cross-project synthesis — "what did we learn on Cue that applies to sourcingBOT?" — is foreclosed by default. It is a genuine capability loss, accepted as the price of the guarantee, and would need its own ADR and an explicit human-authorised path.
+
+---
+
+## ADR-018: The Responder Seam Is the Extension Point for Model Routing
+
+**Date:** 2026-09-02  
+**Status:** Accepted  
+**Deciders:** Lead Software Engineering
+
+### Context
+
+The end-state routes work between providers, model tiers, and specialised agents based on what is being asked. Building that router now would mean designing a routing policy before there is a single conversation to route, and the policy would be guesswork.
+
+Building nothing is equally bad: if the workspace calls a provider directly, adding routing later means rewriting the conversation and context layers that should not care.
+
+### Decision
+
+The workspace depends on a **`WorkspaceResponder` protocol**, never on a provider:
+
+```
+WorkspaceResponder.respond(WorkspaceRequest) -> WorkspaceReply
+```
+
+Increment 1 ships one implementation, `ProviderWorkspaceResponder`, which wraps a single MondayOS `AIProvider` from the existing abstraction ([ADR-004](#adr-004-multi-provider-model-abstraction-provider-independence)). A future `RoutingWorkspaceResponder` implements the same protocol and selects per request, and neither the Conversation model, the Context Engine, nor the service changes.
+
+Two constraints make the seam real rather than decorative:
+
+- **No vendor SDK is imported anywhere in the workspace package.** The provider arrives injected. Which model runs is MondayOS configuration.
+- **The request carries what a router would need to decide** — project, message, context snapshot, history — rather than a pre-rendered prompt string. A responder handed only a finished prompt could not route on anything.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Call `AIProvider` directly from the service | `AIProvider` is one model. Routing is a choice *between* providers, so the seam has to sit above it — otherwise the future router has nowhere to stand. |
+| Build the full router now | The routing policy would be invented rather than observed. Routing rules written before any real traffic are the kind of thing that gets deleted. |
+| Pass a rendered prompt to the responder | Cheaper, and it destroys the information a router needs. Once context is flattened to a string, "which model suits this request" is unanswerable. |
+| Extend `AIProvider` with routing | Conflates two responsibilities: a provider executes a call; a router chooses one. Provider implementations would each need to know about the others. |
+
+### Consequences
+
+- Increment 4 adds routing by adding a class, not by touching conversations or context.
+- Tests inject a fake responder and never make a network call.
+- Provider identity and model are recorded on each assistant message, so routing decisions become auditable the moment routing exists.
+- One indirection is added for a capability not yet present. That is the intended trade: the seam costs a protocol now and saves a rewrite later.

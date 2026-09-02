@@ -302,3 +302,150 @@ class DashboardService:
     def reject_run(self, run_id: str, body: dict[str, Any]) -> Result:
         reason = (body.get("reason") or body.get("note") or "").strip()
         return self._decide(run_id, False, body.get("by", "human:dashboard"), reason)
+
+    # ------------------------------------------------------------ AI Workspace
+    #
+    # Thin passthrough to Monday.workspace(). All conversation, context and
+    # isolation logic lives in the workspace package; this layer only validates
+    # input, maps failures to HTTP codes, and bumps the revision on writes.
+
+    def workspace_projects(self) -> Result:
+        resp = self._m.workspace("list-projects")
+        if not resp.success:
+            return 500, errors.error(errors.UPSTREAM, resp.message)
+        return 200, resp.data.get("projects", [])
+
+    def workspace_conversations(self, project: str, include_archived: bool = False) -> Result:
+        if not project.strip():
+            return 400, errors.error(errors.BAD_REQUEST, "'project' is required.")
+        resp = self._m.workspace(
+            "list-conversations", project=project, include_archived=include_archived
+        )
+        if not resp.success:
+            return 400, errors.error(errors.BAD_REQUEST, resp.message)
+        return 200, resp.data.get("conversations", [])
+
+    def workspace_create_conversation(self, body: dict[str, Any]) -> Result:
+        project = (body.get("project") or "").strip()
+        if not project:
+            return 400, errors.error(errors.BAD_REQUEST, "'project' is required.")
+        resp = self._m.workspace(
+            "create-conversation", project=project, title=body.get("title", "")
+        )
+        self._log_write("workspace_create_conversation", {"project": project}, resp.success, resp.message)
+        if not resp.success:
+            return 400, errors.error(errors.BAD_REQUEST, resp.message)
+        self._bump()
+        return 201, resp.data
+
+    def workspace_conversation(self, project: str, conversation_id: str) -> Result:
+        if not project.strip():
+            return 400, errors.error(errors.BAD_REQUEST, "'project' is required.")
+        resp = self._m.workspace(
+            "get-conversation", project=project, conversation_id=conversation_id
+        )
+        if not resp.success:
+            return 404, errors.error(errors.NOT_FOUND, resp.message)
+        return 200, resp.data
+
+    def workspace_send_message(self, conversation_id: str, body: dict[str, Any]) -> Result:
+        project = (body.get("project") or "").strip()
+        content = (body.get("content") or "").strip()
+        if not project:
+            return 400, errors.error(errors.BAD_REQUEST, "'project' is required.")
+        if not content:
+            return 400, errors.error(errors.BAD_REQUEST, "'content' is required.")
+
+        resp = self._m.workspace(
+            "send-message", project=project, conversation_id=conversation_id, content=content
+        )
+        self._log_write(
+            "workspace_send_message",
+            {"project": project, "conversation_id": conversation_id},
+            resp.success,
+            resp.message,
+        )
+        # A provider failure is a 200 carrying a recorded failed turn, not an HTTP
+        # error: the user's message WAS persisted and the turn is retryable, so
+        # the client needs the conversation back rather than an error envelope.
+        if not resp.data:
+            return 404, errors.error(errors.NOT_FOUND, resp.message)
+        self._bump()
+        return 200, resp.data
+
+    def workspace_retry(self, conversation_id: str, body: dict[str, Any]) -> Result:
+        project = (body.get("project") or "").strip()
+        if not project:
+            return 400, errors.error(errors.BAD_REQUEST, "'project' is required.")
+        resp = self._m.workspace("retry", project=project, conversation_id=conversation_id)
+        self._log_write("workspace_retry", {"conversation_id": conversation_id}, resp.success, resp.message)
+        if not resp.data:
+            return 404, errors.error(errors.NOT_FOUND, resp.message)
+        self._bump()
+        return 200, resp.data
+
+    def workspace_update_conversation(self, conversation_id: str, body: dict[str, Any]) -> Result:
+        """Rename, archive or unarchive. One route, because they are one edit."""
+        project = (body.get("project") or "").strip()
+        if not project:
+            return 400, errors.error(errors.BAD_REQUEST, "'project' is required.")
+
+        title = body.get("title")
+        status = body.get("status")
+        if title is None and status is None:
+            return 400, errors.error(errors.BAD_REQUEST, "Provide 'title' or 'status'.")
+
+        if title is not None:
+            resp = self._m.workspace(
+                "rename-conversation", project=project, conversation_id=conversation_id, title=title
+            )
+            if not resp.success:
+                return 400, errors.error(errors.BAD_REQUEST, resp.message)
+
+        if status is not None:
+            if status not in ("active", "archived"):
+                return 400, errors.error(
+                    errors.BAD_REQUEST, "'status' must be 'active' or 'archived'."
+                )
+            action = "archive-conversation" if status == "archived" else "unarchive-conversation"
+            resp = self._m.workspace(action, project=project, conversation_id=conversation_id)
+            if not resp.success:
+                return 400, errors.error(errors.BAD_REQUEST, resp.message)
+
+        self._log_write("workspace_update_conversation", {"conversation_id": conversation_id}, True)
+        self._bump()
+        return 200, resp.data
+
+    def workspace_context(self, project: str) -> Result:
+        if not project.strip():
+            return 400, errors.error(errors.BAD_REQUEST, "'project' is required.")
+        resp = self._m.workspace("build-context", project=project)
+        if not resp.success:
+            return 404, errors.error(errors.NOT_FOUND, resp.message)
+        return 200, resp.data
+
+    def workspace_save_knowledge(self, conversation_id: str, body: dict[str, Any]) -> Result:
+        project = (body.get("project") or "").strip()
+        message_id = (body.get("message_id") or "").strip()
+        if not project or not message_id:
+            return 400, errors.error(
+                errors.BAD_REQUEST, "Both 'project' and 'message_id' are required."
+            )
+        resp = self._m.workspace(
+            "save-to-knowledge",
+            project=project,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            title=body.get("title", ""),
+        )
+        self._log_write(
+            "workspace_save_knowledge",
+            {"conversation_id": conversation_id, "message_id": message_id},
+            resp.success,
+            resp.message,
+        )
+        if not resp.success:
+            return 400, errors.error(errors.BAD_REQUEST, resp.message)
+        self._bump()
+        return 201, resp.data
+
