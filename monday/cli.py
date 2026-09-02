@@ -2301,6 +2301,60 @@ def _register_growth(subparsers: Any) -> None:
     mv.add_argument("--reason", default="")
     mv.set_defaults(func=_cmd_growth_memory_validate)
 
+    # ---- generation ----
+    pw = sub.add_parser("plan-week", help="Plan a week against Brain recommendations.")
+    _project_arg(pw)
+    pw.add_argument("--week", default="", dest="week_start", help="Any date in the week.")
+    pw.add_argument("--cadence", type=int, default=0)
+    pw.set_defaults(func=_cmd_growth_plan_week)
+
+    gw = sub.add_parser("generate-week", help="Draft a full weekly package.")
+    _project_arg(gw)
+    gw.add_argument("--week", default="", dest="week_start")
+    gw.add_argument("--cadence", type=int, default=0)
+    gw.add_argument(
+        "--mode", required=True, choices=["model", "template"],
+        help="model: draft via the configured MondayOS provider (fails if none). "
+             "template: deterministic offline drafting. There is no fallback between "
+             "them, so the mode must be stated.",
+    )
+    gw.add_argument("--multi-platform", action="store_true",
+                    help="Produce a variant per platform for every slot.")
+    gw.set_defaults(func=_cmd_growth_generate_week)
+
+    pl = sub.add_parser("package-list", help="List weekly packages.")
+    _project_arg(pl)
+    pl.set_defaults(func=_cmd_growth_package_list)
+
+    pg = sub.add_parser("package-get", help="Show one weekly package.")
+    _project_arg(pg)
+    pg.add_argument("--package", required=True, dest="package_id")
+    pg.set_defaults(func=_cmd_growth_package_get)
+
+    aw = sub.add_parser("approve-week", help="Approve a week's posts individually.")
+    _project_arg(aw)
+    aw.add_argument("--package", required=True, dest="package_id")
+    aw.add_argument("--by", default="human:cli")
+    aw.add_argument("--reason", default="")
+    aw.add_argument("--only", nargs="*", default=None, help="Approve a selected subset.")
+    aw.set_defaults(func=_cmd_growth_approve_week)
+
+    ib = sub.add_parser("inbox", help="The approval inbox.")
+    _project_arg(ib)
+    ib.add_argument("--group", default="status",
+                    choices=["status", "campaign", "platform", "week", "priority"])
+    ib.set_defaults(func=_cmd_growth_inbox)
+
+    ia = sub.add_parser("inbox-action", help="Act on one queued item.")
+    _project_arg(ia)
+    _content_arg(ia)
+    ia.add_argument("--do", required=True, dest="inbox_action",
+                    choices=["submit", "approve", "request-changes", "reject", "reschedule"])
+    ia.add_argument("--by", default="human:cli")
+    ia.add_argument("--reason", default="")
+    ia.add_argument("--at", default="", dest="scheduled_at", help="For reschedule; ISO 8601.")
+    ia.set_defaults(func=_cmd_growth_inbox_action)
+
     mi = sub.add_parser("memory-invalidate", help="Mark a claim contradicted.")
     _project_arg(mi)
     mi.add_argument("--entry", required=True, dest="entry_id")
@@ -3191,4 +3245,155 @@ def _cmd_growth_memory_invalidate(args: argparse.Namespace) -> int:
     return _growth_call(
         args, "memory-invalidate", project=args.project, entry_id=args.entry_id,
         by=args.by, reason=args.reason,
+    )
+
+
+def _cmd_growth_plan_week(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("plan-week", project=args.project, week_start=args.week_start,
+                      cadence=args.cadence or None)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    p = r.data.get("plan", {})
+    print(f"Week plan — {p.get('project', '')}  {p.get('week_start', '')[:10]} → "
+          f"{p.get('week_end', '')[:10]}")
+    _hr()
+    print(f"  {p.get('rationale', '')}")
+    for warning in p.get("warnings", []):
+        print(f"  ⚠ {warning}")
+    for post in p.get("posts", []):
+        print(f"  [{post['slot']}] {post['scheduled_at'][:16]}  {post['platform']:<10} "
+              f"{post['kind']:<20} {post['campaign']}")
+        print(f"      {post['rationale']}")
+    return 0
+
+
+def _cmd_growth_generate_week(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("generate-week", project=args.project, week_start=args.week_start,
+                      cadence=args.cadence or None, multi_platform=args.multi_platform,
+                      mode=args.mode)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    p = r.data.get("package", {})
+    print(f"{p.get('id', '')}  [{p.get('status', '')}]")
+    _hr()
+    print(f"  Objective : {p.get('objective', '') or '—'}")
+    print(f"  Audience  : {p.get('audience', '') or '—'}")
+    print(f"  Reasoning : {p.get('reasoning_summary', '')}")
+    effort = p.get("estimated_effort", {})
+    print(
+        f"  Effort    : {effort.get('total_hours', 0)}h across "
+        f"{len(p.get('posts', []))} draft(s)"
+    )
+    outcomes = p.get("expected_outcomes", {})
+    if not outcomes.get("quantified", True):
+        print(f"  Outcomes  : not quantified — {outcomes.get('reason', '')}")
+    for warning in p.get("warnings", []):
+        print(f"  ⚠ {warning}")
+    print()
+    for post in p.get("posts", []):
+        mark = "✗" if post["blocked"] else ("!" if post["escalations"] else
+                                            ("?" if post.get("requires_enhanced_review") else " "))
+        print(f"  {mark} {post['content_id']}  {post['platform']:<10} {post['kind']:<20} "
+              f"{post['scheduled_at'][:16]}")
+        print(f"      {post['title']}")
+        if post.get("requires_enhanced_review"):
+            print(f"      ? ENHANCED REVIEW: {', '.join(post.get('claim_risks', []))}")
+        if post["warnings"]:
+            for w in post["warnings"]:
+                print(f"      ⚠ {w}")
+    print()
+    print("  All drafts entered as DRAFT. Nothing is approved, scheduled, or published.")
+    return 0
+
+
+def _cmd_growth_package_list(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("package-list", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    rows = r.data.get("packages", [])
+    if not rows:
+        print("No weekly packages.")
+        return 0
+    print(f"Weekly packages ({len(rows)})")
+    _hr()
+    for p in rows:
+        print(f"  {p['id']}  [{p['status']:<19}] {len(p['posts'])} post(s)")
+    return 0
+
+
+def _cmd_growth_package_get(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("package-get", project=args.project, package_id=args.package_id)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    p = r.data.get("package", {})
+    print(f"{p['id']}  [{p['status']}]  {p['week_start'][:10]} → {p['week_end'][:10]}")
+    _hr()
+    for post in p.get("posts", []):
+        mark = "✗" if post["blocked"] else ("!" if post["escalations"] else " ")
+        print(f"  {mark} {post['content_id']}  {post['platform']:<10} {post['title']}")
+        if post["recommendation_ids"]:
+            print(f"      cites: {', '.join(post['recommendation_ids'])}")
+    return 0
+
+
+def _cmd_growth_approve_week(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("approve-week", project=args.project, package_id=args.package_id,
+                      by=args.by, reason=args.reason, only=args.only)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    result = r.data.get("result", {})
+    print(f"Approved {result['approved_count']} of {result['requested']} post(s)")
+    _hr()
+    for skipped in result.get("skipped", []):
+        print(f"  skipped {skipped.get('content_id', '')}: {skipped.get('reason', '')}")
+    print(f"  {result.get('note', '')}")
+    return 0
+
+
+def _cmd_growth_inbox(args: argparse.Namespace) -> int:
+    monday = _monday(args)
+    r = monday.growth("inbox", project=args.project)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    data = r.data.get("inbox", {})
+    key = f"by_{args.group}"
+    groups = data.get(key, {})
+    print(f"Approval inbox — {data.get('project', '')}  ({data.get('total', 0)} item(s), "
+          f"grouped by {args.group})")
+    _hr()
+    if not groups:
+        print("  Nothing in the queue.")
+        return 0
+    for name, rows in groups.items():
+        print(f"  {name}  ({len(rows)})")
+        for row in rows:
+            mark = {
+                "blocked": "✗", "escalated": "!", "enhanced-review": "?",
+                "scheduled": "→", "done": "·",
+            }.get(row["priority"], " ")
+            print(f"    {mark} {row['content_id']}  {row['platform'] or '—':<10} "
+                  f"{row['status']:<18} {row['title'][:40]}")
+            if row.get("requires_enhanced_review"):
+                print(f"        ? enhanced review: {', '.join(row.get('claim_risks', []))}")
+            for warning in row.get("warnings", []):
+                print(f"        ⚠ {warning[:90]}")
+    return 0
+
+
+def _cmd_growth_inbox_action(args: argparse.Namespace) -> int:
+    return _growth_call(
+        args, "inbox-action", project=args.project, inbox_action=args.inbox_action,
+        content_id=args.content, by=args.by, reason=args.reason,
+        scheduled_at=args.scheduled_at,
     )

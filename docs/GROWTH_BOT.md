@@ -7,19 +7,21 @@
 
 ---
 
-> **Status note.** Increments 1-6 are implemented: the Growth Workspace and its isolation
+> **Status note.** Increments 1-7 are implemented: the Growth Workspace and its isolation
 > boundary; the Content Item with its lifecycle and approval fingerprinting; the deterministic
 > publishing connector layer with pause controls, retries, idempotency and an audit trail; Campaigns,
 > the Content Library and growth onboarding; and the deterministic analytics layer -
 > performance events, metric formulas, aggregation, time series, trends, funnels and snapshots;
-> and the Growth Brain, which reasons over those measurements by explicit rules and calls no model.
+> the Growth Brain, which reasons over those measurements by explicit rules and calls no model;
+> and content generation - model-backed drafting through the MondayOS provider abstraction,
+> the weekly marketing package and the approval inbox.
 >
 > **Publishing runs against a deterministic fake connector only.** There is no OAuth, no real
 > platform adapter, and no browser automation. Onboarding records account *labels*, never
 > credentials, and no project can be marked ready for real publishing.
 >
-> Increments 7-11 are **not** built: no content generation, no
-> weekly package, no calendar, no reports, no comment handling and no Growth UI. Sections
+> Increments 8-11 are **not** built: no calendar, no reports, no comment handling and no
+> Growth UI. Sections
 > describing those are the intended contract rather than current behaviour. See
 > [Delivery Increments](#delivery-increments).
 

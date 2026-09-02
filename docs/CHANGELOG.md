@@ -9,6 +9,60 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### MondayOS v3.1 — Growth Bot: model-backed content generation (2026-09-02)
+
+Increment 7 (TASK-0067). Adds the generation subsystem on top of the deterministic Growth Brain:
+planner, drafting, platform formatters, long-form and brief generators, claim-risk review, the
+weekly marketing package and the approval inbox.
+
+The division of responsibility, which nothing in this increment blurs: **the Brain decides what to
+say and why** (deterministic, no model); **the writer decides how to phrase it**; **a human approves
+the exact output**.
+
+#### Added
+- `growth/generation/` — twelve modules including `model_writer` and `claim_risk`.
+- `ModelContentWriter` alongside `TemplateContentWriter` behind the existing `ContentWriter`
+  protocol. Drafting goes through the MondayOS `AIProvider` abstraction: **no Anthropic or OpenAI
+  import anywhere in `growth/`, and no vendor name in `growth/generation/`.** Model routing is
+  `MondayConfig.provider_config`; `max_tokens` defaults to 1200 as a configurable initial default,
+  not a product rule.
+- Claim-risk classification across numeric, testimonial, customer, comparative, legal, medical,
+  financial and external-fact shapes, feeding an `enhanced-review` inbox priority.
+- Eighteen asset kinds, weekly packages, the approval inbox, and eleven `Monday.growth()` actions
+  with matching CLI commands.
+- `growth/services/` — `GrowthService` split into domain facades (issue #35), behaviour-preserving
+  with no test changes.
+
+#### Integrity
+- **Generation mode is explicit.** `mode="model"` requires a configured provider and fails clearly
+  without one; `mode="template"` is deterministic and consults no provider. There is no fallback in
+  either direction, and omitting the mode is an error — a reviewer must know which path produced
+  what they are reading.
+- **Structured output, failing closed.** Prose, malformed JSON, missing required fields,
+  out-of-schema keys and runaway bodies are refused; no `ContentItem` is created from an
+  unvalidated response.
+- **Workspace isolation at the prompt.** A test plants confidential copy, a title, a theme and a
+  brand voice in a second workspace and asserts none reach the prompt.
+- **Safety runs on output, not on the prompt.** A fake provider returning "94% of customers cut
+  time-to-hire in half" is blocked, proving the prompt is not the enforcement.
+- **Claim risk escalates rather than blocks.** A flagged draft is a normal draft that may reach
+  ready-for-review; what it may not do is clear review because the regexes found nothing. This is a
+  review escalation layer, not a fact-checking engine, and its own output says so.
+- Provenance — campaign, recommendation and experiment ids, generation method, provider and
+  generated-at — rides through to the `ContentItem`. Provider identity is **not** part of the
+  approval fingerprint: approval is about the exact output, not about which model wrote it.
+- Approving a week approves each post individually against its own fingerprint and authorises
+  nothing outside the package. Rescheduling resets approval by the existing rule.
+
+#### Unchanged
+- The Growth Brain remains deterministic and model-free — a test greps it for provider imports.
+- The publishing connector, `REAL_ADAPTERS` (still empty), OAuth (none), account connections
+  (none), browser automation (none), and the approval fingerprint contract.
+
+#### Known gaps
+- Claim-risk detection is pattern-based and deliberately over-flags. It identifies claim shapes; it
+  does not verify claims.
+
 ### MondayOS v3.0 — Growth Bot: the Growth Brain (2026-08-30)
 
 Increment 6 (TASK-0066). Implements the deterministic reasoning layer ADR-014 described, now that
