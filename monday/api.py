@@ -45,6 +45,8 @@ from monday.types import (
 from search import SearchEngine
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     # Imported for typing only: the workspace package is loaded lazily inside
     # workspace() so importing Monday never pulls in the AI Workspace.
     from workspace.service import WorkspaceService
@@ -398,6 +400,10 @@ class Monday:
                 approval_required=approval,
                 context=context,
                 acceptance_criteria=list(acceptance_criteria) if acceptance_criteria else None,
+                # Explicit project association (increment 2). Empty means the
+                # caller did not state one, which stays "unknown" rather than
+                # being guessed from the title.
+                project=str(kwargs.get("project", "")),
             )
 
             self.__bus.publish(Event(
@@ -2396,7 +2402,7 @@ class Monday:
     # AI Workspace
     # ------------------------------------------------------------------ #
 
-    def _workspace_service(self) -> WorkspaceService:
+    def _workspace_service(self, activity: Any = None) -> WorkspaceService:
         """
         Build the AI Workspace service with every subsystem reader pre-scoped.
 
@@ -2428,47 +2434,102 @@ class Monday:
 
         def read_tasks(slug: str) -> list[dict[str, Any]]:
             """
-            Active then recently-completed tasks that name this project.
+            Active then recently-completed tasks for this project.
 
-            MondayOS tasks are global, so association is by explicit reference:
-            a task's metadata project field, or the slug appearing in its title or
-            objective. Matching on substrings alone would attach one project's
-            tasks to another whose name is a prefix, so the metadata field wins
-            when present.
+            Explicit association wins. `Task.project` is authoritative when set,
+            and a task that names a *different* project is excluded outright — no
+            heuristic gets to override a recorded fact.
+
+            The legacy fallback applies only to tasks with no project at all, and
+            only to those: a task written before the field existed still appears
+            in its project's context, without letting the old substring guess
+            reclassify anything that has since been assigned properly.
             """
             from workspace.context.engine import MAX_ACTIVE_TASKS, MAX_RECENT_TASKS
 
             def owns(task: Any) -> bool:
+                if task.project:
+                    return bool(task.project == slug)
+                # Unassigned (pre-migration) task: fall back to the old heuristic.
                 declared = str((task.metadata or {}).get("project", "")).strip().lower()
                 if declared:
                     return declared == slug
-                haystack = f"{task.title} {task.objective}".lower()
-                return slug in haystack
+                return slug in f"{task.title} {task.objective}".lower()
+
+            def row(task: Any) -> dict[str, Any]:
+                return {
+                    "id": task.id,
+                    "title": task.title,
+                    "status": task.status.value,
+                    "priority": task.priority.value,
+                    # How this task was associated, so a stale legacy match is
+                    # diagnosable rather than mysterious.
+                    "association": "explicit" if task.project else "legacy-fallback",
+                }
 
             active = [t for t in self.__tasks.list_active() if owns(t)]
             active.sort(key=lambda t: (t.priority.value, t.id))
-
-            rows: list[dict[str, Any]] = [
-                {
-                    "id": t.id,
-                    "title": t.title,
-                    "status": t.status.value,
-                    "priority": t.priority.value,
-                }
-                for t in active[:MAX_ACTIVE_TASKS]
-            ]
+            rows: list[dict[str, Any]] = [row(t) for t in active[:MAX_ACTIVE_TASKS]]
 
             done = [t for t in self.__tasks.list_completed() if owns(t)]
-            rows.extend(
+            rows.extend(row(t) for t in done[:MAX_RECENT_TASKS])
+            return rows
+
+        def read_completed(slug: str) -> list[dict[str, Any]]:
+            """Recently completed tasks for this project, newest first."""
+
+            def owns(task: Any) -> bool:
+                if task.project:
+                    return bool(task.project == slug)
+                return slug in f"{task.title} {task.objective}".lower()
+
+            return [
                 {
                     "id": t.id,
                     "title": t.title,
                     "status": t.status.value,
                     "priority": t.priority.value,
+                    "updated": t.updated.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }
-                for t in done[:MAX_RECENT_TASKS]
+                for t in self.__tasks.list_completed(limit=0)
+                if owns(t)
+            ][:10]
+
+        def git_lines(slug: str) -> list[str]:
+            """Raw git-source lines for the briefing, reusing the context adapter."""
+            from workspace.context import adapters as ctx_adapters
+
+            try:
+                _, root, _ = resolve(slug)
+            except Exception:  # noqa: BLE001 — a briefing degrades, never blocks
+                return []
+            return ctx_adapters.git_source(slug, root).items
+
+        def create_task(payload: dict[str, Any]) -> dict[str, Any]:
+            """
+            Create a task through the existing TaskManager.
+
+            The workspace builds no second task system. Provenance travels in the
+            task's own metadata and context so a task created in a conversation
+            can be traced back to the reasoning that produced it.
+            """
+            response = self.task(
+                "create",
+                title=payload["title"],
+                objective=payload["objective"],
+                task_type="feature",
+                priority="P2",
+                created_by="human:ai-workspace",
+                project=payload.get("project", ""),
+                context=(
+                    f"Created from MondayOS AI Workspace conversation "
+                    f"{payload.get('conversation_id', '')} "
+                    f"(message {payload.get('message_id', '')})."
+                ),
             )
-            return rows
+            if not response.success:
+                raise ValueError(f"Task creation refused: {response.message}")
+            return dict(response.data)
 
         def read_knowledge(slug: str) -> list[dict[str, Any]]:
             """Recent knowledge entries scoped to this project by component or tag."""
@@ -2589,7 +2650,30 @@ class Monday:
             responder=responder,
             list_projects=list_projects,
             capture_knowledge=capture,
+            create_task=create_task,
+            read_tasks=read_tasks,
+            read_completed=read_completed,
+            git_lines=git_lines,
+            activity=activity,
         )
+
+    def workspace_stream(
+        self, project: str, conversation_id: str, content: str
+    ) -> Iterator[dict[str, Any]]:
+        """
+        Stream one conversational turn, yielding event dicts.
+
+        Separate from ``workspace()`` because a stream is not a typed response:
+        it is a sequence that the caller drives and may stop partway. Forcing it
+        through WorkspaceResponse would mean buffering the whole answer first,
+        which is the opposite of what streaming is for.
+
+        Closing the returned generator stops generation. Whatever text arrived is
+        persisted as an assistant message marked incomplete — never discarded,
+        and never presented as a finished answer.
+        """
+        service = self._workspace_service()
+        return service.stream_message(project, conversation_id, content)
 
     def workspace(self, action: str, **kwargs: Any) -> WorkspaceResponse:
         """
@@ -2616,6 +2700,13 @@ class Monday:
                                   conversation_id.
             delete-conversation — permanent. Requires: project, conversation_id.
             build-context       — assemble a context snapshot. Requires: project.
+                                  Optional: query (ranks items within each source).
+            search              — search conversations. Requires: query. Optional: project,
+                                  scope ("project" default | "all").
+            briefing            — where work stands, from stored state. Optional: project.
+            create-task         — create a MondayOS task from an assistant message.
+                                  Requires: project, conversation_id, message_id.
+            activity            — recent activity events for this service instance.
             save-to-knowledge   — capture an assistant message as knowledge. Requires:
                                   project, conversation_id, message_id. Optional: title.
 
@@ -2709,8 +2800,33 @@ class Monday:
                 return ok(service.delete_conversation(project, conversation_id), "Deleted.")
 
             if action == "build-context":
-                data = service.build_context(project)
+                data = service.build_context(project, query=str(kwargs.get("query", "")))
                 return ok(data, str(data.get("summary", "")), str(data.get("id", "")))
+
+            if action == "search":
+                data = service.search_conversations(
+                    query=str(kwargs.get("query", "")),
+                    project=project,
+                    scope=str(kwargs.get("scope", "project")),
+                )
+                return ok(data, f"{len(data['hits'])} match(es).")
+
+            if action == "briefing":
+                data = service.briefing(project)
+                return ok(data, data.get("greeting", ""))
+
+            if action == "create-task":
+                data = service.create_task_from_message(
+                    project,
+                    conversation_id,
+                    message_id,
+                    title=str(kwargs.get("title", "")),
+                    objective=str(kwargs.get("objective", "")),
+                )
+                return ok(data, f"Created {data['task'].get('id', '')}.")
+
+            if action == "activity":
+                return ok({"events": service.activity.to_dicts(limit=40)})
 
             if action == "save-to-knowledge":
                 data = service.save_message_to_knowledge(
@@ -2727,7 +2843,8 @@ class Monday:
                     f"Unknown workspace action {action!r}. Valid actions: list-projects, "
                     "list-conversations, create-conversation, get-conversation, send-message, "
                     "retry, rename-conversation, archive-conversation, unarchive-conversation, "
-                    "delete-conversation, build-context, save-to-knowledge."
+                    "delete-conversation, build-context, save-to-knowledge, search, briefing, "
+                    "create-task, activity."
                 ),
             )
         except (WorkspaceError, ValueError, LookupError, OSError) as exc:
@@ -2814,6 +2931,7 @@ def _task_to_dict(task: Any) -> dict[str, Any]:
         "created_by": task.created_by,
         "objective": task.objective,
         "context": task.context,
+        "project": task.project,
         "assigned_to": task.assigned_to,
         "acceptance_criteria": list(task.acceptance_criteria),
         "created": task.created.isoformat(),

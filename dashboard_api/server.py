@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -85,8 +86,61 @@ def make_handler(service: DashboardService):
                     headers = security.cors_headers(origin)
                     self._send(400, headers, errors.error(errors.BAD_REQUEST, "Malformed JSON body."))
                     return
+            # Streaming is a transport concern, so it bypasses `route`, which is
+            # pure by design. The generator itself lives on the service and is
+            # unit-tested without a socket.
+            match = re.match(r"^/workspace/conversations/([^/]+)/stream/?$", parsed.path)
+            if match:
+                self._stream(match.group(1), body, origin)
+                return
+
             status, headers, resp = route(service, "POST", parsed.path, origin=origin, body=body)
             self._send(status, headers, resp)
+
+        def _stream(self, conversation_id: str, body: dict, origin: str | None):
+            """
+            Stream one turn as SSE over a POST.
+
+            POST rather than EventSource because the request carries a message
+            body, and because the client needs AbortController to stop it —
+            aborting closes this connection, which closes the generator, which is
+            how the workspace service learns to persist the partial answer.
+            """
+            if not security.is_allowed_origin(origin):
+                self._send(
+                    403,
+                    security.cors_headers(origin),
+                    errors.error(errors.FORBIDDEN_ORIGIN, "Origin not allowed."),
+                )
+                return
+
+            self.send_response(200)
+            for k, v in security.cors_headers(origin).items():
+                self.send_header(k, v)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            # A finite stream with no Content-Length: the connection close IS the
+            # terminator. Advertising keep-alive here would leave the client
+            # waiting for frames that will never come after the final event.
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+            stream = service.workspace_stream(conversation_id, body)
+            try:
+                for event in stream:
+                    payload = json.dumps(security.redact(event))
+                    kind = event.get("type", "message")
+                    frame = f"event: {kind}\ndata: {payload}\n\n"
+                    self.wfile.write(frame.encode())
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # The client aborted — the Stop button. Closing the generator is
+                # what persists the partial answer, so it must happen even though
+                # nothing can be written back.
+                pass
+            finally:
+                stream.close()
 
         def _sse(self):
             """Server-Sent Events: heartbeat + revision changes. The dashboard

@@ -108,6 +108,11 @@ class Message:
     # message that got no answer is part of what happened, and hiding it makes the
     # transcript lie about the conversation.
     error: str = ""
+    # True when generation stopped before the model finished — the operator
+    # pressed stop, or the stream died mid-answer. Partial text shown as a
+    # complete answer is a quiet correctness failure, so this is persisted and
+    # rendered, never inferred at read time.
+    incomplete: bool = False
     artifact_refs: list[ArtifactRef] = field(default_factory=list)
 
     @property
@@ -126,6 +131,7 @@ class Message:
             "snapshot_id": self.snapshot_id,
             "tokens_used": self.tokens_used,
             "error": self.error,
+            "incomplete": self.incomplete,
             "artifact_refs": [a.to_dict() for a in self.artifact_refs],
         }
 
@@ -141,6 +147,7 @@ class Message:
             snapshot_id=str(data.get("snapshot_id", "")),
             tokens_used=int(data.get("tokens_used", 0) or 0),
             error=str(data.get("error", "")),
+            incomplete=bool(data.get("incomplete", False)),
             artifact_refs=[ArtifactRef.from_dict(a) for a in data.get("artifact_refs") or []],
         )
 

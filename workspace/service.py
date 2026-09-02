@@ -14,12 +14,14 @@ scoped, so there is no call the service could make that widens it (ADR-017).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from workspace import search
+from workspace import briefing as briefing_mod
+from workspace import compaction, search
+from workspace.activity import ActivityKind, ActivityRecorder, NullRecorder
 from workspace.context.engine import ContextEngine
 from workspace.context.snapshot import ContextSnapshot
 from workspace.errors import (
@@ -55,6 +57,12 @@ class WorkspaceService:
         responder: WorkspaceResponder | None = None,
         list_projects: Callable[[], list[dict[str, Any]]] | None = None,
         capture_knowledge: Callable[[dict[str, Any]], str] | None = None,
+        create_task: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        read_tasks: Callable[[str], list[dict[str, Any]]] | None = None,
+        read_completed: Callable[[str], list[dict[str, Any]]] | None = None,
+        git_lines: Callable[[str], list[str]] | None = None,
+        activity: ActivityRecorder | NullRecorder | None = None,
+        summarizer: compaction.ConversationSummarizer | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._root = Path(root)
@@ -63,7 +71,21 @@ class WorkspaceService:
         self._responder = responder
         self._list_projects = list_projects
         self._capture_knowledge = capture_knowledge
+        self._create_task = create_task
+        self._read_tasks = read_tasks
+        self._read_completed = read_completed
+        self._git_lines = git_lines
+        # Defaults to a recorder that drops everything, so nothing in this class
+        # is conditional on whether anyone is watching the activity feed.
+        self._activity = activity or NullRecorder()
+        # Wired but unused: model summarisation is an increment-3 decision about
+        # summary quality, not a refactor to bundle with this one.
+        self._summarizer = summarizer
         self._now = now or (lambda: datetime.now(tz=UTC))
+
+    @property
+    def activity(self) -> ActivityRecorder | NullRecorder:
+        return self._activity
 
     # ------------------------------------------------------------- projects
 
@@ -155,9 +177,22 @@ class WorkspaceService:
         if self._engine is None:
             return ContextSnapshot(id="CTX-none", project=slugify(project), created_at=self._now())
         if allow_reuse:
-            snapshot, _reused = self._engine.build_or_reuse(project, query)
+            snapshot, reused = self._engine.build_or_reuse(project, query)
+            self._activity.record(
+                ActivityKind.CONTEXT,
+                "Reused project context" if reused else "Assembled project context",
+                project=snapshot.project,
+                detail=snapshot.summary(),
+            )
             return snapshot
-        return self._engine.build(project, query)
+        snapshot = self._engine.build(project, query)
+        self._activity.record(
+            ActivityKind.CONTEXT,
+            "Assembled project context",
+            project=snapshot.project,
+            detail=snapshot.summary(),
+        )
+        return snapshot
 
     # ------------------------------------------------------------- messaging
 
@@ -222,10 +257,18 @@ class WorkspaceService:
             snapshot_id=snapshot.id if snapshot else conversation.active_snapshot_id,
             tokens_used=reply.tokens_used,
             error=reply.error,
+            incomplete=reply.incomplete,
         )
         conversation.messages.append(assistant_message)
         conversation.updated_at = assistant_message.created_at
         self._store.save(conversation)
+        self._activity.record(
+            ActivityKind.ERROR if reply.error else ActivityKind.PROVIDER,
+            "Provider failed" if reply.error else f"Answered via {reply.provider or 'provider'}",
+            project=conversation.project,
+            detail=reply.error or f"{reply.tokens_used} tokens",
+            ok=not reply.error,
+        )
 
         return {
             "conversation": conversation.to_dict(),
@@ -233,6 +276,170 @@ class WorkspaceService:
             "assistant_message": assistant_message.to_dict(),
             "context": snapshot.to_dict() if snapshot else None,
         }
+
+    def stream_message(
+        self, project: str, conversation_id: str, content: str
+    ) -> Iterator[dict[str, Any]]:
+        """
+        Record a user message and stream the answer, persisting either way.
+
+        Yields plain dicts the API turns into SSE frames. Three properties make
+        this safe to interrupt at any point:
+
+        **The user message is persisted before the provider is called**, so a
+        failure or a stop never loses what the human said.
+
+        **Stopping persists the partial.** Closing this generator raises
+        GeneratorExit inside it; the ``finally`` block writes whatever text
+        arrived as an assistant message marked ``incomplete``. A stopped
+        response is preserved and visibly partial — never discarded, and never
+        presented as a finished answer.
+
+        **The transcript never claims more than happened.** An empty stream and
+        a mid-stream failure both produce a message carrying the error rather
+        than a blank bubble.
+        """
+        text = content.strip()
+        if not text:
+            raise ValueError("A message cannot be empty.")
+
+        conversation = self._store.get(project, conversation_id)
+        if conversation.is_archived:
+            raise ConversationArchivedError(conversation_id)
+
+        snapshot = self._snapshot(project, query=text)
+        conversation.active_snapshot_id = snapshot.id
+
+        stamp = self._now()
+        user_message = Message(
+            id=self._store.next_message_id(conversation),
+            role=MessageRole.USER,
+            content=text,
+            created_at=stamp,
+            snapshot_id=snapshot.id,
+        )
+        conversation.messages.append(user_message)
+        if conversation.title in ("", "New conversation"):
+            conversation.title = derive_title(text)
+        conversation.updated_at = stamp
+        self._store.save(conversation)
+
+        yield {"type": "user", "message": user_message.to_dict()}
+        yield {"type": "context", "context": snapshot.to_dict()}
+
+        parts: list[str] = []
+        reply: WorkspaceReply | None = None
+        finished = False
+
+        try:
+            if self._responder is None:
+                reply = WorkspaceReply(
+                    content="",
+                    error=(
+                        "No AI provider is configured for this MondayOS instance, so the "
+                        "workspace cannot answer. Configure a provider in MondayConfig."
+                    ),
+                )
+            else:
+                self._activity.record(
+                    ActivityKind.PROVIDER,
+                    f"Calling {self._responder.name}",
+                    project=conversation.project,
+                )
+                request = self._request(conversation, snapshot, text, conversation.messages[:-1])
+                for chunk in self._responder.respond_stream(request):
+                    if chunk.done:
+                        reply = chunk.reply
+                        continue
+                    if chunk.text:
+                        parts.append(chunk.text)
+                        yield {"type": "delta", "text": chunk.text}
+            finished = True
+        finally:
+            # Runs on normal completion AND on GeneratorExit when the caller
+            # stops us. Either way the turn is written down.
+            message = self._persist_stream(conversation, snapshot, parts, reply, finished)
+            if finished:
+                yield {
+                    "type": "done",
+                    "message": message.to_dict(),
+                    "conversation": conversation.to_dict(),
+                }
+
+    def _persist_stream(
+        self,
+        conversation: Conversation,
+        snapshot: ContextSnapshot,
+        parts: list[str],
+        reply: WorkspaceReply | None,
+        finished: bool,
+    ) -> Message:
+        """Write the assistant turn, however the stream ended."""
+        streamed = "".join(parts).strip()
+
+        if not finished:
+            # Stopped by the caller. Whatever arrived is a real partial answer.
+            content, error, incomplete = streamed, "", True
+            provider = self._responder.name if self._responder else ""
+            model, tokens = "", 0
+            if not content:
+                error = "Generation was stopped before any response arrived."
+        elif reply is None:
+            content, error, incomplete = streamed, "The response stream ended unexpectedly.", True
+            provider = self._responder.name if self._responder else ""
+            model, tokens = "", 0
+        else:
+            content = reply.content or streamed
+            error, incomplete = reply.error, reply.incomplete
+            provider, model, tokens = reply.provider, reply.model, reply.tokens_used
+
+        message = Message(
+            id=self._store.next_message_id(conversation),
+            role=MessageRole.ASSISTANT,
+            content=content,
+            created_at=self._now(),
+            provider=provider,
+            model=model,
+            snapshot_id=snapshot.id,
+            tokens_used=tokens,
+            error=error,
+            incomplete=incomplete,
+        )
+        conversation.messages.append(message)
+        conversation.updated_at = message.created_at
+        self._store.save(conversation)
+        self._activity.record(
+            ActivityKind.PERSIST,
+            "Saved conversation",
+            project=conversation.project,
+            detail=("stopped — partial saved" if not finished else (error or "complete")),
+            ok=not error,
+        )
+        return message
+
+    def _request(
+        self,
+        conversation: Conversation,
+        snapshot: ContextSnapshot | None,
+        text: str,
+        history: list[Message],
+    ) -> WorkspaceRequest:
+        """
+        Build the responder request, compacting a long history.
+
+        The stored transcript is untouched: compaction decides only what is
+        *sent*. A long thread contributes recent turns verbatim plus a
+        deterministic digest of what came before.
+        """
+        plan = compaction.compact(history, summarizer=self._summarizer)
+        return WorkspaceRequest(
+            project=conversation.project,
+            message=text,
+            snapshot=snapshot,
+            history=plan.verbatim,
+            conversation_id=conversation.id,
+            history_digest=plan.digest,
+        )
 
     def retry_message(self, project: str, conversation_id: str) -> dict[str, Any]:
         """
@@ -314,8 +521,6 @@ class WorkspaceService:
 
     # ---------------------------------------------------------------- search
 
-    # ---------------------------------------------------------------- search
-
     def search_conversations(
         self, query: str, project: str = "", scope: str = "project", limit: int = 25
     ) -> dict[str, Any]:
@@ -338,12 +543,126 @@ class WorkspaceService:
             conversations.extend(self._store.list(slug, include_archived=True))
 
         hits = search.search(conversations, query, limit=limit)
+        self._activity.record(
+            ActivityKind.KNOWLEDGE,
+            f"Searched conversations for {query!r}",
+            project="" if scope == "all" else slugify(project),
+            detail=f"{len(hits)} match(es) across {len(slugs)} project(s)",
+        )
         return {
             "query": query,
             "scope": scope,
             "project": "" if scope == "all" else slugify(project),
             "projects_searched": slugs,
             "hits": [h.to_dict() for h in hits],
+        }
+
+    # -------------------------------------------------------------- briefing
+
+    def briefing(self, project: str = "") -> dict[str, Any]:
+        """
+        Where work stands, from stored state alone.
+
+        Nothing here is inferred beyond what the task system and git already
+        record. With no project given, the most recently updated conversation
+        across all projects decides which project to brief on — that is the last
+        place work actually happened, not a guess.
+        """
+        latest: dict[str, Any] | None = None
+        slugs = [slugify(project)] if project else self._store.projects_with_conversations()
+
+        candidates: list[Conversation] = []
+        for slug in slugs:
+            candidates.extend(self._store.list(slug))
+        if candidates:
+            candidates.sort(key=lambda c: (c.updated_at, c.id), reverse=True)
+            latest = candidates[0].summary_dict()
+
+        target = slugify(project) or (str(latest["project"]) if latest else "")
+        active = self._read_tasks(target) if (self._read_tasks and target) else []
+        completed = self._read_completed(target) if (self._read_completed and target) else []
+        git = self._git_lines(target) if (self._git_lines and target) else []
+
+        result = briefing_mod.build_briefing(
+            now=self._now(),
+            latest=latest,
+            active_tasks=active,
+            completed_tasks=completed,
+            git_lines=git,
+        )
+        return result.to_dict()
+
+    # ------------------------------------------------------------------ tasks
+
+    def create_task_from_message(
+        self,
+        project: str,
+        conversation_id: str,
+        message_id: str,
+        title: str = "",
+        objective: str = "",
+    ) -> dict[str, Any]:
+        """
+        Create a MondayOS task from an assistant response.
+
+        Uses the existing TaskManager through an injected hook — the workspace
+        builds no second task system. Provenance travels with the task: the
+        project, conversation and message it came from, so a task created in a
+        conversation can be traced back to the reasoning that produced it.
+        """
+        if self._create_task is None:
+            raise ResponderUnavailableError(
+                "No task system is wired into this workspace, so a task cannot be created."
+            )
+
+        conversation = self._store.get(project, conversation_id)
+        message = next((m for m in conversation.messages if m.id == message_id), None)
+        if message is None:
+            raise MessageNotFoundError(message_id, conversation_id)
+        if message.role is not MessageRole.ASSISTANT:
+            raise ValueError(
+                f"Only an assistant message can become a task; {message_id} is a "
+                f"{message.role.value} message."
+            )
+        if message.failed or not message.content.strip():
+            raise ValueError(f"Message {message_id} recorded a failure and has no content.")
+
+        created = self._create_task(
+            {
+                "project": conversation.project,
+                "title": title.strip() or derive_title(message.content),
+                "objective": objective.strip() or message.content.strip(),
+                "conversation_id": conversation.id,
+                "message_id": message.id,
+            }
+        )
+
+        task_id = str(created.get("id", ""))
+        if task_id and task_id not in conversation.task_refs:
+            conversation.task_refs.append(task_id)
+        event = Message(
+            id=self._store.next_message_id(conversation),
+            role=MessageRole.EVENT,
+            content=f"Created task {task_id}: {created.get('title', '')}",
+            created_at=self._now(),
+        )
+        conversation.messages.append(event)
+        conversation.updated_at = event.created_at
+        self._store.save(conversation)
+
+        self._activity.record(
+            ActivityKind.TASK,
+            f"Created task {task_id}",
+            project=conversation.project,
+            detail=str(created.get("title", "")),
+        )
+        # A new task changes what the next snapshot should contain.
+        self.invalidate_context(conversation.project)
+        return {
+            "task": created,
+            "conversation_id": conversation.id,
+            "message_id": message.id,
+            "project": conversation.project,
         }
 
     # ------------------------------------------------------------- knowledge
