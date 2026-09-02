@@ -33,6 +33,9 @@ The boundary that matters now is narrower and more important than "nothing can p
 - The Growth Brain (`growth/brain/`): deterministic reasoning over those measurements —
   opportunities, evidence-backed recommendations, marketing memory, experiments, forecasts and
   health scores.
+- Content generation (`growth/generation/`): the planner, copywriter, platform formatters,
+  long-form and brief generators, claim-risk classification, the weekly marketing package and the
+  approval inbox.
 - Running the deterministic publish gate sequence: pause scopes, status, fingerprint, isolation,
   scheduled time, idempotency, then the connector.
 - Bounded retries with exponential backoff and jitter, and clock-free idempotency keys.
@@ -75,6 +78,13 @@ The boundary that matters now is narrower and more important than "nothing can p
 | `MarketingMemory` / `MemoryEntry` | Project-scoped learnings, tentative until confirmed |
 | `Experiment` / `evaluate_result` | The only route from hypothesis to fact |
 | `Forecast` / `Score` | Rule-based projections and reproducible health scores |
+| `ContentPlanner` / `WeeklyPlan` | Brain recommendations to a week of slots |
+| `Copywriter` / `ContentWriter` | Drafting against brand, and the drafting seam |
+| `adapt` / `make_variants` | Platform adaptation into separate per-platform items |
+| `WeeklyPackage` / `WeeklyPackageBuilder` | One week's plan, assembled and reviewable |
+| `ApprovalInbox` | The review queue and the owner actions on it |
+| `ContentWriter` / `TemplateContentWriter` / `ModelContentWriter` | The drafting seam and its two paths |
+| `classify_claims` / `ClaimRisk` | Claim-risk escalation, not fact-checking |
 | `PublishDispatcher` / `DispatchResult` | The deterministic publish gate sequence |
 | `PublicationRecord` / `PublicationAttempt` | Durable publishing outcome and attempt history |
 | `idempotency_key` / `backoff_seconds` | Clock-free dedupe key; bounded retry curve |
@@ -105,6 +115,7 @@ growth/
     ├── events/events.jsonl       append-only performance observations
     ├── snapshots/SNAPSHOT-N.json point-in-time metric captures
     ├── memory/memory.jsonl       marketing memory, append-only with revision history
+    ├── packages/WEEK-*.json      weekly marketing packages
     ├── aggregates.json           the ONLY file a portfolio view may read
     └── .sequences.json           CONTENT- id allocation, scoped to THIS workspace
 
@@ -152,6 +163,81 @@ The Brain adds three more, and they are the reason it can be trusted at all:
   reason, never a plausible number — an invented figure outlives everyone's memory of inventing it.
 
 `growth/brain/` calls no model, opens no socket, and reads only the workspace it was opened for.
+
+Generation sits **on top of** the Brain and never reaches into it. Three rules hold it together:
+
+- **Generation never bypasses approval.** Every asset becomes a `ContentItem` in `DRAFT` and
+  travels the existing lifecycle. Approving a week approves each post individually against its own
+  fingerprint and authorises nothing that was not in the package.
+- **Nothing appears out of nowhere.** Every asset cites a recommendation, campaign, or experiment,
+  enforced at construction by `MissingProvenanceError`.
+- **Brand context is required.** A request without voice, audience and objective raises
+  `MissingBrandContextError` rather than falling back to a generic template — a generic template
+  published under a brand's name is worse than publishing nothing.
+
+## Who decides what
+
+```
+Analytics → Growth Brain → Recommendations → Planner → Content Writer
+         → Formatter → Safety & claim review → Weekly Package
+         → HUMAN APPROVAL → Publishing connector
+```
+
+The **Brain decides what to say and why** — deterministically, from measured outcomes, calling no
+model. The **model writer decides how to phrase it**. The **human approves the exact output**. Those
+three responsibilities never merge: no reasoning lives in `growth/generation/`, and no drafting
+lives in `growth/brain/`.
+
+## The model seam
+
+Drafting happens behind the `ContentWriter` protocol, which has two implementations:
+
+| Mode | Path | Behaviour |
+|---|---|---|
+| `template` | `TemplateContentWriter` | Deterministic, offline, assembled from the project's own onboarding material. No provider consulted. |
+| `model` | `ModelContentWriter` | Drafts through the MondayOS `AIProvider` abstraction. Fails clearly if no provider is configured. |
+
+**The mode is always explicit.** There is no fallback in either direction — asking for `model`
+without a provider is an error, and having a provider never silently selects `model`. A reviewer
+must be able to know which path produced what they are reading.
+
+**Model routing belongs to MondayOS.** Growth consumes `brain.providers.base.AIProvider` and nothing
+else: no Anthropic or OpenAI import anywhere in `growth/`, no model id, no vendor-specific branch.
+Which model runs is `MondayConfig.provider_config`, and this package works unchanged when it
+changes. `max_tokens` defaults to 1200 — a configurable initial default, not a product rule.
+
+**Workspace isolation holds at the prompt.** The prompt is assembled from one `BrandContext` and one
+`PlannedPost`, both scoped to the project being generated for. A test plants confidential copy, a
+title, a theme and a brand voice in a second workspace and asserts none of it reaches the prompt.
+
+**Output is structured and fails closed.** The model must return a JSON object carrying at least
+`title`, `body` and `cta`. Prose, malformed JSON, missing or empty required fields, out-of-schema
+keys and runaway bodies are all refused — no `ContentItem` is created from an unvalidated response.
+
+**Provenance rides along.** Every generated item records `campaign_id`, `recommendation_ids`,
+`experiment_ids`, `generation_method` (`template` or `model`), `provider` and `generated_at`.
+Provider identity is deliberately *not* part of the approval fingerprint: approval is about the
+exact output, not about which model wrote it.
+
+## Safety and claim review
+
+Two passes run on generated output — never on the prompt, because a prompt is an instruction and
+this system does not treat instructions as enforcement.
+
+- **`check_safety` blocks.** Fabricated statistics, invented testimonials, unsupported superlatives
+  and the project's own prohibited phrases stop a draft from reaching review at all.
+- **`classify_claims` escalates.** Numeric, testimonial, customer, comparative, legal, medical,
+  financial and external-fact claim *shapes* mark a draft `requires_enhanced_review`. Such a draft
+  is normal and may reach ready-for-review; what it may not do is clear review on the strength of
+  the deterministic regexes finding nothing wrong. It surfaces in the inbox at `enhanced-review`
+  priority, above ordinary review.
+
+This is a **review escalation layer, not a fact-checking engine**. An absence of flags is not a
+verification that the copy is accurate, and the code says so in its own output.
+
+There are still **no account connections and no real platform adapters**. `REAL_ADAPTERS` is empty,
+publishing runs against the deterministic fake connector, and no project can be marked ready for
+real publishing.
 
 The sequence file is per workspace on purpose. A shared counter would let one project infer
 another's publishing volume from the gaps in its own ids.
