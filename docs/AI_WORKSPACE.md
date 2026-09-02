@@ -7,15 +7,18 @@
 
 ---
 
-> **Status note.** Increment 1 is implemented: the Conversation domain, project-scoped
+> **Status note.** Increments 1 and 2 are implemented: the Conversation domain, project-scoped
 > persistence, the deterministic Context Engine with attributed sources, the responder seam
 > backed by the existing MondayOS provider abstraction, the `Monday.workspace()` API, the
 > dashboard API routes, and the AI Workspace UI.
 >
-> **There is no model router yet.** One configured provider answers every request. Streaming is
-> not implemented — responses are request/response. Knowledge capture is explicit only: nothing
-> is written to knowledge unless a human presses the button, and what is written records that a
-> model produced it and a human retained it without verifying it (§6).
+> Increment 2 adds real streaming, explicit task→project association, relevance-ranked context
+> with per-item attribution, conservative snapshot reuse, Continue Working, conversation search,
+> slash commands, response actions, and a live activity feed.
+>
+> **There is still no model router.** One configured provider answers every request, behind the
+> unchanged `WorkspaceResponder` seam. Knowledge capture remains explicit only, and what is
+> written records that a model produced it and a human retained it without verifying it (§6).
 
 ---
 
@@ -141,13 +144,63 @@ narrow adapters. It calls no model and is fully deterministic.
 |---|---|---|
 | 1 | `identity` | Project registry — name, description, path |
 | 2 | `docs` | Project `docs/`: ADR titles and statuses, documentation filenames |
-| 3 | `tasks` | `TaskManager` — active tasks, then recently completed |
+| 3 | `tasks` | `TaskManager` — active tasks (explicit project), then recently completed |
 | 4 | `knowledge` | `KnowledgeStore` — recent entries scoped to the project |
 | 5 | `git` | Branch, working-tree state, recent commits |
 
 Priority is the budget order: source 1 is filled before source 5 is considered. Each source has a
 character cap and the snapshot has a total cap; a source that hits its cap is marked
 `truncated: true` and says so in the UI. Nothing is silently dropped.
+
+**Relevance ranking (increment 2).** Within each category, items are ranked against the current
+request and **every item records why it survived**. The reason vocabulary is closed and
+enumerable, so the panel can aggregate it and a human can reason about it:
+
+| Reason | Meaning |
+|---|---|
+| `active-task` | An in-progress or in-review task — relevant to almost any question |
+| `architecture-priority` | Documentation and ADRs, which outrank incidental matches |
+| `keyword-match` | The item shares terms with the request |
+| `recent` | Included by recency where the request does not distinguish |
+| `baseline` | No signal either way; kept in arrival order |
+
+Ranking is deterministic keyword overlap plus structural signals already in the data. No vector
+store, no embeddings, no second index. An empty request reorders nothing — no query is no
+evidence, and inventing an order from no evidence is worse than the order the data arrived in.
+
+**Snapshot reuse (increment 2).** A snapshot is reused only when a fingerprint of what it was
+built from — git HEAD, working-tree state, task statuses, knowledge ids, docs mtimes — is
+unchanged *and* the request ranks equivalently. Everything else rebuilds. Stale context produces a
+confident answer about a state that no longer exists, and nothing in the transcript reveals that,
+so every uncertainty here resolves to rebuilding.
+
+## 5a. Streaming
+
+Responses stream token-by-token through a provider-neutral seam. `AIProvider.stream()` yields
+`ProviderChunk`s; a provider that has not implemented it falls back to yielding the whole answer
+as one chunk and reports `supports_streaming = False`, so the difference is visible rather than
+animated over.
+
+Three lifecycle properties are enforced and tested:
+
+- **The user message is persisted before the provider is called.** A failure or a stop never loses
+  what the human said.
+- **Stopping persists the partial.** Closing the stream — the Stop button aborting the request —
+  raises `GeneratorExit` inside the service, whose `finally` writes whatever text arrived as an
+  assistant message marked `incomplete`. The UI renders it as explicitly partial with a retry.
+- **An incomplete answer is never presented as a finished one.** `Message.incomplete` is
+  persisted, not inferred at read time.
+
+## 5b. Task → project association
+
+`Task.project` is an explicit registry slug. The Context Engine prefers it absolutely: a task
+naming a *different* project is excluded outright, and the increment-1 substring heuristic now
+applies only to tasks with no project at all.
+
+`tasks/migration.py` backfills the field. It never guesses (an ambiguous task stays unassigned and
+is reported), never overwrites an explicit value, and reports every task it skipped so the
+remainder can be assigned by hand. On this repository it assigned 19 tasks, left 4 ambiguous and
+37 unmatched, and a second run changed nothing.
 
 Every assembled string passes `core.redaction` before it can be persisted or sent.
 
@@ -213,7 +266,7 @@ Enforced, and directly tested:
 | Increment | Scope | Status |
 |---|---|---|
 | **1 — Conversational Workspace Foundation** | Conversation domain, project-scoped persistence, deterministic Context Engine, responder seam, `Monday.workspace()`, dashboard routes, AI Workspace UI | **Implemented** |
-| **2 — Context Retrieval & Project Bootstrap** | Token/SSE streaming; explicit task→project association; richer project bootstrap; relevance-ranked context retrieval; conversation summarisation for long threads; snapshot reuse and invalidation rules; improved project documentation discovery | Planned |
+| **2 — Interactive Monday** | Real streaming with stop; explicit task→project association and migration; relevance-ranked context with per-item attribution; snapshot reuse and invalidation; Continue Working and return briefing; conversation search; slash commands; response actions; live activity | **Implemented** |
 | **3 — Artifacts, Tasks, GitHub & Knowledge** | Create and edit artifacts inline, task creation from conversation, PR/issue context, automatic knowledge extraction proposals | Planned |
 | **4 — Model Router** | `RoutingWorkspaceResponder`: route by task shape, cost and capability across providers and local models | Planned |
 | **5 — Execution Engine / Agent Delegation** | Delegate conversation turns to agent teams and the orchestrator, with the existing approval gates | Planned |

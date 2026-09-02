@@ -933,3 +933,473 @@ class TestKnowledgeCapture(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------- #
+# increment 2 — streaming
+# --------------------------------------------------------------------------- #
+
+
+class StreamingProvider(FakeProvider):
+    """A provider that genuinely streams, one word per chunk."""
+
+    def __init__(self, text: str = "one two three four five", fail_after: int = -1) -> None:
+        super().__init__(text)
+        self._words = text.split()
+        self._fail_after = fail_after
+
+    @property
+    def supports_streaming(self) -> bool:
+        return True
+
+    def stream(self, prompt, context="", max_tokens=1024, **kwargs):  # type: ignore[no-untyped-def]
+        from brain.providers.base import ProviderChunk
+
+        self.calls.append({"prompt": prompt, "context": context})
+        for index, word in enumerate(self._words):
+            if index == self._fail_after:
+                raise ProviderError("stream died mid-answer")
+            yield ProviderChunk(text=word + " ")
+        yield ProviderChunk(done=True, model="fake-1", provider="fake", tokens_used=7)
+
+
+class TestStreaming(unittest.TestCase):
+    def _service(self, tmp: str, provider: AIProvider):
+        root = Path(tmp)
+        alpha = _project_tree(root, "alpha")
+        return root, WorkspaceService(
+            root=root,
+            engine=_engine(root, {"alpha": alpha}),
+            responder=ProviderWorkspaceResponder(provider),
+        )
+
+    def test_a_full_stream_yields_context_deltas_and_a_done_frame(self):
+        with TemporaryDirectory() as tmp:
+            _, service = self._service(tmp, StreamingProvider("alpha beta gamma"))
+            conversation = service.create_conversation("alpha", "")
+            kinds = []
+            deltas = []
+            done = None
+            for event in service.stream_message("alpha", conversation["id"], "hi"):
+                kinds.append(event["type"])
+                if event["type"] == "delta":
+                    deltas.append(event["text"])
+                if event["type"] == "done":
+                    done = event
+            self.assertEqual(kinds[0], "user")
+            self.assertEqual(kinds[1], "context")
+            self.assertEqual(len(deltas), 3)
+            assert done is not None
+            self.assertEqual(done["message"]["content"], "alpha beta gamma")
+            self.assertFalse(done["message"]["incomplete"])
+
+    def test_stopping_persists_the_partial_marked_incomplete(self):
+        """Partial text presented as a finished answer is a correctness failure."""
+        with TemporaryDirectory() as tmp:
+            _, service = self._service(tmp, StreamingProvider("one two three four five"))
+            conversation = service.create_conversation("alpha", "")
+            stream = service.stream_message("alpha", conversation["id"], "hi")
+            seen = 0
+            for event in stream:
+                if event["type"] == "delta":
+                    seen += 1
+                    if seen == 2:
+                        stream.close()
+                        break
+
+            loaded = service.get_conversation("alpha", conversation["id"])
+            assistant = loaded["messages"][-1]
+            self.assertEqual(assistant["role"], "assistant")
+            self.assertTrue(assistant["incomplete"])
+            self.assertTrue(assistant["content"])
+            self.assertNotEqual(assistant["content"], "one two three four five")
+
+    def test_stopping_preserves_the_user_message(self):
+        with TemporaryDirectory() as tmp:
+            _, service = self._service(tmp, StreamingProvider())
+            conversation = service.create_conversation("alpha", "")
+            stream = service.stream_message("alpha", conversation["id"], "do not lose me")
+            next(stream)
+            stream.close()
+            loaded = service.get_conversation("alpha", conversation["id"])
+            self.assertEqual(loaded["messages"][0]["content"], "do not lose me")
+
+    def test_a_mid_stream_failure_keeps_what_arrived(self):
+        with TemporaryDirectory() as tmp:
+            _, service = self._service(tmp, StreamingProvider("one two three", fail_after=2))
+            conversation = service.create_conversation("alpha", "")
+            done = None
+            for event in service.stream_message("alpha", conversation["id"], "hi"):
+                if event["type"] == "done":
+                    done = event
+            assert done is not None
+            self.assertIn("stream died", done["message"]["error"])
+            self.assertTrue(done["message"]["incomplete"])
+            self.assertIn("one", done["message"]["content"])
+
+    def test_a_stream_with_no_provider_records_a_clear_failure(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alpha = _project_tree(root, "alpha")
+            service = WorkspaceService(root=root, engine=_engine(root, {"alpha": alpha}))
+            conversation = service.create_conversation("alpha", "")
+            done = [
+                e
+                for e in service.stream_message("alpha", conversation["id"], "hi")
+                if e["type"] == "done"
+            ]
+            self.assertIn("No AI provider is configured", done[0]["message"]["error"])
+
+    def test_a_non_streaming_provider_still_works_through_the_seam(self):
+        """Every existing provider satisfies the interface without change."""
+        with TemporaryDirectory() as tmp:
+            provider = FakeProvider("delivered at once")
+            _, service = self._service(tmp, provider)
+            self.assertFalse(provider.supports_streaming)
+            conversation = service.create_conversation("alpha", "")
+            done = [
+                e
+                for e in service.stream_message("alpha", conversation["id"], "hi")
+                if e["type"] == "done"
+            ]
+            self.assertEqual(done[0]["message"]["content"], "delivered at once")
+
+    def test_streaming_does_not_leak_another_project(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alpha = _project_tree(root, "alpha")
+            beta = _project_tree(root, "beta")
+            (beta / "README.md").write_text("# beta\n\nBETA_STREAM_SECRET.\n")
+            provider = StreamingProvider("ok")
+            service = WorkspaceService(
+                root=root,
+                engine=_engine(root, {"alpha": alpha, "beta": beta}),
+                responder=ProviderWorkspaceResponder(provider),
+            )
+            conversation = service.create_conversation("alpha", "")
+            list(service.stream_message("alpha", conversation["id"], "hi"))
+            self.assertNotIn("BETA_STREAM_SECRET", json.dumps(provider.calls))
+
+
+# --------------------------------------------------------------------------- #
+# increment 2 — search, relevance, reuse, compaction, briefing
+# --------------------------------------------------------------------------- #
+
+
+class TestConversationSearch(unittest.TestCase):
+    def _service(self, tmp: str):
+        root = Path(tmp)
+        alpha = _project_tree(root, "alpha")
+        beta = _project_tree(root, "beta")
+        service = WorkspaceService(
+            root=root,
+            engine=_engine(root, {"alpha": alpha, "beta": beta}),
+            responder=ProviderWorkspaceResponder(FakeProvider("noted")),
+        )
+        a = service.create_conversation("alpha", "Shortlist design")
+        service.send_message("alpha", a["id"], "How does the shortlist promotion work?")
+        b = service.create_conversation("beta", "Beta planning")
+        service.send_message("beta", b["id"], "BETA_ONLY_TERM planning notes")
+        return service
+
+    def test_search_is_scoped_to_one_project_by_default(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            result = service.search_conversations("planning", project="alpha")
+            self.assertEqual(result["hits"], [])
+            self.assertEqual(result["projects_searched"], ["alpha"])
+
+    def test_search_finds_title_and_body_matches(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            result = service.search_conversations("shortlist", project="alpha")
+            self.assertEqual(len(result["hits"]), 1)
+            self.assertTrue(result["hits"][0]["matched_title"])
+            self.assertTrue(result["hits"][0]["snippets"])
+
+    def test_cross_project_search_is_opt_in_and_names_the_project(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            result = service.search_conversations("BETA_ONLY_TERM", scope="all")
+            self.assertEqual(len(result["hits"]), 1)
+            self.assertEqual(result["hits"][0]["project"], "beta")
+
+    def test_project_scope_without_a_project_is_refused(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            with self.assertRaises(ValueError):
+                service.search_conversations("anything")
+
+    def test_an_unknown_scope_is_refused(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            with self.assertRaises(ValueError):
+                service.search_conversations("x", project="alpha", scope="everything")
+
+    def test_every_term_must_match(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            self.assertEqual(
+                service.search_conversations("shortlist unicorn", project="alpha")["hits"], []
+            )
+
+
+class TestRelevance(unittest.TestCase):
+    def test_matching_items_outrank_non_matching_and_record_why(self):
+        from workspace.context import relevance
+
+        ranked = relevance.rank(["about widgets", "about sourcing", "about pipes"], "sourcing")
+        self.assertEqual(ranked[0].text, "about sourcing")
+        self.assertEqual(ranked[0].reason, relevance.REASON_KEYWORD)
+        self.assertEqual(ranked[1].reason, relevance.REASON_BASELINE)
+
+    def test_an_empty_query_preserves_arrival_order(self):
+        """No query is no evidence; inventing an order would be worse."""
+        from workspace.context import relevance
+
+        items = ["c", "a", "b"]
+        self.assertEqual([r.text for r in relevance.rank(items, "")], items)
+
+    def test_a_pinned_item_outranks_a_keyword_match(self):
+        from workspace.context import relevance
+
+        ranked = relevance.rank(
+            ["TASK-1 [in-progress] unrelated", "TASK-2 [backlog] sourcing"],
+            "sourcing",
+            priority={0: relevance.REASON_ACTIVE_TASK},
+        )
+        self.assertEqual(ranked[0].reason, relevance.REASON_ACTIVE_TASK)
+
+    def test_ranking_reasons_survive_the_budget(self):
+        """The budget must cut reasons in step with items, never drop them."""
+        source = ContextSource(
+            name="tasks",
+            label="Tasks",
+            items=["aaaa", "bbbb", "cccc"],
+            reasons=["keyword-match", "baseline", "baseline"],
+        )
+        result = ctx_budget.apply([source], total_cap=100, source_caps={"tasks": 9})
+        kept = result.sources[0]
+        self.assertEqual(len(kept.items), len(kept.reasons))
+        self.assertEqual(kept.reasons[0], "keyword-match")
+
+    def test_the_snapshot_records_what_it_was_ranked_for(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alpha = _project_tree(root, "alpha")
+            snapshot = _engine(root, {"alpha": alpha}).build("alpha", query="widgets")
+            self.assertEqual(snapshot.query, "widgets")
+
+
+class TestSnapshotReuse(unittest.TestCase):
+    def _engine_for(self, tmp: str, tasks=None):
+        root = Path(tmp)
+        alpha = _project_tree(root, "alpha")
+        return root, alpha, _engine(root, {"alpha": alpha}, read_tasks=tasks or (lambda s: []))
+
+    def test_an_identical_request_reuses_the_snapshot(self):
+        with TemporaryDirectory() as tmp:
+            _, _, engine = self._engine_for(tmp)
+            first, reused_a = engine.build_or_reuse("alpha", "same question")
+            second, reused_b = engine.build_or_reuse("alpha", "same question")
+            self.assertFalse(reused_a)
+            self.assertTrue(reused_b)
+            self.assertEqual(first.id, second.id)
+
+    def test_a_different_request_rebuilds(self):
+        """A snapshot ranked for another question may have dropped what this needs."""
+        with TemporaryDirectory() as tmp:
+            _, _, engine = self._engine_for(tmp)
+            engine.build_or_reuse("alpha", "first question")
+            _, reused = engine.build_or_reuse("alpha", "completely different")
+            self.assertFalse(reused)
+
+    def test_a_changed_task_invalidates(self):
+        state = {"status": "backlog"}
+
+        def tasks(_slug):
+            return [{"id": "TASK-1", "title": "t", "status": state["status"], "priority": "P2"}]
+
+        with TemporaryDirectory() as tmp:
+            _, _, engine = self._engine_for(tmp, tasks)
+            engine.build_or_reuse("alpha", "q")
+            _, reused = engine.build_or_reuse("alpha", "q")
+            self.assertTrue(reused)
+            state["status"] = "in-progress"
+            _, reused_after = engine.build_or_reuse("alpha", "q")
+            self.assertFalse(reused_after)
+
+    def test_changed_docs_invalidate(self):
+        with TemporaryDirectory() as tmp:
+            _, alpha, engine = self._engine_for(tmp)
+            engine.build_or_reuse("alpha", "q")
+            import os
+            import time
+
+            doc = alpha / "docs" / "ARCHITECTURE.md"
+            doc.write_text("# changed\n")
+            os.utime(doc, (time.time() + 60, time.time() + 60))
+            _, reused = engine.build_or_reuse("alpha", "q")
+            self.assertFalse(reused)
+
+    def test_explicit_invalidation_forces_a_rebuild(self):
+        with TemporaryDirectory() as tmp:
+            _, _, engine = self._engine_for(tmp)
+            engine.build_or_reuse("alpha", "q")
+            engine.invalidate("alpha")
+            _, reused = engine.build_or_reuse("alpha", "q")
+            self.assertFalse(reused)
+
+
+class TestCompaction(unittest.TestCase):
+    def _messages(self, count: int) -> list:
+        from workspace.models import Message
+
+        return [
+            Message(
+                id=f"MSG-{i:04d}",
+                role=MessageRole.USER if i % 2 == 0 else MessageRole.ASSISTANT,
+                content=f"turn number {i}",
+                created_at=T0,
+            )
+            for i in range(count)
+        ]
+
+    def test_a_short_conversation_is_sent_whole(self):
+        from workspace import compaction
+
+        plan = compaction.compact(self._messages(6))
+        self.assertFalse(plan.was_compacted)
+        self.assertEqual(len(plan.verbatim), 6)
+
+    def test_a_long_conversation_keeps_recent_turns_verbatim(self):
+        from workspace import compaction
+
+        plan = compaction.compact(self._messages(50), verbatim_turns=10, threshold=20)
+        self.assertTrue(plan.was_compacted)
+        self.assertEqual(len(plan.verbatim), 10)
+        self.assertIn("turn number 49", plan.verbatim[-1].content)
+        self.assertIn("turn number 0", plan.digest)
+
+    def test_compaction_never_mutates_the_stored_transcript(self):
+        from workspace import compaction
+
+        messages = self._messages(50)
+        before = [m.content for m in messages]
+        compaction.compact(messages, verbatim_turns=5, threshold=10)
+        self.assertEqual([m.content for m in messages], before)
+
+    def test_a_failing_summarizer_degrades_to_the_deterministic_digest(self):
+        from workspace import compaction
+
+        class Broken:
+            def summarize(self, messages):
+                raise RuntimeError("summariser down")
+
+        plan = compaction.compact(
+            self._messages(40), verbatim_turns=5, threshold=10, summarizer=Broken()
+        )
+        self.assertTrue(plan.digest)
+        self.assertIn("condensed", plan.digest)
+
+
+class TestBriefing(unittest.TestCase):
+    def test_next_step_prefers_work_already_in_progress(self):
+        from workspace.briefing import choose_next_step
+
+        step = choose_next_step(
+            [
+                {"id": "TASK-2", "title": "b", "status": "backlog", "priority": "P0"},
+                {"id": "TASK-1", "title": "a", "status": "in-progress", "priority": "P2"},
+            ]
+        )
+        assert step is not None
+        self.assertEqual(step.task_id, "TASK-1")
+        self.assertEqual(step.reason, "already in progress")
+
+    def test_next_step_falls_back_to_highest_priority_backlog(self):
+        from workspace.briefing import choose_next_step
+
+        step = choose_next_step(
+            [
+                {"id": "TASK-2", "title": "b", "status": "backlog", "priority": "P2"},
+                {"id": "TASK-3", "title": "c", "status": "backlog", "priority": "P0"},
+            ]
+        )
+        assert step is not None
+        self.assertEqual(step.task_id, "TASK-3")
+
+    def test_no_tasks_means_no_recommendation(self):
+        """An invented priority is worse than none."""
+        from workspace.briefing import choose_next_step
+
+        self.assertIsNone(choose_next_step([]))
+
+    def test_a_briefing_with_nothing_recorded_says_so(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = WorkspaceService(root=root)
+            result = service.briefing()
+            self.assertFalse(result["can_continue"])
+            self.assertIn("No conversations recorded yet.", result["notes"])
+
+    def test_a_briefing_points_at_the_most_recent_conversation(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alpha = _project_tree(root, "alpha")
+            service = WorkspaceService(
+                root=root,
+                engine=_engine(root, {"alpha": alpha}),
+                responder=ProviderWorkspaceResponder(FakeProvider()),
+                read_tasks=lambda s: [
+                    {"id": "TASK-9", "title": "Do it", "status": "in-progress", "priority": "P1"}
+                ],
+                read_completed=lambda s: [
+                    {"id": "TASK-8", "title": "Done", "status": "completed", "priority": "P1"}
+                ],
+            )
+            conversation = service.create_conversation("alpha", "")
+            service.send_message("alpha", conversation["id"], "the last thing I asked")
+
+            result = service.briefing()
+            self.assertTrue(result["can_continue"])
+            self.assertEqual(result["project"], "alpha")
+            self.assertEqual(result["conversation_id"], conversation["id"])
+            self.assertEqual(result["active_task"]["id"], "TASK-9")
+            self.assertEqual(result["next_step"]["task_id"], "TASK-9")
+
+
+class TestActivity(unittest.TestCase):
+    def test_real_operations_are_recorded(self):
+        from workspace.activity import ActivityRecorder
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alpha = _project_tree(root, "alpha")
+            recorder = ActivityRecorder()
+            service = WorkspaceService(
+                root=root,
+                engine=_engine(root, {"alpha": alpha}),
+                responder=ProviderWorkspaceResponder(FakeProvider()),
+                activity=recorder,
+            )
+            conversation = service.create_conversation("alpha", "")
+            service.send_message("alpha", conversation["id"], "hi")
+
+            kinds = [e["kind"] for e in recorder.to_dicts()]
+            self.assertIn("context", kinds)
+            self.assertIn("provider", kinds)
+
+    def test_nothing_is_recorded_when_nothing_happens(self):
+        from workspace.activity import ActivityRecorder
+
+        self.assertEqual(ActivityRecorder().to_dicts(), [])
+
+    def test_the_feed_is_bounded(self):
+        from workspace.activity import ActivityKind, ActivityRecorder
+
+        recorder = ActivityRecorder(limit=5)
+        for i in range(20):
+            recorder.record(ActivityKind.CONTEXT, f"event {i}")
+        self.assertEqual(len(recorder.events()), 5)
+        self.assertEqual(recorder.events()[0].message, "event 19")

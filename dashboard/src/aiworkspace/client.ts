@@ -16,12 +16,17 @@
  */
 
 import type {
+  ActivityEvent,
+  Briefing,
   Conversation,
   ConversationSummary,
   ContextSnapshot,
+  CreatedTask,
   KnowledgeCapture,
   Result,
+  SearchResult,
   SendResult,
+  StreamEvent,
   WorkspaceProject,
 } from "./types";
 
@@ -81,6 +86,22 @@ export interface WorkspaceClient {
     id: string,
     messageId: string,
   ): Promise<Result<KnowledgeCapture>>;
+  createTask(project: string, id: string, messageId: string): Promise<Result<CreatedTask>>;
+  search(query: string, project: string, scope: "project" | "all"): Promise<Result<SearchResult>>;
+  briefing(project?: string): Promise<Result<Briefing>>;
+  activity(): Promise<Result<{ events: ActivityEvent[] }>>;
+  /**
+   * Stream one turn. Returns an async iterator of events plus a `stop`.
+   *
+   * `stop` aborts the request, which closes the server's generator, which is how
+   * the partial answer gets persisted and marked incomplete. Stopping is a
+   * first-class outcome here, not an error path.
+   */
+  streamMessage(
+    project: string,
+    id: string,
+    content: string,
+  ): { events: AsyncIterable<StreamEvent>; stop: () => void };
 }
 
 export function createWorkspaceClient(cfg: WorkspaceClientConfig): WorkspaceClient {
@@ -172,5 +193,88 @@ export function createWorkspaceClient(cfg: WorkspaceClientConfig): WorkspaceClie
         project,
         message_id: messageId,
       }),
+
+    createTask: (project, id, messageId) =>
+      post<CreatedTask>(`/workspace/conversations/${encodeURIComponent(id)}/task`, {
+        project,
+        message_id: messageId,
+      }),
+
+    search: (query, project, scope) =>
+      get<SearchResult>(
+        `/workspace/search?q=${encodeURIComponent(query)}` +
+          `&project=${encodeURIComponent(project)}&scope=${scope}`,
+      ),
+
+    briefing: (project = "") =>
+      get<Briefing>(`/workspace/briefing?project=${encodeURIComponent(project)}`),
+
+    activity: () => get<{ events: ActivityEvent[] }>("/workspace/activity"),
+
+    streamMessage(project, id, content) {
+      const ctrl = new AbortController();
+      const url = `${base}/workspace/conversations/${encodeURIComponent(id)}/stream`;
+
+      async function* events(): AsyncIterable<StreamEvent> {
+        let res: Response;
+        try {
+          res = await f(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ project, content }),
+            signal: ctrl.signal,
+          });
+        } catch (err) {
+          // An abort before the response arrived is a stop, not a failure.
+          if (ctrl.signal.aborted) return;
+          yield { type: "error", code: "network", message: String(err) };
+          return;
+        }
+
+        if (!res.ok || !res.body) {
+          const parsed = await parseError(res);
+          yield { type: "error", code: parsed.code, message: parsed.message };
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            // SSE frames are separated by a blank line. Anything after the last
+            // separator is a partial frame and stays buffered.
+            const frames = buffer.split("\n\n");
+            buffer = frames.pop() ?? "";
+            for (const frame of frames) {
+              const parsed = parseFrame(frame);
+              if (parsed) yield parsed;
+            }
+          }
+        } catch {
+          // Aborted mid-read: the server is persisting the partial. Nothing to
+          // report here — the caller already holds every delta it rendered.
+          return;
+        }
+      }
+
+      return { events: events(), stop: () => ctrl.abort() };
+    },
   };
+}
+
+/** Parse one SSE frame into a typed event. Returns null for comments/heartbeats. */
+function parseFrame(frame: string): StreamEvent | null {
+  const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+  if (!dataLine) return null;
+  try {
+    return JSON.parse(dataLine.slice(5).trim()) as StreamEvent;
+  } catch {
+    return null;
+  }
 }

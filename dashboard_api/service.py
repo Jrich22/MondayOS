@@ -25,7 +25,7 @@ from typing import Any
 
 from monday import Monday
 
-from . import errors, serialize
+from . import errors, security, serialize
 
 # (status_code, body). body is the serialized payload on success or an error
 # envelope on failure.
@@ -449,3 +449,80 @@ class DashboardService:
         self._bump()
         return 201, resp.data
 
+    def workspace_stream(self, conversation_id: str, body: dict[str, Any]):
+        """
+        Stream one turn, yielding event dicts the server serialises as SSE.
+
+        Returned as a generator rather than a Result because `router.route` is
+        pure by design — it maps a request to a finished response and has no
+        socket. Streaming is a transport concern, so the server pumps this
+        directly. Keeping the generator here rather than in the server means the
+        streaming lifecycle is still unit-testable without opening a port.
+
+        Closing this generator is how the client's Stop button works: the
+        workspace service persists whatever arrived, marked incomplete.
+        """
+        project = (body.get("project") or "").strip()
+        content = (body.get("content") or "").strip()
+        if not project:
+            yield {"type": "error", "code": errors.BAD_REQUEST, "message": "'project' is required."}
+            return
+        if not content:
+            yield {"type": "error", "code": errors.BAD_REQUEST, "message": "'content' is required."}
+            return
+
+        try:
+            # `yield from` rather than a loop: closing this generator (the Stop
+            # button aborting the request) propagates the close inward, which is
+            # what lets the workspace service persist the partial answer.
+            yield from self._m.workspace_stream(
+                project=project, conversation_id=conversation_id, content=content
+            )
+        except Exception as exc:  # noqa: BLE001 — the edge must never leak a raw crash
+            yield {
+                "type": "error",
+                "code": errors.UPSTREAM,
+                "message": security.redact_text(str(exc)) or "stream failed",
+            }
+        finally:
+            self._bump()
+
+    def workspace_search(self, query: str, project: str, scope: str) -> Result:
+        if not query.strip():
+            return 400, errors.error(errors.BAD_REQUEST, "'query' is required.")
+        resp = self._m.workspace("search", query=query, project=project, scope=scope)
+        if not resp.success:
+            return 400, errors.error(errors.BAD_REQUEST, resp.message)
+        return 200, resp.data
+
+    def workspace_briefing(self, project: str) -> Result:
+        resp = self._m.workspace("briefing", project=project)
+        if not resp.success:
+            return 400, errors.error(errors.BAD_REQUEST, resp.message)
+        return 200, resp.data
+
+    def workspace_create_task(self, conversation_id: str, body: dict[str, Any]) -> Result:
+        project = (body.get("project") or "").strip()
+        message_id = (body.get("message_id") or "").strip()
+        if not project or not message_id:
+            return 400, errors.error(
+                errors.BAD_REQUEST, "Both 'project' and 'message_id' are required."
+            )
+        resp = self._m.workspace(
+            "create-task",
+            project=project,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            title=body.get("title", ""),
+            objective=body.get("objective", ""),
+        )
+        self._log_write(
+            "workspace_create_task",
+            {"conversation_id": conversation_id, "message_id": message_id},
+            resp.success,
+            resp.message,
+        )
+        if not resp.success:
+            return 400, errors.error(errors.BAD_REQUEST, resp.message)
+        self._bump()
+        return 201, resp.data

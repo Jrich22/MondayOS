@@ -45,16 +45,19 @@ function MessageRow({
   isLast,
   onRetry,
   onSave,
+  onTask,
   busy,
 }: {
   message: Message;
   isLast: boolean;
   onRetry: () => void;
   onSave: (id: string) => void;
+  onTask: (id: string) => void;
   busy: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [tasked, setTasked] = useState(false);
 
   const copy = () => {
     void navigator.clipboard?.writeText(message.content).then(() => {
@@ -101,6 +104,17 @@ function MessageRow({
               >
                 {saved ? "saved" : "save to knowledge"}
               </button>
+              <button
+                onClick={() => {
+                  onTask(message.id);
+                  setTasked(true);
+                }}
+                disabled={tasked}
+                className="text-[10px] text-ink-faint opacity-0 transition group-hover:opacity-100 hover:text-brand-400 disabled:opacity-100 disabled:text-ink-faint/60"
+                title="Create a MondayOS task from this response"
+              >
+                {tasked ? "task created" : "create task"}
+              </button>
             </>
           )}
           <span className="text-[10px] text-ink-faint/70">{timeOf(message.created_at)}</span>
@@ -122,9 +136,28 @@ function MessageRow({
           )}
         </div>
       ) : (
-        <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-ink">
-          {message.content}
-        </div>
+        <>
+          <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-ink">
+            {message.content}
+          </div>
+          {/* A partial answer is never presented as a finished one. */}
+          {message.incomplete && (
+            <div className="mt-2 flex items-center gap-2 text-[11px] text-status-awaiting">
+              <span className="h-px flex-1 bg-status-awaiting/30" />
+              <span>Stopped before completion — this response is partial</span>
+              {isLast && (
+                <button
+                  onClick={onRetry}
+                  disabled={busy}
+                  className="rounded border border-line px-1.5 py-0.5 text-ink-muted hover:text-ink disabled:opacity-50"
+                >
+                  Retry
+                </button>
+              )}
+              <span className="h-px flex-1 bg-status-awaiting/30" />
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -133,28 +166,29 @@ function MessageRow({
 export function ConversationView({
   conversation,
   sending,
+  streaming,
   loading,
-  onSend,
   onRetry,
   onSave,
+  onTask,
   onRename,
 }: {
   conversation: ConversationType | null;
   sending: boolean;
+  streaming: string;
   loading: boolean;
-  onSend: (text: string) => void;
   onRetry: () => void;
   onSave: (messageId: string) => void;
+  onTask: (messageId: string) => void;
   onRename: (id: string, title: string) => void;
 }) {
-  const [draft, setDraft] = useState("");
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
-  }, [conversation?.messages.length, sending]);
+  }, [conversation?.messages.length, streaming, sending]);
 
   if (!conversation) {
     return (
@@ -169,13 +203,6 @@ export function ConversationView({
       </div>
     );
   }
-
-  const submit = () => {
-    const text = draft.trim();
-    if (!text || sending) return;
-    setDraft("");
-    onSend(text);
-  };
 
   return (
     <div className="flex h-full min-w-0 flex-1 flex-col">
@@ -228,46 +255,33 @@ export function ConversationView({
                 isLast={i === conversation.messages.length - 1}
                 onRetry={onRetry}
                 onSave={onSave}
+                onTask={onTask}
                 busy={sending}
               />
             ))}
           </div>
         )}
+        {/* The live turn. Rendered as a normal assistant message with a caret,
+            so streamed text and settled text look the same — the only difference
+            is that this one is still arriving. */}
         {sending && (
-          <div className="px-6 py-3 text-[12px] text-ink-faint">
-            <span className="animate-pulse-soft">Monday is thinking…</span>
+          <div className="px-6 py-3">
+            <div className="mb-1 text-[11px] font-medium text-brand-400">Monday</div>
+            {streaming ? (
+              <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-ink">
+                {streaming}
+                <span className="ml-0.5 inline-block h-[13px] w-[6px] translate-y-[2px] animate-pulse-soft bg-brand-400/70" />
+              </div>
+            ) : (
+              <span className="animate-pulse-soft text-[12px] text-ink-faint">
+                Reading project context…
+              </span>
+            )}
           </div>
         )}
         <div ref={endRef} />
       </div>
 
-      <div className="shrink-0 border-t border-line px-6 py-3">
-        <div className="flex items-end gap-2">
-          <textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                submit();
-              }
-            }}
-            rows={1}
-            placeholder="Ask MondayOS about this project…"
-            className="focus-ring max-h-40 min-h-[38px] flex-1 resize-y rounded-lg border border-line bg-canvas px-3 py-2 text-[13px] text-ink placeholder:text-ink-faint"
-          />
-          <button
-            onClick={submit}
-            disabled={sending || !draft.trim()}
-            className="focus-ring h-[38px] shrink-0 rounded-lg border border-brand-400/40 bg-brand-500/10 px-4 text-[12px] font-medium text-brand-200 transition hover:bg-brand-500/20 disabled:opacity-40"
-          >
-            Send
-          </button>
-        </div>
-        <div className="mt-1.5 text-[10px] text-ink-faint/70">
-          Enter to send · Shift+Enter for a new line
-        </div>
-      </div>
     </div>
   );
 }

@@ -7,9 +7,9 @@ Swap the provider by changing ProviderConfig — zero application code changes.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
-
 
 # ---------------------------------------------------------------------------
 # Response type
@@ -30,6 +30,28 @@ class ProviderResponse:
     tokens_used: int = 0                  # Input + output tokens (0 if unknown)
     cached: bool = False                  # True if response came from a cache
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ProviderChunk:
+    """
+    One piece of a streamed response.
+
+    Deliberately not a vendor's SSE frame. Every provider streams in its own
+    shape — Anthropic emits `content_block_delta`, OpenAI emits `choices[].delta`
+    — and translating those into this type inside each provider file is what
+    keeps the streaming format from leaking into callers. Nothing above this
+    package should ever see a provider's wire format.
+
+    The final chunk carries `done=True` and the response metadata; text chunks
+    before it carry only `text`.
+    """
+
+    text: str = ""
+    done: bool = False
+    model: str = ""
+    provider: str = ""
+    tokens_used: int = 0
 
 
 @dataclass
@@ -143,7 +165,46 @@ class AIProvider(ABC):
         """Relative capability: higher is more capable."""
         return 2
 
-    def availability(self) -> "ProviderAvailability":
+    @property
+    def supports_streaming(self) -> bool:
+        """
+        True when this provider emits incremental chunks.
+
+        False by default, and the default is honest rather than pessimistic: a
+        provider that has not implemented `stream` still works through the
+        fallback below, but it delivers the whole answer at once. Callers show
+        that difference rather than animating a single chunk to look like
+        streaming, because a fake progressive reveal misrepresents latency the
+        user is actually waiting through.
+        """
+        return False
+
+    def stream(
+        self,
+        prompt: str,
+        context: str = "",
+        max_tokens: int = 1024,
+        **kwargs: Any,
+    ) -> Iterator[ProviderChunk]:
+        """
+        Stream a response as incremental chunks.
+
+        The default implementation calls `ask` and yields the whole answer as one
+        chunk, so every existing provider satisfies this interface without
+        change and no caller needs to branch on capability. A provider that can
+        genuinely stream overrides this and sets `supports_streaming`.
+        """
+        response = self.ask(prompt, context=context, max_tokens=max_tokens, **kwargs)
+        if response.content:
+            yield ProviderChunk(text=response.content)
+        yield ProviderChunk(
+            done=True,
+            model=response.model,
+            provider=response.provider or self.name,
+            tokens_used=response.tokens_used,
+        )
+
+    def availability(self) -> ProviderAvailability:
         """
         Report whether this provider can run right now.
 

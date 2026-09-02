@@ -59,10 +59,17 @@ function SourceBlock({ source }: { source: ContextSource }) {
 
       {open && !empty && (
         <div className="px-3 pb-2">
-          <ul className="space-y-0.5">
+          <ul className="space-y-1">
             {source.items.map((item, i) => (
-              <li key={i} className="truncate font-mono text-[10px] text-ink-muted" title={item}>
-                {item}
+              <li key={i}>
+                <div className="truncate font-mono text-[10px] text-ink-muted" title={item}>
+                  {item}
+                </div>
+                {/* Why this item survived ranking. The answer to "why did Monday
+                    know this?" is per-item, not per-source. */}
+                {source.reasons[i] && (
+                  <div className="text-[9px] text-brand-400/60">{source.reasons[i]}</div>
+                )}
               </li>
             ))}
           </ul>
@@ -122,6 +129,39 @@ export function ContextPanel({
                 Omitted for budget: {context.omitted.join(", ")}
               </div>
             )}
+
+            {/* WHY MONDAY KNOWS THIS — the aggregate view of the same
+                attribution, so a reader sees the shape of the selection before
+                expanding any one source. */}
+            <div className="border-b border-line/60 px-3 py-2.5">
+              <div className="text-[10px] uppercase tracking-wider text-ink-faint">
+                Why Monday knows this
+              </div>
+              {context.query ? (
+                <div className="mt-1 truncate text-[10px] text-ink-muted" title={context.query}>
+                  ranked for: “{context.query}”
+                </div>
+              ) : (
+                <div className="mt-1 text-[10px] text-ink-faint">
+                  no request yet — nothing reordered
+                </div>
+              )}
+              <ul className="mt-1.5 space-y-0.5">
+                {Object.entries(
+                  context.sources.reduce<Record<string, number>>((acc, s) => {
+                    for (const [reason, count] of Object.entries(s.reason_counts)) {
+                      acc[reason] = (acc[reason] ?? 0) + count;
+                    }
+                    return acc;
+                  }, {}),
+                ).map(([reason, count]) => (
+                  <li key={reason} className="flex justify-between text-[10px]">
+                    <span className="text-brand-400/70">{reason}</span>
+                    <span className="text-ink-faint">{count}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
 
             <div className="px-3 py-2.5 text-[10px] leading-relaxed text-ink-faint">
               <div className="flex justify-between">

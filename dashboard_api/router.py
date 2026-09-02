@@ -111,6 +111,14 @@ def _dispatch(
             return service.workspace_conversation(query.get("project", ""), p["id"])
         if (p := _match(parts, ["workspace", "context", "{project}"])) is not None:
             return service.workspace_context(p["project"])
+        if parts == ["workspace", "search"]:
+            return service.workspace_search(
+                query.get("q", query.get("query", "")),
+                query.get("project", ""),
+                query.get("scope", "project"),
+            )
+        if parts == ["workspace", "briefing"]:
+            return service.workspace_briefing(query.get("project", ""))
         return 404, errors.error(errors.NOT_FOUND, "Unknown endpoint.")
 
     # ---- writes ----
@@ -139,6 +147,8 @@ def _dispatch(
             return service.workspace_update_conversation(p["id"], body)
         if (p := _match(parts, ["workspace", "conversations", "{id}", "knowledge"])) is not None:
             return service.workspace_save_knowledge(p["id"], body)
+        if (p := _match(parts, ["workspace", "conversations", "{id}", "task"])) is not None:
+            return service.workspace_create_task(p["id"], body)
         return 404, errors.error(errors.NOT_FOUND, "Unknown endpoint.")
 
     return 405, errors.error(errors.BAD_REQUEST, f"Method {method} not allowed.")

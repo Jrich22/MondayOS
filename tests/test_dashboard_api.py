@@ -9,6 +9,7 @@ Two layers:
 Everything uses provider="fake" so the team pipeline runs deterministically
 offline — no API keys, no network.
 """
+
 from __future__ import annotations
 
 import os
@@ -28,7 +29,9 @@ from dashboard_api.service import DashboardService
 
 def make_service(root: Path) -> DashboardService:
     monday = Monday(MondayConfig(project_root=root))
-    return DashboardService(monday, provider="fake", write_log=root / "logs" / "dashboard_api.jsonl")
+    return DashboardService(
+        monday, provider="fake", write_log=root / "logs" / "dashboard_api.jsonl"
+    )
 
 
 class DashboardApiBase(unittest.TestCase):
@@ -47,7 +50,9 @@ class DashboardApiBase(unittest.TestCase):
         return route(self.service, "POST", path, body=body or {}, origin=origin)
 
     def _new_task(self):
-        status, _, body = self.POST("/tasks", {"title": "Vendor Workspace", "objective": "Add a vendor workspace."})
+        status, _, body = self.POST(
+            "/tasks", {"title": "Vendor Workspace", "objective": "Add a vendor workspace."}
+        )
         self.assertEqual(status, 201)
         return body["id"]
 
@@ -245,7 +250,9 @@ class TestSecretRedaction(unittest.TestCase):
             del os.environ["ANTHROPIC_API_KEY"]
 
     def test_token_patterns_redacted(self):
-        out = security.redact({"a": "ghp_abcdefghijklmnopqrstuvwxyz012345", "b": ["sk-abcdefghijklmnop1234"]})
+        out = security.redact(
+            {"a": "ghp_abcdefghijklmnopqrstuvwxyz012345", "b": ["sk-abcdefghijklmnop1234"]}
+        )
         self.assertIn("REDACTED", out["a"])
         self.assertIn("REDACTED", out["b"][0])
 
@@ -279,7 +286,12 @@ class TestLiveServer(unittest.TestCase):
         self.assertTrue(r.json()["ok"])
 
     def test_malformed_json(self):
-        r = httpx.post(f"{self.base}/tasks", content=b"{not json", headers={"Content-Type": "application/json"}, timeout=5)
+        r = httpx.post(
+            f"{self.base}/tasks",
+            content=b"{not json",
+            headers={"Content-Type": "application/json"},
+            timeout=5,
+        )
         self.assertEqual(r.status_code, 400)
         self.assertEqual(r.json()["error"]["code"], "bad-request")
 
@@ -429,3 +441,139 @@ class WorkspaceRouteTests(DashboardApiBase):
     def test_unknown_workspace_endpoint_is_a_404(self):
         status, _, _body = self.GET("/workspace/nonsense")
         self.assertEqual(status, 404)
+
+
+class WorkspaceIncrement2RouteTests(DashboardApiBase):
+    """Streaming, search, briefing and task creation over the API."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "config").mkdir(parents=True, exist_ok=True)
+        for name in ("alpha", "beta"):
+            (self.root / name / "docs").mkdir(parents=True, exist_ok=True)
+            (self.root / name / "README.md").write_text(f"# {name}\n\nThe {name} project.\n")
+        monday = self.service._m
+        monday.project("register", name="alpha", path=str(self.root / "alpha"))
+        monday.project("register", name="beta", path=str(self.root / "beta"))
+
+        # A provider that genuinely streams, so the lifecycle is exercised rather
+        # than the single-chunk fallback.
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from test_workspace import StreamingProvider
+
+        monday._Monday__provider = StreamingProvider("alpha beta gamma delta")
+
+    def _create(self, project: str = "alpha") -> str:
+        status, _, body = self.POST("/workspace/conversations", {"project": project})
+        self.assertEqual(status, 201)
+        return str(body["id"])
+
+    def _drain(self, conversation_id: str, project: str = "alpha", content: str = "hi"):
+        return list(
+            self.service.workspace_stream(conversation_id, {"project": project, "content": content})
+        )
+
+    def test_the_stream_emits_user_context_deltas_and_done(self):
+        events = self._drain(self._create())
+        kinds = [e["type"] for e in events]
+        self.assertEqual(kinds[0], "user")
+        self.assertEqual(kinds[1], "context")
+        self.assertIn("delta", kinds)
+        self.assertEqual(kinds[-1], "done")
+
+    def test_a_stream_without_a_project_is_a_structured_error(self):
+        events = list(self.service.workspace_stream("CONV-0001", {"content": "hi"}))
+        self.assertEqual(events[0]["type"], "error")
+        self.assertEqual(events[0]["code"], "bad-request")
+
+    def test_a_stream_without_content_is_a_structured_error(self):
+        events = list(self.service.workspace_stream("CONV-0001", {"project": "alpha"}))
+        self.assertEqual(events[0]["type"], "error")
+
+    def test_closing_the_stream_persists_a_partial(self):
+        conversation_id = self._create()
+        stream = self.service.workspace_stream(
+            conversation_id, {"project": "alpha", "content": "stop me"}
+        )
+        seen = 0
+        for event in stream:
+            if event["type"] == "delta":
+                seen += 1
+                if seen == 2:
+                    stream.close()
+                    break
+
+        _status, _, body = self.GET(
+            f"/workspace/conversations/{conversation_id}", {"project": "alpha"}
+        )
+        assistant = body["messages"][-1]
+        self.assertTrue(assistant["incomplete"])
+        self.assertEqual(body["messages"][0]["content"], "stop me")
+
+    def test_search_route_is_project_scoped_by_default(self):
+        alpha = self._create("alpha")
+        self._drain(alpha, content="ALPHA_MARKER question")
+        beta = self._create("beta")
+        self._drain(beta, "beta", "BETA_MARKER question")
+
+        status, _, body = self.GET("/workspace/search", {"q": "BETA_MARKER", "project": "alpha"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["hits"], [])
+
+    def test_search_route_supports_explicit_cross_project_scope(self):
+        beta = self._create("beta")
+        self._drain(beta, "beta", "BETA_MARKER question")
+        status, _, body = self.GET("/workspace/search", {"q": "BETA_MARKER", "scope": "all"})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["hits"]), 1)
+        self.assertEqual(body["hits"][0]["project"], "beta")
+
+    def test_search_without_a_query_is_a_400(self):
+        status, _, _body = self.GET("/workspace/search", {"project": "alpha"})
+        self.assertEqual(status, 400)
+
+    def test_briefing_route_reports_stored_state(self):
+        conversation_id = self._create()
+        self._drain(conversation_id, content="the last thing")
+        status, _, body = self.GET("/workspace/briefing")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["project"], "alpha")
+        self.assertEqual(body["conversation_id"], conversation_id)
+        self.assertTrue(body["can_continue"])
+
+    def test_briefing_with_nothing_recorded_says_so(self):
+        status, _, body = self.GET("/workspace/briefing")
+        self.assertEqual(status, 200)
+        self.assertFalse(body["can_continue"])
+        self.assertIn("No conversations recorded yet.", body["notes"])
+
+    def test_create_task_route_records_provenance(self):
+        conversation_id = self._create()
+        events = self._drain(conversation_id)
+        message_id = events[-1]["message"]["id"]
+
+        status, _, body = self.POST(
+            f"/workspace/conversations/{conversation_id}/task",
+            {"project": "alpha", "message_id": message_id},
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["project"], "alpha")
+        self.assertEqual(body["conversation_id"], conversation_id)
+        self.assertEqual(body["message_id"], message_id)
+        self.assertEqual(body["task"]["project"], "alpha")
+
+    def test_create_task_requires_project_and_message(self):
+        conversation_id = self._create()
+        status, _, _body = self.POST(
+            f"/workspace/conversations/{conversation_id}/task", {"project": "alpha"}
+        )
+        self.assertEqual(status, 400)
+
+    def test_context_route_reports_ranking_reasons(self):
+        status, _, body = self.GET("/workspace/context/alpha")
+        self.assertEqual(status, 200)
+        for source in body["sources"]:
+            self.assertIn("reasons", source)
+            self.assertIn("reason_counts", source)

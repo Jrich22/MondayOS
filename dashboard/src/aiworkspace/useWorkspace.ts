@@ -14,11 +14,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createWorkspaceClient, type WorkspaceClient } from "./client";
 import type {
+  ActivityEvent,
+  Briefing,
   Conversation,
   ConversationSummary,
   ContextSnapshot,
+  SearchResult,
   WorkspaceProject,
 } from "./types";
+
+/** What Monday is doing, mapped onto the Brain's existing visual states. */
+export type MondayState =
+  | "idle"
+  | "thinking"
+  | "learning"
+  | "executing"
+  | "completed"
+  | "blocked";
 
 export interface WorkspaceState {
   projects: WorkspaceProject[];
@@ -26,9 +38,17 @@ export interface WorkspaceState {
   conversations: ConversationSummary[];
   conversation: Conversation | null;
   context: ContextSnapshot | null;
+  briefing: Briefing | null;
+  activity: ActivityEvent[];
+  searchResult: SearchResult | null;
   loadingProjects: boolean;
   loadingConversation: boolean;
   sending: boolean;
+  /** Text arriving from the current stream. Rendered as a live assistant turn. */
+  streaming: string;
+  /** Set while switching projects, so the transition is visible rather than a flicker. */
+  switchingTo: string;
+  mondayState: MondayState;
   error: string;
   notice: string;
 }
@@ -38,11 +58,17 @@ export interface WorkspaceActions {
   selectConversation(id: string): void;
   newConversation(): Promise<void>;
   send(content: string): Promise<void>;
+  stop(): void;
   retry(): Promise<void>;
   rename(id: string, title: string): Promise<void>;
   archive(id: string): Promise<void>;
   saveToKnowledge(messageId: string): Promise<void>;
+  createTask(messageId: string): Promise<void>;
+  search(query: string, scope: "project" | "all"): Promise<void>;
+  clearSearch(): void;
   refreshContext(): Promise<void>;
+  refreshBriefing(): Promise<void>;
+  continueWorking(): void;
   dismissNotice(): void;
 }
 
@@ -60,6 +86,12 @@ export function useWorkspace(
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [context, setContext] = useState<ContextSnapshot | null>(null);
+  const [briefing, setBriefing] = useState<Briefing | null>(null);
+  const [activity, setActivity] = useState<ActivityEvent[]>([]);
+  const [searchResult, setSearchResult] = useState<SearchResult | null>(null);
+  const [streaming, setStreaming] = useState("");
+  const [switchingTo, setSwitchingTo] = useState("");
+  const [mondayState, setMondayState] = useState<MondayState>("idle");
   const [loadingProjects, setLoadingProjects] = useState(false);
   const [loadingConversation, setLoadingConversation] = useState(false);
   const [sending, setSending] = useState(false);
@@ -71,6 +103,13 @@ export function useWorkspace(
   // conversations under B's name.
   const activeProject = useRef("");
   activeProject.current = project;
+
+  // Held so Stop can abort the in-flight request. Cleared when a turn settles.
+  const stopRef = useRef<(() => void) | null>(null);
+
+  // Continue Working may need to switch project first; the conversation opens
+  // once that project's list has loaded, so it is never opened under the wrong one.
+  const [pendingConversation, setPendingConversation] = useState("");
 
   // ------------------------------------------------------------------ loads
 
@@ -118,6 +157,8 @@ export function useWorkspace(
         return;
       }
       setContext(res.data);
+      setSwitchingTo("");
+      setMondayState("idle");
     },
     [client],
   );
@@ -128,6 +169,7 @@ export function useWorkspace(
     void loadConversations(project);
     void loadContext(project);
   }, [project, loadConversations, loadContext]);
+
 
   // ---------------------------------------------------------------- actions
 
@@ -140,8 +182,11 @@ export function useWorkspace(
       setConversation(null);
       setConversations([]);
       setContext(null);
+      setSearchResult(null);
       setError("");
       setNotice("");
+      setSwitchingTo(next);
+      setMondayState("learning");
       setProject(next);
     },
     [project],
@@ -180,19 +225,57 @@ export function useWorkspace(
     async (content: string) => {
       if (!client || !project || !conversation || !content.trim()) return;
       setSending(true);
+      setStreaming("");
       setError("");
-      const res = await client.sendMessage(project, conversation.id, content);
-      setSending(false);
-      if (!res.ok) {
-        setError(res.error.message);
-        return;
+      setMondayState("learning"); // reading project context first
+
+      const { events, stop } = client.streamMessage(project, conversation.id, content);
+      stopRef.current = stop;
+
+      let accumulated = "";
+      try {
+        for await (const event of events) {
+          if (event.type === "context") {
+            setContext(event.context);
+            setMondayState("thinking");
+          } else if (event.type === "user") {
+            // Show the user's turn immediately; the server has already stored it.
+            setConversation((c) =>
+              c ? { ...c, messages: [...c.messages, event.message] } : c,
+            );
+          } else if (event.type === "delta") {
+            accumulated += event.text;
+            setStreaming(accumulated);
+          } else if (event.type === "done") {
+            setConversation(event.conversation);
+            setStreaming("");
+            setMondayState(event.message.error ? "blocked" : "completed");
+          } else if (event.type === "error") {
+            setError(event.message);
+            setMondayState("blocked");
+          }
+        }
+      } finally {
+        stopRef.current = null;
+        setSending(false);
+        setStreaming("");
+        // Re-read: on a stop the server persisted a partial that never arrived
+        // as a `done` frame, so the client's view would otherwise be missing it.
+        const fresh = await client.getConversation(project, conversation.id);
+        if (fresh.ok && activeProject.current === project) setConversation(fresh.data);
+        await loadConversations(project);
+        void client.activity().then((r) => {
+          if (r.ok) setActivity(r.data.events);
+        });
+        setTimeout(() => setMondayState("idle"), 1200);
       }
-      setConversation(res.data.conversation);
-      if (res.data.context) setContext(res.data.context);
-      await loadConversations(project);
     },
     [client, project, conversation, loadConversations],
   );
+
+  const stop = useCallback(() => {
+    stopRef.current?.();
+  }, []);
 
   const retry = useCallback(async () => {
     if (!client || !project || !conversation) return;
@@ -252,9 +335,70 @@ export function useWorkspace(
     [client, project, conversation, selectConversation],
   );
 
+  const createTask = useCallback(
+    async (messageId: string) => {
+      if (!client || !project || !conversation) return;
+      setMondayState("executing");
+      const res = await client.createTask(project, conversation.id, messageId);
+      setMondayState("idle");
+      if (!res.ok) {
+        setError(res.error.message);
+        return;
+      }
+      setNotice(`Created task ${res.data.task.id}: ${res.data.task.title}`);
+      selectConversation(conversation.id);
+    },
+    [client, project, conversation, selectConversation],
+  );
+
+  const search = useCallback(
+    async (query: string, scope: "project" | "all") => {
+      if (!client || !query.trim()) return;
+      const res = await client.search(query, project, scope);
+      if (!res.ok) {
+        setError(res.error.message);
+        return;
+      }
+      setSearchResult(res.data);
+    },
+    [client, project],
+  );
+
+  const clearSearch = useCallback(() => setSearchResult(null), []);
+
+  const refreshBriefing = useCallback(async () => {
+    if (!client) return;
+    const res = await client.briefing("");
+    if (res.ok) setBriefing(res.data);
+  }, [client]);
+
+  const continueWorking = useCallback(() => {
+    // Only ever reopens what the briefing actually found. With nothing recorded
+    // there is nothing to continue, and the button is not offered.
+    if (!briefing?.can_continue) return;
+    if (briefing.project !== project) selectProject(briefing.project);
+    setPendingConversation(briefing.conversation_id);
+  }, [briefing, project, selectProject]);
+
   const refreshContext = useCallback(async () => {
     await loadContext(project);
   }, [loadContext, project]);
+
+  // Declared after the callbacks they use: these effects close over
+  // `refreshBriefing` and `selectConversation`, which are defined below the
+  // loaders. Placing them here keeps declaration order honest rather than
+  // reaching forward.
+  useEffect(() => {
+    void refreshBriefing();
+  }, [refreshBriefing]);
+
+  useEffect(() => {
+    if (!pendingConversation || !conversations.length) return;
+    if (conversations.some((c) => c.id === pendingConversation)) {
+      selectConversation(pendingConversation);
+      setPendingConversation("");
+    }
+  }, [pendingConversation, conversations, selectConversation]);
 
   const dismissNotice = useCallback(() => setNotice(""), []);
 
@@ -265,9 +409,15 @@ export function useWorkspace(
       conversations,
       conversation,
       context,
+      briefing,
+      activity,
+      searchResult,
       loadingProjects,
       loadingConversation,
       sending,
+      streaming,
+      switchingTo,
+      mondayState,
       error,
       notice,
     },
@@ -276,11 +426,17 @@ export function useWorkspace(
       selectConversation,
       newConversation,
       send,
+      stop,
       retry,
       rename,
       archive,
       saveToKnowledge,
+      createTask,
+      search,
+      clearSearch,
       refreshContext,
+      refreshBriefing,
+      continueWorking,
       dismissNotice,
     },
   ];

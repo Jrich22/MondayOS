@@ -109,6 +109,11 @@ def apply(
                 name=source.name,
                 label=source.label,
                 items=fitted,
+                # Reasons are parallel to items and must be cut to the same
+                # length. Dropping them here would silently discard the ranking
+                # attribution ADR-016 exists to preserve — the budget would make
+                # a ranked snapshot indistinguishable from an unranked one.
+                reasons=source.reasons[: len(fitted)],
                 truncated=source.truncated or truncated,
                 error=source.error,
                 origin=source.origin,

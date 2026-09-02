@@ -21,6 +21,7 @@ works unchanged when that changes.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -67,6 +68,10 @@ class WorkspaceRequest:
     history: list[Message] = field(default_factory=list)
     conversation_id: str = ""
     max_tokens: int = DEFAULT_MAX_TOKENS
+    # A deterministic condensation of turns older than the verbatim window. Empty
+    # for a short conversation. Carried separately from ``history`` so a router
+    # can see that a thread was compacted rather than inferring it from length.
+    history_digest: str = ""
 
     def render_context(self, history_turns: int = DEFAULT_HISTORY_TURNS) -> str:
         """
@@ -78,6 +83,8 @@ class WorkspaceRequest:
         blocks: list[str] = []
         if self.snapshot is not None:
             blocks.append(self.snapshot.render())
+        if self.history_digest:
+            blocks.append(self.history_digest)
 
         turns = [m for m in self.history if m.role in (MessageRole.USER, MessageRole.ASSISTANT)]
         recent = turns[-history_turns:] if history_turns > 0 else []
@@ -107,11 +114,31 @@ class WorkspaceReply:
     model: str = ""
     tokens_used: int = 0
     error: str = ""
+    # True when generation stopped before the model finished — a user pressing
+    # stop, or a stream that died mid-answer. The distinction matters: partial
+    # text presented as a complete answer is a quiet correctness failure, so the
+    # flag travels with the reply and is persisted on the message.
+    incomplete: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
         return not self.error and bool(self.content.strip())
+
+
+@dataclass
+class ReplyChunk:
+    """
+    One increment of a streaming reply, in the workspace's own vocabulary.
+
+    A provider's chunk shape never reaches this far: ``ProviderWorkspaceResponder``
+    translates. That is what lets a future router stream from providers with
+    completely different wire formats without anything above noticing.
+    """
+
+    text: str = ""
+    done: bool = False
+    reply: WorkspaceReply | None = None
 
 
 class WorkspaceResponder(Protocol):
@@ -127,9 +154,24 @@ class WorkspaceResponder(Protocol):
         """Answer one turn."""
         ...
 
+    def respond_stream(self, request: WorkspaceRequest) -> Iterator[ReplyChunk]:
+        """
+        Answer one turn incrementally.
+
+        Yields text chunks, then a final chunk carrying the assembled reply.
+        Closing the iterator early is how a caller stops generation: the
+        implementation must treat that as a stop, not an error.
+        """
+        ...
+
     @property
     def name(self) -> str:
         """Identifier for provenance. Never branched on."""
+        ...
+
+    @property
+    def streams(self) -> bool:
+        """True when this responder emits genuinely incremental chunks."""
         ...
 
 
@@ -155,6 +197,87 @@ class ProviderWorkspaceResponder:
     @property
     def name(self) -> str:
         return self._provider.name
+
+    @property
+    def streams(self) -> bool:
+        """Whether the configured provider genuinely emits incremental chunks."""
+        return self._provider.supports_streaming
+
+    def respond_stream(self, request: WorkspaceRequest) -> Iterator[ReplyChunk]:
+        """
+        Stream one turn through the provider.
+
+        Three failures are handled here rather than left to the caller:
+
+        **Stop.** A caller that closes this iterator gets ``GeneratorExit``.
+        That is a stop, not an error: whatever text arrived is assembled into a
+        reply marked ``incomplete`` and handed back through the final chunk, so
+        the partial answer is preserved rather than discarded.
+
+        **Mid-stream failure.** A provider that dies after emitting text has
+        still produced something. The reply keeps that text, records the error,
+        and is marked incomplete — the alternative is throwing away work the
+        user watched arrive.
+
+        **Empty stream.** A stream that yields nothing is a failed turn, not an
+        empty answer, for the same reason a blank `ask` response is.
+        """
+        availability = self._provider.availability()
+        if not availability.available:
+            yield ReplyChunk(
+                done=True,
+                reply=WorkspaceReply(
+                    content="", provider=self._provider.name, error=availability.instructions()
+                ),
+            )
+            return
+
+        context = request.render_context(self._history_turns)
+        prompt = f"{SYSTEM_INSTRUCTION}\n\n{request.message}"
+
+        parts: list[str] = []
+        model = ""
+        provider_name = self._provider.name
+        tokens = 0
+        error = ""
+
+        try:
+            for chunk in self._provider.stream(
+                prompt, context=context, max_tokens=request.max_tokens or self._max_tokens
+            ):
+                if chunk.done:
+                    model = chunk.model or model
+                    provider_name = chunk.provider or provider_name
+                    tokens = chunk.tokens_used or tokens
+                    continue
+                if chunk.text:
+                    parts.append(chunk.text)
+                    yield ReplyChunk(text=chunk.text)
+        except GeneratorExit:
+            # The caller stopped us. Preserve what arrived and re-raise so the
+            # generator closes cleanly; the caller already holds the text it saw.
+            raise
+        except ProviderError as exc:
+            error = str(exc)
+        except Exception as exc:  # noqa: BLE001 — a provider bug must surface, not vanish
+            error = f"{type(exc).__name__}: {exc}"
+
+        content = "".join(parts).strip()
+        if not content and not error:
+            error = "The provider returned an empty response."
+
+        yield ReplyChunk(
+            done=True,
+            reply=WorkspaceReply(
+                content=content,
+                provider=provider_name,
+                model=model,
+                tokens_used=tokens,
+                error=error,
+                # Text arrived and then something went wrong: partial, not failed.
+                incomplete=bool(error and content),
+            ),
+        )
 
     def respond(self, request: WorkspaceRequest) -> WorkspaceReply:
         """
