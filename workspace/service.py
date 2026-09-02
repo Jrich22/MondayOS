@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from workspace import search
 from workspace.context.engine import ContextEngine
 from workspace.context.snapshot import ContextSnapshot
 from workspace.errors import (
@@ -141,18 +142,22 @@ class WorkspaceService:
 
     # -------------------------------------------------------------- context
 
-    def build_context(self, project: str) -> dict[str, Any]:
+    def build_context(self, project: str, query: str = "") -> dict[str, Any]:
         """Assemble a fresh context snapshot for one project."""
-        return self._snapshot(project).to_dict()
+        return self._snapshot(project, query, allow_reuse=False).to_dict()
 
-    def _snapshot(self, project: str) -> ContextSnapshot:
+    def invalidate_context(self, project: str = "") -> None:
+        """Drop cached context. Called whenever something a snapshot reads changes."""
+        if self._engine is not None:
+            self._engine.invalidate(project)
+
+    def _snapshot(self, project: str, query: str = "", allow_reuse: bool = True) -> ContextSnapshot:
         if self._engine is None:
-            return ContextSnapshot(
-                id="CTX-none",
-                project=slugify(project),
-                created_at=self._now(),
-            )
-        return self._engine.build(project)
+            return ContextSnapshot(id="CTX-none", project=slugify(project), created_at=self._now())
+        if allow_reuse:
+            snapshot, _reused = self._engine.build_or_reuse(project, query)
+            return snapshot
+        return self._engine.build(project, query)
 
     # ------------------------------------------------------------- messaging
 
@@ -179,7 +184,7 @@ class WorkspaceService:
         if conversation.is_archived:
             raise ConversationArchivedError(conversation_id)
 
-        snapshot = self._snapshot(project) if rebuild_context else None
+        snapshot = self._snapshot(project, query=text) if rebuild_context else None
         if snapshot is not None:
             conversation.active_snapshot_id = snapshot.id
 
@@ -306,6 +311,40 @@ class WorkspaceService:
                 conversation_id=conversation.id,
             )
         )
+
+    # ---------------------------------------------------------------- search
+
+    # ---------------------------------------------------------------- search
+
+    def search_conversations(
+        self, query: str, project: str = "", scope: str = "project", limit: int = 25
+    ) -> dict[str, Any]:
+        """
+        Search conversations by title and visible content.
+
+        Scoped to one project by default. ``scope="all"`` searches every project
+        that has conversations, and every hit names its project — a cross-project
+        search that did not would be the same disclosure as a context leak,
+        arriving through a different door.
+        """
+        if scope not in ("project", "all"):
+            raise ValueError(f"scope must be 'project' or 'all'; got {scope!r}.")
+        if scope == "project" and not project:
+            raise ValueError("A project is required unless scope='all'.")
+
+        slugs = self._store.projects_with_conversations() if scope == "all" else [slugify(project)]
+        conversations: list[Conversation] = []
+        for slug in slugs:
+            conversations.extend(self._store.list(slug, include_archived=True))
+
+        hits = search.search(conversations, query, limit=limit)
+        return {
+            "query": query,
+            "scope": scope,
+            "project": "" if scope == "all" else slugify(project),
+            "projects_searched": slugs,
+            "hits": [h.to_dict() for h in hits],
+        }
 
     # ------------------------------------------------------------- knowledge
 

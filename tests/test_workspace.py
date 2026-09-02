@@ -933,3 +933,225 @@ class TestKnowledgeCapture(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------- #
+# increment 2 — search, relevance, reuse, compaction
+# --------------------------------------------------------------------------- #
+
+
+class TestConversationSearch(unittest.TestCase):
+    def _service(self, tmp: str):
+        root = Path(tmp)
+        alpha = _project_tree(root, "alpha")
+        beta = _project_tree(root, "beta")
+        service = WorkspaceService(
+            root=root,
+            engine=_engine(root, {"alpha": alpha, "beta": beta}),
+            responder=ProviderWorkspaceResponder(FakeProvider("noted")),
+        )
+        a = service.create_conversation("alpha", "Shortlist design")
+        service.send_message("alpha", a["id"], "How does the shortlist promotion work?")
+        b = service.create_conversation("beta", "Beta planning")
+        service.send_message("beta", b["id"], "BETA_ONLY_TERM planning notes")
+        return service
+
+    def test_search_is_scoped_to_one_project_by_default(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            result = service.search_conversations("planning", project="alpha")
+            self.assertEqual(result["hits"], [])
+            self.assertEqual(result["projects_searched"], ["alpha"])
+
+    def test_search_finds_title_and_body_matches(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            result = service.search_conversations("shortlist", project="alpha")
+            self.assertEqual(len(result["hits"]), 1)
+            self.assertTrue(result["hits"][0]["matched_title"])
+            self.assertTrue(result["hits"][0]["snippets"])
+
+    def test_cross_project_search_is_opt_in_and_names_the_project(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            result = service.search_conversations("BETA_ONLY_TERM", scope="all")
+            self.assertEqual(len(result["hits"]), 1)
+            self.assertEqual(result["hits"][0]["project"], "beta")
+
+    def test_project_scope_without_a_project_is_refused(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            with self.assertRaises(ValueError):
+                service.search_conversations("anything")
+
+    def test_an_unknown_scope_is_refused(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            with self.assertRaises(ValueError):
+                service.search_conversations("x", project="alpha", scope="everything")
+
+    def test_every_term_must_match(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            self.assertEqual(
+                service.search_conversations("shortlist unicorn", project="alpha")["hits"], []
+            )
+
+
+class TestRelevance(unittest.TestCase):
+    def test_matching_items_outrank_non_matching_and_record_why(self):
+        from workspace.context import relevance
+
+        ranked = relevance.rank(["about widgets", "about sourcing", "about pipes"], "sourcing")
+        self.assertEqual(ranked[0].text, "about sourcing")
+        self.assertEqual(ranked[0].reason, relevance.REASON_KEYWORD)
+        self.assertEqual(ranked[1].reason, relevance.REASON_BASELINE)
+
+    def test_an_empty_query_preserves_arrival_order(self):
+        """No query is no evidence; inventing an order would be worse."""
+        from workspace.context import relevance
+
+        items = ["c", "a", "b"]
+        self.assertEqual([r.text for r in relevance.rank(items, "")], items)
+
+    def test_a_pinned_item_outranks_a_keyword_match(self):
+        from workspace.context import relevance
+
+        ranked = relevance.rank(
+            ["TASK-1 [in-progress] unrelated", "TASK-2 [backlog] sourcing"],
+            "sourcing",
+            priority={0: relevance.REASON_ACTIVE_TASK},
+        )
+        self.assertEqual(ranked[0].reason, relevance.REASON_ACTIVE_TASK)
+
+    def test_ranking_reasons_survive_the_budget(self):
+        """The budget must cut reasons in step with items, never drop them."""
+        source = ContextSource(
+            name="tasks",
+            label="Tasks",
+            items=["aaaa", "bbbb", "cccc"],
+            reasons=["keyword-match", "baseline", "baseline"],
+        )
+        result = ctx_budget.apply([source], total_cap=100, source_caps={"tasks": 9})
+        kept = result.sources[0]
+        self.assertEqual(len(kept.items), len(kept.reasons))
+        self.assertEqual(kept.reasons[0], "keyword-match")
+
+    def test_the_snapshot_records_what_it_was_ranked_for(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alpha = _project_tree(root, "alpha")
+            snapshot = _engine(root, {"alpha": alpha}).build("alpha", query="widgets")
+            self.assertEqual(snapshot.query, "widgets")
+
+
+class TestSnapshotReuse(unittest.TestCase):
+    def _engine_for(self, tmp: str, tasks=None):
+        root = Path(tmp)
+        alpha = _project_tree(root, "alpha")
+        return root, alpha, _engine(root, {"alpha": alpha}, read_tasks=tasks or (lambda s: []))
+
+    def test_an_identical_request_reuses_the_snapshot(self):
+        with TemporaryDirectory() as tmp:
+            _, _, engine = self._engine_for(tmp)
+            first, reused_a = engine.build_or_reuse("alpha", "same question")
+            second, reused_b = engine.build_or_reuse("alpha", "same question")
+            self.assertFalse(reused_a)
+            self.assertTrue(reused_b)
+            self.assertEqual(first.id, second.id)
+
+    def test_a_different_request_rebuilds(self):
+        """A snapshot ranked for another question may have dropped what this needs."""
+        with TemporaryDirectory() as tmp:
+            _, _, engine = self._engine_for(tmp)
+            engine.build_or_reuse("alpha", "first question")
+            _, reused = engine.build_or_reuse("alpha", "completely different")
+            self.assertFalse(reused)
+
+    def test_a_changed_task_invalidates(self):
+        state = {"status": "backlog"}
+
+        def tasks(_slug):
+            return [{"id": "TASK-1", "title": "t", "status": state["status"], "priority": "P2"}]
+
+        with TemporaryDirectory() as tmp:
+            _, _, engine = self._engine_for(tmp, tasks)
+            engine.build_or_reuse("alpha", "q")
+            _, reused = engine.build_or_reuse("alpha", "q")
+            self.assertTrue(reused)
+            state["status"] = "in-progress"
+            _, reused_after = engine.build_or_reuse("alpha", "q")
+            self.assertFalse(reused_after)
+
+    def test_changed_docs_invalidate(self):
+        with TemporaryDirectory() as tmp:
+            _, alpha, engine = self._engine_for(tmp)
+            engine.build_or_reuse("alpha", "q")
+            import os
+            import time
+
+            doc = alpha / "docs" / "ARCHITECTURE.md"
+            doc.write_text("# changed\n")
+            os.utime(doc, (time.time() + 60, time.time() + 60))
+            _, reused = engine.build_or_reuse("alpha", "q")
+            self.assertFalse(reused)
+
+    def test_explicit_invalidation_forces_a_rebuild(self):
+        with TemporaryDirectory() as tmp:
+            _, _, engine = self._engine_for(tmp)
+            engine.build_or_reuse("alpha", "q")
+            engine.invalidate("alpha")
+            _, reused = engine.build_or_reuse("alpha", "q")
+            self.assertFalse(reused)
+
+
+class TestCompaction(unittest.TestCase):
+    def _messages(self, count: int) -> list:
+        from workspace.models import Message
+
+        return [
+            Message(
+                id=f"MSG-{i:04d}",
+                role=MessageRole.USER if i % 2 == 0 else MessageRole.ASSISTANT,
+                content=f"turn number {i}",
+                created_at=T0,
+            )
+            for i in range(count)
+        ]
+
+    def test_a_short_conversation_is_sent_whole(self):
+        from workspace import compaction
+
+        plan = compaction.compact(self._messages(6))
+        self.assertFalse(plan.was_compacted)
+        self.assertEqual(len(plan.verbatim), 6)
+
+    def test_a_long_conversation_keeps_recent_turns_verbatim(self):
+        from workspace import compaction
+
+        plan = compaction.compact(self._messages(50), verbatim_turns=10, threshold=20)
+        self.assertTrue(plan.was_compacted)
+        self.assertEqual(len(plan.verbatim), 10)
+        self.assertIn("turn number 49", plan.verbatim[-1].content)
+        self.assertIn("turn number 0", plan.digest)
+
+    def test_compaction_never_mutates_the_stored_transcript(self):
+        from workspace import compaction
+
+        messages = self._messages(50)
+        before = [m.content for m in messages]
+        compaction.compact(messages, verbatim_turns=5, threshold=10)
+        self.assertEqual([m.content for m in messages], before)
+
+    def test_a_failing_summarizer_degrades_to_the_deterministic_digest(self):
+        from workspace import compaction
+
+        class Broken:
+            def summarize(self, messages):
+                raise RuntimeError("summariser down")
+
+        plan = compaction.compact(
+            self._messages(40), verbatim_turns=5, threshold=10, summarizer=Broken()
+        )
+        self.assertTrue(plan.digest)
+        self.assertIn("condensed", plan.digest)

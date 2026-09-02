@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from core import redaction
+from workspace.context import relevance
 from workspace.context.snapshot import ContextSource
 
 # Filenames and directories an adapter must never read from. Matched on the
@@ -92,13 +93,20 @@ def safe_source(
     label: str,
     origin: str,
     build: Callable[[], list[str]],
+    query: str = "",
+    baseline_reason: str = relevance.REASON_BASELINE,
+    pin: Callable[[str], str] | None = None,
 ) -> ContextSource:
     """
-    Run an adapter body, failing closed.
+    Run an adapter body, failing closed, and rank what it produced.
 
     Any exception becomes an empty source carrying the reason. The error text is
     redacted too: an exception message can quote a path or a value, and an
     unredacted traceback is exactly the kind of thing that leaks a token.
+
+    Ranking happens here rather than in each adapter so every source records why
+    its items were chosen, without five adapters each implementing attribution
+    slightly differently.
     """
     try:
         items = build()
@@ -109,11 +117,16 @@ def safe_source(
             origin=origin,
             error=redaction.redact_text(f"{type(exc).__name__}: {exc}"),
         )
+
+    pinned = {i: reason for i, text in enumerate(items) if (reason := (pin(text) if pin else ""))}
+    ranked = relevance.rank(items, query, baseline_reason=baseline_reason, priority=pinned)
+    texts, reasons = relevance.split(ranked[:_MAX_ITEMS])
     return ContextSource(
         name=name,
         label=label,
         origin=origin,
-        items=[redaction.redact_text(i) for i in items[:_MAX_ITEMS]],
+        items=[redaction.redact_text(i) for i in texts],
+        reasons=reasons,
         truncated=len(items) > _MAX_ITEMS,
     )
 
@@ -123,7 +136,7 @@ def safe_source(
 # --------------------------------------------------------------------------- #
 
 
-def identity_source(project: str, root: Path, description: str) -> ContextSource:
+def identity_source(project: str, root: Path, description: str, query: str = "") -> ContextSource:
     """Who this project is. The one source without which nothing else means anything."""
 
     def build() -> list[str]:
@@ -139,6 +152,7 @@ def identity_source(project: str, root: Path, description: str) -> ContextSource
                 items.append(f"README: {headline}")
         return items
 
+    # Identity is never reordered: every line of it is load-bearing.
     return safe_source("identity", "Project identity", "project registry", build)
 
 
@@ -147,7 +161,7 @@ def identity_source(project: str, root: Path, description: str) -> ContextSource
 # --------------------------------------------------------------------------- #
 
 
-def docs_source(project: str, root: Path) -> ContextSource:
+def docs_source(project: str, root: Path, query: str = "") -> ContextSource:
     """
     Architecture decisions and documentation the project already wrote.
 
@@ -178,7 +192,14 @@ def docs_source(project: str, root: Path) -> ContextSource:
             items.append(f"Documentation available: {', '.join(names)}")
         return items
 
-    return safe_source("docs", "Documentation & ADRs", f"{root / 'docs'}", build)
+    return safe_source(
+        "docs",
+        "Documentation & ADRs",
+        f"{root / 'docs'}",
+        build,
+        query=query,
+        baseline_reason=relevance.REASON_ARCHITECTURE,
+    )
 
 
 def _adr_titles(path: Path) -> list[str]:
@@ -206,7 +227,9 @@ def _adr_titles(path: Path) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-def tasks_source(project: str, fetch: Callable[[], list[dict[str, Any]]]) -> ContextSource:
+def tasks_source(
+    project: str, fetch: Callable[[], list[dict[str, Any]]], query: str = ""
+) -> ContextSource:
     """
     What is being worked on, from the real TaskManager.
 
@@ -234,7 +257,19 @@ def tasks_source(project: str, fetch: Callable[[], list[dict[str, Any]]]) -> Con
             items.append(f"{task_id} {bits} {title}".strip())
         return items
 
-    return safe_source("tasks", "Tasks", "TaskManager", build)
+    return safe_source("tasks", "Tasks", "TaskManager", build, query=query, pin=_pin_live_task)
+
+
+def _pin_live_task(text: str) -> str:
+    """
+    Mark a task that is actively being worked as always-relevant.
+
+    An in-progress or in-review task bears on almost any question about a
+    project, whether or not the question happens to use its words. Derived from
+    the rendered item rather than re-reading the task list, so the source is
+    fetched exactly once and the pin cannot disagree with what was rendered.
+    """
+    return relevance.REASON_ACTIVE_TASK if ("[in-progress]" in text or "[review]" in text) else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -242,7 +277,9 @@ def tasks_source(project: str, fetch: Callable[[], list[dict[str, Any]]]) -> Con
 # --------------------------------------------------------------------------- #
 
 
-def knowledge_source(project: str, fetch: Callable[[], list[dict[str, Any]]]) -> ContextSource:
+def knowledge_source(
+    project: str, fetch: Callable[[], list[dict[str, Any]]], query: str = ""
+) -> ContextSource:
     """
     What has been learned and written down, from the existing KnowledgeStore.
 
@@ -266,7 +303,14 @@ def knowledge_source(project: str, fetch: Callable[[], list[dict[str, Any]]]) ->
             items.append(f"{head} — {summary}" if summary else head)
         return items
 
-    return safe_source("knowledge", "Project knowledge", "KnowledgeStore", build)
+    return safe_source(
+        "knowledge",
+        "Project knowledge",
+        "KnowledgeStore",
+        build,
+        query=query,
+        baseline_reason=relevance.REASON_RECENT,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -274,7 +318,7 @@ def knowledge_source(project: str, fetch: Callable[[], list[dict[str, Any]]]) ->
 # --------------------------------------------------------------------------- #
 
 
-def git_source(project: str, root: Path, commit_limit: int = 10) -> ContextSource:
+def git_source(project: str, root: Path, commit_limit: int = 10, query: str = "") -> ContextSource:
     """
     Branch, working-tree state and recent commits for the project's own repo.
 
@@ -285,7 +329,7 @@ def git_source(project: str, root: Path, commit_limit: int = 10) -> ContextSourc
     """
 
     def build() -> list[str]:
-        toplevel = _git(root, "rev-parse", "--show-toplevel")
+        toplevel = git_command(root, "rev-parse", "--show-toplevel")
         if not toplevel:
             return []
 
@@ -302,11 +346,11 @@ def git_source(project: str, root: Path, commit_limit: int = 10) -> ContextSourc
         if nested:
             items.append(f"Lives inside the {repo.name} repository at {root.name}/")
 
-        branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+        branch = git_command(root, "rev-parse", "--abbrev-ref", "HEAD")
         if branch:
             items.append(f"Current branch: {branch}")
 
-        porcelain = _git(root, "status", "--porcelain", *scope)
+        porcelain = git_command(root, "status", "--porcelain", *scope)
         changed = [line for line in porcelain.splitlines() if line.strip()]
         if changed:
             where = "in this project" if nested else ""
@@ -316,7 +360,7 @@ def git_source(project: str, root: Path, commit_limit: int = 10) -> ContextSourc
         else:
             items.append("Working tree: clean")
 
-        log = _git(root, "log", f"-{commit_limit}", "--format=%h %s", *scope)
+        log = git_command(root, "log", f"-{commit_limit}", "--format=%h %s", *scope)
         commits = [line for line in log.splitlines() if line.strip()]
         if commits:
             label = "touching this project" if nested else ""
@@ -324,10 +368,17 @@ def git_source(project: str, root: Path, commit_limit: int = 10) -> ContextSourc
             items.extend(f"  {c}" for c in commits)
         return items
 
-    return safe_source("git", "Git state", f"git in {root}", build)
+    return safe_source(
+        "git",
+        "Git state",
+        f"git in {root}",
+        build,
+        query=query,
+        baseline_reason=relevance.REASON_RECENT,
+    )
 
 
-def _git(root: Path, *args: str) -> str:
+def git_command(root: Path, *args: str) -> str:
     """
     Run one git command in a project directory.
 

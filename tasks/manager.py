@@ -57,6 +57,7 @@ class TaskManager:
         approval_required: ApprovalLevel = ApprovalLevel.HUMAN_REVIEW,
         context: str = "",
         acceptance_criteria: list[str] | None = None,
+        project: str = "",
     ) -> Task:
         """
         Create and persist a new task with status BACKLOG.
@@ -91,6 +92,7 @@ class TaskManager:
             created_by=created_by,
             objective=objective,
             context=context,
+            project=project,
             approval_required=approval_required,
             acceptance_criteria=list(acceptance_criteria or []),
             status_history=[initial_transition],
@@ -196,11 +198,18 @@ class TaskManager:
         priority: TaskPriority | None = None,
         assigned_to: str | None = None,
         task_type: TaskType | None = None,
+        project: str | None = None,
     ) -> list[Task]:
         """
         Return active tasks from tasks/active/, optionally filtered.
 
         Does not include completed or cancelled tasks.
+
+        ``project`` filters on the explicit association only. A task with no
+        project is not returned for any project: "unknown" is not "matches
+        everything", and guessing here is what the slug-in-title heuristic did.
+        Callers that still need legacy behaviour apply their own fallback and can
+        say so, which is the point of keeping this exact.
         """
         if not self._active_dir.exists():
             return []
@@ -223,10 +232,12 @@ class TaskManager:
             tasks = [t for t in tasks if t.assigned_to == assigned_to]
         if task_type is not None:
             tasks = [t for t in tasks if t.task_type == task_type]
+        if project is not None:
+            tasks = [t for t in tasks if t.project == project]
 
         return tasks
 
-    def list_completed(self, limit: int = 0) -> list[Task]:
+    def list_completed(self, limit: int = 0, project: str | None = None) -> list[Task]:
         """
         Return terminal tasks from tasks/completed/, most recently updated first.
 
@@ -251,6 +262,9 @@ class TaskManager:
                 )
             except Exception as exc:
                 warnings.warn(f"Skipping {path.name}: {exc}", stacklevel=2)
+
+        if project is not None:
+            tasks = [t for t in tasks if t.project == project]
 
         tasks.sort(key=lambda t: (t.updated, t.id), reverse=True)
         return tasks[:limit] if limit > 0 else tasks

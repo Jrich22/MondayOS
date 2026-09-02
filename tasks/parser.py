@@ -109,6 +109,10 @@ class TaskParser:
             created_by=str(fm["created_by"]),
             objective=str(fm["objective"]),
             context=str(fm.get("context", "")),
+            # `.get` with a default, not `fm["project"]`: every task written
+            # before explicit association lacks the key, and a task that will not
+            # load is worse than one whose project is unknown.
+            project=str(fm.get("project", "") or ""),
             assigned_to=str(fm["assigned_to"]) if fm.get("assigned_to") else None,
             parent_task_id=str(fm["parent_task_id"]) if fm.get("parent_task_id") else None,
             child_task_ids=list(fm.get("child_task_ids") or []),
@@ -140,6 +144,7 @@ class TaskParser:
             "objective": task.objective,
             "parent_task_id": task.parent_task_id,
             "priority": task.priority.value,
+            "project": task.project,
             "status": task.status.value,
             "status_history": [
                 {

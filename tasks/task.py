@@ -86,6 +86,11 @@ class Task:
     created_by: str                            # "human:{name}" or "agent:{id}"
     objective: str
     context: str = ""
+    # The project this task belongs to, as a registry slug. Empty means the task
+    # predates explicit association (or is MondayOS-internal work): consumers
+    # must treat "" as unknown rather than as "no project", because a legacy task
+    # silently reclassified as unowned would disappear from its project's view.
+    project: str = ""
     assigned_to: str | None = None
     parent_task_id: EntityId | None = None
     child_task_ids: list[EntityId] = field(default_factory=list)

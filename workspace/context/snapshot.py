@@ -46,6 +46,22 @@ class ContextSource:
     error: str = ""
     # Where this actually came from, for the "why did Monday know this" answer.
     origin: str = ""
+    # Why each item survived selection, parallel to ``items``. Increment 1 could
+    # answer "where did this come from"; ranking makes "why was this one chosen
+    # over another" a separate question, and an unexplained ranking is exactly
+    # the thing ADR-016 exists to prevent.
+    reasons: list[str] = field(default_factory=list)
+
+    def reason_for(self, index: int) -> str:
+        """Why the item at ``index`` was included. Empty when unranked."""
+        return self.reasons[index] if index < len(self.reasons) else ""
+
+    def reason_counts(self) -> dict[str, int]:
+        """How many items each reason contributed — the panel's summary line."""
+        counts: dict[str, int] = {}
+        for reason in self.reasons:
+            counts[reason] = counts.get(reason, 0) + 1
+        return dict(sorted(counts.items()))
 
     @property
     def item_count(self) -> int:
@@ -69,7 +85,9 @@ class ContextSource:
         if not self.items:
             return ""
         lines = [f"## {self.label}"]
-        lines.extend(f"- {item}" for item in self.items)
+        for index, item in enumerate(self.items):
+            reason = self.reason_for(index)
+            lines.append(f"- {item}" + (f"  [{reason}]" if reason else ""))
         if self.truncated:
             lines.append("- (truncated: more exists that did not fit the context budget)")
         return "\n".join(lines)
@@ -86,6 +104,8 @@ class ContextSource:
             "error": self.error,
             "origin": self.origin,
             "ok": self.ok,
+            "reasons": list(self.reasons),
+            "reason_counts": self.reason_counts(),
         }
 
     @classmethod
@@ -97,6 +117,7 @@ class ContextSource:
             truncated=bool(data.get("truncated", False)),
             error=str(data.get("error", "")),
             origin=str(data.get("origin", "")),
+            reasons=[str(r) for r in data.get("reasons") or []],
         )
 
 
@@ -111,6 +132,14 @@ class ContextSnapshot:
     # Sources the budget refused to include at all, by name, so the omission is
     # recorded rather than invisible.
     omitted: list[str] = field(default_factory=list)
+    # What the world looked like when this was assembled. Reuse compares
+    # fingerprints; a difference means rebuild. Stored on the snapshot rather
+    # than in a side table so a cached snapshot always carries its own validity
+    # evidence — a cache whose key lives elsewhere is a cache that goes stale
+    # silently.
+    fingerprint: str = ""
+    # The request text this was ranked for, when it was ranked for one.
+    query: str = ""
 
     @property
     def token_estimate(self) -> int:
@@ -158,6 +187,8 @@ class ContextSnapshot:
             "created_at": _iso(self.created_at),
             "sources": [s.to_dict() for s in self.sources],
             "omitted": list(self.omitted),
+            "fingerprint": self.fingerprint,
+            "query": self.query,
             "token_estimate": self.token_estimate,
             "char_count": self.char_count,
             "truncated": self.truncated,
@@ -172,6 +203,8 @@ class ContextSnapshot:
             created_at=_parse(str(data.get("created_at", ""))),
             sources=[ContextSource.from_dict(s) for s in data.get("sources") or []],
             omitted=[str(o) for o in data.get("omitted") or []],
+            fingerprint=str(data.get("fingerprint", "")),
+            query=str(data.get("query", "")),
         )
 
 
