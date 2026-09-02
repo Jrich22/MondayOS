@@ -33,6 +33,7 @@ interface Counts {
 }
 
 const NODES: NodeDef[] = [
+  { section: "ai-workspace", label: "AI Workspace", dot: "bg-brand-400", count: () => undefined, status: () => "talk" },
   { section: "products", label: "Products", dot: "bg-status-completed", count: (c) => c.products, status: () => "portfolio" },
   { section: "tasks", label: "Tasks", dot: "bg-status-executing", count: (c) => c.tasksActive, status: () => "active" },
   { section: "agents", label: "Agents", dot: "bg-accent-violet", count: (c) => c.agentsBusy, status: () => "working" },

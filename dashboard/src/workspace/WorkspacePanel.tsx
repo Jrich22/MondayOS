@@ -15,6 +15,8 @@ import { stageTone, workflowProgress, elapsedLabel } from "./workflow";
 
 const TITLES: Record<Section, string> = {
   home: "Home",
+  // Rendered full-width by MissionControl, not in this side panel.
+  "ai-workspace": "AI Workspace",
   products: "Products",
   tasks: "Tasks",
   agents: "Agent fleet",

@@ -10,6 +10,7 @@
 /** Where a command wants to take the operator. Also the dashboard's sections. */
 export type Section =
   | "home"
+  | "ai-workspace"
   | "products"
   | "tasks"
   | "agents"
@@ -21,6 +22,7 @@ export type Section =
 
 export const SECTIONS: Section[] = [
   "home",
+  "ai-workspace",
   "products",
   "tasks",
   "agents",
