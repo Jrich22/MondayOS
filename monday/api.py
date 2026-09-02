@@ -8,9 +8,10 @@ details accessed exclusively through this class.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from brain import Brain, BrainConfig, create_provider
 from brain.reasoner import ReasoningEngine
@@ -20,6 +21,7 @@ from knowledge import KnowledgeStore
 from knowledge.entry import KnowledgeEntry, KnowledgeType, LifecycleStatus
 from memory import SessionMemory
 from monday.config import MondayConfig
+from monday.project import ProjectRegistry
 from monday.types import (
     AdviseResponse,
     AgentResponse,
@@ -27,7 +29,6 @@ from monday.types import (
     DoctorResponse,
     ExecuteResponse,
     GrowthResponse,
-    TeamResponse,
     LearnResponse,
     MigrateResponse,
     ModuleStatus,
@@ -37,9 +38,17 @@ from monday.types import (
     SearchResponse,
     StatusResponse,
     TaskResponse,
+    TeamResponse,
     WorkflowResponse,
+    WorkspaceResponse,
 )
 from search import SearchEngine
+
+if TYPE_CHECKING:
+    # Imported for typing only: the workspace package is loaded lazily inside
+    # workspace() so importing Monday never pulls in the AI Workspace.
+    from workspace.service import WorkspaceService
+
 from tasks import (
     ApprovalLevel,
     InvalidTransitionError,
@@ -86,7 +95,7 @@ class Monday:
     def __init__(self, config: MondayConfig | None = None) -> None:
         self._config = config or MondayConfig()
         self._session_id = self._config.session_id or _new_session_id()
-        self._created_at: datetime = datetime.now(tz=timezone.utc)
+        self._created_at: datetime = datetime.now(tz=UTC)
 
         brain_config = BrainConfig.from_project_root(self._config.project_root)
         self.__brain = Brain(brain_config)
@@ -150,6 +159,9 @@ class Monday:
         tags: list[str] | None = None,
         components: list[str] | None = None,
         authored_by: str = "human",
+        metadata: dict[str, Any] | None = None,
+        type_fields: dict[str, Any] | None = None,
+        confidence: float = 1.0,
     ) -> LearnResponse:
         """
         Teach MondayOS something new by adding a knowledge entry.
@@ -173,6 +185,19 @@ class Monday:
                         tree. Recording it accurately matters: entries captured
                         by the orchestrator previously claimed "human", which
                         left no way to tell curated knowledge from model output.
+            metadata:   Provenance and any frontmatter the CKO does not model as a
+                        first-class field. Passed through to KnowledgeEntry.metadata
+                        unchanged. Use it to record where an entry came from — the
+                        conversation, message, provider and model behind it — so a
+                        reader can trace a claim back to what produced it.
+            type_fields: MKS type-specific fields for the chosen entry_type (MKS
+                        section 9). Each type declares mandatory fields; an entry
+                        that omits them is structurally incomplete, so a caller
+                        choosing a type is responsible for supplying them.
+            confidence: How much weight a consumer should give this entry (MKS
+                        section 264). Human-authored knowledge defaults to 1.0;
+                        agent-authored content should self-report honestly, and
+                        content nobody verified should not claim certainty.
 
         Returns:
             LearnResponse with entry_id, accepted=True, and a status message.
@@ -189,7 +214,7 @@ class Monday:
                 message=f"Unknown entry_type {entry_type!r}. Valid values: {valid}",
             )
 
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         summary = _extract_summary(content)
         effective_title = title if title else summary[:80]
 
@@ -207,6 +232,9 @@ class Monday:
             created_by=f"{authored_by}:{self._session_id}",
             updated_at=now,
             updated_by=f"{authored_by}:{self._session_id}",
+            confidence=confidence,
+            metadata=dict(metadata or {}),
+            type_fields=dict(type_fields or {}),
         )
 
         entry_id = self.__knowledge.add(entry)
@@ -214,7 +242,7 @@ class Monday:
         self.__bus.publish(Event(
             event_type=EventType.KNOWLEDGE_ENTRY_CREATED,
             source="monday",
-            timestamp=datetime.now(tz=timezone.utc),
+            timestamp=datetime.now(tz=UTC),
             payload={"entry_id": entry_id, "entry_type": entry_type},
             session_id=self._session_id,
         ))
@@ -375,7 +403,7 @@ class Monday:
             self.__bus.publish(Event(
                 event_type=EventType.TASK_CREATED,
                 source="monday",
-                timestamp=datetime.now(tz=timezone.utc),
+                timestamp=datetime.now(tz=UTC),
                 payload={"task_id": created_task.id, "title": created_task.title},
                 session_id=self._session_id,
             ))
@@ -589,7 +617,7 @@ class Monday:
             self.__bus.publish(Event(
                 event_type=EventType.TASK_COMPLETED,
                 source="monday",
-                timestamp=datetime.now(tz=timezone.utc),
+                timestamp=datetime.now(tz=UTC),
                 payload={"task_id": updated.id},
                 session_id=self._session_id,
             ))
@@ -1156,8 +1184,8 @@ class Monday:
             OnboardResponse with health_score, sprint_goal, report_path, and
             the composite data payload. Does not raise.
         """
-        from monday.project import ProjectNotFoundError, ProjectRegistry
         from monday import Monday, MondayConfig
+        from monday.project import ProjectNotFoundError, ProjectRegistry
 
         registry = ProjectRegistry(self._config.project_root / "config")
 
@@ -1274,7 +1302,11 @@ class Monday:
         Returns:
             ExecuteResponse describing the outcome. Does not raise.
         """
-        from orchestrator.executor import ExecutionMode, ExecutionOrchestrator, ProviderSelectionPolicy
+        from orchestrator.executor import (
+            ExecutionMode,
+            ExecutionOrchestrator,
+            ProviderSelectionPolicy,
+        )
 
         try:
             mode_enum = ExecutionMode.from_str(mode)
@@ -2360,13 +2392,360 @@ class Monday:
         except (GrowthError, ValueError, LookupError) as exc:
             return GrowthResponse(action=action, success=False, project=project, message=str(exc))
 
+    # ------------------------------------------------------------------ #
+    # AI Workspace
+    # ------------------------------------------------------------------ #
+
+    def _workspace_service(self) -> WorkspaceService:
+        """
+        Build the AI Workspace service with every subsystem reader pre-scoped.
+
+        The readers are closures that capture a project slug at call time. That is
+        what makes isolation structural rather than disciplined: the Context Engine
+        holds a reader that is already scoped, so there is no argument it could
+        pass to widen it (ADR-017).
+        """
+        from workspace.context.engine import ContextEngine
+        from workspace.responder import ProviderWorkspaceResponder
+        from workspace.service import WorkspaceService
+
+        registry = ProjectRegistry(self._config.project_root / "config")
+
+        def resolve(name: str) -> tuple[str, Path, str]:
+            """Resolve a project to (slug, root, description) or refuse."""
+            from workspace.errors import InvalidProjectError
+            from workspace.models import slugify
+
+            slug = slugify(name)
+            if not slug:
+                raise InvalidProjectError(name, "It does not normalise to a project slug.")
+
+            wanted = slug
+            for entry in registry.list():
+                if slugify(entry.name) == wanted:
+                    return wanted, entry.path, entry.description
+            raise InvalidProjectError(name)
+
+        def read_tasks(slug: str) -> list[dict[str, Any]]:
+            """
+            Active then recently-completed tasks that name this project.
+
+            MondayOS tasks are global, so association is by explicit reference:
+            a task's metadata project field, or the slug appearing in its title or
+            objective. Matching on substrings alone would attach one project's
+            tasks to another whose name is a prefix, so the metadata field wins
+            when present.
+            """
+            from workspace.context.engine import MAX_ACTIVE_TASKS, MAX_RECENT_TASKS
+
+            def owns(task: Any) -> bool:
+                declared = str((task.metadata or {}).get("project", "")).strip().lower()
+                if declared:
+                    return declared == slug
+                haystack = f"{task.title} {task.objective}".lower()
+                return slug in haystack
+
+            active = [t for t in self.__tasks.list_active() if owns(t)]
+            active.sort(key=lambda t: (t.priority.value, t.id))
+
+            rows: list[dict[str, Any]] = [
+                {
+                    "id": t.id,
+                    "title": t.title,
+                    "status": t.status.value,
+                    "priority": t.priority.value,
+                }
+                for t in active[:MAX_ACTIVE_TASKS]
+            ]
+
+            done = [t for t in self.__tasks.list_completed() if owns(t)]
+            rows.extend(
+                {
+                    "id": t.id,
+                    "title": t.title,
+                    "status": t.status.value,
+                    "priority": t.priority.value,
+                }
+                for t in done[:MAX_RECENT_TASKS]
+            )
+            return rows
+
+        def read_knowledge(slug: str) -> list[dict[str, Any]]:
+            """Recent knowledge entries scoped to this project by component or tag."""
+            from workspace.context.engine import MAX_KNOWLEDGE
+
+            entries = [
+                e
+                for e in self.__knowledge.list_all()
+                if slug in {c.lower() for c in e.components} or slug in {t.lower() for t in e.tags}
+            ]
+            entries.sort(key=lambda e: e.created_at, reverse=True)
+            return [
+                {
+                    "id": e.id,
+                    "title": e.title,
+                    "type": e.entry_type.value,
+                    "summary": e.summary,
+                }
+                for e in entries[:MAX_KNOWLEDGE]
+            ]
+
+        def list_projects() -> list[dict[str, Any]]:
+            from workspace.models import slugify
+
+            seen: dict[str, dict[str, Any]] = {}
+            for entry in registry.list():
+                slug = slugify(entry.name)
+                if not slug or slug in seen:
+                    continue
+                seen[slug] = {
+                    "name": slug,
+                    "display_name": entry.name,
+                    "description": entry.description,
+                    "path": entry.source_path,
+                }
+            return [seen[k] for k in sorted(seen)]
+
+        def capture(payload: dict[str, Any]) -> str:
+            """
+            Write a captured message through the existing knowledge system.
+
+            Two things have to be true of the resulting entry, and the type
+            system is what makes them true rather than a convention.
+
+            **The type must not overclaim.** MKS RESEARCH means an investigation
+            was conducted: it mandates a question, a methodology and findings
+            (MKS 9.10). A model answering in a chat did none of those, and filing
+            its output as RESEARCH would assert a rigour that never happened.
+            DOCUMENTATION (MKS 9.9) is a structured reference record, which is
+            exactly what this is, and its mandatory fields are satisfiable
+            honestly.
+
+            **Provenance must say who did what.** The model produced the content;
+            a human chose to keep it. Those are different acts by different
+            parties and the entry records both — ``authored_by="agent"`` for the
+            content, ``saved_by`` in metadata for the decision. Confidence is
+            below 1.0 because nothing verified the claim: a human electing to
+            retain an answer is not the same as a human checking it.
+            """
+            captured_at = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            provider = str(payload.get("provider", "")) or "unknown"
+            model = str(payload.get("model", "")) or "unknown"
+
+            body = (
+                f"{payload['body']}\n\n"
+                f"---\n"
+                f"Captured from a MondayOS AI Workspace conversation about "
+                f"{payload['project']}. Written by {provider}/{model}; retained by a human. "
+                f"Not independently verified."
+            )
+            response = self.learn(
+                content=body,
+                title=payload["title"],
+                # DOCUMENTATION, not RESEARCH: see the docstring above.
+                entry_type="documentation",
+                tags=["ai-workspace", payload["project"]],
+                components=[payload["project"], payload["conversation_id"]],
+                authored_by="agent",
+                # MKS 9.9 mandates both of these for a DOCUMENTATION entry.
+                type_fields={
+                    "content_type": "REFERENCE",
+                    "scope": (
+                        f"{payload['project']} — saved from AI Workspace conversation "
+                        f"{payload['conversation_id']}"
+                    ),
+                },
+                metadata={
+                    "source": "ai-workspace",
+                    "project": payload["project"],
+                    "conversation_id": payload["conversation_id"],
+                    "message_id": payload["message_id"],
+                    "context_snapshot_id": payload.get("snapshot_id", ""),
+                    "provider": provider,
+                    "model": model,
+                    # The content and the decision to keep it have different
+                    # authors. Recording only one of them would misattribute.
+                    "produced_by": f"model:{provider}/{model}",
+                    "saved_by": "human",
+                    "saved_at": captured_at,
+                    "verification": "none — retained by a human, not independently verified",
+                },
+                confidence=0.5,
+            )
+            if not response.accepted:
+                raise ValueError(f"Knowledge capture refused: {response.message}")
+            return response.entry_id
+
+        responder = (
+            ProviderWorkspaceResponder(self.__provider) if self.__provider is not None else None
+        )
+        return WorkspaceService(
+            root=self._config.project_root,
+            engine=ContextEngine(
+                resolve_project=resolve,
+                read_tasks=read_tasks,
+                read_knowledge=read_knowledge,
+            ),
+            responder=responder,
+            list_projects=list_projects,
+            capture_knowledge=capture,
+        )
+
+    def workspace(self, action: str, **kwargs: Any) -> WorkspaceResponse:
+        """
+        Drive the AI Workspace — project-scoped conversations with MondayOS.
+
+        Every action that touches a conversation names its project, and a
+        conversation belongs to exactly one project for its whole life. Context is
+        assembled per project by the Context Engine and never spans two
+        (ADR-015, ADR-017).
+
+        Actions:
+            list-projects       — projects the workspace can open, with conversation counts.
+            list-conversations  — conversation summaries. Requires: project.
+                                  Optional: include_archived.
+            create-conversation — start a conversation. Requires: project. Optional: title.
+            get-conversation    — full conversation with messages. Requires: project,
+                                  conversation_id.
+            send-message        — record a user turn, answer it, persist both. Requires:
+                                  project, conversation_id, content.
+            retry               — re-answer the last user message. Requires: project,
+                                  conversation_id.
+            rename-conversation — set a title. Requires: project, conversation_id, title.
+            archive-conversation / unarchive-conversation — Requires: project,
+                                  conversation_id.
+            delete-conversation — permanent. Requires: project, conversation_id.
+            build-context       — assemble a context snapshot. Requires: project.
+            save-to-knowledge   — capture an assistant message as knowledge. Requires:
+                                  project, conversation_id, message_id. Optional: title.
+
+        Returns a WorkspaceResponse. Does not raise for expected failures.
+        """
+        from workspace.errors import WorkspaceError
+
+        service = self._workspace_service()
+        project = str(kwargs.get("project", ""))
+        conversation_id = str(kwargs.get("conversation_id", ""))
+        message_id = str(kwargs.get("message_id", ""))
+
+        def ok(data: Any, message: str = "", snapshot_id: str = "") -> WorkspaceResponse:
+            payload = data if isinstance(data, dict) else {"items": data}
+            return WorkspaceResponse(
+                action=action,
+                success=True,
+                message=message,
+                project=project,
+                conversation_id=conversation_id,
+                snapshot_id=snapshot_id,
+                data=payload,
+            )
+
+        try:
+            if action == "list-projects":
+                projects = service.list_projects()
+                return ok({"projects": projects}, f"{len(projects)} project(s).")
+
+            if action == "list-conversations":
+                items = service.list_conversations(
+                    project, include_archived=bool(kwargs.get("include_archived", False))
+                )
+                return ok({"conversations": items}, f"{len(items)} conversation(s).")
+
+            if action == "create-conversation":
+                data = service.create_conversation(project, title=str(kwargs.get("title", "")))
+                conversation_id = str(data["id"])
+                return ok(data, f"Created {conversation_id}.")
+
+            if action == "get-conversation":
+                data = service.get_conversation(project, conversation_id)
+                return ok(data, "", str(data.get("active_snapshot_id", "")))
+
+            if action == "send-message":
+                data = service.send_message(
+                    project, conversation_id, str(kwargs.get("content", ""))
+                )
+                assistant = data.get("assistant_message") or {}
+                failed = bool(assistant.get("error"))
+                return WorkspaceResponse(
+                    action=action,
+                    # The turn was recorded either way; success reports whether an
+                    # answer was produced, so the UI can offer retry without having
+                    # to inspect the payload.
+                    success=not failed,
+                    message=str(assistant.get("error", "")) or "Answered.",
+                    project=project,
+                    conversation_id=conversation_id,
+                    snapshot_id=str(assistant.get("snapshot_id", "")),
+                    data=data,
+                )
+
+            if action == "retry":
+                data = service.retry_message(project, conversation_id)
+                assistant = data.get("assistant_message") or {}
+                failed = bool(assistant.get("error"))
+                return WorkspaceResponse(
+                    action=action,
+                    success=not failed,
+                    message=str(assistant.get("error", "")) or "Answered.",
+                    project=project,
+                    conversation_id=conversation_id,
+                    snapshot_id=str(assistant.get("snapshot_id", "")),
+                    data=data,
+                )
+
+            if action == "rename-conversation":
+                data = service.rename_conversation(
+                    project, conversation_id, str(kwargs.get("title", ""))
+                )
+                return ok(data, "Renamed.")
+
+            if action == "archive-conversation":
+                return ok(service.archive_conversation(project, conversation_id), "Archived.")
+
+            if action == "unarchive-conversation":
+                return ok(service.unarchive_conversation(project, conversation_id), "Unarchived.")
+
+            if action == "delete-conversation":
+                return ok(service.delete_conversation(project, conversation_id), "Deleted.")
+
+            if action == "build-context":
+                data = service.build_context(project)
+                return ok(data, str(data.get("summary", "")), str(data.get("id", "")))
+
+            if action == "save-to-knowledge":
+                data = service.save_message_to_knowledge(
+                    project, conversation_id, message_id, title=str(kwargs.get("title", ""))
+                )
+                return ok(data, f"Saved as {data['knowledge_id']}.")
+
+            return WorkspaceResponse(
+                action=action,
+                success=False,
+                project=project,
+                conversation_id=conversation_id,
+                message=(
+                    f"Unknown workspace action {action!r}. Valid actions: list-projects, "
+                    "list-conversations, create-conversation, get-conversation, send-message, "
+                    "retry, rename-conversation, archive-conversation, unarchive-conversation, "
+                    "delete-conversation, build-context, save-to-knowledge."
+                ),
+            )
+        except (WorkspaceError, ValueError, LookupError, OSError) as exc:
+            return WorkspaceResponse(
+                action=action,
+                success=False,
+                project=project,
+                conversation_id=conversation_id,
+                message=str(exc),
+            )
+
     def status(self) -> StatusResponse:
         """
         Return the current health and configuration status of this Monday instance.
 
         Reads only from live instance state — no external I/O.
         """
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         uptime = (now - self._created_at).total_seconds()
 
         modules = [
@@ -2464,10 +2843,10 @@ def _generate_onboarding_report(
     Combines migrate, doctor, and advisory data into a structured document
     that answers all onboarding questions defined in Initiative 010.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
     lines: list[str] = []
 
-    now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
 
     lines.append(f"# {project_name.title()} — MondayOS Onboarding Report")
     lines.append("")
@@ -2488,7 +2867,7 @@ def _generate_onboarding_report(
         lines.append("")
 
     lines.append(
-        f"| Metric | Value |"
+        "| Metric | Value |"
     )
     lines.append("| --- | --- |")
     lines.append(f"| Health Score | {doctor_resp.health_score}/100 ({doctor_resp.grade}) |")

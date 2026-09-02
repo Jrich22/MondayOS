@@ -441,6 +441,34 @@ class ModuleStatus:
 
 
 @dataclass
+class WorkspaceResponse:
+    """
+    Response from Monday.workspace().
+
+    One shape across every AI Workspace action. The action-specific payload lives
+    in ``data``; the flat fields surface what the API edge and the UI need without
+    digging into it.
+
+    Attributes:
+        action:          The workspace action performed.
+        success:         True if the action succeeded.
+        message:         Human-readable status or error message.
+        project:         Project slug the action addressed ("" for project listings).
+        conversation_id: Conversation involved, if any.
+        snapshot_id:     Context snapshot the action built or answered against.
+        data:            Full action payload (conversation, listing, snapshot, ...).
+    """
+
+    action: str
+    success: bool
+    message: str = ""
+    project: str = ""
+    conversation_id: str = ""
+    snapshot_id: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class StatusResponse:
     """
     Response from Monday.status().

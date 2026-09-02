@@ -34,6 +34,7 @@ Public surface:
     OnboardResponse  — return type of Monday.onboard()
     ExecuteResponse  — return type of Monday.execute()
     StatusResponse   — return type of Monday.status()
+    WorkspaceResponse — return type of Monday.workspace()
     ModuleStatus     — per-module health in StatusResponse
 """
 from __future__ import annotations
@@ -56,6 +57,7 @@ from monday.types import (
     TaskResponse,
     TeamResponse,
     WorkflowResponse,
+    WorkspaceResponse,
 )
 
 __all__ = [
@@ -75,5 +77,6 @@ __all__ = [
     "TaskResponse",
     "TeamResponse",
     "WorkflowResponse",
+    "WorkspaceResponse",
     "ModuleStatus",
 ]

@@ -226,6 +226,35 @@ class TaskManager:
 
         return tasks
 
+    def list_completed(self, limit: int = 0) -> list[Task]:
+        """
+        Return terminal tasks from tasks/completed/, most recently updated first.
+
+        The read-only counterpart to list_active(). Parsing lives here rather
+        than in callers because this module owns the on-disk task format; a
+        caller that walked completed/ itself would be a second parser to keep
+        correct.
+
+        Args:
+            limit: Maximum tasks to return. 0 (default) returns all.
+        """
+        if not self._completed_dir.exists():
+            return []
+
+        tasks: list[Task] = []
+        for path in sorted(self._completed_dir.glob("*.md")):
+            if path.name in _SKIP_NAMES:
+                continue
+            try:
+                tasks.append(
+                    self._parser.parse(path.read_text(encoding="utf-8"), source_path=str(path))
+                )
+            except Exception as exc:
+                warnings.warn(f"Skipping {path.name}: {exc}", stacklevel=2)
+
+        tasks.sort(key=lambda t: (t.updated, t.id), reverse=True)
+        return tasks[:limit] if limit > 0 else tasks
+
     def archive(self, task_id: EntityId) -> None:
         """
         Move a terminal task file from active/ to completed/.
