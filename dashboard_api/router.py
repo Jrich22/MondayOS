@@ -98,6 +98,19 @@ def _dispatch(
         if parts == ["pull-requests"]:
             # MondayOS does not manage PRs (Phase 3). Honest empty list.
             return 200, []
+
+        # ---- AI Workspace ----
+        if parts == ["workspace", "projects"]:
+            return service.workspace_projects()
+        if parts == ["workspace", "conversations"]:
+            return service.workspace_conversations(
+                query.get("project", ""),
+                include_archived=query.get("includeArchived") == "true",
+            )
+        if (p := _match(parts, ["workspace", "conversations", "{id}"])) is not None:
+            return service.workspace_conversation(query.get("project", ""), p["id"])
+        if (p := _match(parts, ["workspace", "context", "{project}"])) is not None:
+            return service.workspace_context(p["project"])
         return 404, errors.error(errors.NOT_FOUND, "Unknown endpoint.")
 
     # ---- writes ----
@@ -114,6 +127,18 @@ def _dispatch(
             return service.approve_run(p["id"], body)
         if (p := _match(parts, ["agent-runs", "{id}", "reject"])) is not None:
             return service.reject_run(p["id"], body)
+
+        # ---- AI Workspace ----
+        if parts == ["workspace", "conversations"]:
+            return service.workspace_create_conversation(body)
+        if (p := _match(parts, ["workspace", "conversations", "{id}", "messages"])) is not None:
+            return service.workspace_send_message(p["id"], body)
+        if (p := _match(parts, ["workspace", "conversations", "{id}", "retry"])) is not None:
+            return service.workspace_retry(p["id"], body)
+        if (p := _match(parts, ["workspace", "conversations", "{id}", "update"])) is not None:
+            return service.workspace_update_conversation(p["id"], body)
+        if (p := _match(parts, ["workspace", "conversations", "{id}", "knowledge"])) is not None:
+            return service.workspace_save_knowledge(p["id"], body)
         return 404, errors.error(errors.NOT_FOUND, "Unknown endpoint.")
 
     return 405, errors.error(errors.BAD_REQUEST, f"Method {method} not allowed.")

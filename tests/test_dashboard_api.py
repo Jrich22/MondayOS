@@ -300,3 +300,132 @@ class TestLiveServer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkspaceRouteTests(DashboardApiBase):
+    """
+    AI Workspace routes.
+
+    No provider is configured on this Monday, so a send-message turn records a
+    failure. That is the honest offline shape and it is what these tests assert:
+    the user's message must still persist, and the route must still return the
+    conversation so the client can offer retry.
+    """
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "config").mkdir(parents=True, exist_ok=True)
+        (self.root / "alpha" / "docs").mkdir(parents=True, exist_ok=True)
+        (self.root / "alpha" / "README.md").write_text("# alpha\n\nThe alpha project.\n")
+        (self.root / "beta").mkdir(parents=True, exist_ok=True)
+        monday = self.service._m
+        monday.project("register", name="alpha", path=str(self.root / "alpha"))
+        monday.project("register", name="beta", path=str(self.root / "beta"))
+
+    def _create(self, project: str = "alpha", title: str = "First") -> str:
+        status, _, body = self.POST(
+            "/workspace/conversations", {"project": project, "title": title}
+        )
+        self.assertEqual(status, 201)
+        return str(body["id"])
+
+    def test_projects_route_lists_registered_projects(self):
+        status, _, body = self.GET("/workspace/projects")
+        self.assertEqual(status, 200)
+        self.assertEqual({p["name"] for p in body}, {"alpha", "beta"})
+
+    def test_create_and_get_a_conversation(self):
+        conversation_id = self._create()
+        status, _, body = self.GET(
+            f"/workspace/conversations/{conversation_id}", {"project": "alpha"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["id"], conversation_id)
+        self.assertEqual(body["project"], "alpha")
+
+    def test_creating_without_a_project_is_a_400(self):
+        status, _, body = self.POST("/workspace/conversations", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "bad-request")
+
+    def test_listing_is_scoped_to_the_requested_project(self):
+        self._create("alpha", "a1")
+        self._create("beta", "b1")
+        status, _, body = self.GET("/workspace/conversations", {"project": "alpha"})
+        self.assertEqual(status, 200)
+        self.assertEqual([c["title"] for c in body], ["a1"])
+
+    def test_reading_another_projects_conversation_is_a_404(self):
+        conversation_id = self._create("alpha")
+        status, _, _body = self.GET(
+            f"/workspace/conversations/{conversation_id}", {"project": "beta"}
+        )
+        self.assertEqual(status, 404)
+
+    def test_sending_a_message_persists_it_even_with_no_provider(self):
+        conversation_id = self._create()
+        status, _, body = self.POST(
+            f"/workspace/conversations/{conversation_id}/messages",
+            {"project": "alpha", "content": "What are we building?"},
+        )
+        self.assertEqual(status, 200)
+        messages = body["conversation"]["messages"]
+        self.assertEqual(messages[0]["content"], "What are we building?")
+        self.assertTrue(messages[1]["error"])
+
+    def test_an_empty_message_is_a_400(self):
+        conversation_id = self._create()
+        status, _, _body = self.POST(
+            f"/workspace/conversations/{conversation_id}/messages",
+            {"project": "alpha", "content": "   "},
+        )
+        self.assertEqual(status, 400)
+
+    def test_context_route_returns_attributed_sources(self):
+        status, _, body = self.GET("/workspace/context/alpha")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["project"], "alpha")
+        self.assertEqual(
+            [s["name"] for s in body["sources"]],
+            ["identity", "docs", "tasks", "knowledge", "git"],
+        )
+
+    def test_context_for_an_unregistered_project_is_a_404(self):
+        status, _, _body = self.GET("/workspace/context/ghost")
+        self.assertEqual(status, 404)
+
+    def test_rename_and_archive_through_the_update_route(self):
+        conversation_id = self._create()
+        status, _, body = self.POST(
+            f"/workspace/conversations/{conversation_id}/update",
+            {"project": "alpha", "title": "Renamed"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["title"], "Renamed")
+
+        status, _, body = self.POST(
+            f"/workspace/conversations/{conversation_id}/update",
+            {"project": "alpha", "status": "archived"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "archived")
+
+        _status, _, listing = self.GET("/workspace/conversations", {"project": "alpha"})
+        self.assertEqual(listing, [])
+
+    def test_update_with_an_unknown_status_is_a_400(self):
+        conversation_id = self._create()
+        status, _, _body = self.POST(
+            f"/workspace/conversations/{conversation_id}/update",
+            {"project": "alpha", "status": "deleted"},
+        )
+        self.assertEqual(status, 400)
+
+    def test_a_write_bumps_the_revision(self):
+        before = self.service.revision
+        self._create()
+        self.assertGreater(self.service.revision, before)
+
+    def test_unknown_workspace_endpoint_is_a_404(self):
+        status, _, _body = self.GET("/workspace/nonsense")
+        self.assertEqual(status, 404)
