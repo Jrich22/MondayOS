@@ -35,11 +35,17 @@ const pointsVertex = /* glsl */ `
   void main() {
     vec3 pos = position;
     float rad = length(position);
-    // Organic breathing along the surface normal.
-    float b = sin(uTime * 1.2 + aSeed * 6.2831) * 0.5 + 0.5;
-    pos += aNormal * b * 0.045 * uBreathe;
-    // Restrained blocked-state jitter.
-    pos += aNormal * sin(uTime * 9.0 + aSeed * 3.0) * 0.018 * uDistort;
+    // Breathing along the surface normal, on a ~7-second cycle.
+    //
+    // The phase offset is deliberately small. It used to be a full turn
+    // (aSeed * 6.2831), which meant every particle breathed independently — the
+    // surface shimmered instead of breathing, and the eye read it as noise. A
+    // narrow spread keeps the organic quality while the volume moves as one.
+    float b = sin(uTime * 0.9 + aSeed * 0.6) * 0.5 + 0.5;
+    pos += aNormal * b * 0.05 * uBreathe;
+    // Blocked-state unsettledness. Slow: at 9 rad/s this read as a fault light
+    // rather than as a system that had encountered a problem.
+    pos += aNormal * sin(uTime * 2.2 + aSeed * 3.0) * 0.012 * uDistort;
     // Expanding completion wave.
     float wavefront = fract(uTime * 0.28);
     float w = exp(-pow((rad - wavefront * 1.6) * 3.0, 2.0)) * uWave;
@@ -49,9 +55,12 @@ const pointsVertex = /* glsl */ `
     gl_Position = projectionMatrix * mv;
     gl_PointSize = uSize * aScale * uPixelRatio * (1.0 / max(0.1, -mv.z));
 
-    float coreFactor = smoothstep(0.55, 0.0, rad);
-    vColor = mix(aColor, uAccent, 0.15) + coreFactor * uCore * 0.45;
-    vGlow = uBrightness * (0.55 + coreFactor * uCore * 0.9) + w * 1.5;
+    // The core is the brightest thing on screen, so its range is the tightest.
+    // A wider smoothstep spreads the glow instead of concentrating it into a
+    // hot centre that blooms over whatever sits next to it.
+    float coreFactor = smoothstep(0.75, 0.05, rad);
+    vColor = mix(aColor, uAccent, 0.15) + coreFactor * uCore * 0.22;
+    vGlow = uBrightness * (0.62 + coreFactor * uCore * 0.38) + w * 0.6;
   }
 `;
 
@@ -92,15 +101,21 @@ const lineFragment = /* glsl */ `
   varying float vPhase;
   varying vec3 vColor;
   void main() {
-    // A gaussian pulse travelling from one node to the other.
+    // A signal travelling from one node to the other.
+    //
+    // This was the flicker. A tight gaussian (exp(-d*d*60)) scaled by 1.9x
+    // brightness produced a hard bright dot snapping along each edge — dozens of
+    // them at once, which the eye integrates as flashing. Widening the falloff
+    // turns the dot into a soft travelling swell, and capping the multiplier
+    // keeps a pulse from ever being twice the brightness of the line it rides.
     float pulsePos = fract(uTime * uPulseSpeed * 0.16 + vPhase);
     float d = abs(vLineT - pulsePos);
     d = min(d, 1.0 - d);
-    float pulse = exp(-d * d * 60.0);
-    float base = 0.05 * uConnectivity;
-    float intensity = base + pulse * uConnectivity;
+    float pulse = exp(-d * d * 14.0);
+    float base = 0.06 * uConnectivity;
+    float intensity = base + pulse * uConnectivity * 0.75;
     vec3 c = mix(vColor, uAccent, 0.3);
-    gl_FragColor = vec4(c * (0.6 + pulse * 1.9) * uBrightness, intensity);
+    gl_FragColor = vec4(c * (0.7 + pulse * 0.55) * uBrightness, intensity);
   }
 `;
 
@@ -122,7 +137,9 @@ export function NeuralBrain({ tier, visual }: Props) {
   const pointsUniforms = useMemo(
     () => ({
       uTime: { value: 0 },
-      uSize: { value: 26 },
+      // Larger points to compensate for the reduced count: the volume should
+      // still read as a brain, just as fewer, more deliberate specks.
+      uSize: { value: 38 },
       uPixelRatio: { value: pixelRatio },
       uBreathe: { value: 0.75 },
       uBrightness: { value: 0.8 },

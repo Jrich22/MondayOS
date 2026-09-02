@@ -21,6 +21,30 @@ function timeOf(iso: string): string {
     : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+/**
+ * The gap between sending and the first token.
+ *
+ * Three staggered dots rather than a spinner: a spinner says "wait", which is
+ * what every loading state says, while this reads as Monday composing. Slow
+ * enough (1.6s) that it never suggests urgency.
+ */
+function ThinkingIndicator() {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="flex gap-1">
+        {[0, 1, 2].map((i) => (
+          <span
+            key={i}
+            className="h-1 w-1 animate-think-dot rounded-full bg-brand-400"
+            style={{ animationDelay: `${i * 180}ms` }}
+          />
+        ))}
+      </span>
+      <span className="text-[12px] text-ink-faint">Thinking</span>
+    </div>
+  );
+}
+
 function RoleTag({ message }: { message: Message }) {
   if (message.role === "user") {
     return <span className="text-[11px] font-medium text-ink-muted">You</span>;
@@ -81,7 +105,7 @@ function MessageRow({
   const failed = Boolean(message.error);
 
   return (
-    <div className="group px-6 py-3">
+    <div className="group animate-message-in px-6 py-4">
       <div className="mb-1 flex items-baseline justify-between gap-3">
         <RoleTag message={message} />
         <div className="flex items-center gap-2">
@@ -129,15 +153,18 @@ function MessageRow({
             <button
               onClick={onRetry}
               disabled={busy}
-              className="focus-ring mt-2 rounded border border-line px-2 py-1 text-[11px] text-ink-muted transition hover:border-brand-400/50 hover:text-ink disabled:opacity-50"
+              className="focus-ring mt-2 flex items-center gap-1.5 rounded border border-line px-2 py-1 text-[11px] text-ink-muted transition hover:border-brand-400/50 hover:text-ink disabled:opacity-50"
             >
-              {busy ? "retrying…" : "Retry"}
+              {busy && (
+                <span className="h-1 w-1 animate-pulse-soft rounded-full bg-current" />
+              )}
+              {busy ? "Retrying" : "Retry"}
             </button>
           )}
         </div>
       ) : (
         <>
-          <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-ink">
+          <div className="max-w-[68ch] whitespace-pre-wrap text-[13px] leading-relaxed text-ink">
             {message.content}
           </div>
           {/* A partial answer is never presented as a finished one. */}
@@ -185,9 +212,17 @@ export function ConversationView({
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Follow the stream only while the reader is already at the bottom. Yanking
+  // the viewport back down while someone is reading earlier text is the most
+  // irritating thing a streaming interface can do, and it is the default
+  // behaviour of an unconditional scrollIntoView.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
+    const box = scrollRef.current;
+    if (!box) return;
+    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+    if (nearBottom) endRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
   }, [conversation?.messages.length, streaming, sending]);
 
   if (!conversation) {
@@ -239,7 +274,7 @@ export function ConversationView({
         </span>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
         {loading ? (
           <div className="px-6 py-4 text-[12px] text-ink-faint">Loading…</div>
         ) : conversation.messages.length === 0 ? (
@@ -265,17 +300,15 @@ export function ConversationView({
             so streamed text and settled text look the same — the only difference
             is that this one is still arriving. */}
         {sending && (
-          <div className="px-6 py-3">
+          <div className="animate-message-in px-6 py-4">
             <div className="mb-1 text-[11px] font-medium text-brand-400">Monday</div>
             {streaming ? (
-              <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-ink">
+              <div className="max-w-[68ch] whitespace-pre-wrap text-[13px] leading-relaxed text-ink">
                 {streaming}
-                <span className="ml-0.5 inline-block h-[13px] w-[6px] translate-y-[2px] animate-pulse-soft bg-brand-400/70" />
+                <span className="ml-0.5 inline-block h-[13px] w-[2px] translate-y-[2px] animate-caret bg-brand-400" />
               </div>
             ) : (
-              <span className="animate-pulse-soft text-[12px] text-ink-faint">
-                Reading project context…
-              </span>
+              <ThinkingIndicator />
             )}
           </div>
         )}

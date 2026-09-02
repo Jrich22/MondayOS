@@ -60,7 +60,10 @@ const haloFragment = /* glsl */ `
     vec2 uv = gl_PointCoord - 0.5;
     float d = length(uv);
     if (d > 0.5) discard;
-    float alpha = pow(smoothstep(0.5, 0.0, d), 1.5);
+    // A steeper falloff makes each speck a small bright point with a dark
+    // surround rather than a soft disc. Fewer, crisper points read as stars;
+    // soft overlapping discs read as fog.
+    float alpha = pow(smoothstep(0.5, 0.0, d), 2.4);
     gl_FragColor = vec4(vColor * vGlow, alpha * 0.9);
   }
 `;

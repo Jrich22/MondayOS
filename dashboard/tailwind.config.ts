@@ -79,10 +79,31 @@ export default {
           "0%,100%": { opacity: "0.55" },
           "50%": { opacity: "1" },
         },
+        // A message settling in. Short and small: the eye should register that
+        // something arrived, not watch it travel.
+        "message-in": {
+          "0%": { opacity: "0", transform: "translateY(3px)" },
+          "100%": { opacity: "1", transform: "translateY(0)" },
+        },
+        // The thinking indicator. Three dots on a slow stagger — visibly alive,
+        // slow enough that it never reads as urgency.
+        "think-dot": {
+          "0%,70%,100%": { opacity: "0.25", transform: "translateY(0)" },
+          "35%": { opacity: "1", transform: "translateY(-2px)" },
+        },
+        // The streaming caret. A soft fade rather than a hard blink.
+        "caret": {
+          "0%,100%": { opacity: "0.25" },
+          "50%": { opacity: "0.9" },
+        },
       },
       animation: {
         "fade-up": "fade-up 0.4s ease both",
-        "pulse-soft": "pulse-soft 2.4s ease-in-out infinite",
+        // Slower than it was: 2.4s reads as a heartbeat, 4s as breathing.
+        "pulse-soft": "pulse-soft 4s ease-in-out infinite",
+        "message-in": "message-in 0.22s ease-out both",
+        "think-dot": "think-dot 1.6s ease-in-out infinite",
+        caret: "caret 1.1s ease-in-out infinite",
       },
     },
   },

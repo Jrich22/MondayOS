@@ -19,39 +19,69 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useApp } from "@/state/store";
-import { MondayBrain } from "@/components/monday";
-import type { BrainState } from "@/components/monday";
-import { ActivityTimeline } from "./ActivityTimeline";
 import { Composer, COMMANDS } from "./Composer";
-import { ContextPanel } from "./ContextPanel";
+import { ProjectContext } from "./ProjectContext";
 import { ConversationView } from "./Conversation";
 import { ReturnBrief } from "./ReturnBrief";
 import { Sidebar } from "./Sidebar";
-import { useWorkspace, type MondayState } from "./useWorkspace";
+import { StatusRail } from "./StatusRail";
+import { useWorkspace } from "./useWorkspace";
+import type { MondayActivity } from "./mondayState";
 import type { WorkspaceClient } from "./client";
+import type { Conversation, ContextSnapshot } from "./types";
 
-/** Monday's operational state → the Brain's existing visual vocabulary. */
-const BRAIN_STATE: Record<MondayState, BrainState> = {
-  idle: "idle",
-  thinking: "thinking",
-  learning: "learning",
-  executing: "executing",
-  completed: "completed",
-  blocked: "blocked",
+
+/**
+ * What is being worked on in this project, as one readable line.
+ *
+ * The in-progress task's title with its id and status markers stripped — the
+ * rail wants "Building Repository Intelligence", not
+ * "TASK-0074 [in-progress] P1 Building Repository Intelligence". Empty when
+ * nothing is in progress; the rail then shows no subtitle rather than a
+ * placeholder.
+ */
+function activeTaskTitle(context: ContextSnapshot | null): string {
+  const item = context?.sources
+    .find((s) => s.name === "tasks")
+    ?.items.find((i) => i.includes("[in-progress]") || i.includes("[review]"));
+  if (!item) return "";
+  return item.replace(/^\S+\s*/, "").replace(/^\[[^\]]+\]\s*/, "").replace(/^P\d\s*/, "").trim();
+}
+
+
+function lastProvider(conversation: Conversation | null): string {
+  const withProvider = conversation?.messages.filter((m) => m.provider) ?? [];
+  const last = withProvider[withProvider.length - 1];
+  return last ? last.model || last.provider : "";
+}
+
+/**
+ * The ambient wash, per activity. Deliberately near-invisible: these are 4-6%
+ * tints, chosen so a state change is felt peripherally rather than seen.
+ */
+const AMBIENT: Record<MondayActivity, string> = {
+  idle: "from-brand-500/[0.04]",
+  "reading-project": "from-accent-magenta/[0.05]",
+  "loading-context": "from-accent-violet/[0.05]",
+  "searching-knowledge": "from-accent-magenta/[0.05]",
+  "analyzing-repository": "from-accent-violet/[0.05]",
+  thinking: "from-accent-violet/[0.06]",
+  streaming: "from-brand-500/[0.06]",
+  "writing-knowledge": "from-accent-magenta/[0.05]",
+  "creating-task": "from-status-executing/[0.05]",
+  "waiting-approval": "from-status-awaiting/[0.05]",
+  error: "from-status-blocked/[0.05]",
 };
 
-const STATE_LABEL: Record<MondayState, string> = {
-  idle: "Idle",
-  thinking: "Thinking",
-  learning: "Reading context",
-  executing: "Executing",
-  completed: "Done",
-  blocked: "Error",
-};
-
-export function AIWorkspace({ client }: { client?: WorkspaceClient }) {
+export function AIWorkspace({
+  client,
+  onOpenDiagnostics = () => {},
+}: {
+  client?: WorkspaceClient;
+  onOpenDiagnostics?: () => void;
+}) {
   const { state } = useApp();
-  const [ws, actions] = useWorkspace(state.baseUrl, client);
+  const [ws, actions] = useWorkspace(state.baseUrl, client, state.activeProduct);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [panelCollapsed, setPanelCollapsed] = useState(false);
   const [commandNotice, setCommandNotice] = useState("");
@@ -165,24 +195,23 @@ export function AIWorkspace({ client }: { client?: WorkspaceClient }) {
         onSearch={(q, scope) => void actions.search(q, scope)}
         onClearSearch={actions.clearSearch}
         onToggle={() => setSidebarCollapsed((v) => !v)}
+        onOpenDiagnostics={onOpenDiagnostics}
+        projectSubtitle={activeTaskTitle(ws.context)}
+        statusRail={
+          <StatusRail
+            activity={ws.activityState}
+            project={ws.project}
+            provider={lastProvider(ws.conversation)}
+            healthy={state.healthOk}
+          />
+        }
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
         {/* Monday's presence: small, live, and never in the way. */}
         <header className="flex shrink-0 items-center justify-between border-b border-line px-4 py-2">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <div className="h-7 w-7 shrink-0">
-              <MondayBrain state={BRAIN_STATE[ws.mondayState]} />
-            </div>
-            <div className="min-w-0">
-              <div className="truncate text-[12px] text-ink">
-                {ws.conversation?.title ?? "AI Workspace"}
-              </div>
-              <div className="text-[10px] text-ink-faint">
-                {STATE_LABEL[ws.mondayState]}
-                {ws.project ? ` · ${ws.project}` : ""}
-              </div>
-            </div>
+          <div className="min-w-0 truncate text-[12px] text-ink">
+            {ws.conversation?.title ?? "AI Workspace"}
           </div>
           <button
             onClick={() => setPanelCollapsed((v) => !v)}
@@ -214,7 +243,16 @@ export function AIWorkspace({ client }: { client?: WorkspaceClient }) {
           </Banner>
         )}
 
-        <div className="min-h-0 flex-1">
+        {/* The atmosphere. A single very faint wash behind the conversation,
+            tinted by what Monday is doing. This is the ambient presence the orb
+            used to provide by being large and bright — moved behind the text
+            where it can be felt without being looked at. At 5% it is below the
+            threshold of "an element"; you notice it change, not that it exists. */}
+        <div className="relative min-h-0 flex-1">
+          <div
+            aria-hidden
+            className={`pointer-events-none absolute inset-x-0 top-0 h-64 bg-gradient-to-b ${AMBIENT[ws.activityState]} to-transparent transition-colors duration-[1500ms]`}
+          />
           {ws.conversation ? (
             <ConversationView
               conversation={ws.conversation}
@@ -227,7 +265,16 @@ export function AIWorkspace({ client }: { client?: WorkspaceClient }) {
               onRename={(id, title) => void actions.rename(id, title)}
             />
           ) : (
-            <ReturnBrief briefing={ws.briefing} onContinue={actions.continueWorking} />
+            <ReturnBrief
+              briefing={ws.briefing}
+              onContinue={actions.continueWorking}
+              onSuggest={(text) => {
+                // A suggestion needs somewhere to land. With no conversation
+                // open, start one and let the composer carry the text.
+                if (ws.conversation) void actions.send(text);
+                else void actions.newConversation().then(() => actions.send(text));
+              }}
+            />
           )}
         </div>
 
@@ -238,23 +285,19 @@ export function AIWorkspace({ client }: { client?: WorkspaceClient }) {
           sending={ws.sending}
           project={ws.project}
           contextLoaded={Boolean(ws.context && ws.context.sources.some((s) => s.item_count > 0))}
-          provider={
-            ws.conversation?.messages.filter((m) => m.provider).slice(-1)[0]?.provider ?? ""
-          }
+          provider={lastProvider(ws.conversation)}
           disabled={!ws.conversation}
         />
       </div>
 
       {!panelCollapsed && (
-        <div className="flex w-[288px] shrink-0 flex-col border-l border-line bg-canvas-raised/40">
-          <div className="min-h-0 flex-1 overflow-hidden">
-            <ContextPanel
-              context={ws.context}
-              project={ws.project}
-              onRefresh={() => void actions.refreshContext()}
-            />
-          </div>
-          <ActivityTimeline events={ws.activity} />
+        <div className="w-[248px] shrink-0 border-l border-line/70">
+          <ProjectContext
+            context={ws.context}
+            project={ws.project}
+            activity={ws.activity}
+            onRefresh={() => void actions.refreshContext()}
+          />
         </div>
       )}
     </div>

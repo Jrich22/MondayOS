@@ -7,7 +7,7 @@ import { PALETTE } from "./brainState";
 /**
  * The translucent energy chamber around the brain: a fresnel-rimmed glass
  * sphere, an energy sweep band rotating across its surface, independently
- * spinning orbital rings and partial arcs, an amber approval ring that forms on
+ * one slow ring, an amber approval ring that forms on
  * demand, and a green completion wave that expands up through the shell. No real
  * refraction (that needs a transmission pass and a scene render target — too
  * costly here); the holographic read comes from additive fresnel + sweeps.
@@ -125,35 +125,18 @@ export function GlassShell({ visual }: Props) {
         />
       </mesh>
 
-      {/* Independently rotating orbital rings + a partial arc. */}
+      {/* One slow ring. Three plus an arc read as instrumentation. */}
+      {/* One faint ring, where there were three plus an arc.
+          Concentric spinning rings are the visual grammar of a system monitor —
+          they read as instrumentation, and instrumentation asks to be watched. A
+          single slow ring gives the volume an axis without claiming attention. */}
       <group ref={rings}>
         <mesh rotation={[Math.PI / 2.2, 0, 0]}>
-          <torusGeometry args={[1.85, 0.006, 8, 160]} />
+          <torusGeometry args={[1.9, 0.004, 6, 96]} />
           <meshBasicMaterial
             color={new THREE.Color(...PALETTE.cyan)}
             transparent
-            opacity={0.5}
-            blending={THREE.AdditiveBlending}
-            depthWrite={false}
-          />
-        </mesh>
-        <mesh rotation={[Math.PI / 3, Math.PI / 5, 0]}>
-          <torusGeometry args={[2.05, 0.005, 8, 160]} />
-          <meshBasicMaterial
-            color={new THREE.Color(...PALETTE.violet)}
-            transparent
-            opacity={0.4}
-            blending={THREE.AdditiveBlending}
-            depthWrite={false}
-          />
-        </mesh>
-        {/* Partial arc. */}
-        <mesh rotation={[Math.PI / 1.7, 0, Math.PI / 6]}>
-          <torusGeometry args={[2.25, 0.004, 8, 120, Math.PI * 1.1]} />
-          <meshBasicMaterial
-            color={new THREE.Color(...PALETTE.magenta)}
-            transparent
-            opacity={0.35}
+            opacity={0.18}
             blending={THREE.AdditiveBlending}
             depthWrite={false}
           />
