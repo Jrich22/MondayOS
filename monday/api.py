@@ -1721,10 +1721,18 @@ class Monday:
         from growth.errors import GrowthError
         from growth.service import GrowthService, _as_datetime
 
-        service = GrowthService(self._config.project_root)
+        # MondayOS owns provider routing; Growth consumes the abstraction. The
+        # instance's configured provider becomes the creative writing seam.
+        service = GrowthService(
+            self._config.project_root, writer_provider=self.__provider
+        )
         project = str(kwargs.get("project", ""))
         # The routing keys are passed positionally; splatting them again would collide.
-        fields = {k: v for k, v in kwargs.items() if k not in ("project", "content_id")}
+        fields = {
+            k: v
+            for k, v in kwargs.items()
+            if k not in ("project", "content_id", "package_id", "inbox_action")
+        }
 
         try:
             if action == "workspace-init":
@@ -1889,6 +1897,86 @@ class Monday:
                         f"Paused ({state['scope']})." if state["paused"]
                         else "Pause cleared."
                     ),
+                )
+
+            if action == "plan-week":
+                data = service.plan_week(project, **fields)
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"plan": data},
+                    message=(
+                        f"{len(data['posts'])} slot(s) across {len(data['platforms'])} "
+                        f"platform(s), citing {len(data['cited_recommendations'])} "
+                        "recommendation(s)."
+                    ),
+                )
+
+            if action == "generate-week":
+                data = service.generate_week(project, **fields)
+                blocked = sum(1 for p in data["posts"] if p["blocked"])
+                return GrowthResponse(
+                    action=action, success=True, project=project, status=data["status"],
+                    data={"package": data},
+                    message=(
+                        f"{data['id']}: {len(data['posts'])} draft(s), {blocked} blocked. "
+                        "All entered as DRAFT; nothing is approved or scheduled."
+                    ),
+                )
+
+            if action == "package-list":
+                rows = service.list_packages(project)
+                return GrowthResponse(
+                    action=action, success=True, project=project,
+                    data={"packages": rows, "count": len(rows)},
+                    message=f"{len(rows)} weekly package(s).",
+                )
+
+            if action == "package-get":
+                data = service.get_package(project, str(kwargs.get("package_id", "")))
+                return GrowthResponse(
+                    action=action, success=True, project=project, status=data["status"],
+                    data={"package": data},
+                    message=f"{data['id']}: {len(data['posts'])} post(s).",
+                )
+
+            if action == "approve-week":
+                data = service.approve_week(
+                    project, str(kwargs.get("package_id", "")), **fields
+                )
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"result": data},
+                    message=(
+                        f"{data['approved_count']} approved, {data['skipped_count']} "
+                        "skipped. Each approval binds one post's own fingerprint."
+                    ),
+                )
+
+            if action == "inbox":
+                data = service.inbox(project, **fields)
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"inbox": data},
+                    message=f"{data['total']} item(s) in the approval inbox.",
+                )
+
+            if action == "inbox-summary":
+                data = service.inbox_summary(project)
+                return GrowthResponse(
+                    action=action, success=True, project=project, data={"summary": data},
+                    message=(
+                        f"{data['awaiting_review']} awaiting review, "
+                        f"{data['blocked']} blocked, {data['escalated']} escalated."
+                    ),
+                )
+
+            if action == "inbox-action":
+                data = service.inbox_action(
+                    project, str(kwargs.get("inbox_action", "")),
+                    str(kwargs.get("content_id", "")), **fields,
+                )
+                return GrowthResponse(
+                    action=action, success=bool(data.get("ok", False)), project=project,
+                    content_id=str(data.get("content_id", "")),
+                    status=str(data.get("status", "")), data={"result": data},
+                    message=str(data.get("reason") or data.get("note") or "Done."),
                 )
 
             if action == "brain-analyze":
@@ -2264,7 +2352,9 @@ class Monday:
                     "snapshot-take, snapshot-list, aggregate-write, brain-analyze, "
                     "brain-recommendations, brain-hypotheses, brain-opportunities, "
                     "brain-scores, brain-forecasts, brain-experiments, memory-record, "
-                    "memory-list, memory-validate, memory-invalidate"
+                    "memory-list, memory-validate, memory-invalidate, plan-week, "
+                    "generate-week, package-list, package-get, approve-week, inbox, "
+                    "inbox-summary, inbox-action"
                 ),
             )
         except (GrowthError, ValueError, LookupError) as exc:

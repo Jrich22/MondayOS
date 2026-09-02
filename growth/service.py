@@ -3,9 +3,9 @@ GrowthService — the public composition facade behind Monday.growth().
 
 The service holds no domain logic of its own. Isolation belongs to
 growth.project, the approval contract to growth.fingerprint, the lifecycle to
-growth.content, the human-approval gate to agents.gates and reasoning to
-growth.brain. This module wires those together and returns plain dictionaries
-for the API layer to wrap.
+growth.content, the human-approval gate to agents.gates, reasoning to
+growth.brain and drafting to growth.generation. This module wires those together
+and returns plain dictionaries for the API layer to wrap.
 
 Each domain lives in growth/services/ and is composed here (issue #35). The
 public surface is unchanged: every method callers used before is still a method
@@ -20,6 +20,7 @@ from growth.services import (
     BrainServiceMixin,
     CampaignServiceMixin,
     ContentServiceMixin,
+    GenerationServiceMixin,
     PublishingServiceMixin,
     WorkspaceServiceMixin,
 )
@@ -41,6 +42,9 @@ class GrowthService(
     CampaignServiceMixin,
     PublishingServiceMixin,
     AnalyticsServiceMixin,
+    # Generation precedes Brain because it inherits it: generation sits on top of
+    # the Brain, and Python requires a subclass to come before its base.
+    GenerationServiceMixin,
     BrainServiceMixin,
 ):
     """

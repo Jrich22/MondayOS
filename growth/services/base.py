@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brain.providers.base import AIProvider
 from growth.analytics import GrowthAnalytics
 from growth.brain.engine import GrowthBrain
 from growth.campaign import Campaign
@@ -36,6 +37,9 @@ class GrowthServiceBase:
     _connector: PublishingConnector | None
     _now: Callable[[], datetime] | None
     _jitter: float
+    # The generic reasoning/generation provider used for creative drafting.
+    # MondayOS owns which model this is; Growth only consumes the abstraction.
+    _writer_provider: AIProvider | None
 
     def __init__(
         self,
@@ -44,6 +48,7 @@ class GrowthServiceBase:
         connector: PublishingConnector | None = None,
         now: Callable[[], datetime] | None = None,
         jitter: float = 0.0,
+        writer_provider: AIProvider | None = None,
     ) -> None:
         self._root = Path(project_root)
         self._store = GrowthStore(self._root, registry=registry)
@@ -52,6 +57,7 @@ class GrowthServiceBase:
         self._connector = connector
         self._now = now
         self._jitter = jitter
+        self._writer_provider = writer_provider
 
     def _dispatcher(self, project: str, actor: str = "human:cli") -> PublishDispatcher:
         """A dispatcher bound to exactly one workspace."""

@@ -7,7 +7,7 @@ split is behaviour-preserving: the methods are the same methods, and the public
 API, the CLI and the existing tests are unchanged (issue #35).
 
 The split exists because the service had accumulated one domain per increment —
-twelve of them behind one class — and the next increment was about to add more.
+twelve of them behind one class — and increment 7 was about to add three more.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from growth.services.base import GrowthServiceBase
 from growth.services.brain import BrainServiceMixin
 from growth.services.campaign import CampaignServiceMixin
 from growth.services.content import ContentServiceMixin
+from growth.services.generation import GenerationServiceMixin
 from growth.services.publishing import PublishingServiceMixin
 from growth.services.workspace import WorkspaceServiceMixin
 
@@ -25,6 +26,7 @@ __all__ = [
     "BrainServiceMixin",
     "CampaignServiceMixin",
     "ContentServiceMixin",
+    "GenerationServiceMixin",
     "GrowthServiceBase",
     "PublishingServiceMixin",
     "WorkspaceServiceMixin",
