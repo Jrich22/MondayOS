@@ -90,7 +90,9 @@ type Action =
 const initial: State = {
   mode: "loading",
   healthOk: true,
-  section: "home",
+  // The AI Workspace is the home screen: MondayOS opens into a conversation,
+  // not a dashboard (TASK-0074).
+  section: "ai-workspace",
   commandOpen: false,
   busy: false,
   transcript: [],

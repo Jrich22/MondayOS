@@ -59,11 +59,18 @@ export function BrainScene({ state, tier, haloCount, reducedMotion, pointer }: P
       <EffectComposer>
         <Bloom
           ref={bloomRef as never}
-          intensity={0.9}
-          luminanceThreshold={0.08}
-          luminanceSmoothing={0.9}
+          intensity={0.22}
+          // A 0.08 threshold blooms almost everything on screen, which is how a
+          // field of dim particles became a bright haze behind the text. Raising
+          // it means only the core and an active pulse bloom — the rest of the
+          // volume stays a set of points instead of a light source.
+          // Higher still. At the size the brain now renders, bloom does not add
+          // depth — it just spreads the core into a soft bright disc, which is
+          // exactly the "glowing dot" the atmosphere is meant to avoid.
+          luminanceThreshold={0.72}
+          luminanceSmoothing={0.55}
           mipmapBlur
-          radius={0.7}
+          radius={0.4}
         />
       </EffectComposer>
     ),
@@ -74,7 +81,11 @@ export function BrainScene({ state, tier, haloCount, reducedMotion, pointer }: P
     const v = visual.current;
     const target = STATE_TARGETS[state];
     // Frame-rate independent easing.
-    const k = 1 - Math.pow(0.0025, delta);
+    // Settle over ~1.5s rather than ~0.5s. State changes should read as the
+    // brain easing into a new mood; at the old rate a transient state (a
+    // completed wave, a blocked settle) snapped in and out fast enough to
+    // register as a blink.
+    const k = 1 - Math.pow(0.15, delta);
 
     v.pulseSpeed += (target.pulseSpeed - v.pulseSpeed) * k;
     v.brightness += (target.brightness - v.brightness) * k;

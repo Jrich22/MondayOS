@@ -13,6 +13,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createWorkspaceClient, type WorkspaceClient } from "./client";
+import type { MondayActivity } from "./mondayState";
 import type {
   ActivityEvent,
   Briefing,
@@ -23,14 +24,7 @@ import type {
   WorkspaceProject,
 } from "./types";
 
-/** What Monday is doing, mapped onto the Brain's existing visual states. */
-export type MondayState =
-  | "idle"
-  | "thinking"
-  | "learning"
-  | "executing"
-  | "completed"
-  | "blocked";
+export type { MondayActivity } from "./mondayState";
 
 export interface WorkspaceState {
   projects: WorkspaceProject[];
@@ -48,7 +42,7 @@ export interface WorkspaceState {
   streaming: string;
   /** Set while switching projects, so the transition is visible rather than a flicker. */
   switchingTo: string;
-  mondayState: MondayState;
+  activityState: MondayActivity;
   error: string;
   notice: string;
 }
@@ -69,12 +63,19 @@ export interface WorkspaceActions {
   refreshContext(): Promise<void>;
   refreshBriefing(): Promise<void>;
   continueWorking(): void;
+  resume(project: string, conversationId: string): void;
   dismissNotice(): void;
 }
 
 export function useWorkspace(
   baseUrl: string | undefined,
   clientOverride?: WorkspaceClient,
+  /**
+   * A project handed in from elsewhere — Mission Control's "Resume in AI
+   * Workspace". Used only to choose the *initial* project; once the operator
+   * has picked one here, this no longer overrides them.
+   */
+  initialProject?: string,
 ): [WorkspaceState, WorkspaceActions] {
   const client = useMemo(
     () => clientOverride ?? (baseUrl ? createWorkspaceClient({ baseUrl }) : null),
@@ -91,7 +92,7 @@ export function useWorkspace(
   const [searchResult, setSearchResult] = useState<SearchResult | null>(null);
   const [streaming, setStreaming] = useState("");
   const [switchingTo, setSwitchingTo] = useState("");
-  const [mondayState, setMondayState] = useState<MondayState>("idle");
+  const [activityState, setActivityState] = useState<MondayActivity>("idle");
   const [loadingProjects, setLoadingProjects] = useState(false);
   const [loadingConversation, setLoadingConversation] = useState(false);
   const [sending, setSending] = useState(false);
@@ -125,12 +126,18 @@ export function useWorkspace(
         return;
       }
       setProjects(res.data);
-      setProject((current) => current || res.data[0]?.name || "");
+      setProject((current) => {
+        if (current) return current;
+        // Honour the requested project only if it actually exists; a stale or
+        // unknown name falls back rather than leaving the workspace empty.
+        const requested = res.data.find((p) => p.name === initialProject);
+        return requested?.name ?? res.data[0]?.name ?? "";
+      });
     });
     return () => {
       cancelled = true;
     };
-  }, [client]);
+  }, [client, initialProject]);
 
   const loadConversations = useCallback(
     async (target: string) => {
@@ -158,7 +165,7 @@ export function useWorkspace(
       }
       setContext(res.data);
       setSwitchingTo("");
-      setMondayState("idle");
+      setActivityState("idle");
     },
     [client],
   );
@@ -186,7 +193,7 @@ export function useWorkspace(
       setError("");
       setNotice("");
       setSwitchingTo(next);
-      setMondayState("learning");
+      setActivityState("reading-project");
       setProject(next);
     },
     [project],
@@ -227,7 +234,7 @@ export function useWorkspace(
       setSending(true);
       setStreaming("");
       setError("");
-      setMondayState("learning"); // reading project context first
+      setActivityState("loading-context");
 
       const { events, stop } = client.streamMessage(project, conversation.id, content);
       stopRef.current = stop;
@@ -237,7 +244,7 @@ export function useWorkspace(
         for await (const event of events) {
           if (event.type === "context") {
             setContext(event.context);
-            setMondayState("thinking");
+            setActivityState("thinking");
           } else if (event.type === "user") {
             // Show the user's turn immediately; the server has already stored it.
             setConversation((c) =>
@@ -246,13 +253,15 @@ export function useWorkspace(
           } else if (event.type === "delta") {
             accumulated += event.text;
             setStreaming(accumulated);
+            // First token: thinking is over, the answer is arriving.
+            if (!accumulated.trimStart().slice(1)) setActivityState("streaming");
           } else if (event.type === "done") {
             setConversation(event.conversation);
             setStreaming("");
-            setMondayState(event.message.error ? "blocked" : "completed");
+            setActivityState(event.message.error ? "error" : "idle");
           } else if (event.type === "error") {
             setError(event.message);
-            setMondayState("blocked");
+            setActivityState("error");
           }
         }
       } finally {
@@ -267,7 +276,9 @@ export function useWorkspace(
         void client.activity().then((r) => {
           if (r.ok) setActivity(r.data.events);
         });
-        setTimeout(() => setMondayState("idle"), 1200);
+        // Return to rest. An error lingers a moment longer so it is legible,
+        // then settles — a permanently red brain is one nobody looks at.
+        setTimeout(() => setActivityState("idle"), 2000);
       }
     },
     [client, project, conversation, loadConversations],
@@ -322,7 +333,9 @@ export function useWorkspace(
   const saveToKnowledge = useCallback(
     async (messageId: string) => {
       if (!client || !project || !conversation) return;
+      setActivityState("writing-knowledge");
       const res = await client.saveToKnowledge(project, conversation.id, messageId);
+      setActivityState("idle");
       if (!res.ok) {
         setError(res.error.message);
         return;
@@ -338,9 +351,9 @@ export function useWorkspace(
   const createTask = useCallback(
     async (messageId: string) => {
       if (!client || !project || !conversation) return;
-      setMondayState("executing");
+      setActivityState("creating-task");
       const res = await client.createTask(project, conversation.id, messageId);
-      setMondayState("idle");
+      setActivityState("idle");
       if (!res.ok) {
         setError(res.error.message);
         return;
@@ -354,7 +367,9 @@ export function useWorkspace(
   const search = useCallback(
     async (query: string, scope: "project" | "all") => {
       if (!client || !query.trim()) return;
+      setActivityState("searching-knowledge");
       const res = await client.search(query, project, scope);
+      setActivityState("idle");
       if (!res.ok) {
         setError(res.error.message);
         return;
@@ -371,6 +386,26 @@ export function useWorkspace(
     const res = await client.briefing("");
     if (res.ok) setBriefing(res.data);
   }, [client]);
+
+  /**
+   * Switch project and open one of its threads in a single action.
+   *
+   * Reuses the pending-conversation handshake rather than opening directly: the
+   * thread belongs to a project that may not be loaded yet, and opening it
+   * before that project's list has settled is how a conversation ends up on
+   * screen under the wrong project's name.
+   */
+  const resume = useCallback(
+    (target: string, conversationId: string) => {
+      if (target !== project) {
+        selectProject(target);
+        setPendingConversation(conversationId);
+        return;
+      }
+      selectConversation(conversationId);
+    },
+    [project, selectProject, selectConversation],
+  );
 
   const continueWorking = useCallback(() => {
     // Only ever reopens what the briefing actually found. With nothing recorded
@@ -417,7 +452,7 @@ export function useWorkspace(
       sending,
       streaming,
       switchingTo,
-      mondayState,
+      activityState,
       error,
       notice,
     },
@@ -437,6 +472,7 @@ export function useWorkspace(
       refreshContext,
       refreshBriefing,
       continueWorking,
+      resume,
       dismissNotice,
     },
   ];

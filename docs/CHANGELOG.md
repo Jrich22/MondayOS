@@ -9,6 +9,50 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### MondayOS v3.4 — AI Workspace: Deep Project Intelligence (2026-09-03)
+
+Increment 3 (TASK-0074). Monday can now answer questions *from the project* — what is being
+built, why a decision was made, where something is implemented, what changed — and cite the
+evidence for every answer.
+
+New `intelligence/` package, an OS-level service beside `knowledge/` and `tasks/`:
+
+- **Project indexer** covering source, tests, documentation, decision records, config and
+  prompts, classified by role rather than extension.
+- **Symbol index** — classes, functions, methods, interfaces, protocols, dataclasses, enums,
+  constants and types — with a file and line range for each definition.
+- **Term index** over real file content, with identifiers split on `snake_case` and `camelCase`
+  and kept whole, so `render_context` is findable three ways.
+- **Relationship graph**: Task → ADR → Code → Test → Commit → PR. Every edge derives from
+  something the project wrote down and carries the literal reason; nothing is inferred by
+  similarity. ADR ids are namespaced by their decision log, because MondayOS and sourcingBOT
+  both define an ADR-017 and citing the wrong one is the failure the evidence trail exists to
+  prevent.
+- **Question engine** with eight intents, each with its own retrieval strategy.
+- **Navigable evidence** — `workspace/context/engine.py lines 42-201`, `ADR-015`, `TASK-0073`,
+  `PR #39`. A citation nobody can follow is one nobody verifies.
+
+Two commitments hold throughout. **Deterministic**: no embeddings, no vector database, no model
+in the indexing or retrieval path, so identical project state produces identical answers.
+**Derived**: the index is a gitignored cache, never a system of record — every fact in it is
+recoverable by re-reading the project.
+
+Intelligence reaches conversation through the **existing Context Engine** as one more source, so
+budgeting, attribution, redaction and project isolation apply without being reimplemented.
+Retrieval runs before the model, so evidence is fixed before any prose is generated.
+
+Conversations now carry their subject, so a follow-up need not restate it. The back-reference
+pronoun is the signal — an earlier version relied on a verb stoplist, where one missing word
+turned "find every place **it** is used" into a search for "used".
+
+On this repository: 725 files and 5,688 symbols indexed in 924 ms cold, 99 ms warm; graph of 995
+nodes and 1,628 edges in 41 ms; questions answered in 1.5 ms mean.
+
+Known limitations, documented rather than hidden: TypeScript symbols are regex-extracted rather
+than parsed; test→code links use naming convention rather than import analysis; task→commit
+quality depends on task references and commit messages; and retrieval produces grounded evidence
+while the configured provider still writes the final prose.
+
 ### MondayOS v3.1 — Growth Bot: model-backed content generation (2026-09-02)
 
 Increment 7 (TASK-0067). Adds the generation subsystem on top of the deterministic Growth Brain:

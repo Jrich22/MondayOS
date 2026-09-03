@@ -46,10 +46,21 @@ export interface BrainTier {
 }
 
 /** Particle budgets by device capability. */
+// About 2.5% of the original budget.
+//
+// The brain is no longer an object on the screen; it is atmosphere at the edge
+// of one. At the size it now renders — roughly 22 pixels — a dense point cloud
+// resolves to a solid glowing dot, so the density was not buying detail, it was
+// buying brightness the conversation had to compete with.
+//
+// These counts are chosen for what survives at that scale: enough points to
+// suggest volume and depth, few enough that each one is a distinct speck rather
+// than part of a mass. Node count falls hardest because every node anchors
+// edges, and edges are the moving parts.
 export const TIERS: Record<"high" | "mid" | "low", BrainTier> = {
-  high: { surface: 7000, volume: 2600, core: 900, nodes: 340, halo: 4200 },
-  mid: { surface: 4200, volume: 1500, core: 520, nodes: 240, halo: 2400 },
-  low: { surface: 2200, volume: 700, core: 260, nodes: 150, halo: 1100 },
+  high: { surface: 180, volume: 64, core: 22, nodes: 10, halo: 105 },
+  mid: { surface: 120, volume: 42, core: 16, nodes: 8, halo: 70 },
+  low: { surface: 70, volume: 24, core: 10, nodes: 6, halo: 40 },
 };
 
 // Ellipsoid radii: longer front-back (z), narrower top-bottom (y) → brain-ish.
@@ -211,7 +222,10 @@ export interface NeuralNet {
 export function buildNeuralNet(nodes: number[][], seed = 71): NeuralNet {
   const rnd = mulberry32(seed);
   const links: [number, number][] = [];
-  const K = 2;
+  // One neighbour per node, not two. Halving the edge count removes most of the
+  // moving lines: what remains reads as a few quiet connections rather than a
+  // network diagram.
+  const K = 1;
   for (let a = 0; a < nodes.length; a++) {
     // Find nearest neighbours to node a.
     const dists: [number, number][] = [];

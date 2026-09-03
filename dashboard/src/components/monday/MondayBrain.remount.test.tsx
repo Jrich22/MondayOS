@@ -54,7 +54,7 @@ let bumpRefresh: () => void = () => {};
 let setBrain: (s: BrainState) => void = () => {};
 
 /**
- * Stand-in for BrainStage: `refresh` models an unrelated store snapshot update
+ * Stand-in for a Brain host: `refresh` models an unrelated store snapshot update
  * (activity/health/revision) that re-renders the parent WITHOUT changing the
  * Brain's props; `brain` models a real Brain-state transition.
  */

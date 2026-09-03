@@ -79,3 +79,8 @@ config/projects.json
 # AI Workspace conversations — runtime state, and user content rather than
 # source. MondayOS owns the record (ADR-015); it is not version-controlled.
 workspace/conversations/
+
+# Project intelligence index — a derived cache. Every fact in it is recoverable
+# by re-reading the project; deleting it costs a rebuild and nothing else.
+.index/
+intelligence/cache/

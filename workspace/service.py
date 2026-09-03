@@ -173,11 +173,17 @@ class WorkspaceService:
         if self._engine is not None:
             self._engine.invalidate(project)
 
-    def _snapshot(self, project: str, query: str = "", allow_reuse: bool = True) -> ContextSnapshot:
+    def _snapshot(
+        self,
+        project: str,
+        query: str = "",
+        allow_reuse: bool = True,
+        carry: str = "",
+    ) -> ContextSnapshot:
         if self._engine is None:
             return ContextSnapshot(id="CTX-none", project=slugify(project), created_at=self._now())
         if allow_reuse:
-            snapshot, reused = self._engine.build_or_reuse(project, query)
+            snapshot, reused = self._engine.build_or_reuse(project, query, carry)
             self._activity.record(
                 ActivityKind.CONTEXT,
                 "Reused project context" if reused else "Assembled project context",
@@ -185,7 +191,7 @@ class WorkspaceService:
                 detail=snapshot.summary(),
             )
             return snapshot
-        snapshot = self._engine.build(project, query)
+        snapshot = self._engine.build(project, query, carry)
         self._activity.record(
             ActivityKind.CONTEXT,
             "Assembled project context",
@@ -219,9 +225,14 @@ class WorkspaceService:
         if conversation.is_archived:
             raise ConversationArchivedError(conversation_id)
 
-        snapshot = self._snapshot(project, query=text) if rebuild_context else None
+        snapshot = (
+            self._snapshot(project, query=text, carry=conversation.subject)
+            if rebuild_context
+            else None
+        )
         if snapshot is not None:
             conversation.active_snapshot_id = snapshot.id
+            conversation.subject = _subject_of(snapshot) or conversation.subject
 
         stamp = self._now()
         user_message = Message(
@@ -307,8 +318,10 @@ class WorkspaceService:
         if conversation.is_archived:
             raise ConversationArchivedError(conversation_id)
 
-        snapshot = self._snapshot(project, query=text)
+        snapshot = self._snapshot(project, query=text, carry=conversation.subject)
         conversation.active_snapshot_id = snapshot.id
+        # Carry the subject forward, so the next question need not restate it.
+        conversation.subject = _subject_of(snapshot) or conversation.subject
 
         stamp = self._now()
         user_message = Message(
@@ -743,3 +756,20 @@ __all__ = [
     "ConversationNotFoundError",
     "WorkspaceService",
 ]
+
+
+def _subject_of(snapshot: ContextSnapshot) -> str:
+    """
+    What the intelligence source decided this exchange was about.
+
+    Read back off the snapshot rather than recomputed: the question engine
+    already resolved the subject (including its own carry-over), and deriving it
+    a second time here would be a second implementation that could disagree.
+    """
+    source = snapshot.source("intelligence")
+    if source is None:
+        return ""
+    for item in source.items:
+        if item.startswith("Subject: "):
+            return item.removeprefix("Subject: ").strip()
+    return ""
