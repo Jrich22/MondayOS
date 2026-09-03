@@ -54,17 +54,22 @@ class ContextEngine:
         resolve_project: Callable[[str], tuple[str, Path, str]],
         read_tasks: Callable[[str], list[dict[str, Any]]] | None = None,
         read_knowledge: Callable[[str], list[dict[str, Any]]] | None = None,
+        ask_intelligence: Callable[[str, str, str], Any] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._resolve = resolve_project
         self._read_tasks = read_tasks
         self._read_knowledge = read_knowledge
+        # Deterministic project retrieval. Optional: without it the snapshot is
+        # exactly what increments 1 and 2 produced, which is still a valid
+        # snapshot rather than a degraded one.
+        self._ask_intelligence = ask_intelligence
         self._now = now or (lambda: datetime.now(tz=UTC))
         self._cache: dict[str, ContextSnapshot] = {}
 
     # ------------------------------------------------------------------ build
 
-    def build(self, project: str, query: str = "") -> ContextSnapshot:
+    def build(self, project: str, query: str = "", carry: str = "") -> ContextSnapshot:
         """
         Assemble a snapshot for exactly one project.
 
@@ -87,6 +92,7 @@ class ContextEngine:
             self._tasks(slug, query),
             self._knowledge(slug, query),
             adapters.git_source(slug, root, commit_limit=MAX_COMMITS, query=query),
+            self._intelligence(slug, query, carry),
         ]
 
         result = budget.apply(gathered)
@@ -103,7 +109,9 @@ class ContextEngine:
         self._cache[slug] = snapshot
         return snapshot
 
-    def build_or_reuse(self, project: str, query: str = "") -> tuple[ContextSnapshot, bool]:
+    def build_or_reuse(
+        self, project: str, query: str = "", carry: str = ""
+    ) -> tuple[ContextSnapshot, bool]:
         """
         Return a snapshot and whether it was reused.
 
@@ -117,7 +125,7 @@ class ContextEngine:
         cached = self._cache.get(slug)
         if cached is not None and cached.fingerprint and self._reusable(cached, root, query):
             return cached, True
-        return self.build(project, query), False
+        return self.build(project, query, carry), False
 
     def invalidate(self, project: str = "") -> None:
         """Drop cached context for one project, or for all of them."""
@@ -180,6 +188,19 @@ class ContextEngine:
             return hashlib.sha256("|".join(parts).encode()).hexdigest()[:24]
         except Exception:  # noqa: BLE001 — fail toward rebuilding, never toward stale
             return f"unknown-{self._now().timestamp()}"
+
+    def _intelligence(self, slug: str, query: str, carry: str = "") -> ContextSource:
+        """Evidence retrieved for this request, when an indexer is wired."""
+        from workspace.context.intelligence_source import intelligence_source
+
+        if self._ask_intelligence is None or not query:
+            return ContextSource(
+                name="intelligence",
+                label="Project intelligence",
+                origin="project index (not configured)",
+            )
+        ask = self._ask_intelligence
+        return intelligence_source(slug, lambda: ask(slug, query, carry), query=query)
 
     # ---------------------------------------------------------------- readers
 

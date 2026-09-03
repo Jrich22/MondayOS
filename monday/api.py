@@ -5,6 +5,7 @@ This is the only import external consumers need. Internal modules
 (brain, events, knowledge, memory, search, tasks) are implementation
 details accessed exclusively through this class.
 """
+
 from __future__ import annotations
 
 import uuid
@@ -108,6 +109,8 @@ class Monday:
         self.__tasks = TaskManager(self._config.project_root)
         self.__reasoner = ReasoningEngine(self.__knowledge, self.__tasks)
         self.__provider = create_provider(self._config.provider_config)
+        # Per-project question engines, built on first use.
+        self.__question_engines: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -241,13 +244,15 @@ class Monday:
 
         entry_id = self.__knowledge.add(entry)
 
-        self.__bus.publish(Event(
-            event_type=EventType.KNOWLEDGE_ENTRY_CREATED,
-            source="monday",
-            timestamp=datetime.now(tz=UTC),
-            payload={"entry_id": entry_id, "entry_type": entry_type},
-            session_id=self._session_id,
-        ))
+        self.__bus.publish(
+            Event(
+                event_type=EventType.KNOWLEDGE_ENTRY_CREATED,
+                source="monday",
+                timestamp=datetime.now(tz=UTC),
+                payload={"entry_id": entry_id, "entry_type": entry_type},
+                session_id=self._session_id,
+            )
+        )
 
         return LearnResponse(
             entry_id=entry_id,
@@ -406,13 +411,15 @@ class Monday:
                 project=str(kwargs.get("project", "")),
             )
 
-            self.__bus.publish(Event(
-                event_type=EventType.TASK_CREATED,
-                source="monday",
-                timestamp=datetime.now(tz=UTC),
-                payload={"task_id": created_task.id, "title": created_task.title},
-                session_id=self._session_id,
-            ))
+            self.__bus.publish(
+                Event(
+                    event_type=EventType.TASK_CREATED,
+                    source="monday",
+                    timestamp=datetime.now(tz=UTC),
+                    payload={"task_id": created_task.id, "title": created_task.title},
+                    session_id=self._session_id,
+                )
+            )
 
             return TaskResponse(
                 action="create",
@@ -561,30 +568,46 @@ class Monday:
             )
         except TaskNotFoundError as exc:
             return TaskResponse(
-                action="review", success=False, task_id=task_id, data={}, message=str(exc),
+                action="review",
+                success=False,
+                task_id=task_id,
+                data={},
+                message=str(exc),
             )
         except InvalidTransitionError as exc:
             return TaskResponse(
-                action="review", success=False, task_id=task_id, data={}, message=str(exc),
+                action="review",
+                success=False,
+                task_id=task_id,
+                data={},
+                message=str(exc),
             )
 
     def _task_assign(self, task_id: str, kwargs: dict[str, Any]) -> TaskResponse:
         """Assign a task to an assignee (person, model, or 'role:<slug>')."""
         if not task_id:
             return TaskResponse(
-                action="assign", success=False, task_id=None, data={},
+                action="assign",
+                success=False,
+                task_id=None,
+                data={},
                 message="task_id is required for action 'assign'",
             )
         assignee = kwargs.get("assignee", "")
         if not assignee:
             return TaskResponse(
-                action="assign", success=False, task_id=task_id, data={},
+                action="assign",
+                success=False,
+                task_id=task_id,
+                data={},
                 message="assignee is required for action 'assign'",
             )
         assigned_by = kwargs.get("assigned_by", f"workflow:{self._session_id}")
         try:
             updated = self.__tasks.assign(
-                task_id=task_id, assignee=assignee, assigned_by=assigned_by,
+                task_id=task_id,
+                assignee=assignee,
+                assigned_by=assigned_by,
             )
             return TaskResponse(
                 action="assign",
@@ -595,11 +618,19 @@ class Monday:
             )
         except TaskNotFoundError as exc:
             return TaskResponse(
-                action="assign", success=False, task_id=task_id, data={}, message=str(exc),
+                action="assign",
+                success=False,
+                task_id=task_id,
+                data={},
+                message=str(exc),
             )
         except InvalidTransitionError as exc:
             return TaskResponse(
-                action="assign", success=False, task_id=task_id, data={}, message=str(exc),
+                action="assign",
+                success=False,
+                task_id=task_id,
+                data={},
+                message=str(exc),
             )
 
     def _task_complete(self, task_id: str, kwargs: dict[str, Any]) -> TaskResponse:
@@ -620,13 +651,15 @@ class Monday:
                 changed_by=changed_by,
                 reason=reason,
             )
-            self.__bus.publish(Event(
-                event_type=EventType.TASK_COMPLETED,
-                source="monday",
-                timestamp=datetime.now(tz=UTC),
-                payload={"task_id": updated.id},
-                session_id=self._session_id,
-            ))
+            self.__bus.publish(
+                Event(
+                    event_type=EventType.TASK_COMPLETED,
+                    source="monday",
+                    timestamp=datetime.now(tz=UTC),
+                    payload={"task_id": updated.id},
+                    session_id=self._session_id,
+                )
+            )
             return TaskResponse(
                 action="complete",
                 success=True,
@@ -1114,9 +1147,13 @@ class Monday:
                     message=f"Registered project {name!r} → {entry.source_path}",
                 )
             except ProjectAlreadyExistsError as exc:
-                return ProjectResponse(action="register", success=False, project_name=name, message=str(exc))
+                return ProjectResponse(
+                    action="register", success=False, project_name=name, message=str(exc)
+                )
             except ValueError as exc:
-                return ProjectResponse(action="register", success=False, project_name=name, message=str(exc))
+                return ProjectResponse(
+                    action="register", success=False, project_name=name, message=str(exc)
+                )
 
         if action == "list":
             entries = registry.list()
@@ -1132,7 +1169,9 @@ class Monday:
 
         if action == "get":
             if not name:
-                return ProjectResponse(action="get", success=False, message="'name' is required for action 'get'")
+                return ProjectResponse(
+                    action="get", success=False, message="'name' is required for action 'get'"
+                )
             try:
                 entry = registry.get(name)
                 return ProjectResponse(
@@ -1143,11 +1182,15 @@ class Monday:
                     message=f"Project {name!r} — {entry.source_path}",
                 )
             except ProjectNotFoundError as exc:
-                return ProjectResponse(action="get", success=False, project_name=name, message=str(exc))
+                return ProjectResponse(
+                    action="get", success=False, project_name=name, message=str(exc)
+                )
 
         if action == "remove":
             if not name:
-                return ProjectResponse(action="remove", success=False, message="'name' is required for action 'remove'")
+                return ProjectResponse(
+                    action="remove", success=False, message="'name' is required for action 'remove'"
+                )
             try:
                 registry.remove(name)
                 return ProjectResponse(
@@ -1157,7 +1200,9 @@ class Monday:
                     message=f"Project {name!r} removed from registry",
                 )
             except ProjectNotFoundError as exc:
-                return ProjectResponse(action="remove", success=False, project_name=name, message=str(exc))
+                return ProjectResponse(
+                    action="remove", success=False, project_name=name, message=str(exc)
+                )
 
         return ProjectResponse(
             action=action,
@@ -1317,11 +1362,15 @@ class Monday:
         try:
             mode_enum = ExecutionMode.from_str(mode)
         except ValueError as exc:
-            return ExecuteResponse(action="execute", success=False, task_id=task_id, message=str(exc))
+            return ExecuteResponse(
+                action="execute", success=False, task_id=task_id, message=str(exc)
+            )
         try:
             policy_enum = ProviderSelectionPolicy.from_str(policy)
         except ValueError as exc:
-            return ExecuteResponse(action="execute", success=False, task_id=task_id, message=str(exc))
+            return ExecuteResponse(
+                action="execute", success=False, task_id=task_id, message=str(exc)
+            )
 
         if providers is None:
             available = [self.__provider] if self.__provider is not None else []
@@ -1343,11 +1392,12 @@ class Monday:
         )
 
         report = orchestrator.execute(task_id)
-        report_path = str(self._config.project_root / "logs" / "executions" / f"{report.execution_id}.json")
+        report_path = str(
+            self._config.project_root / "logs" / "executions" / f"{report.execution_id}.json"
+        )
 
         message = report.error or (
-            f"{report.status} via {report.provider_used}" if report.provider_used
-            else report.status
+            f"{report.status} via {report.provider_used}" if report.provider_used else report.status
         )
 
         return ExecuteResponse(
@@ -1412,7 +1462,8 @@ class Monday:
                     d["provider_status"] = av.reason
                     rows.append(d)
                 return AgentResponse(
-                    action="list", success=True,
+                    action="list",
+                    success=True,
                     data={"agents": rows, "count": len(rows)},
                     message=f"{len(rows)} agent(s)",
                 )
@@ -1427,7 +1478,10 @@ class Monday:
                     description=kwargs.get("description", ""),
                 )
                 return AgentResponse(
-                    action="register", success=True, agent_id=agent.id, role=agent.role,
+                    action="register",
+                    success=True,
+                    agent_id=agent.id,
+                    role=agent.role,
                     data={"agent": agent.to_dict()},
                     message=f"Registered {agent.id} ({agent.name}) for role {agent.role}",
                 )
@@ -1439,8 +1493,12 @@ class Monday:
                     assigned_by=kwargs.get("assigned_by", "human:cli"),
                 )
                 return AgentResponse(
-                    action="assign", success=r.success, task_id=kwargs.get("task_id", ""),
-                    role=kwargs.get("role", ""), data=r.data, message=r.message,
+                    action="assign",
+                    success=r.success,
+                    task_id=kwargs.get("task_id", ""),
+                    role=kwargs.get("role", ""),
+                    data=r.data,
+                    message=r.message,
                 )
 
             if action == "run":
@@ -1455,9 +1513,16 @@ class Monday:
                     requested_actions=kwargs.get("requested_actions"),
                 )
                 return AgentResponse(
-                    action="run", success=run.success, run_id=run.run_id, task_id=run.task_id,
-                    role=run.role, agent_id=run.agent_id, provider_used=run.provider_used,
-                    status=run.status, data=run.to_dict(), message=run.message,
+                    action="run",
+                    success=run.success,
+                    run_id=run.run_id,
+                    task_id=run.task_id,
+                    role=run.role,
+                    agent_id=run.agent_id,
+                    provider_used=run.provider_used,
+                    status=run.status,
+                    data=run.to_dict(),
+                    message=run.message,
                 )
 
             if action == "review":
@@ -1468,8 +1533,14 @@ class Monday:
                     note=kwargs.get("note", ""),
                 )
                 return AgentResponse(
-                    action="review", success=True, run_id=run.run_id, task_id=run.task_id,
-                    role=run.role, status=run.status, data=run.to_dict(), message=run.message,
+                    action="review",
+                    success=True,
+                    run_id=run.run_id,
+                    task_id=run.task_id,
+                    role=run.role,
+                    status=run.status,
+                    data=run.to_dict(),
+                    message=run.message,
                 )
 
             if action == "history":
@@ -1479,13 +1550,15 @@ class Monday:
                     limit=int(kwargs.get("limit", 20)),
                 )
                 return AgentResponse(
-                    action="history", success=True,
+                    action="history",
+                    success=True,
                     data={"runs": [r.to_dict() for r in runs], "count": len(runs)},
                     message=f"{len(runs)} run(s)",
                 )
 
             return AgentResponse(
-                action=action, success=False,
+                action=action,
+                success=False,
                 message=(
                     f"Unknown action {action!r}. "
                     "Valid actions: list, register, assign, run, review, history"
@@ -1532,10 +1605,16 @@ class Monday:
                     stage_providers=kwargs.get("stage_providers"),
                 )
                 return TeamResponse(
-                    action="run", success=tr.success, message=tr.message,
-                    team_run_id=tr.team_run_id, task_id=tr.task_id, status=tr.status,
-                    stopped_at=tr.stopped_at, approval_run_id=tr.approval_run_id,
-                    stages=list(tr.stages), data=tr.to_dict(),
+                    action="run",
+                    success=tr.success,
+                    message=tr.message,
+                    team_run_id=tr.team_run_id,
+                    task_id=tr.task_id,
+                    status=tr.status,
+                    stopped_at=tr.stopped_at,
+                    approval_run_id=tr.approval_run_id,
+                    stages=list(tr.stages),
+                    data=tr.to_dict(),
                 )
 
             if action == "history":
@@ -1543,13 +1622,15 @@ class Monday:
                     task_id=kwargs.get("task_id"), limit=int(kwargs.get("limit", 20))
                 )
                 return TeamResponse(
-                    action="history", success=True,
+                    action="history",
+                    success=True,
                     message=f"{len(runs)} team run(s)",
                     data={"runs": [r.to_dict() for r in runs], "count": len(runs)},
                 )
 
             return TeamResponse(
-                action=action, success=False,
+                action=action,
+                success=False,
                 message=f"Unknown action {action!r}. Valid actions: run, history",
             )
         except (ValueError, LookupError) as exc:
@@ -1588,14 +1669,16 @@ class Monday:
                 publisher = ConfluencePublisher(root, ConfluenceConfig.from_env())
                 events = publisher.history(limit=int(kwargs.get("limit", 20)))
                 return PublishResponse(
-                    action="history", success=True,
+                    action="history",
+                    success=True,
                     message=f"{len(events)} publish event(s)",
                     data={"history": events, "count": len(events)},
                 )
 
             if action != "confluence":
                 return PublishResponse(
-                    action=action, success=False,
+                    action=action,
+                    success=False,
                     message=f"Unknown action {action!r}. Valid actions: confluence, history",
                 )
 
@@ -1622,8 +1705,11 @@ class Monday:
                 check = config.credential_check(require_space=needs_space)
                 if not check.ok:
                     return PublishResponse(
-                        action=action, success=False, doc_id=doc.doc_id,
-                        status="failed", message=check.instructions(),
+                        action=action,
+                        success=False,
+                        doc_id=doc.doc_id,
+                        status="failed",
+                        message=check.instructions(),
                     )
 
             publisher = ConfluencePublisher(root, config, client=client)
@@ -1636,15 +1722,22 @@ class Monday:
                 force=bool(kwargs.get("force", False)),
             )
             return PublishResponse(
-                action=action, success=result.success, message=result.message,
-                doc_id=result.doc_id, page_id=result.page_id, url=result.url,
-                status=result.action, dry_run=result.dry_run, data=result.to_dict(),
+                action=action,
+                success=result.success,
+                message=result.message,
+                doc_id=result.doc_id,
+                page_id=result.page_id,
+                url=result.url,
+                status=result.action,
+                dry_run=result.dry_run,
+                data=result.to_dict(),
             )
         except (ValueError, LookupError) as exc:
             return PublishResponse(action=action, success=False, message=str(exc))
 
     def _publish_has_mapping(self, root: Path, doc_id: str) -> bool:
         from integrations.confluence import PublishStore
+
         return PublishStore(root).get(doc_id) is not None
 
     def _resolve_publish_doc(self, doc_id: str, file: str, title: str) -> Any:
@@ -1761,9 +1854,7 @@ class Monday:
 
         # MondayOS owns provider routing; Growth consumes the abstraction. The
         # instance's configured provider becomes the creative writing seam.
-        service = GrowthService(
-            self._config.project_root, writer_provider=self.__provider
-        )
+        service = GrowthService(self._config.project_root, writer_provider=self.__provider)
         project = str(kwargs.get("project", ""))
         # The routing keys are passed positionally; splatting them again would collide.
         fields = {
@@ -1776,7 +1867,9 @@ class Monday:
             if action == "workspace-init":
                 data = service.init_workspace(project)
                 return GrowthResponse(
-                    action=action, success=True, project=data["slug"],
+                    action=action,
+                    success=True,
+                    project=data["slug"],
                     data={"workspace": data},
                     message=f"Growth workspace created for {data['slug']}.",
                 )
@@ -1784,7 +1877,9 @@ class Monday:
             if action == "workspace-get":
                 data = service.get_workspace(project)
                 return GrowthResponse(
-                    action=action, success=True, project=data["slug"],
+                    action=action,
+                    success=True,
+                    project=data["slug"],
                     data={"workspace": data},
                     message=f"Growth workspace for {data['slug']}.",
                 )
@@ -1792,7 +1887,8 @@ class Monday:
             if action == "workspace-list":
                 slugs = service.list_workspaces()
                 return GrowthResponse(
-                    action=action, success=True,
+                    action=action,
+                    success=True,
                     data={"workspaces": slugs, "count": len(slugs)},
                     message=f"{len(slugs)} growth workspace(s).",
                 )
@@ -1806,7 +1902,9 @@ class Monday:
                     secret_name=str(kwargs.get("secret_name", "")),
                 )
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"binding": binding},
                     message=f"Bound {binding['platform']} for {project}.",
                 )
@@ -1814,7 +1912,9 @@ class Monday:
             if action == "bindings":
                 rows = service.list_bindings(project)
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"bindings": rows, "count": len(rows)},
                     message=f"{len(rows)} binding(s).",
                 )
@@ -1823,7 +1923,9 @@ class Monday:
                 rows = service.credential_status(project, kwargs.get("environ"))
                 ready = sum(1 for r in rows if r["ready"])
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"credentials": rows, "ready": ready, "count": len(rows)},
                     message=f"{ready}/{len(rows)} credential(s) present.",
                 )
@@ -1839,15 +1941,15 @@ class Monday:
             if action == "content-list":
                 items = service.list_content(project, str(kwargs.get("status", "")))
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"content": items, "count": len(items)},
                     message=f"{len(items)} content item(s).",
                 )
 
             if action == "content-update":
-                item = service.update_content(
-                    project, str(kwargs.get("content_id", "")), **fields
-                )
+                item = service.update_content(project, str(kwargs.get("content_id", "")), **fields)
                 note = "Updated"
                 if item["approval_is_stale"] or (
                     item["status"] == "ready-for-review" and not item["approved_fingerprint"]
@@ -1897,24 +1999,31 @@ class Monday:
                     result = service.schedule_content(project, content_id, actor=actor)
                 elif action == "publish":
                     result = service.publish_content_now(
-                        project, content_id, actor=actor,
+                        project,
+                        content_id,
+                        actor=actor,
                         force=bool(kwargs.get("force", False)),
                     )
                 else:
                     result = service.retry_publication(project, content_id, actor=actor)
                 return GrowthResponse(
-                    action=action, success=bool(result["ok"]), project=project,
-                    content_id=result["content_id"], status=result["status"],
-                    message=result["message"], data={"result": result},
+                    action=action,
+                    success=bool(result["ok"]),
+                    project=project,
+                    content_id=result["content_id"],
+                    status=result["status"],
+                    message=result["message"],
+                    data={"result": result},
                 )
 
             if action == "publication-status":
-                status = service.publication_status(
-                    project, str(kwargs.get("content_id", ""))
-                )
+                status = service.publication_status(project, str(kwargs.get("content_id", "")))
                 return GrowthResponse(
-                    action=action, success=True, project=project,
-                    content_id=status["content_id"], status=status["status"],
+                    action=action,
+                    success=True,
+                    project=project,
+                    content_id=status["content_id"],
+                    status=status["status"],
                     is_approved=bool(status["is_approved"]),
                     data={"publication_status": status},
                     message=f"{status['content_id']} is {status['status']}.",
@@ -1929,18 +2038,22 @@ class Monday:
                     reason=str(kwargs.get("reason", "")),
                 )
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"pause": state},
                     message=(
-                        f"Paused ({state['scope']})." if state["paused"]
-                        else "Pause cleared."
+                        f"Paused ({state['scope']})." if state["paused"] else "Pause cleared."
                     ),
                 )
 
             if action == "plan-week":
                 data = service.plan_week(project, **fields)
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"plan": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"plan": data},
                     message=(
                         f"{len(data['posts'])} slot(s) across {len(data['platforms'])} "
                         f"platform(s), citing {len(data['cited_recommendations'])} "
@@ -1952,7 +2065,10 @@ class Monday:
                 data = service.generate_week(project, **fields)
                 blocked = sum(1 for p in data["posts"] if p["blocked"])
                 return GrowthResponse(
-                    action=action, success=True, project=project, status=data["status"],
+                    action=action,
+                    success=True,
+                    project=project,
+                    status=data["status"],
                     data={"package": data},
                     message=(
                         f"{data['id']}: {len(data['posts'])} draft(s), {blocked} blocked. "
@@ -1963,7 +2079,9 @@ class Monday:
             if action == "package-list":
                 rows = service.list_packages(project)
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"packages": rows, "count": len(rows)},
                     message=f"{len(rows)} weekly package(s).",
                 )
@@ -1971,17 +2089,21 @@ class Monday:
             if action == "package-get":
                 data = service.get_package(project, str(kwargs.get("package_id", "")))
                 return GrowthResponse(
-                    action=action, success=True, project=project, status=data["status"],
+                    action=action,
+                    success=True,
+                    project=project,
+                    status=data["status"],
                     data={"package": data},
                     message=f"{data['id']}: {len(data['posts'])} post(s).",
                 )
 
             if action == "approve-week":
-                data = service.approve_week(
-                    project, str(kwargs.get("package_id", "")), **fields
-                )
+                data = service.approve_week(project, str(kwargs.get("package_id", "")), **fields)
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"result": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"result": data},
                     message=(
                         f"{data['approved_count']} approved, {data['skipped_count']} "
                         "skipped. Each approval binds one post's own fingerprint."
@@ -1991,14 +2113,20 @@ class Monday:
             if action == "inbox":
                 data = service.inbox(project, **fields)
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"inbox": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"inbox": data},
                     message=f"{data['total']} item(s) in the approval inbox.",
                 )
 
             if action == "inbox-summary":
                 data = service.inbox_summary(project)
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"summary": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"summary": data},
                     message=(
                         f"{data['awaiting_review']} awaiting review, "
                         f"{data['blocked']} blocked, {data['escalated']} escalated."
@@ -2007,20 +2135,27 @@ class Monday:
 
             if action == "inbox-action":
                 data = service.inbox_action(
-                    project, str(kwargs.get("inbox_action", "")),
-                    str(kwargs.get("content_id", "")), **fields,
+                    project,
+                    str(kwargs.get("inbox_action", "")),
+                    str(kwargs.get("content_id", "")),
+                    **fields,
                 )
                 return GrowthResponse(
-                    action=action, success=bool(data.get("ok", False)), project=project,
+                    action=action,
+                    success=bool(data.get("ok", False)),
+                    project=project,
                     content_id=str(data.get("content_id", "")),
-                    status=str(data.get("status", "")), data={"result": data},
+                    status=str(data.get("status", "")),
+                    data={"result": data},
                     message=str(data.get("reason") or data.get("note") or "Done."),
                 )
 
             if action == "brain-analyze":
                 data = service.brain_analyze(project, _as_datetime(kwargs.get("now")))
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"analysis": data},
                     message=(
                         f"{len(data['recommendations'])} recommendation(s), "
@@ -2033,7 +2168,9 @@ class Monday:
             if action == "brain-recommendations":
                 rows = service.brain_recommendations(project, _as_datetime(kwargs.get("now")))
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"recommendations": rows, "count": len(rows)},
                     message=f"{len(rows)} recommendation(s).",
                 )
@@ -2041,7 +2178,9 @@ class Monday:
             if action == "brain-hypotheses":
                 rows = service.brain_hypotheses(project, _as_datetime(kwargs.get("now")))
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"hypotheses": rows, "count": len(rows)},
                     message=f"{len(rows)} UNCONFIRMED hypothesis(es).",
                 )
@@ -2049,7 +2188,9 @@ class Monday:
             if action == "brain-opportunities":
                 rows = service.brain_opportunities(project, _as_datetime(kwargs.get("now")))
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"opportunities": rows, "count": len(rows)},
                     message=f"{len(rows)} opportunity(ies).",
                 )
@@ -2057,24 +2198,29 @@ class Monday:
             if action == "brain-scores":
                 data = service.brain_scores(project)
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"scores": data},
-                    message=(
-                        f"workspace health: "
-                        f"{data['workspace_health']['band']}"
-                    ),
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"scores": data},
+                    message=(f"workspace health: {data['workspace_health']['band']}"),
                 )
 
             if action == "brain-forecasts":
                 data = service.brain_forecasts(project, _as_datetime(kwargs.get("now")))
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"forecasts": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"forecasts": data},
                     message=f"Forecasts for {len(data['campaigns'])} campaign(s).",
                 )
 
             if action == "brain-experiments":
                 rows = service.brain_experiments(project, _as_datetime(kwargs.get("now")))
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"experiments": rows, "count": len(rows)},
                     message=(
                         f"{len(rows)} proposed experiment(s). All require human approval "
@@ -2085,63 +2231,86 @@ class Monday:
             if action == "memory-record":
                 data = service.memory_record(project, **fields)
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"memory": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"memory": data},
                     message=f"Remembered {data['id']} as TENTATIVE.",
                 )
 
             if action == "memory-list":
                 rows = service.memory_list(project, str(kwargs.get("status", "")))
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"memory": rows, "count": len(rows)},
                     message=f"{len(rows)} memory entr(ies).",
                 )
 
             if action == "memory-validate":
                 data = service.memory_validate(
-                    project, str(kwargs.get("entry_id", "")),
-                    str(kwargs.get("by", "human:cli")), str(kwargs.get("reason", "")),
+                    project,
+                    str(kwargs.get("entry_id", "")),
+                    str(kwargs.get("by", "human:cli")),
+                    str(kwargs.get("reason", "")),
                 )
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"memory": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"memory": data},
                     message=f"{data['id']} is now VALIDATED.",
                 )
 
             if action == "memory-invalidate":
                 data = service.memory_invalidate(
-                    project, str(kwargs.get("entry_id", "")),
-                    str(kwargs.get("by", "human:cli")), str(kwargs.get("reason", "")),
+                    project,
+                    str(kwargs.get("entry_id", "")),
+                    str(kwargs.get("by", "human:cli")),
+                    str(kwargs.get("reason", "")),
                 )
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"memory": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"memory": data},
                     message=f"{data['id']} is now INVALIDATED.",
                 )
 
             if action == "event-record":
                 data = service.record_event(project, **fields)
                 return GrowthResponse(
-                    action=action, success=True, project=project,
-                    content_id=data["content_id"], data={"event": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    content_id=data["content_id"],
+                    data={"event": data},
                     message=(
-                        f"Recorded {data['event_type']} "
-                        f"({data['source']}, value={data['value']})."
+                        f"Recorded {data['event_type']} ({data['source']}, value={data['value']})."
                     ),
                 )
 
             if action == "event-import":
                 data = service.import_events(
-                    project, list(kwargs.get("events") or []),
+                    project,
+                    list(kwargs.get("events") or []),
                     source=str(kwargs.get("source", "imported")),
                 )
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"import": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"import": data},
                     message=f"Recorded {data['recorded']} {data['source']} event(s).",
                 )
 
             if action == "event-list":
                 rows = service.list_events(project, **fields)
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"events": rows, "count": len(rows)},
                     message=f"{len(rows)} event(s).",
                 )
@@ -2149,7 +2318,9 @@ class Monday:
             if action == "analytics":
                 data = service.workspace_analytics(project)
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"analytics": data},
                     message=(
                         f"{data['event_count']} event(s) across {data['content_total']} item(s)."
@@ -2158,11 +2329,12 @@ class Monday:
                 )
 
             if action == "analytics-campaign":
-                data = service.campaign_analytics(
-                    project, str(kwargs.get("campaign_id", ""))
-                )
+                data = service.campaign_analytics(project, str(kwargs.get("campaign_id", "")))
                 return GrowthResponse(
-                    action=action, success=True, project=project, status=data["status"],
+                    action=action,
+                    success=True,
+                    project=project,
+                    status=data["status"],
                     data={"analytics": data},
                     message=(
                         f"{data['campaign_id']}: {data['content_published']} published"
@@ -2173,8 +2345,11 @@ class Monday:
             if action == "analytics-content":
                 data = service.content_analytics(project, str(kwargs.get("content_id", "")))
                 return GrowthResponse(
-                    action=action, success=True, project=project,
-                    content_id=data["content_id"], status=data["status"],
+                    action=action,
+                    success=True,
+                    project=project,
+                    content_id=data["content_id"],
+                    status=data["status"],
                     data={"analytics": data},
                     message=f"{data['content_id']}: {data['event_count']} event(s).",
                 )
@@ -2182,7 +2357,9 @@ class Monday:
             if action == "analytics-platform":
                 rows = service.platform_analytics(project)
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"platforms": rows, "count": len(rows)},
                     message=f"{len(rows)} platform(s) with data.",
                 )
@@ -2190,7 +2367,10 @@ class Monday:
             if action == "analytics-series":
                 data = service.time_series(project, **fields)
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"series": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"series": data},
                     message=f"{len(data['points'])} bucket(s) of {data['metric']}.",
                 )
 
@@ -2199,35 +2379,49 @@ class Monday:
                     k: v for k, v in fields.items() if k not in ("metric", "period_days")
                 }
                 data = service.trend(
-                    project, str(kwargs.get("metric", "impressions")),
-                    int(kwargs.get("period_days", 7)), **trend_fields,
+                    project,
+                    str(kwargs.get("metric", "impressions")),
+                    int(kwargs.get("period_days", 7)),
+                    **trend_fields,
                 )
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"trend": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"trend": data},
                     message=f"{data['metric']}: {data['direction']}",
                 )
 
             if action == "analytics-funnel":
                 data = service.funnel(
-                    project, str(kwargs.get("campaign", "")),
+                    project,
+                    str(kwargs.get("campaign", "")),
                     str(kwargs.get("platform", "")),
                 )
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"funnel": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"funnel": data},
                     message=f"{data['total_conversions']} conversion(s).",
                 )
 
             if action == "snapshot-take":
                 data = service.take_snapshot(project, **fields)
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"snapshot": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"snapshot": data},
                     message=f"Captured {data['id']} at {data['taken_at']}.",
                 )
 
             if action == "snapshot-list":
                 rows = service.list_snapshots(project)
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"snapshots": rows, "count": len(rows)},
                     message=f"{len(rows)} snapshot(s).",
                 )
@@ -2235,64 +2429,82 @@ class Monday:
             if action == "aggregate-write":
                 data = service.write_aggregate(project)
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"aggregate": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"aggregate": data},
                     message=f"Wrote the portfolio aggregate for {project}.",
                 )
 
             if action == "campaign-create":
                 data = service.create_campaign(
-                    project, str(kwargs.get("name", "")),
+                    project,
+                    str(kwargs.get("name", "")),
                     **{k: v for k, v in fields.items() if k != "name"},
                 )
                 return GrowthResponse(
-                    action=action, success=True, project=project,
-                    status=data["status"], data={"campaign": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    status=data["status"],
+                    data={"campaign": data},
                     message=f"Created {data['id']} ({data['name']}).",
                 )
 
             if action == "campaign-get":
                 data = service.get_campaign(project, str(kwargs.get("campaign_id", "")))
                 return GrowthResponse(
-                    action=action, success=True, project=project, status=data["status"],
-                    data={"campaign": data}, message=f"{data['id']} ({data['status']}).",
+                    action=action,
+                    success=True,
+                    project=project,
+                    status=data["status"],
+                    data={"campaign": data},
+                    message=f"{data['id']} ({data['status']}).",
                 )
 
             if action == "campaign-list":
                 rows = service.list_campaigns(project, str(kwargs.get("status", "")))
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"campaigns": rows, "count": len(rows)},
                     message=f"{len(rows)} campaign(s).",
                 )
 
             if action == "campaign-status":
                 data = service.transition_campaign(
-                    project, str(kwargs.get("campaign_id", "")),
+                    project,
+                    str(kwargs.get("campaign_id", "")),
                     str(kwargs.get("status", "")),
                     changed_by=str(kwargs.get("changed_by", "human:cli")),
                     reason=str(kwargs.get("reason", "")),
                 )
                 return GrowthResponse(
-                    action=action, success=True, project=project, status=data["status"],
+                    action=action,
+                    success=True,
+                    project=project,
+                    status=data["status"],
                     data={"campaign": data},
                     message=f"{data['id']} is now {data['status']}.",
                 )
 
             if action == "campaign-assign":
                 item = service.assign_campaign(
-                    project, str(kwargs.get("content_id", "")),
+                    project,
+                    str(kwargs.get("content_id", "")),
                     str(kwargs.get("campaign_id", "")),
                     changed_by=str(kwargs.get("changed_by", "human:cli")),
                 )
                 target = kwargs.get("campaign_id") or "(none)"
-                return _growth_content_response(
-                    action, project, item, f"Assigned to {target}"
-                )
+                return _growth_content_response(action, project, item, f"Assigned to {target}")
 
             if action == "library-search":
                 rows = service.library_search(project, **fields)
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"entries": rows, "count": len(rows)},
                     message=f"{len(rows)} library entr(ies).",
                 )
@@ -2300,7 +2512,9 @@ class Monday:
             if action == "library-summary":
                 data = service.library_summary(project)
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"summary": data},
                     message=f"{data['total']} item(s) in the {project} library.",
                 )
@@ -2308,26 +2522,29 @@ class Monday:
             if action == "library-top":
                 data = service.library_top(project, int(kwargs.get("limit", 10)))
                 return GrowthResponse(
-                    action=action, success=True, project=project, data=data,
-                    message=(
-                        f"{len(data['entries'])} item(s), ranked by {data['basis']}."
-                    ),
+                    action=action,
+                    success=True,
+                    project=project,
+                    data=data,
+                    message=(f"{len(data['entries'])} item(s), ranked by {data['basis']}."),
                 )
 
             if action == "library-reusable":
                 rows = service.library_reusable(project, int(kwargs.get("days", 0)))
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"entries": rows, "count": len(rows)},
                     message=f"{len(rows)} reusable item(s).",
                 )
 
             if action == "library-variants":
-                rows = service.library_variants(
-                    project, str(kwargs.get("variant_group_id", ""))
-                )
+                rows = service.library_variants(project, str(kwargs.get("variant_group_id", "")))
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"entries": rows, "count": len(rows)},
                     message=f"{len(rows)} variant(s).",
                 )
@@ -2335,7 +2552,9 @@ class Monday:
             if action == "onboard":
                 data = service.onboard(project, **fields)
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"onboarding": data},
                     message=(
                         "Onboarding complete; project is ready for planning."
@@ -2347,7 +2566,9 @@ class Monday:
             if action == "onboarding-status":
                 data = service.onboarding_status(project)
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"onboarding": data},
                     message=(
                         f"planning={data['growth_ready_for_planning']} "
@@ -2358,7 +2579,10 @@ class Monday:
             if action == "seed-demo":
                 data = service.seed_demo(project)
                 return GrowthResponse(
-                    action=action, success=True, project=project, data={"demo": data},
+                    action=action,
+                    success=True,
+                    project=project,
+                    data={"demo": data},
                     message=(
                         f"Seeded {len(data['campaigns'])} campaign(s) and "
                         f"{len(data['content'])} content item(s). All marked SYNTHETIC."
@@ -2368,13 +2592,17 @@ class Monday:
             if action == "pauses":
                 pause_rows = service.list_pauses(project)
                 return GrowthResponse(
-                    action=action, success=True, project=project,
+                    action=action,
+                    success=True,
+                    project=project,
                     data={"pauses": pause_rows, "count": len(pause_rows)},
                     message=f"{len(pause_rows)} active pause(s).",
                 )
 
             return GrowthResponse(
-                action=action, success=False, project=project,
+                action=action,
+                success=False,
+                project=project,
                 message=(
                     f"Unknown action {action!r}. Valid actions: workspace-init, "
                     "workspace-get, workspace-list, bind, bindings, credentials, "
@@ -2637,6 +2865,27 @@ class Monday:
                 raise ValueError(f"Knowledge capture refused: {response.message}")
             return response.entry_id
 
+        def ask_intelligence(slug: str, question: str, carry: str = "") -> Any:
+            """
+            Retrieve evidence for one question from the project's own index.
+
+            Built lazily and cached per project on this Monday instance: the
+            first question pays for the index, later ones reuse it, and the
+            on-disk cache means even the first one after a restart reparses only
+            what changed.
+
+            Failure is silent and total. A project that cannot be indexed — no
+            such directory, unreadable tree — yields no evidence source rather
+            than blocking the conversation.
+            """
+            try:
+                engine = self._question_engine(slug)
+            except Exception:  # noqa: BLE001 — thin context, never a dead conversation
+                return None
+            if engine is None:
+                return None
+            return engine.ask(question, carry=carry)
+
         responder = (
             ProviderWorkspaceResponder(self.__provider) if self.__provider is not None else None
         )
@@ -2646,6 +2895,7 @@ class Monday:
                 resolve_project=resolve,
                 read_tasks=read_tasks,
                 read_knowledge=read_knowledge,
+                ask_intelligence=ask_intelligence,
             ),
             responder=responder,
             list_projects=list_projects,
@@ -2656,6 +2906,56 @@ class Monday:
             git_lines=git_lines,
             activity=activity,
         )
+
+    def _question_engine(self, project: str) -> Any:
+        """
+        The question engine for one project, built once per Monday instance.
+
+        The index is a derived cache: it holds nothing that is not recoverable by
+        re-reading the project, and every fact in it belongs to the TaskManager,
+        the KnowledgeStore or git. Nothing here is a second system of record.
+        """
+        from intelligence import QuestionEngine, build_graph, build_index
+        from workspace.errors import InvalidProjectError
+        from workspace.models import slugify
+
+        slug = slugify(project)
+        cached = self.__question_engines.get(slug)
+        if cached is not None:
+            return cached
+
+        registry = ProjectRegistry(self._config.project_root / "config")
+        root = None
+        for entry in registry.list():
+            if slugify(entry.name) == slug:
+                root = entry.path
+                break
+        if root is None or not Path(root).is_dir():
+            raise InvalidProjectError(project)
+
+        index = build_index(slug, Path(root), cache_root=self._config.project_root / ".index")
+        rows = [
+            {
+                "id": t.id,
+                "title": t.title,
+                "status": t.status.value,
+                "objective": t.objective,
+                "context": t.context,
+                "project": t.project,
+                "commit_refs": list(t.commit_refs),
+                "knowledge_refs": list(t.knowledge_refs),
+                "blocked_reason": t.blocked_by or "",
+            }
+            for t in self.__tasks.list_active() + self.__tasks.list_completed()
+        ]
+        knowledge = [
+            {"id": e.id, "title": e.title, "type": e.entry_type.value}
+            for e in self.__knowledge.list_all()
+        ]
+        graph = build_graph(index, tasks=rows, knowledge=knowledge)
+        engine = QuestionEngine(index, graph, rows)
+        self.__question_engines[slug] = engine
+        return engine
 
     def workspace_stream(
         self, project: str, conversation_id: str, content: str
@@ -2866,12 +3166,12 @@ class Monday:
         uptime = (now - self._created_at).total_seconds()
 
         modules = [
-            ModuleStatus("brain",     available=True, initialized=self.__brain     is not None),
-            ModuleStatus("events",    available=True, initialized=self.__bus       is not None),
+            ModuleStatus("brain", available=True, initialized=self.__brain is not None),
+            ModuleStatus("events", available=True, initialized=self.__bus is not None),
             ModuleStatus("knowledge", available=True, initialized=self.__knowledge is not None),
-            ModuleStatus("memory",    available=True, initialized=self.__memory    is not None),
-            ModuleStatus("search",    available=True, initialized=self.__search    is not None),
-            ModuleStatus("tasks",     available=True, initialized=self.__tasks     is not None),
+            ModuleStatus("memory", available=True, initialized=self.__memory is not None),
+            ModuleStatus("search", available=True, initialized=self.__search is not None),
+            ModuleStatus("tasks", available=True, initialized=self.__tasks is not None),
         ]
         healthy = all(m.initialized for m in modules)
 
@@ -2962,6 +3262,7 @@ def _generate_onboarding_report(
     that answers all onboarding questions defined in Initiative 010.
     """
     from datetime import datetime
+
     lines: list[str] = []
 
     now = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
@@ -2984,9 +3285,7 @@ def _generate_onboarding_report(
         lines.append(repo_summary)
         lines.append("")
 
-    lines.append(
-        "| Metric | Value |"
-    )
+    lines.append("| Metric | Value |")
     lines.append("| --- | --- |")
     lines.append(f"| Health Score | {doctor_resp.health_score}/100 ({doctor_resp.grade}) |")
     lines.append(f"| Advisory Confidence | {advise_resp.confidence:.0%} |")
@@ -3006,6 +3305,7 @@ def _generate_onboarding_report(
     repo_summary_lower = advisory.get("repository_summary", "").lower()
     kb_size_from_advisory = 0
     import re as _re
+
     _kb_match = _re.search(r"(\d+) active entr", repo_summary_lower)
     if _kb_match:
         kb_size_from_advisory = int(_kb_match.group(1))
@@ -3036,10 +3336,14 @@ def _generate_onboarding_report(
             lines.append("")
         skipped = migrate_resp.skipped_count
         if skipped:
-            lines.append(f"*{skipped} candidate(s) were skipped (already imported or below confidence threshold).*")
+            lines.append(
+                f"*{skipped} candidate(s) were skipped (already imported or below confidence threshold).*"
+            )
             lines.append("")
     else:
-        lines.append("No knowledge entries found. Run `monday migrate` to import project documentation.")
+        lines.append(
+            "No knowledge entries found. Run `monday migrate` to import project documentation."
+        )
         lines.append("")
 
     # ── Documentation Inventory ──────────────────────────────────────────
@@ -3047,7 +3351,8 @@ def _generate_onboarding_report(
     lines.append("")
     doctor_data = doctor_resp.data or {}
     doc_findings = [
-        f for r in doctor_data.get("analyzers", [])
+        f
+        for r in doctor_data.get("analyzers", [])
         if r.get("name") == "documentation"
         for f in r.get("findings", [])
     ]
@@ -3179,7 +3484,7 @@ def _generate_onboarding_report(
     lines.append("")
     lines.append(
         "The following tasks are recommended based on the advisory analysis. "
-        "Create them with `monday task create --title \"...\" --objective \"...\"` "
+        'Create them with `monday task create --title "..." --objective "..."` '
         f"against the {project_name} project root."
     )
     lines.append("")
@@ -3191,7 +3496,9 @@ def _generate_onboarding_report(
             prio = "P0" if risk.get("severity") == "critical" else "P1"
             tasks.append((prio, title, obj))
     if gaps:
-        tasks.append(("P2", "Expand knowledge base", "Add missing knowledge types: " + ", ".join(gaps[:3])))
+        tasks.append(
+            ("P2", "Expand knowledge base", "Add missing knowledge types: " + ", ".join(gaps[:3]))
+        )
     if doc_gaps:
         tasks.append(("P2", "Close documentation gaps", "Address: " + "; ".join(doc_gaps[:2])))
     if actions:

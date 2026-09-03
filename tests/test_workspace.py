@@ -334,7 +334,9 @@ class TestContextEngine(unittest.TestCase):
             snapshot = _engine(root, {"alpha": path}).build("alpha")
 
             names = [s.name for s in snapshot.sources]
-            self.assertEqual(names, ["identity", "docs", "tasks", "knowledge", "git"])
+            self.assertEqual(
+                names, ["identity", "intelligence", "docs", "tasks", "knowledge", "git"]
+            )
             for source in snapshot.sources:
                 self.assertTrue(source.origin, f"{source.name} has no recorded origin")
 
@@ -1403,3 +1405,244 @@ class TestActivity(unittest.TestCase):
             recorder.record(ActivityKind.CONTEXT, f"event {i}")
         self.assertEqual(len(recorder.events()), 5)
         self.assertEqual(recorder.events()[0].message, "event 19")
+
+
+# --------------------------------------------------------------------------- #
+# increment 3 — project intelligence in the workspace
+# --------------------------------------------------------------------------- #
+
+
+def _indexable_project(root: Path, name: str) -> Path:
+    """A project with enough real material to index and retrieve from."""
+    path = root / name
+    (path / "src").mkdir(parents=True, exist_ok=True)
+    (path / "docs").mkdir(parents=True, exist_ok=True)
+    (path / "README.md").write_text(f"# {name}\n\nThe {name} project.\n")
+    (path / "src" / "engine.py").write_text(
+        '"""Assembles context. Implements ADR-017."""\n\n\nclass ContextEngine:\n'
+        '    """Builds snapshots."""\n\n    def build(self, project: str) -> str:\n'
+        "        return project\n"
+    )
+    (path / "src" / "responder.py").write_text(
+        "class WorkspaceResponder:\n    def respond(self) -> None:\n        return None\n"
+    )
+    (path / "docs" / "DECISIONS.md").write_text(
+        "# Decisions\n\n## ADR-017: The Context Engine Assembles Snapshots\n\n"
+        "**Status:** Accepted\n\nBecause it must be explainable.\n"
+    )
+    return path
+
+
+class TestIntelligenceIntegration(unittest.TestCase):
+    """
+    Project intelligence reaching a conversation.
+
+    The property under test is not "retrieval works" — that is covered in
+    tests/test_intelligence.py. It is that retrieval arrives through the *same*
+    Context Engine as everything else, so budgeting, attribution, redaction and
+    project isolation apply to it without being reimplemented.
+    """
+
+    def _engine_with_intelligence(self, root: Path, projects: dict[str, Path]):
+        from intelligence import QuestionEngine, build_graph, build_index
+
+        engines: dict[str, QuestionEngine] = {}
+
+        def ask(slug: str, question: str, carry: str = ""):
+            if slug not in engines:
+                index = build_index(slug, projects[slug], use_cache=False)
+                engines[slug] = QuestionEngine(index, build_graph(index), [])
+            return engines[slug].ask(question, carry=carry)
+
+        def resolve(name: str) -> tuple[str, Path, str]:
+            slug = slugify(name)
+            if slug not in projects:
+                raise InvalidProjectError(name)
+            return slug, projects[slug], f"{slug} description"
+
+        return ContextEngine(resolve_project=resolve, ask_intelligence=ask)
+
+    def _service(self, tmp: str, provider: AIProvider | None = None):
+        root = Path(tmp)
+        projects = {
+            "alpha": _indexable_project(root, "alpha"),
+            "beta": _indexable_project(root, "beta"),
+        }
+        responder = ProviderWorkspaceResponder(provider) if provider else None
+        return WorkspaceService(
+            root=root,
+            engine=self._engine_with_intelligence(root, projects),
+            responder=responder,
+        )
+
+    def _intelligence(self, snapshot: dict) -> list[str]:
+        source = next(s for s in snapshot["sources"] if s["name"] == "intelligence")
+        return list(source["items"])
+
+    def test_intelligence_arrives_as_a_context_source(self):
+        """
+        Not a second route into the prompt.
+
+        Everything the Context Engine assembles is budgeted, attributed and
+        redacted in one place. A separate path would be a second place those
+        rules have to hold, and eventually one of them would be wrong.
+        """
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            snapshot = service.build_context("alpha", query="Where is ContextEngine implemented?")
+            names = [s["name"] for s in snapshot["sources"]]
+            self.assertIn("intelligence", names)
+            # Identity still outranks it: an answer about the wrong project is
+            # worse than one with thin evidence.
+            self.assertLess(names.index("identity"), names.index("intelligence"))
+
+    def test_retrieved_evidence_names_files_and_lines(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            snapshot = service.build_context("alpha", query="Where is ContextEngine implemented?")
+            items = self._intelligence(snapshot)
+            self.assertTrue(any("ContextEngine" in i for i in items))
+            self.assertTrue(any("engine.py:" in i for i in items))
+
+    def test_evidence_reasons_survive_budgeting(self):
+        """The budget must cut reasons in step with items, never drop them."""
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            snapshot = service.build_context("alpha", query="Where is ContextEngine implemented?")
+            source = next(s for s in snapshot["sources"] if s["name"] == "intelligence")
+            self.assertEqual(len(source["items"]), len(source["reasons"]))
+            self.assertEqual(set(source["reasons"]), {"retrieved-evidence"})
+
+    def test_no_intelligence_source_without_a_question(self):
+        """Retrieval is per-request; a snapshot with no query has nothing to rank."""
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            snapshot = service.build_context("alpha")
+            source = next(s for s in snapshot["sources"] if s["name"] == "intelligence")
+            self.assertEqual(source["items"], [])
+
+    def test_a_broken_indexer_leaves_the_snapshot_intact(self):
+        """Fail closed: thin context, never a dead conversation."""
+
+        def exploding(slug: str, question: str, carry: str = ""):
+            raise RuntimeError("index is on fire")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alpha = _indexable_project(root, "alpha")
+            engine = ContextEngine(
+                resolve_project=lambda n: ("alpha", alpha, "d"), ask_intelligence=exploding
+            )
+            service = WorkspaceService(root=root, engine=engine)
+            snapshot = service.build_context("alpha", query="anything")
+            source = next(s for s in snapshot["sources"] if s["name"] == "intelligence")
+            self.assertEqual(source["items"], [])
+            self.assertIn("on fire", source["error"])
+            self.assertTrue(
+                next(s for s in snapshot["sources"] if s["name"] == "identity")["items"]
+            )
+
+    def test_intelligence_never_reaches_across_projects(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = {
+                "alpha": _indexable_project(root, "alpha"),
+                "beta": _indexable_project(root, "beta"),
+            }
+            # Not named "secret.py": the scanner skips credential-shaped
+            # filenames, which would make this fixture invisible for the right
+            # reason and mask the wrong one.
+            (projects["beta"] / "src" / "beta_only.py").write_text("BETA_ONLY_SYMBOL = 1\n")
+
+            service = WorkspaceService(
+                root=root, engine=self._engine_with_intelligence(root, projects)
+            )
+            snapshot = service.build_context("alpha", query="Where is BETA_ONLY_SYMBOL defined?")
+
+            # Assert on the retrieved *sources*, not the whole snapshot: the
+            # snapshot records the query verbatim, and the query contains the
+            # term because the question did. Searching the recorded question for
+            # the question's own words proves nothing.
+            retrieved = json.dumps([s["items"] for s in snapshot["sources"]])
+            self.assertNotIn("BETA_ONLY_SYMBOL", retrieved)
+            self.assertNotIn("beta", retrieved)
+
+            # And the same question against beta does find it — so the absence
+            # above is isolation, not a broken indexer.
+            beta = service.build_context("beta", query="Where is BETA_ONLY_SYMBOL defined?")
+            beta_items = json.dumps([s["items"] for s in beta["sources"]])
+            self.assertIn("BETA_ONLY_SYMBOL", beta_items)
+
+    def test_the_provider_receives_the_retrieved_evidence(self):
+        with TemporaryDirectory() as tmp:
+            provider = FakeProvider("noted")
+            service = self._service(tmp, provider)
+            conversation = service.create_conversation("alpha", "")
+            service.send_message("alpha", conversation["id"], "Where is ContextEngine implemented?")
+
+            context = json.dumps(provider.calls)
+            self.assertIn("Project intelligence", context)
+            self.assertIn("ContextEngine", context)
+            self.assertIn("engine.py", context)
+
+
+class TestSubjectCarryOver(unittest.TestCase):
+    """
+    A conversation keeps its subject so a follow-up need not restate it.
+
+    Twenty minutes into discussing the ContextEngine, "find every place it is
+    used" means the ContextEngine. The subject is persisted on the conversation,
+    so it survives a reload like everything else.
+    """
+
+    def _service(self, tmp: str):
+        return TestIntelligenceIntegration()._service(tmp, FakeProvider("noted"))
+
+    def _subject(self, service, conversation_id: str) -> str:
+        return str(service.get_conversation("alpha", conversation_id)["subject"])
+
+    def test_the_first_question_sets_the_subject(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            conversation = service.create_conversation("alpha", "")
+            service.send_message("alpha", conversation["id"], "Where is ContextEngine implemented?")
+            self.assertIn("contextengine", self._subject(service, conversation["id"]))
+
+    def test_a_follow_up_keeps_the_subject(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            conversation = service.create_conversation("alpha", "")
+            service.send_message("alpha", conversation["id"], "Where is ContextEngine implemented?")
+            service.send_message("alpha", conversation["id"], "Why did we design it that way?")
+            self.assertIn("contextengine", self._subject(service, conversation["id"]))
+
+    def test_a_back_reference_keeps_the_subject(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            conversation = service.create_conversation("alpha", "")
+            service.send_message("alpha", conversation["id"], "Where is ContextEngine implemented?")
+            service.send_message("alpha", conversation["id"], "Find every place it is used.")
+            self.assertIn("contextengine", self._subject(service, conversation["id"]))
+
+    def test_an_explicit_new_subject_replaces_the_old_one(self):
+        """Carry-over must never override what was actually asked."""
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            conversation = service.create_conversation("alpha", "")
+            service.send_message("alpha", conversation["id"], "Where is ContextEngine implemented?")
+            service.send_message("alpha", conversation["id"], "Now explain WorkspaceResponder.")
+            subject = self._subject(service, conversation["id"])
+            self.assertIn("workspaceresponder", subject)
+            self.assertNotIn("contextengine", subject)
+
+    def test_the_subject_survives_a_restart(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self._service(tmp)
+            conversation = first.create_conversation("alpha", "")
+            first.send_message("alpha", conversation["id"], "Where is ContextEngine implemented?")
+
+            del first
+            second = WorkspaceService(root=root)
+            loaded = second.get_conversation("alpha", conversation["id"])
+            self.assertIn("contextengine", loaded["subject"])

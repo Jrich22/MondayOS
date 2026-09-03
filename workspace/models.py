@@ -168,6 +168,12 @@ class Conversation:
     updated_at: datetime
     status: ConversationStatus = ConversationStatus.ACTIVE
     active_snapshot_id: str = ""
+    # What this conversation is currently about, carried forward from the last
+    # question that named a subject. Twenty minutes into discussing the
+    # ContextEngine, "where is that implemented?" should mean the ContextEngine —
+    # requiring the operator to restate it is the difference between a tool and a
+    # search box. Persisted so it survives a reload, like everything else here.
+    subject: str = ""
     messages: list[Message] = field(default_factory=list)
     artifact_refs: list[ArtifactRef] = field(default_factory=list)
     task_refs: list[str] = field(default_factory=list)
@@ -199,6 +205,7 @@ class Conversation:
             "created_at": iso(self.created_at),
             "updated_at": iso(self.updated_at),
             "active_snapshot_id": self.active_snapshot_id,
+            "subject": self.subject,
             "message_count": self.message_count,
             "messages": [m.to_dict() for m in self.messages],
             "artifact_refs": [a.to_dict() for a in self.artifact_refs],

@@ -399,7 +399,7 @@ class WorkspaceRouteTests(DashboardApiBase):
         self.assertEqual(body["project"], "alpha")
         self.assertEqual(
             [s["name"] for s in body["sources"]],
-            ["identity", "docs", "tasks", "knowledge", "git"],
+            ["identity", "intelligence", "docs", "tasks", "knowledge", "git"],
         )
 
     def test_context_for_an_unregistered_project_is_a_404(self):

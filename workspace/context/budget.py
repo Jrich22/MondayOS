@@ -32,13 +32,25 @@ from workspace.context.snapshot import ContextSource
 
 # Budget priority. The list order IS the priority; a source not named here is
 # appended last, so adding an adapter never silently outranks an existing one.
-PRIORITY: tuple[str, ...] = ("identity", "docs", "tasks", "knowledge", "git")
+PRIORITY: tuple[str, ...] = (
+    "identity",
+    # Retrieved evidence ranks high because it is the only source selected *for
+    # this question* — everything else is selected for the project. It sits
+    # below identity because an answer about the wrong project is worse than one
+    # with thin evidence.
+    "intelligence",
+    "docs",
+    "tasks",
+    "knowledge",
+    "git",
+)
 
 # Per-source character caps. Chosen so a full snapshot lands near 6-8k tokens:
 # comfortably inside any provider's window, and small enough that a human can
 # actually read what was sent.
 SOURCE_CAPS: dict[str, int] = {
     "identity": 2_000,
+    "intelligence": 8_000,
     "docs": 6_000,
     "tasks": 6_000,
     "knowledge": 6_000,
