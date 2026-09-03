@@ -52,6 +52,10 @@ class ProviderChunk:
     model: str = ""
     provider: str = ""
     tokens_used: int = 0
+    # Provider-reported termination, on the final chunk. A run cut off at
+    # max_tokens is truncated, not finished, and a caller that cannot tell the
+    # difference will read a half-answer as a whole one.
+    stop_reason: str = ""
 
 
 @dataclass
@@ -202,6 +206,7 @@ class AIProvider(ABC):
             model=response.model,
             provider=response.provider or self.name,
             tokens_used=response.tokens_used,
+            stop_reason=str(response.metadata.get("stop_reason", "")),
         )
 
     def availability(self) -> ProviderAvailability:
