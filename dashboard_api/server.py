@@ -7,6 +7,7 @@ warrant one. Uses `ThreadingHTTPServer` so a long-lived SSE stream doesn't block
 other requests. Binds to 127.0.0.1 by default; never 0.0.0.0 unless an operator
 explicitly overrides the host.
 """
+
 from __future__ import annotations
 
 import json
@@ -18,6 +19,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from monday import Monday, MondayConfig
+from monday.provider_env import choose, load_env_file
+from monday.provider_env import provider_config as resolve_provider_config
 
 from . import errors, security
 from .router import route
@@ -25,10 +28,31 @@ from .service import DashboardService
 
 
 def build_service(root: Path | None = None, provider: str | None = None) -> DashboardService:
-    """Construct a DashboardService over a real Monday instance."""
+    """
+    Construct a DashboardService over a real Monday instance.
+
+    Resolves the AI provider from the environment. Without this the workspace
+    ran with `provider_config=None` — it could hold a conversation but never
+    answer one, which looked like a missing feature and was a missing line of
+    configuration.
+
+    The key never passes through here: `provider_config` carries the provider
+    name and model only, and each provider reads its own variable directly, so
+    the secret cannot reach a repr or a log line by way of MondayOS's config.
+    """
     project_root = root or Path(os.environ.get("MONDAYOS_ROOT", ".")).resolve()
+    # A project-local .env, if present, filling only variables the shell has not
+    # already set. An exported value is a deliberate act; a file is a default.
+    load_env_file(project_root / ".env")
+
     prov = provider or os.environ.get("MONDAYOS_DASHBOARD_PROVIDER", "fake")
-    monday = Monday(MondayConfig(project_root=project_root, require_human_approval=True))
+    monday = Monday(
+        MondayConfig(
+            project_root=project_root,
+            require_human_approval=True,
+            provider_config=resolve_provider_config(),
+        )
+    )
     return DashboardService(
         monday,
         provider=prov,
@@ -68,7 +92,9 @@ def make_handler(service: DashboardService):
                 self._sse()
                 return
             query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-            status, headers, body = route(service, "GET", parsed.path, query=query, origin=self._origin())
+            status, headers, body = route(
+                service, "GET", parsed.path, query=query, origin=self._origin()
+            )
             self._send(status, headers, body)
 
         def do_POST(self):  # noqa: N802
@@ -84,7 +110,9 @@ def make_handler(service: DashboardService):
                         raise ValueError("body must be a JSON object")
                 except (ValueError, UnicodeDecodeError):
                     headers = security.cors_headers(origin)
-                    self._send(400, headers, errors.error(errors.BAD_REQUEST, "Malformed JSON body."))
+                    self._send(
+                        400, headers, errors.error(errors.BAD_REQUEST, "Malformed JSON body.")
+                    )
                     return
             # Streaming is a transport concern, so it bypasses `route`, which is
             # pure by design. The generator itself lives on the service and is
@@ -148,7 +176,11 @@ def make_handler(service: DashboardService):
             /revision is the documented fallback if EventSource is unavailable."""
             origin = self._origin()
             if not security.is_allowed_origin(origin):
-                self._send(403, security.cors_headers(origin), errors.error(errors.FORBIDDEN_ORIGIN, "Origin not allowed."))
+                self._send(
+                    403,
+                    security.cors_headers(origin),
+                    errors.error(errors.FORBIDDEN_ORIGIN, "Origin not allowed."),
+                )
                 return
             self.send_response(200)
             for k, v in security.cors_headers(origin).items():
@@ -174,7 +206,9 @@ def make_handler(service: DashboardService):
     return Handler
 
 
-def create_server(service: DashboardService, host: str = security.DEFAULT_HOST, port: int = security.DEFAULT_PORT) -> ThreadingHTTPServer:
+def create_server(
+    service: DashboardService, host: str = security.DEFAULT_HOST, port: int = security.DEFAULT_PORT
+) -> ThreadingHTTPServer:
     return ThreadingHTTPServer((host, port), make_handler(service))
 
 
@@ -183,7 +217,8 @@ def main() -> None:
     port = int(os.environ.get("MONDAYOS_API_PORT", security.DEFAULT_PORT))
     service = build_service()
     httpd = create_server(service, host, port)
-    print(f"MondayOS dashboard API on http://{host}:{port} (provider={service.provider})")
+    print(f"MondayOS dashboard API on http://{host}:{port} (team provider={service.provider})")
+    print(f"AI Workspace provider: {choose().describe()}")
     print(f"CORS allowlist: {sorted(security.allowed_origins())}")
     try:
         httpd.serve_forever()

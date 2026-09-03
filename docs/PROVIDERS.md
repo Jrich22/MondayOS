@@ -4,6 +4,48 @@ Agents and the team workflow run on real AI providers. This page lists the
 providers, the environment variables and packages each needs, and how MondayOS
 behaves when a provider is not ready.
 
+## AI Workspace provider
+
+The AI Workspace resolves its provider from the environment at startup. There is
+no separate configuration and no new secrets system — it reads the variables
+already listed below.
+
+Selection order, when `MONDAYOS_PROVIDER` is unset:
+
+1. `anthropic` — `ANTHROPIC_API_KEY` set and the SDK importable
+2. `openai` — `OPENAI_API_KEY` set and the SDK importable
+3. `ollama` — a local daemon answering on `OLLAMA_HOST`
+4. none — the workspace says so rather than pretending to be configured
+
+Set `MONDAYOS_PROVIDER` to pin one explicitly. An explicit choice is honoured
+even if it cannot run: being told "you asked for anthropic and the key is not
+set" is more useful than silently answering with a different model.
+
+A project-local `.env` is read if present, filling only variables the shell has
+**not** already set — an exported value is a deliberate act, a file is a default.
+The key never enters MondayOS's own config object: each provider reads its own
+variable directly, so a secret cannot surface in a repr, a log line or a crash
+dump.
+
+The startup banner states the choice without the key:
+
+```
+AI Workspace provider: anthropic · claude-sonnet-4-5 · streams natively — ANTHROPIC_API_KEY is set
+```
+
+**Streaming is reported honestly.** A provider that streams natively does; one
+that does not still works, delivering the whole answer as a single chunk, and
+reports `supports_streaming = False` so the interface can show the difference
+rather than animating one chunk to look like tokens arriving.
+
+| Provider | Native streaming |
+|---|---|
+| `anthropic` | yes |
+| `openai` | not yet — single chunk |
+| `ollama` | not yet — single chunk |
+
+---
+
 ## Role → provider mapping
 
 | Role | Provider | Model (default) | Needs |
