@@ -1,4 +1,5 @@
 """Anthropic (Claude) provider implementation."""
+
 from __future__ import annotations
 
 import os
@@ -8,11 +9,15 @@ from brain.providers.base import (
     AIProvider,
     ProviderAuthError,
     ProviderAvailability,
+    ProviderChunk,
     ProviderError,
     ProviderRateLimitError,
     ProviderResponse,
     ProviderUnavailableError,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 if TYPE_CHECKING:
     from brain.providers.factory import ProviderConfig
@@ -38,7 +43,7 @@ class AnthropicProvider(AIProvider):
     Requires ANTHROPIC_API_KEY in the environment or explicit api_key in config.
     """
 
-    def __init__(self, config: "ProviderConfig") -> None:
+    def __init__(self, config: ProviderConfig) -> None:
         self._model = config.model or _DEFAULT_MODEL
         self._api_key = config.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self._max_tokens = config.max_tokens
@@ -68,19 +73,33 @@ class AnthropicProvider(AIProvider):
             importlib.import_module("anthropic")
         except ImportError:
             return ProviderAvailability(
-                available=False, provider=_PROVIDER_NAME, model=self._model,
+                available=False,
+                provider=_PROVIDER_NAME,
+                model=self._model,
                 reason="anthropic SDK not installed",
-                env_var="ANTHROPIC_API_KEY", install_hint="pip install anthropic",
+                env_var="ANTHROPIC_API_KEY",
+                install_hint="pip install anthropic",
             )
         if not self._api_key:
             return ProviderAvailability(
-                available=False, provider=_PROVIDER_NAME, model=self._model,
-                reason="ANTHROPIC_API_KEY is not set", env_var="ANTHROPIC_API_KEY",
+                available=False,
+                provider=_PROVIDER_NAME,
+                model=self._model,
+                reason="ANTHROPIC_API_KEY is not set",
+                env_var="ANTHROPIC_API_KEY",
             )
         return ProviderAvailability(
-            available=True, provider=_PROVIDER_NAME, model=self._model,
-            reason="ready", env_var="ANTHROPIC_API_KEY",
+            available=True,
+            provider=_PROVIDER_NAME,
+            model=self._model,
+            reason="ready",
+            env_var="ANTHROPIC_API_KEY",
         )
+
+    @property
+    def supports_streaming(self) -> bool:
+        """Claude streams token deltas natively."""
+        return True
 
     def ask(
         self,
@@ -91,6 +110,75 @@ class AnthropicProvider(AIProvider):
     ) -> ProviderResponse:
         messages = _user_messages(prompt, context)
         return self._call(messages, max_tokens=max_tokens)
+
+    def stream(
+        self,
+        prompt: str,
+        context: str = "",
+        max_tokens: int = 1024,
+        **kwargs: Any,
+    ) -> Iterator[ProviderChunk]:
+        """
+        Stream a response as real token deltas.
+
+        Anthropic's SDK yields its own event shapes; they are translated into
+        ProviderChunk here so no vendor wire format escapes this package. That
+        boundary is the reason the workspace above can stream from any provider
+        without knowing which one it is.
+
+        Errors are raised, not yielded. A caller that has already received text
+        needs to distinguish "the model finished" from "the connection died
+        mid-answer", and the workspace marks the second case incomplete — which
+        it can only do if the failure actually surfaces.
+        """
+        try:
+            import anthropic as _anthropic
+        except ImportError as exc:
+            raise ProviderError(
+                "anthropic package not installed. Run: pip install anthropic"
+            ) from exc
+
+        messages = _user_messages(prompt, context)
+        model = self._model
+        tokens = 0
+        stop_reason = ""
+
+        try:
+            client = _anthropic.Anthropic(api_key=self._api_key)
+            # Kwargs bag, matching `_call` above: the SDK's typed signature wants
+            # its own MessageParam, and the rest of this module already passes
+            # plain dicts through a dict[str, Any].
+            stream_kwargs: dict[str, Any] = {
+                "model": self._model,
+                "max_tokens": max_tokens,
+                "messages": messages,
+            }
+            with client.messages.stream(**stream_kwargs) as stream:
+                for text in stream.text_stream:
+                    if text:
+                        yield ProviderChunk(text=text)
+                final = stream.get_final_message()
+                model = getattr(final, "model", model) or model
+                if final.usage:
+                    tokens = final.usage.input_tokens + final.usage.output_tokens
+                stop_reason = str(getattr(final, "stop_reason", "") or "")
+        except _anthropic.AuthenticationError as exc:
+            raise ProviderAuthError(f"Anthropic auth failed: {exc}") from exc
+        except _anthropic.RateLimitError as exc:
+            raise ProviderRateLimitError(f"Anthropic rate limit: {exc}") from exc
+        except _anthropic.APIError as exc:
+            raise ProviderUnavailableError(f"Anthropic API error: {exc}") from exc
+
+        yield ProviderChunk(
+            done=True,
+            model=model,
+            provider=_PROVIDER_NAME,
+            tokens_used=tokens,
+            # A run cut off at max_tokens is truncated, not finished. The caller
+            # decides what that means; hiding it would let a half-answer read as
+            # a whole one.
+            stop_reason=stop_reason,
+        )
 
     def plan(
         self,
@@ -197,6 +285,7 @@ class AnthropicProvider(AIProvider):
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
 
 def _user_messages(prompt: str, context: str) -> list[dict[str, str]]:
     if context:
