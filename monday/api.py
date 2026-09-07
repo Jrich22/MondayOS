@@ -111,6 +111,10 @@ class Monday:
         self.__provider = create_provider(self._config.provider_config)
         # Per-project question engines, built on first use.
         self.__question_engines: dict[str, Any] = {}
+        # Reasoning engines, cached per project alongside the question engines
+        # they share an index and graph with. Building a second index for the
+        # same project would double the cost of the expensive half of both.
+        self.__reasoning_engines: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -2886,6 +2890,23 @@ class Monday:
                 return None
             return engine.ask(question, carry=carry)
 
+        def assess(slug: str, question: str, subject: str, thin: bool) -> Any:
+            """
+            Reason about one turn, after retrieval and before generation.
+
+            Fails the same way `ask_intelligence` does — silently and totally.
+            A project whose index cannot be built produces no assessment and a
+            grounded answer, which is the behaviour that shipped in increments
+            1 to 3 and is a working conversation rather than a broken one.
+            """
+            try:
+                engine = self._reasoning_engine(slug)
+            except Exception:  # noqa: BLE001 — no reasoning beats no conversation
+                return None
+            if engine is None:
+                return None
+            return engine.assess(question, subject=subject, thin_retrieval=thin)
+
         responder = (
             ProviderWorkspaceResponder(self.__provider) if self.__provider is not None else None
         )
@@ -2905,6 +2926,7 @@ class Monday:
             read_completed=read_completed,
             git_lines=git_lines,
             activity=activity,
+            assess=assess,
         )
 
     def _question_engine(self, project: str) -> Any:
@@ -2955,7 +2977,27 @@ class Monday:
         graph = build_graph(index, tasks=rows, knowledge=knowledge)
         engine = QuestionEngine(index, graph, rows)
         self.__question_engines[slug] = engine
+        # The reasoning engine reads the same index, graph and task rows. Built
+        # here rather than lazily elsewhere so there is exactly one place a
+        # project's derived artefacts come into existence.
+        from reasoning import ReasoningEngine
+
+        self.__reasoning_engines[slug] = ReasoningEngine(
+            index, graph, rows, config_dir=self._config.project_root / "config"
+        )
         return engine
+
+    def _reasoning_engine(self, project: str) -> Any:
+        """The reasoning engine for one project, sharing the question engine's index."""
+        from workspace.models import slugify
+
+        slug = slugify(project)
+        cached = self.__reasoning_engines.get(slug)
+        if cached is not None:
+            return cached
+        # Building the question engine populates both caches.
+        self._question_engine(project)
+        return self.__reasoning_engines.get(slug)
 
     def workspace_stream(
         self, project: str, conversation_id: str, content: str
