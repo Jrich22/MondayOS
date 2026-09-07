@@ -50,6 +50,26 @@ GAP_LIMIT = 5
 INITIATIVE_LIMIT = 12
 
 
+def _changed_since(state: Any, named: list[Any]) -> str:
+    """
+    What moved, in terms the reader can check.
+
+    Deliberately narrow: health and blocker counts for the capabilities the prior
+    decision actually named. A full diff of the project would be accurate and
+    unreadable, and the question being answered is "does the prior advice still
+    hold", not "what happened".
+    """
+    notes: list[str] = []
+    for initiative in named:
+        if initiative.health.needs_attention:
+            notes.append(f"{initiative.name} is now {initiative.health.value}")
+        if initiative.blockers:
+            notes.append(f"{initiative.name} has {len(initiative.blockers)} blocker(s)")
+        for drift in initiative.drift:
+            notes.append(drift.statement)
+    return "; ".join(notes[:4])
+
+
 class ReasoningEngine:
     """
     Reasons about one project.
@@ -109,6 +129,70 @@ class ReasoningEngine:
             except Exception:  # noqa: BLE001 — a partial view beats no answer
                 self._initiatives = []
         return self._initiatives
+
+    def continue_from(
+        self,
+        state: Any,
+        question: str,
+        fingerprint: str = "",
+        current_action: bool = False,
+    ) -> Assessment:
+        """
+        Answer a follow-up about a decision already made.
+
+        **The ranking is not re-run.** The stored winner and its alternatives are
+        the answer to "what did you recommend"; recomputing them would risk
+        producing a different winner and then discussing it as though it were the
+        one the user is asking about — which is worse than not answering.
+
+        Current state is consulted only to say whether the decision still holds:
+        whether the project moved, and whether the capabilities it named still
+        exist. That is reporting, not re-deciding.
+
+        One exception, and it is the point of ``current_action``. A follow-up
+        asking what to do *now* against a project that has since changed must not
+        be answered from the old record. Describing a past recommendation is
+        always safe; acting on an outdated one is how a system gives confidently
+        obsolete advice. In that case the caller is told to reassess instead.
+        """
+        stale = bool(fingerprint and state.fingerprint and fingerprint != state.fingerprint)
+
+        if stale and current_action:
+            # Not answerable from the record. The caller reassesses.
+            return Assessment(
+                question=question,
+                mode=Mode.EXECUTIVE,
+                subject=state.initiative_slug,
+                mode_reason="prior decision is stale and the question asks what to do now",
+                stale=True,
+            )
+
+        capabilities = self.initiatives()
+        by_slug = {i.slug: i for i in capabilities}
+        named = [by_slug[s] for s in state.initiative_slugs if s in by_slug]
+        missing = [s for s in state.initiative_slugs if s not in by_slug]
+
+        assessment = Assessment(
+            question=question,
+            mode=Mode.EXECUTIVE,
+            subject=state.initiative_slug,
+            mode_reason="continues the prior strategic assessment",
+            continuation=True,
+            prior=state,
+            stale=stale,
+            obsolete=bool(missing),
+            initiatives=named[:INITIATIVE_LIMIT],
+            facts=self.facts().claims[:FACT_LIMIT],
+        )
+
+        if missing:
+            assessment.stale_because = (
+                f"{', '.join(missing)} is no longer discovered in this project"
+            )
+        elif stale:
+            assessment.stale_because = _changed_since(state, named)
+
+        return assessment
 
     def assess(
         self,

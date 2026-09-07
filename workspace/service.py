@@ -31,11 +31,19 @@ from workspace.errors import (
     ResponderUnavailableError,
 )
 from workspace.models import (
+    MAX_ALTERNATIVES,
+    MAX_EVIDENCE_REFS,
+    MAX_INITIATIVES,
+    AlternativeRef,
     Conversation,
     ConversationStatus,
+    EvidenceRef,
     Message,
     MessageRole,
+    Score,
+    StrategicState,
     derive_title,
+    recommendation_key,
     slugify,
 )
 from workspace.responder import WorkspaceReply, WorkspaceRequest, WorkspaceResponder
@@ -63,7 +71,8 @@ class WorkspaceService:
         git_lines: Callable[[str], list[str]] | None = None,
         activity: ActivityRecorder | NullRecorder | None = None,
         summarizer: compaction.ConversationSummarizer | None = None,
-        assess: Callable[[str, str, str, bool], Any] | None = None,
+        # (project, question, subject, thin_retrieval, strategic_state, fingerprint)
+        assess: Callable[[str, str, str, bool, Any, str], Any] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._root = Path(root)
@@ -256,7 +265,7 @@ class WorkspaceService:
         conversation.updated_at = stamp
         self._store.save(conversation)
 
-        reply = self._respond(
+        reply, assessment = self._respond(
             project=conversation.project,
             conversation=conversation,
             snapshot=snapshot,
@@ -278,6 +287,7 @@ class WorkspaceService:
         )
         conversation.messages.append(assistant_message)
         conversation.updated_at = assistant_message.created_at
+        _capture_strategy(conversation, assessment, assistant_message, snapshot, self._now())
         self._store.save(conversation)
         self._activity.record(
             ActivityKind.ERROR if reply.error else ActivityKind.PROVIDER,
@@ -349,6 +359,10 @@ class WorkspaceService:
         parts: list[str] = []
         reply: WorkspaceReply | None = None
         finished = False
+        # Bound before the try because the finally block reads it: a provider
+        # that fails before the request is built would otherwise raise NameError
+        # from the cleanup path, turning a recorded failure into a crash.
+        assessment: Any = None
 
         try:
             if self._responder is None:
@@ -366,6 +380,7 @@ class WorkspaceService:
                     project=conversation.project,
                 )
                 request = self._request(conversation, snapshot, text, conversation.messages[:-1])
+                assessment = request.assessment
                 for chunk in self._responder.respond_stream(request):
                     if chunk.done:
                         reply = chunk.reply
@@ -377,7 +392,9 @@ class WorkspaceService:
         finally:
             # Runs on normal completion AND on GeneratorExit when the caller
             # stops us. Either way the turn is written down.
-            message = self._persist_stream(conversation, snapshot, parts, reply, finished)
+            message = self._persist_stream(
+                conversation, snapshot, parts, reply, finished, assessment
+            )
             if finished:
                 yield {
                     "type": "done",
@@ -392,6 +409,7 @@ class WorkspaceService:
         parts: list[str],
         reply: WorkspaceReply | None,
         finished: bool,
+        assessment: Any = None,
     ) -> Message:
         """Write the assistant turn, however the stream ended."""
         streamed = "".join(parts).strip()
@@ -426,6 +444,7 @@ class WorkspaceService:
         )
         conversation.messages.append(message)
         conversation.updated_at = message.created_at
+        _capture_strategy(conversation, assessment, message, snapshot, self._now())
         self._store.save(conversation)
         self._activity.record(
             ActivityKind.PERSIST,
@@ -458,14 +477,13 @@ class WorkspaceService:
             history=plan.verbatim,
             conversation_id=conversation.id,
             history_digest=plan.digest,
-            assessment=self._assessment(conversation.project, text, conversation.subject, snapshot),
+            assessment=self._assessment(conversation, text, snapshot),
         )
 
     def _assessment(
         self,
-        project: str,
+        conversation: Conversation,
         text: str,
-        subject: str,
         snapshot: ContextSnapshot | None,
     ) -> Any:
         """
@@ -482,7 +500,14 @@ class WorkspaceService:
         if self._assess is None:
             return None
         try:
-            return self._assess(project, text, subject, _thin(snapshot))
+            return self._assess(
+                conversation.project,
+                text,
+                conversation.subject,
+                _thin(snapshot),
+                conversation.strategy,
+                snapshot.fingerprint if snapshot is not None else "",
+            )
         except Exception:  # noqa: BLE001 — reasoning must never break a turn
             return None
 
@@ -509,7 +534,7 @@ class WorkspaceService:
         snapshot = self._snapshot(project)
         conversation.active_snapshot_id = snapshot.id
 
-        reply = self._respond(
+        reply, assessment = self._respond(
             project=conversation.project,
             conversation=conversation,
             snapshot=snapshot,
@@ -529,6 +554,7 @@ class WorkspaceService:
         )
         conversation.messages.append(assistant_message)
         conversation.updated_at = assistant_message.created_at
+        _capture_strategy(conversation, assessment, assistant_message, snapshot, self._now())
         self._store.save(conversation)
 
         return {
@@ -544,25 +570,32 @@ class WorkspaceService:
         snapshot: ContextSnapshot | None,
         text: str,
         history: list[Message],
-    ) -> WorkspaceReply:
-        """Ask the responder, turning "nothing configured" into a recorded failure."""
+    ) -> tuple[WorkspaceReply, Any]:
+        """
+        Ask the responder, turning "nothing configured" into a recorded failure.
+
+        Builds its request through ``_request`` rather than inline. It used to
+        construct one directly, which quietly meant this path never received an
+        assessment at all: every non-streaming turn ran without the reasoning
+        layer while the streaming path had it.
+
+        Returns the assessment alongside the reply so the caller can record what
+        was recommended. Rebuilding it at persist time would run the analysis
+        twice and could produce a different winner than the one the user read.
+        """
         if self._responder is None:
-            return WorkspaceReply(
-                content="",
-                error=(
-                    "No AI provider is configured for this MondayOS instance, so the "
-                    "workspace cannot answer. Configure a provider in MondayConfig."
+            return (
+                WorkspaceReply(
+                    content="",
+                    error=(
+                        "No AI provider is configured for this MondayOS instance, so the "
+                        "workspace cannot answer. Configure a provider in MondayConfig."
+                    ),
                 ),
+                None,
             )
-        return self._responder.respond(
-            WorkspaceRequest(
-                project=project,
-                message=text,
-                snapshot=snapshot,
-                history=history,
-                conversation_id=conversation.id,
-            )
-        )
+        request = self._request(conversation, snapshot, text, history)
+        return self._responder.respond(request), request.assessment
 
     # ---------------------------------------------------------------- search
 
@@ -795,6 +828,89 @@ __all__ = [
 # a question the project barely covers — without firing on every ordinary lookup,
 # which would attach a memo to "where is X defined".
 THIN_CONTEXT_ITEMS = 8
+
+
+def _capture_strategy(
+    conversation: Conversation,
+    assessment: Any,
+    message: Message,
+    snapshot: ContextSnapshot | None,
+    now: datetime,
+) -> None:
+    """
+    Record what Monday recommended, when this turn actually recommended something.
+
+    Three conditions, each a correctness rule rather than a filter.
+
+    **It must be a fresh executive assessment.** A continuation answers about a
+    decision already stored; letting it overwrite the record with a re-derivation
+    of itself would let the decision drift turn by turn while appearing stable.
+
+    **The turn must have completed.** A truncated narration may have stopped
+    before the recommendation was shown, and the guarantee this state rests on is
+    that everything in it was visible in a completed answer.
+
+    **There must be a recommendation.** An executive turn that ranked nothing has
+    nothing for a follow-up to refer to.
+    """
+    if assessment is None or message.incomplete or message.failed:
+        return
+    if getattr(assessment, "continuation", False):
+        return
+    mode = getattr(assessment, "mode", None)
+    if mode is None or getattr(mode, "value", "") != "executive":
+        return
+    recommendations = list(getattr(assessment, "recommendations", []) or [])
+    if not recommendations:
+        return
+
+    top = recommendations[0]
+    slug = _slug_for(assessment, getattr(top, "initiative", ""))
+    risk = getattr(top, "execution_risk", None)
+
+    conversation.strategy = StrategicState(
+        question=assessment.question,
+        topic=str(getattr(assessment, "mode_reason", "")).replace("matched ", "").strip(),
+        source_message_id=message.id,
+        snapshot_id=snapshot.id if snapshot is not None else "",
+        fingerprint=snapshot.fingerprint if snapshot is not None else "",
+        project=conversation.project,
+        created_at=now,
+        recommendation_key=recommendation_key(top.statement, slug),
+        recommendation=top.statement,
+        rationale=top.rationale,
+        initiative_slug=slug,
+        effort=getattr(top, "effort", ""),
+        alternatives=[
+            AlternativeRef(statement=a.statement, why_not=a.why_not)
+            for a in list(getattr(top, "alternatives", []) or [])[:MAX_ALTERNATIVES]
+        ],
+        evidence_refs=[
+            EvidenceRef(
+                kind=c.kind.value,
+                reference=c.reference,
+                path=c.path,
+                line=c.line,
+                because=c.because,
+            )
+            for c in list(top.evidence.citations)[:MAX_EVIDENCE_REFS]
+        ],
+        initiative_slugs=[
+            str(i.slug)
+            for i in list(getattr(assessment, "initiatives", []) or [])[:MAX_INITIATIVES]
+        ],
+        evidence_strength=Score(top.strength.score, top.strength.band.value),
+        confidence=Score(top.confidence.score, top.confidence.band.value),
+        execution_risk=Score(risk.score, risk.band.value) if risk is not None else Score(),
+    )
+
+
+def _slug_for(assessment: Any, initiative_name: str) -> str:
+    """The capability slug behind a recommendation's display name."""
+    for initiative in list(getattr(assessment, "initiatives", []) or []):
+        if initiative.name == initiative_name:
+            return str(initiative.slug)
+    return slugify(initiative_name) if initiative_name else ""
 
 
 def _thin(snapshot: ContextSnapshot | None) -> bool:
