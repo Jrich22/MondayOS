@@ -26,7 +26,7 @@ from growth.publication import (
 from growth.service import GrowthService
 from integrations.publishing import FakePublishingConnector
 from monday import Monday, MondayConfig
-from monday.project import ProjectRegistry
+from core.project import ProjectRegistry
 
 SECRET_VALUE = "super-secret-token-value-do-not-store"
 SECRET_NAME = "LINKEDIN_TOKEN"

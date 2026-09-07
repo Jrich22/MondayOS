@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from monday.project import (
+from core.project import (
     ProjectAlreadyExistsError,
     ProjectEntry,
     ProjectNotFoundError,

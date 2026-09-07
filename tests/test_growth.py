@@ -33,7 +33,7 @@ from growth.binding import InvalidSecretNameError
 from growth.content import REQUIRED_FOR_REVIEW
 from monday import Monday, MondayConfig
 from monday.cli import main
-from monday.project import ProjectRegistry
+from core.project import ProjectRegistry
 from orchestrator.report import ExecutionMode
 
 SECRET_VALUE = "super-secret-token-value-do-not-store"

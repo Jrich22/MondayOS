@@ -5,6 +5,14 @@ The registry maps project names to their source paths and metadata.
 It is stored in {mondayos_root}/config/projects.json and is always
 accessed through the main MondayOS instance (not through external project
 instances).
+
+Lives in `core` rather than `monday` because project identity is a foundational
+concept, not a facade concern. It sat under `monday/` for historical reasons —
+the Architecture Freeze discouraged new packages — and that placement created
+the only import cycle in the system: `growth` needs the registry, `monday`
+imports `growth.service`, so the two packages depended on each other. Nothing in
+this module imports anything from MondayOS, so it was always a leaf wearing the
+wrong address.
 """
 
 from __future__ import annotations

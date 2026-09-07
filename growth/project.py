@@ -25,7 +25,7 @@ from growth.errors import (
     InvalidProjectSlugError,
     ProjectNotRegisteredError,
 )
-from monday.project import ProjectRegistry
+from core.project import ProjectRegistry
 
 
 @dataclass(frozen=True)

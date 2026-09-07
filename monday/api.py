@@ -22,7 +22,7 @@ from knowledge import KnowledgeStore
 from knowledge.entry import KnowledgeEntry, KnowledgeType, LifecycleStatus
 from memory import SessionMemory
 from monday.config import MondayConfig
-from monday.project import ProjectRegistry
+from core.project import ProjectRegistry
 from monday.types import (
     AdviseResponse,
     AgentResponse,
@@ -1130,7 +1130,7 @@ class Monday:
             ProjectResponse with success=True on success or success=False with
             a descriptive message on failure. Does not raise.
         """
-        from monday.project import ProjectAlreadyExistsError, ProjectNotFoundError, ProjectRegistry
+        from core.project import ProjectAlreadyExistsError, ProjectNotFoundError, ProjectRegistry
 
         registry = ProjectRegistry(self._config.project_root / "config")
 
@@ -1240,7 +1240,7 @@ class Monday:
             the composite data payload. Does not raise.
         """
         from monday import Monday, MondayConfig
-        from monday.project import ProjectNotFoundError, ProjectRegistry
+        from core.project import ProjectNotFoundError, ProjectRegistry
 
         registry = ProjectRegistry(self._config.project_root / "config")
 

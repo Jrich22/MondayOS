@@ -49,7 +49,7 @@ from growth.generation import (
 )
 from growth.generation.models import GeneratedAsset
 from monday import Monday, MondayConfig
-from monday.project import ProjectRegistry
+from core.project import ProjectRegistry
 
 T0 = datetime(2026, 9, 7, 9, 0, tzinfo=UTC)  # a Monday
 

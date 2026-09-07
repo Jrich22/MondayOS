@@ -46,7 +46,7 @@ from growth.generation import (
     parse_response,
 )
 from growth.service import GrowthService
-from monday.project import ProjectRegistry
+from core.project import ProjectRegistry
 
 T0 = datetime(2026, 9, 7, 9, 0, tzinfo=UTC)
 
