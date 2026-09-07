@@ -310,23 +310,31 @@ class TestContinuationReasoning(unittest.TestCase):
         self.assertIn("STATUS: stale", rendered)
         self.assertIn("Do not present it as current advice", rendered)
 
-    def test_a_stale_current_action_question_refuses_to_answer_from_the_record(self):
+    def test_a_stale_current_action_question_is_routed_away_from_the_record(self):
         """
-        Case C. Acting on an outdated recommendation is a different failure from
-        describing one, and only the first is dangerous.
+        Case C, asserted where the decision now lives.
+
+        Acting on an outdated recommendation is a different failure from
+        describing one, and only the first is dangerous. The router refuses to
+        route such a question to the stored decision at all, so `continue_from`
+        is never reached — which is why this asserts on the route rather than on
+        the assessment.
         """
-        assessment = self.engine.continue_from(
-            self._state(fingerprint="FP-1"),
+        from reasoning.router import ROUTER, Register
+
+        decision = ROUTER.route(
             "Is that still the best option?",
-            "FP-2",
-            current_action=True,
+            strategy=self._state(fingerprint="FP-1"),
+            fingerprint="FP-2",
         )
-        self.assertFalse(assessment.continuation)
-        self.assertTrue(assessment.stale)
+        self.assertIs(decision.register, Register.EXECUTIVE)
+        self.assertFalse(decision.continuation)
+        self.assertTrue(decision.stale)
+        self.assertTrue(decision.current_action)
 
     def test_a_current_action_question_on_fresh_state_continues_normally(self):
         assessment = self.engine.continue_from(
-            self._state(), "Is that still the best option?", "FP-1", current_action=True
+            self._state(), "Is that still the best option?", "FP-1"
         )
         self.assertTrue(assessment.continuation)
         self.assertFalse(assessment.stale)

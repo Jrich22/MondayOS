@@ -346,68 +346,20 @@ def is_current_action(question: str) -> bool:
 
 def route(question: str, state: Any = None) -> Routing:
     """
-    Decide the register for a question, given any strategic state in play.
+    Deprecated. Use ``reasoning.router.ROUTER.route``.
 
-    Precedence is explicit and ordered, and the order is the design:
-
-    1. **Grounded lookup override.** Unconditional. A question asking where
-       something lives gets a file and a line even mid-strategy.
-    2. **Fresh executive.** An explicit strategic question starts a new
-       assessment, replacing whatever was stored.
-    3. **Continuation.** A follow-up referring to the stored decision.
-    4. **Grounded.** Everything else, unchanged from before.
-
-    Putting the lookup guard first is what prevents executive framing leaking
-    into ordinary code questions. It is checked before the strategic patterns
-    rather than after, so no amount of widening those patterns can undo it.
+    This was one of two routing implementations. It is kept only as a thin
+    redirect so nothing can accidentally reintroduce a second policy by importing
+    it, and it now delegates rather than deciding: the router is the single
+    authority, and this returns its verdict in the old shape.
     """
-    text = (question or "").strip()
-    if not text:
-        return Routing(executive=False, reason="empty question")
+    from reasoning.router import ROUTER
 
-    if _LOOKUP.search(text):
-        return Routing(executive=False, reason="phrased as a retrieval lookup")
-
-    # A question that can only be a follow-up is never a fresh one, however much
-    # strategic vocabulary it happens to share with the fresh patterns.
-    #
-    # "Is that still the best option?" matched the fresh next-work pattern on
-    # "best ... option" and was answered as a brand-new prioritisation, silently
-    # discarding the decision it was asking about. The back-reference is what
-    # settles it: nothing referring to a prior answer can be starting a new one.
-    only_a_followup = state is not None and (
-        bool(_BARE_FOLLOWUP.match(text))
-        or bool(_ASSESSMENT_DEICTIC.search(text))
-        or bool(_APPLY_TO_PRIOR.search(text))
-    )
-
-    if not only_a_followup:
-        for topic, pattern in _PATTERNS:
-            if pattern.search(text):
-                return Routing(executive=True, topic=topic, reason=f"matched {topic.value}")
-
-    continues, why = is_continuation(text, state)
-    if continues:
-        return Routing(
-            executive=True,
-            topic=_topic_of(state),
-            reason=f"continues the prior assessment: {why}",
-            continuation=True,
-            current_action=is_current_action(text),
-        )
-
-    if _NOT_STRATEGIC.search(text):
-        return Routing(executive=False, reason="phrased as a factual lookup")
-
+    decision = ROUTER.route(question, strategy=state)
     return Routing(
-        executive=False, reason=why if state is not None else "no strategic pattern matched"
+        executive=decision.executive,
+        topic=decision.topic,
+        reason=decision.reason,
+        continuation=decision.continuation,
+        current_action=decision.current_action,
     )
-
-
-def _topic_of(state: Any) -> Topic | None:
-    """The stored topic, so a continuation reasons in the same register."""
-    raw = str(getattr(state, "topic", "") or "")
-    for topic in Topic:
-        if topic.value == raw:
-            return topic
-    return None

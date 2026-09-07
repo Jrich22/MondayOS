@@ -34,10 +34,11 @@ from intelligence.graph import RelationshipGraph
 from intelligence.index import ProjectIndex
 from reasoning import gaps as gap_analysis
 from reasoning import recommend
-from reasoning.executive import Routing, Topic, route
+from reasoning.executive import Topic
 from reasoning.facts import ProjectFacts, gather
 from reasoning.inference import infer
 from reasoning.models import Assessment, Mode
+from reasoning.router import ROUTER
 
 # How many facts and inferences reach the narrator. The assessment is injected
 # into a prompt with a finite budget, and twenty inferences would crowd out the
@@ -135,7 +136,6 @@ class ReasoningEngine:
         state: Any,
         question: str,
         fingerprint: str = "",
-        current_action: bool = False,
     ) -> Assessment:
         """
         Answer a follow-up about a decision already made.
@@ -149,23 +149,16 @@ class ReasoningEngine:
         whether the project moved, and whether the capabilities it named still
         exist. That is reporting, not re-deciding.
 
-        One exception, and it is the point of ``current_action``. A follow-up
-        asking what to do *now* against a project that has since changed must not
-        be answered from the old record. Describing a past recommendation is
-        always safe; acting on an outdated one is how a system gives confidently
-        obsolete advice. In that case the caller is told to reassess instead.
+        A follow-up asking what to do *now* against a project that has since
+        changed never reaches here: the router sends it for a fresh assessment
+        instead. Describing a past recommendation is always safe; acting on an
+        outdated one is how a system gives confidently obsolete advice, and that
+        judgement belongs with the routing decision rather than being made twice.
         """
+        # Staleness is the router's decision -- it is a property of the
+        # conversation, not of the project this engine reasons about. Recomputing
+        # it here would be a second opinion nobody asked for.
         stale = bool(fingerprint and state.fingerprint and fingerprint != state.fingerprint)
-
-        if stale and current_action:
-            # Not answerable from the record. The caller reassesses.
-            return Assessment(
-                question=question,
-                mode=Mode.EXECUTIVE,
-                subject=state.initiative_slug,
-                mode_reason="prior decision is stale and the question asks what to do now",
-                stale=True,
-            )
 
         capabilities = self.initiatives()
         by_slug = {i.slug: i for i in capabilities}
@@ -199,6 +192,7 @@ class ReasoningEngine:
         question: str,
         subject: str = "",
         thin_retrieval: bool = False,
+        route: Any = None,
     ) -> Assessment:
         """
         Reason about one question.
@@ -213,17 +207,20 @@ class ReasoningEngine:
         "what should we build next" there is no retrieval result that would make
         reasoning unnecessary.
         """
-        routing = route(question)
+        # The decision arrives from the router. It used to be re-derived here,
+        # which meant a second routing pass that could not see the conversation's
+        # strategic state -- two policies, one of them structurally blind.
+        decision = route if route is not None else ROUTER.route(question)
         facts = self.facts()
 
-        if routing.executive and routing.topic is not None:
-            return self._executive(question, subject, routing, routing.topic)
+        if decision.executive and decision.topic is not None:
+            return self._executive(question, subject, decision, decision.topic)
 
         assessment = Assessment(
             question=question,
             mode=Mode.GROUNDED,
             subject=subject,
-            mode_reason=routing.reason,
+            mode_reason=decision.reason,
             facts=facts.claims[:FACT_LIMIT],
         )
 
@@ -234,7 +231,7 @@ class ReasoningEngine:
             assessment.inferences = infer(facts)[:INFERENCE_LIMIT]
             assessment.gaps = self.gaps()[:2]
             assessment.initiatives = self.initiatives()[:6]
-            assessment.mode_reason = f"{routing.reason}; retrieval was thin"
+            assessment.mode_reason = f"{decision.reason}; retrieval was thin"
 
         return assessment
 
@@ -242,7 +239,7 @@ class ReasoningEngine:
         self,
         question: str,
         subject: str,
-        routing: Routing,
+        routing: Any,
         topic: Topic,
     ) -> Assessment:
         facts = self.facts()

@@ -16,13 +16,13 @@ from typing import TYPE_CHECKING, Any
 
 from brain import Brain, BrainConfig, create_provider
 from brain.reasoner import ReasoningEngine
+from core.project import ProjectRegistry
 from events import EventBus
 from events.types import Event, EventType
 from knowledge import KnowledgeStore
 from knowledge.entry import KnowledgeEntry, KnowledgeType, LifecycleStatus
 from memory import SessionMemory
 from monday.config import MondayConfig
-from core.project import ProjectRegistry
 from monday.types import (
     AdviseResponse,
     AgentResponse,
@@ -1239,8 +1239,8 @@ class Monday:
             OnboardResponse with health_score, sprint_goal, report_path, and
             the composite data payload. Does not raise.
         """
-        from monday import Monday, MondayConfig
         from core.project import ProjectNotFoundError, ProjectRegistry
+        from monday import Monday, MondayConfig
 
         registry = ProjectRegistry(self._config.project_root / "config")
 
@@ -2901,17 +2901,18 @@ class Monday:
             """
             Reason about one turn, after retrieval and before generation.
 
-            Routing happens here rather than inside the engine because it needs
-            the conversation's strategic state, which the engine has no business
-            holding: the engine reasons about a project, and which register a
-            question belongs in is a fact about the dialogue.
+            Routing is delegated to the shared ``ROUTER`` rather than decided
+            here. It used to be decided here *and* again inside the engine, with
+            the second pass unable to see the conversation's strategic state --
+            two policies, one of them structurally blind. This function now only
+            dispatches on the decision.
 
-            Fails the same way `ask_intelligence` does — silently and totally.
+            Fails the same way `ask_intelligence` does -- silently and totally.
             A project whose index cannot be built produces no assessment and a
-            grounded answer, which is the behaviour that shipped in increments
-            1 to 3 and is a working conversation rather than a broken one.
+            grounded answer, which is a working conversation rather than a
+            broken one.
             """
-            from reasoning.executive import route
+            from reasoning.router import ROUTER
 
             try:
                 engine = self._reasoning_engine(slug)
@@ -2920,27 +2921,22 @@ class Monday:
             if engine is None:
                 return None
 
-            routing = route(question, strategy)
-            if routing.continuation and strategy is not None:
-                assessment = engine.continue_from(
-                    strategy,
-                    question,
-                    fingerprint=fingerprint,
-                    current_action=routing.current_action,
-                )
-                # A stale record cannot answer "what should I do now". The engine
-                # says so by returning a continuation-less assessment, and the
-                # honest response is to reassess rather than to answer from it.
-                if not assessment.continuation:
-                    fresh = engine.assess(question, subject=subject, thin_retrieval=thin)
-                    # Say why this is fresh. Otherwise it reads as an unprompted
-                    # new analysis and the model may assert the project is
-                    # unchanged on the very turn we reassessed because it wasn't.
-                    fresh.replaced_stale = True
-                    return fresh
-                return assessment
+            decision = ROUTER.route(question, strategy=strategy, fingerprint=fingerprint)
 
-            return engine.assess(question, subject=subject, thin_retrieval=thin)
+            if decision.continuation and strategy is not None:
+                return engine.continue_from(strategy, question, fingerprint=fingerprint)
+
+            assessment = engine.assess(
+                question, subject=subject, thin_retrieval=thin, route=decision
+            )
+            # The router sends a stale current-action question here for a fresh
+            # answer. Saying so matters: otherwise it reads as an unprompted new
+            # analysis, and a model that has seen an earlier "Status: Current"
+            # line in the transcript will repeat it -- asserting the project is
+            # unchanged on the very turn we reassessed because it wasn't.
+            if decision.stale and decision.current_action:
+                assessment.replaced_stale = True
+            return assessment
 
         responder = (
             ProviderWorkspaceResponder(self.__provider) if self.__provider is not None else None
