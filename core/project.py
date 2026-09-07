@@ -5,14 +5,25 @@ The registry maps project names to their source paths and metadata.
 It is stored in {mondayos_root}/config/projects.json and is always
 accessed through the main MondayOS instance (not through external project
 instances).
+
+Lives in `core` rather than `monday` because project identity is a foundational
+concept, not a facade concern. It sat under `monday/` for historical reasons —
+the Architecture Freeze discouraged new packages — and that placement created
+the only import cycle in the system: `growth` needs the registry, `monday`
+imports `growth.service`, so the two packages depended on each other. Nothing in
+this module imports anything from MondayOS, so it was always a leaf wearing the
+wrong address.
 """
+
 from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from core.identity import slug
 
 
 class ProjectNotFoundError(Exception):
@@ -28,12 +39,12 @@ class ProjectEntry:
     """A single registered project."""
 
     name: str
-    source_path: str    # absolute path to the external project directory
+    source_path: str  # absolute path to the external project directory
     description: str
     registered_at: str  # ISO 8601 UTC
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ProjectEntry":
+    def from_dict(cls, data: dict[str, Any]) -> ProjectEntry:
         return cls(
             name=data["name"],
             source_path=data["source_path"],
@@ -90,15 +101,34 @@ class ProjectRegistry:
         projects = self._load()
         if name in projects and not overwrite:
             raise ProjectAlreadyExistsError(
-                f"Project {name!r} is already registered. "
-                "Use overwrite=True to replace it."
+                f"Project {name!r} is already registered. Use overwrite=True to replace it."
             )
+
+        # Collision protection. Project names are stored verbatim but *addressed*
+        # by their canonical slug, so two different names can reach the same
+        # storage. That is fine when they describe the same project -- WeatherBot
+        # and weatherbot are one project under two spellings -- and is a silent
+        # data-sharing bug when they do not.
+        #
+        # Rejected at registration rather than detected later, because by the
+        # time two projects are writing to one directory the damage is done.
+        incoming = slug(name)
+        for existing_name, existing in projects.items():
+            if existing_name == name or slug(existing_name) != incoming:
+                continue
+            if str(existing.get("source_path", "")) != source_path:
+                raise ProjectAlreadyExistsError(
+                    f"Project {name!r} resolves to the slug {incoming!r}, which is "
+                    f"already used by {existing_name!r} at a different path "
+                    f"({existing.get('source_path')!r}). Two projects cannot share "
+                    "one identity; rename one of them."
+                )
 
         entry = ProjectEntry(
             name=name,
             source_path=source_path,
             description=description,
-            registered_at=datetime.now(tz=timezone.utc).isoformat(),
+            registered_at=datetime.now(tz=UTC).isoformat(),
         )
         projects[name] = entry.to_dict()
         self._save(projects)
@@ -116,7 +146,11 @@ class ProjectRegistry:
             registered = list(projects.keys())
             raise ProjectNotFoundError(
                 f"Project {name!r} is not registered. "
-                + (f"Registered projects: {registered}" if registered else "No projects registered yet.")
+                + (
+                    f"Registered projects: {registered}"
+                    if registered
+                    else "No projects registered yet."
+                )
             )
         return ProjectEntry.from_dict(projects[name])
 

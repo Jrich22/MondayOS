@@ -145,11 +145,20 @@ def _engine(root: Path, projects: dict[str, Path], **readers: Any) -> ContextEng
 
 class TestModels(unittest.TestCase):
     def test_slugify_refuses_path_traversal(self):
-        """The slug is the isolation primitive: no separators survive it."""
+        """
+        The slug is the isolation primitive, and traversal is now a *rejected
+        name* rather than a sanitized one.
+
+        This previously folded "a/b" into "a-b" and accepted it. That silently
+        turned a name describing two path segments into one, which is the
+        sanitize-instead-of-reject behaviour ADR-011 forbids. Rejecting is the
+        stronger guarantee and matches what Growth already did.
+        """
+        from core.identity import InvalidSlugError
+
         for hostile in ("../other", "/etc/passwd", "a/../b", "..\\win"):
-            self.assertNotIn("/", slugify(hostile))
-            self.assertNotIn("\\", slugify(hostile))
-            self.assertNotIn("..", slugify(hostile))
+            with self.subTest(name=hostile), self.assertRaises(InvalidSlugError):
+                slugify(hostile)
 
     def test_slugify_normalises_case_and_spaces(self):
         self.assertEqual(slugify("Cue App"), "cue-app")
@@ -248,13 +257,20 @@ class TestConversationStore(unittest.TestCase):
             self.assertEqual([c.title for c in store.list("beta")], ["b1"])
 
     def test_a_traversal_slug_cannot_escape_the_conversations_directory(self):
+        """
+        A traversal name never reaches the filesystem at all now.
+
+        It used to be sanitized to "escape" and stored; it is refused before a
+        path is built, so there is no directory to reason about.
+        """
+        from core.identity import InvalidSlugError
+
         with TemporaryDirectory() as tmp:
             store = ConversationStore(Path(tmp))
-            created = store.create("../escape", "x", now=T0)
-            base = (Path(tmp) / "workspace" / "conversations").resolve()
-            path = store.project_dir("../escape").resolve()
-            self.assertTrue(str(path).startswith(str(base)))
-            self.assertEqual(created.project, "escape")
+            with self.assertRaises(InvalidSlugError):
+                store.create("../escape", "x", now=T0)
+            with self.assertRaises(InvalidSlugError):
+                store.project_dir("../escape")
 
     def test_an_unusable_project_name_is_refused(self):
         with TemporaryDirectory() as tmp:

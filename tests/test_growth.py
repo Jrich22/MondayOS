@@ -31,10 +31,9 @@ from growth import (
 )
 from growth.binding import InvalidSecretNameError
 from growth.content import REQUIRED_FOR_REVIEW
-from growth.service import GrowthService
 from monday import Monday, MondayConfig
 from monday.cli import main
-from monday.project import ProjectRegistry
+from core.project import ProjectRegistry
 from orchestrator.report import ExecutionMode
 
 SECRET_VALUE = "super-secret-token-value-do-not-store"
@@ -104,8 +103,38 @@ class TestProjectResolution(unittest.TestCase):
             self.assertEqual(handle.slug, "weatherbot")
 
     def test_duplicate_names_different_source_paths_are_ambiguous(self):
+        """
+        Defence in depth for a registry that was hand-edited.
+
+        The registry itself now refuses to create this state — two names sharing
+        a slug but pointing at different paths is rejected at registration. The
+        check here still matters because config/projects.json is a file a human
+        can edit, so the ambiguity is written directly rather than registered.
+        """
         with TemporaryDirectory() as tmp:
-            root = _make_root(tmp, {"weatherbot": "wb-one", "WeatherBot": "wb-two"})
+            root = Path(tmp)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            for source in ("wb-one", "wb-two"):
+                (root / source).mkdir(parents=True, exist_ok=True)
+            (root / "config" / "projects.json").write_text(
+                json.dumps(
+                    {
+                        "weatherbot": {
+                            "name": "weatherbot",
+                            "source_path": str(root / "wb-one"),
+                            "description": "",
+                            "registered_at": "2026-09-07T00:00:00+00:00",
+                        },
+                        "WeatherBot": {
+                            "name": "WeatherBot",
+                            "source_path": str(root / "wb-two"),
+                            "description": "",
+                            "registered_at": "2026-09-07T00:00:00+00:00",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             with self.assertRaises(AmbiguousProjectError):
                 GrowthStore(root).open("weatherbot")
 

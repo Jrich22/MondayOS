@@ -91,6 +91,47 @@ GENERATED_MARKERS: tuple[str, ...] = (
     ".d.ts",
 )
 
+# Directories holding MondayOS's *own* output rather than the project's material.
+#
+# This is the boundary that stops the system citing itself. A conversation
+# MondayOS wrote is not evidence about the project — it is evidence about what
+# MondayOS previously said, and indexing it creates a loop where an answer
+# becomes the ground for the next one. Before this existed, 13 of the 103 files
+# matching "recommendation" in this repository were MondayOS's own transcripts.
+#
+# Relative to the project root, matched on path prefix. Deliberately a declared
+# list rather than a git-ignore check: it is deterministic, costs no subprocess
+# per build, works in a project that is not a git repository, and is reviewable
+# in one place. (Git-ignore status catches 61 of these 64 files but misses the
+# tracked-but-generated ones below, so it is not sufficient on its own.)
+GENERATED_DIRS: tuple[str, ...] = (
+    # Conversations MondayOS held. The feedback loop.
+    "workspace/conversations",
+    # Machine-generated knowledge. `docs/KNOWLEDGE_RUNTIME_POLICY.md` already
+    # adopted this split by *provenance*: runtime/ is where captured execution
+    # output lives, and the rest of knowledge/ is human-authored and stays
+    # indexed. Note the frontmatter cannot be used for this — records under
+    # runtime/ carry `authored_by: human` while being orchestrator output.
+    "knowledge/runtime",
+    # Agent registry records, written by the agent system.
+    "agents/active",
+    "agents/completed",
+    # The index's own cache, and runtime registries.
+    ".index",
+    "config",
+)
+
+# Individual generated artefacts that are tracked in git, so a git-ignore check
+# would miss them.
+GENERATED_NAMES: frozenset[str] = frozenset(
+    {
+        "generated_index.md",
+        ".sequences.json",
+        "knowledge_ledger_repair.md",
+        "ledger_repair_report.md",
+    }
+)
+
 _PROMPT_HINT = re.compile(r"(^|[/_])(prompt|prompts|instruction|instructions)([/_.]|$)", re.I)
 
 
@@ -101,7 +142,24 @@ def is_secret(path: Path) -> bool:
 
 def is_generated(path: Path) -> bool:
     name = path.name.lower()
-    return any(marker in name for marker in GENERATED_MARKERS)
+    return name in GENERATED_NAMES or any(marker in name for marker in GENERATED_MARKERS)
+
+
+def is_self_generated(path: Path, root: Path) -> bool:
+    """
+    Whether this file is MondayOS's own output rather than project material.
+
+    Kept separate from `is_generated` because the question is different. That one
+    asks "is this a build artefact"; this asks "did we write it". A system that
+    treats its own prior answers as evidence for its next one is not grounded, it
+    is circular — and the citation trail looks identical either way, which is
+    what makes it worth excluding structurally rather than filtering later.
+    """
+    try:
+        relative = path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return False
+    return any(relative == prefix or relative.startswith(f"{prefix}/") for prefix in GENERATED_DIRS)
 
 
 def classify(path: Path, root: Path) -> FileKind:
@@ -157,7 +215,7 @@ def walk(root: Path) -> Iterator[Path]:
             suffix = path.suffix.lower()
             if suffix not in SOURCE_EXT | DOC_EXT | CONFIG_EXT:
                 continue
-            if is_secret(path) or is_generated(path):
+            if is_secret(path) or is_generated(path) or is_self_generated(path, root):
                 continue
             try:
                 if path.stat().st_size > MAX_FILE_BYTES:

@@ -49,7 +49,7 @@ from growth.errors import (
 )
 from growth.project import ResolvedProject, resolve_project, workspace_path
 from growth.workspace import Workspace
-from monday.project import ProjectRegistry
+from core.project import ProjectRegistry
 
 if TYPE_CHECKING:
     from growth.events import EventStore

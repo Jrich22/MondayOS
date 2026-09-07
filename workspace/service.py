@@ -656,7 +656,9 @@ class WorkspaceService:
             candidates.sort(key=lambda c: (c.updated_at, c.id), reverse=True)
             latest = candidates[0].summary_dict()
 
-        target = slugify(project) or (str(latest["project"]) if latest else "")
+        # An empty project means "brief across everything", not "a project whose
+        # name is empty" -- so it never reaches slug validation.
+        target = (slugify(project) if project else "") or (str(latest["project"]) if latest else "")
         active = self._read_tasks(target) if (self._read_tasks and target) else []
         completed = self._read_completed(target) if (self._read_completed and target) else []
         git = self._git_lines(target) if (self._git_lines and target) else []

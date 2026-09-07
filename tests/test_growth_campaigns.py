@@ -21,7 +21,7 @@ from growth.errors import (
     InvalidTransitionError,
 )
 from monday import Monday, MondayConfig
-from monday.project import ProjectRegistry
+from core.project import ProjectRegistry
 
 EPOCH = datetime(2026, 9, 1, 9, 0, tzinfo=UTC)
 

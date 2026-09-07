@@ -1,10 +1,12 @@
 """KnowledgeCandidate — a pre-validation knowledge object extracted from a source document."""
+
 from __future__ import annotations
 
 import hashlib
-import re
 from dataclasses import dataclass, field
 from typing import Any
+
+from core.identity import slug
 
 
 @dataclass
@@ -70,9 +72,15 @@ def _extract_summary(content: str, max_len: int = 200) -> str:
     return content.replace("\n", " ").strip()[:max_len]
 
 
+_SOURCE_REF_MAX = 60
+
+
 def slugify(text: str) -> str:
-    """Convert a title to a stable lowercase slug for source_ref discriminators."""
-    text = text.lower()
-    text = re.sub(r"[^\w\s-]", "", text)
-    text = re.sub(r"[-\s]+", "-", text)
-    return text.strip("-")[:60]
+    """
+    A title reduced to a stable discriminator for a ``source_ref``.
+
+    The canonical transformation plus this module's own length cap. The cap is a
+    property of source references, not of identity, so it is applied here rather
+    than pushed into the shared function.
+    """
+    return slug(text)[:_SOURCE_REF_MAX]

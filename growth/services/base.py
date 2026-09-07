@@ -21,7 +21,7 @@ from growth.content import ContentItem, ContentStatus
 from growth.dispatch import PublishDispatcher
 from growth.store import GrowthStore, WorkspaceHandle
 from integrations.publishing.connector import PublishingConnector
-from monday.project import ProjectRegistry
+from core.project import ProjectRegistry
 
 
 class GrowthServiceBase:

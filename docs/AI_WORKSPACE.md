@@ -55,7 +55,7 @@ new memory system, and it does not own domain state.
 | `knowledge/` — the knowledge store and MKS contract | A second knowledge store |
 | `tasks/` — TaskManager and the real state machine | A parallel task model |
 | `brain/providers/` — the `AIProvider` abstraction | Any vendor SDK call |
-| `monday/project.py` — the project registry | A second project concept |
+| `core/project.py` — the project registry | A second project concept |
 | `dashboard_api/` — routing, CORS, redaction, revision | A separate HTTP server |
 | `core/redaction.py` — secret redaction | Bespoke secret handling |
 
