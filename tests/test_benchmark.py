@@ -14,6 +14,7 @@ required to exist and are reported individually rather than folded into a rate.
 
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -22,7 +23,7 @@ from benchmark.cases import ALL_CASES, Dimension
 from benchmark.corpus import CORPUS_QUESTIONS, discover
 from benchmark.guard import FORBIDDEN, assert_provider_free, imported_packages
 from benchmark.probes import CaseResult, CitationBreakdown, CorpusProbe
-from benchmark.report import SCHEMA, CorpusReport, Report, Verdict
+from benchmark.report import SCHEMA, CorpusReport, Report, Verdict, load_baseline
 from benchmark.runner import run, verdict
 from benchmark.scoring import Assertions, compare, score
 
@@ -362,6 +363,161 @@ class TestAgainstRealCorpora(unittest.TestCase):
             self.skipTest("mondayos corpus unavailable")
         self.assertEqual(corpus.assertions["citations_outside_root"], 0)
         self.assertGreater(corpus.volatile["files"], 0)
+
+
+class TestBaselineGate(unittest.TestCase):
+    """
+    The committed baseline, and the behaviour that makes it worth committing.
+
+    A baseline that only prints worse numbers is a baseline people stop reading.
+    These tests prove the gate actually fails — including on *improvement*, which
+    is deliberate: a baseline that silently absorbs good news stops describing the
+    system and stops protecting it.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.report = run(config_dir=REPO / "config")
+        cls.baseline = load_baseline()
+        cls.available = [s for s, c in cls.report.corpora.items() if c.available]
+
+    def _require_corpora(self) -> None:
+        """
+        Skip when nothing is checked out.
+
+        The gate tests work by mutating the baseline and asserting the run then
+        fails. With no corpora available there is nothing to compare, so the
+        verdict is legitimately empty and the mutation proves nothing — the test
+        would fail for the environment rather than for the behaviour.
+        """
+        if not self.available:
+            self.skipTest("no benchmark corpora are checked out on this machine")
+
+    def test_a_baseline_is_committed(self):
+        self.assertTrue(self.baseline, "benchmark/baseline.json is missing or unreadable")
+        self.assertEqual(self.baseline["schema"], SCHEMA)
+
+    def test_the_current_run_matches_the_committed_baseline(self):
+        available = [s for s, c in self.report.corpora.items() if c.available]
+        if not available:
+            self.skipTest("no corpora checked out")
+        result = verdict(self.report, self.baseline)
+        self.assertTrue(result.ok, result.render())
+
+    def test_a_regression_fails(self):
+        self._require_corpora()
+        import copy
+
+        worse = copy.deepcopy(self.baseline)
+        for corpus in worse.get("corpora", {}).values():
+            if corpus.get("available"):
+                corpus["observations"]["routing_accuracy"] = 1.0
+        result = verdict(self.report, worse)
+        self.assertFalse(result.ok)
+        self.assertTrue(any("routing_accuracy fell" in f for f in result.failures))
+
+    def test_an_improvement_fails_with_an_explicit_stale_baseline_message(self):
+        """
+        A generic failure trains developers to ignore it. This one must name what
+        happened and how to fix it.
+        """
+        self._require_corpora()
+        import copy
+
+        better = copy.deepcopy(self.baseline)
+        for corpus in better.get("corpora", {}).values():
+            if corpus.get("available"):
+                corpus["observations"]["routing_accuracy"] = 0.1
+        result = verdict(self.report, better)
+        self.assertFalse(result.ok)
+        rendered = result.render()
+        self.assertIn("Benchmark improved", rendered)
+        self.assertIn("baseline is stale", rendered)
+        self.assertIn("--record", rendered)
+
+    def test_a_changed_initiative_set_is_caught(self):
+        """S3 must not be able to change discovery without this noticing."""
+        self._require_corpora()
+        import copy
+
+        moved = copy.deepcopy(self.baseline)
+        target = moved.get("corpora", {}).get("cue-app")
+        if not target or not target.get("available"):
+            self.skipTest("cue-app not available")
+        target["observations"]["initiatives"] = [{"name": "components", "slug": "components"}]
+        result = verdict(self.report, moved)
+        self.assertFalse(result.ok)
+        self.assertTrue(any("initiatives changed" in i for i in result.improvements))
+
+    def test_the_baseline_records_todays_weaknesses_rather_than_hiding_them(self):
+        """
+        The baseline is only useful if it describes what MondayOS actually does,
+        including what it does badly. If these ever pass, S3/S4 landed and the
+        baseline must be re-recorded deliberately.
+        """
+        self._require_corpora()
+        corpora = self.baseline.get("corpora", {})
+        cue = corpora.get("cue-app")
+        if cue and cue.get("available"):
+            names = [i["name"] for i in cue["observations"]["initiatives"]]
+            self.assertEqual(names, ["src"], "cue-app discovery weakness is no longer recorded")
+
+        for slug, corpus in corpora.items():
+            if not corpus.get("available"):
+                continue
+            with self.subTest(project=slug):
+                failing = {
+                    k["case_id"]
+                    for k in corpus["observations"]["known_failing"]
+                    if k.get("still_failing")
+                }
+                for name in (
+                    "blocking-us",
+                    "how-healthy",
+                    "refactor-or-ship",
+                    "highest-leverage",
+                    "say-more",
+                ):
+                    self.assertIn(f"routing.strategic.{name}", failing)
+
+    def test_the_baseline_records_zero_leaks_and_zero_false_positives(self):
+        self._require_corpora()
+        for slug, corpus in self.baseline.get("corpora", {}).items():
+            if not corpus.get("available"):
+                continue
+            with self.subTest(project=slug):
+                self.assertEqual(corpus["assertions"]["leaked_commits"], 0)
+                self.assertEqual(corpus["assertions"]["grounded_false_positives"], 0)
+                self.assertEqual(corpus["assertions"]["citations_outside_root"], 0)
+
+
+class TestDeterminism(unittest.TestCase):
+    def test_two_runs_produce_an_identical_comparable_block(self):
+        """
+        Determinism must be a property of the measurement, not of what happened
+        to be cached.
+        """
+        first = run(config_dir=REPO / "config").stable()
+        second = run(config_dir=REPO / "config").stable()
+        self.assertEqual(json.dumps(first, sort_keys=True), json.dumps(second, sort_keys=True))
+
+    def test_a_warm_cache_gives_the_same_answer_as_a_cold_one(self):
+        with TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            cold = run(config_dir=REPO / "config", cache_root=shared).stable()
+            warm = run(config_dir=REPO / "config", cache_root=shared).stable()
+            self.assertEqual(json.dumps(cold, sort_keys=True), json.dumps(warm, sort_keys=True))
+
+    def test_volatile_values_are_never_compared(self):
+        """Ordinary source growth must not fail a run."""
+        import copy
+
+        report = run(config_dir=REPO / "config")
+        shifted = copy.deepcopy(load_baseline())
+        for corpus in shifted.get("corpora", {}).values():
+            if corpus.get("available"):
+                corpus["volatile"] = {"files": 999999, "index_ms": 999999}
+        self.assertTrue(verdict(report, shifted).ok)
 
 
 if __name__ == "__main__":
