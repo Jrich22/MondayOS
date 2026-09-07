@@ -37,6 +37,7 @@ from workspace.models import (
     ConversationStatus,
     Message,
     MessageRole,
+    StrategicState,
     iso,
     parse_iso,
     slugify,
@@ -246,6 +247,13 @@ def _serialize(conversation: Conversation) -> str:
         "updated_at": iso(conversation.updated_at),
         "active_snapshot_id": conversation.active_snapshot_id,
         "subject": conversation.subject,
+        # Written only when one exists, so an ordinary conversation file gains
+        # nothing. Every field in it was visible in a completed answer.
+        **(
+            {"strategy": conversation.strategy.to_dict()}
+            if conversation.strategy is not None
+            else {}
+        ),
         "artifact_refs": [a.to_dict() for a in conversation.artifact_refs],
         "task_refs": list(conversation.task_refs),
         "messages": [m.to_dict() for m in conversation.messages],
@@ -262,6 +270,26 @@ def _serialize(conversation: Conversation) -> str:
         lines.append(message.error if message.failed else message.content)
         lines.append("")
     return f"---\n{header}---\n\n" + "\n".join(lines)
+
+
+def _strategy_of(loaded: dict[str, Any], project: str) -> StrategicState | None:
+    """
+    Load strategic state, refusing anything attributed to another project.
+
+    The project check is defence in depth: state already lives inside a
+    project-scoped file, so a mismatch means the file was hand-edited or moved.
+    Dropping it is right either way -- a strategic recommendation attributed to
+    the wrong project is worse than having none.
+    """
+    raw = loaded.get("strategy")
+    if not isinstance(raw, dict):
+        return None
+    state = StrategicState.from_dict(raw)
+    if state.empty:
+        return None
+    if state.project and project and state.project != project:
+        return None
+    return state
 
 
 def _parse(text: str, fallback_project: str) -> Conversation:
@@ -287,6 +315,7 @@ def _parse(text: str, fallback_project: str) -> Conversation:
         status=ConversationStatus(str(loaded.get("status", "active"))),
         active_snapshot_id=str(loaded.get("active_snapshot_id", "")),
         subject=str(loaded.get("subject", "")),
+        strategy=_strategy_of(loaded, fallback_project),
         messages=[Message.from_dict(m) for m in loaded.get("messages") or []],
         artifact_refs=[ArtifactRef.from_dict(a) for a in loaded.get("artifact_refs") or []],
         task_refs=[str(t) for t in loaded.get("task_refs") or []],
