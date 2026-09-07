@@ -8,11 +8,13 @@ here is proving it writes nothing and that cataloguing cannot disturb approvals.
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from core.project import ProjectRegistry
 from growth import GrowthStore
 from growth.campaign import CampaignStatus
 from growth.content import ContentStatus, ContentType
@@ -27,7 +29,6 @@ from growth.onboarding import (
 )
 from growth.service import GrowthService
 from monday import Monday, MondayConfig
-from core.project import ProjectRegistry
 
 EPOCH = datetime(2026, 9, 1, 9, 0, tzinfo=UTC)
 
@@ -354,8 +355,27 @@ class TestOnboarding(LibraryCase):
 # ---------------------------------------------------------------------------
 
 
+def _sequence_of(value):
+    """`CAMPAIGN-0002-fj12y9jb` -> `CAMPAIGN-0002`; anything else unchanged."""
+    if isinstance(value, str):
+        match = re.match(r"^([A-Z]+-\d+)(?:-[0-9a-z]{8})?$", value)
+        if match:
+            return match.group(1)
+    return value
+
+
 class TestDemoData(LibraryCase):
-    def test_seeding_is_deterministic(self):
+    def test_seeding_is_deterministic_in_shape(self):
+        """
+        Seeding produces the same workspace twice — the same counts, the same
+        content, the same sequence numbers.
+
+        The ids themselves are no longer byte-identical, and cannot be: growth
+        workspaces are gitignored runtime records, so their ids carry a random
+        suffix for the uniqueness git cannot supply. What determinism means here
+        is that seeding is reproducible, not that two independent workspaces
+        share identifiers — which they must not.
+        """
         with TemporaryDirectory() as tmp_a, TemporaryDirectory() as tmp_b:
             summaries = []
             for tmp in (tmp_a, tmp_b):
@@ -363,7 +383,16 @@ class TestDemoData(LibraryCase):
                 store = GrowthStore(root)
                 store.init_workspace("acme")
                 summaries.append(seed_workspace(store.open("acme")))
-            self.assertEqual(summaries[0], summaries[1])
+
+            def shape(summary):
+                return {
+                    key: ([_sequence_of(v) for v in value] if isinstance(value, list) else value)
+                    for key, value in summary.items()
+                }
+
+            self.assertEqual(shape(summaries[0]), shape(summaries[1]))
+            # And the ids really are distinct between the two workspaces.
+            self.assertNotEqual(summaries[0], summaries[1])
 
     def test_every_seeded_record_is_marked_synthetic(self):
         seed_workspace(self.handle)

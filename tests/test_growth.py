@@ -5,12 +5,14 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from agents.gates import GATED_ACTIONS, ApprovalGate
+from core.project import ProjectRegistry
 from growth import (
     FINGERPRINTED_FIELDS,
     PUBLISH_ACTION,
@@ -33,7 +35,6 @@ from growth.binding import InvalidSecretNameError
 from growth.content import REQUIRED_FOR_REVIEW
 from monday import Monday, MondayConfig
 from monday.cli import main
-from core.project import ProjectRegistry
 from orchestrator.report import ExecutionMode
 
 SECRET_VALUE = "super-secret-token-value-do-not-store"
@@ -162,8 +163,14 @@ class TestWorkspaceIsolation(unittest.TestCase):
                 alpha.create_content()
             first_beta = beta.create_content()
 
-            self.assertEqual(first_beta.id, "CONTENT-0001")
-            self.assertEqual(alpha.list_content()[-1].id, "CONTENT-0005")
+            # The sequence restarts per workspace, which is the isolation
+            # property. Growth workspaces are gitignored runtime records, so the
+            # full id also carries a random suffix.
+            self.assertTrue(first_beta.id.startswith("CONTENT-0001-"), first_beta.id)
+            self.assertTrue(
+                alpha.list_content()[-1].id.startswith("CONTENT-0005-"),
+                alpha.list_content()[-1].id,
+            )
 
     def test_a_workspace_lists_only_its_own_content(self):
         with TemporaryDirectory() as tmp:
@@ -732,19 +739,19 @@ class TestGrowthCLI(unittest.TestCase):
                 "2026-09-01T09:00:00Z",
             )
             self.assertEqual(code, 0, out)
-            self.assertIn("CONTENT-0001", out)
+            match = re.search(r"CONTENT-\d{4}-[0-9a-z]{8}", out)
+            self.assertIsNotNone(match, out)
+            content_id = match.group(0)
 
-            code, out = self._run(root, "review", "--project", "acme", "--content", "CONTENT-0001")
+            code, out = self._run(root, "review", "--project", "acme", "--content", content_id)
             self.assertEqual(code, 0, out)
 
             code, out = self._run(
-                root, "approve", "--project", "acme", "--content", "CONTENT-0001", "--by", "jrich"
+                root, "approve", "--project", "acme", "--content", content_id, "--by", "jrich"
             )
             self.assertEqual(code, 0, out)
 
-            code, out = self._run(
-                root, "content-get", "--project", "acme", "--content", "CONTENT-0001"
-            )
+            code, out = self._run(root, "content-get", "--project", "acme", "--content", content_id)
             self.assertIn("Approved   : True", out)
 
             code, out = self._run(
@@ -753,15 +760,13 @@ class TestGrowthCLI(unittest.TestCase):
                 "--project",
                 "acme",
                 "--content",
-                "CONTENT-0001",
+                content_id,
                 "--copy",
                 "edited",
             )
             self.assertEqual(code, 0, out)
 
-            code, out = self._run(
-                root, "content-get", "--project", "acme", "--content", "CONTENT-0001"
-            )
+            code, out = self._run(root, "content-get", "--project", "acme", "--content", content_id)
             self.assertIn("Approved   : False", out)
 
     def test_cli_reports_an_unregistered_project_as_an_error(self):

@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from core.project import ProjectRegistry
+from core.sequence import IdentityPolicy, Namespace, SequenceAllocator
 from core.types import EntityId
 from growth.binding import PlatformBinding, normalize_platform
 from growth.campaign import Campaign, CampaignStatus, CampaignTransition
@@ -49,7 +51,6 @@ from growth.errors import (
 )
 from growth.project import ResolvedProject, resolve_project, workspace_path
 from growth.workspace import Workspace
-from core.project import ProjectRegistry
 
 if TYPE_CHECKING:
     from growth.events import EventStore
@@ -68,7 +69,13 @@ _AGGREGATE_FILENAME = "aggregates.json"
 # A CAMPAIGN-shaped value on a content item must resolve to a campaign in THIS
 # workspace. Any other string stays a free-text label, which keeps the existing
 # descriptive use of ContentItem.campaign working unchanged.
-_CAMPAIGN_ID_RE = re.compile(rf"^{_CAMPAIGN_PREFIX}-\d+$")
+#
+# Both id forms are accepted. Growth workspaces are gitignored runtime records,
+# so ids issued now carry a random suffix; ids issued before that are bare
+# sequences and are never rewritten. A pattern that recognised only one form
+# would silently demote the other to a free-text label -- the campaign would stop
+# resolving and the content item would look uncategorised rather than broken.
+_CAMPAIGN_ID_RE = re.compile(rf"^{_CAMPAIGN_PREFIX}-\d+(?:-[0-9a-z]{{8}})?$")
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 
 
@@ -589,61 +596,29 @@ class WorkspaceHandle:
         self._campaign_dir.mkdir(parents=True, exist_ok=True)
         _write_frontmatter(self._campaign_dir / f"{campaign.id}.md", campaign.to_dict())
 
-    def _next_content_id(self) -> EntityId:
-        return self._next_id(_CONTENT_PREFIX, self._content_dir)
-
     def _next_id(self, prefix: str, directory: Path) -> EntityId:
         """
         Allocate the next id for a prefix within THIS workspace.
 
-        Per-workspace, never global: a shared counter would let one project infer
-        another's volume from the gaps in its own ids.
+        RUNTIME_HYBRID: growth workspaces are gitignored, so a duplicate would
+        never reach a merge. Per-workspace and never global — a shared counter
+        would let one project infer another's publishing volume from the gaps in
+        its own ids (ADR-011).
         """
-        sequences = self._load_sequences()
-        counter = max(sequences.get(prefix, 0), self._highest_id_on_disk(prefix, directory))
-        next_seq = counter + 1
-        sequences[prefix] = next_seq
-        self._save_sequences(sequences)
-        return f"{prefix}-{next_seq:04d}"
-
-    def _highest_id_on_disk(self, prefix: str, directory: Path) -> int:
-        """
-        Highest sequence number on disk for a prefix in this workspace.
-
-        Reads filenames rather than contents, so an item whose body is unreadable
-        still reserves its id. Guards against a lost or truncated sequence file
-        silently reissuing an id that is already taken.
-        """
-        if not directory.exists():
-            return 0
-        pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
-        highest = 0
-        try:
-            paths = list(directory.glob(f"{prefix}-*.md"))
-        except OSError:
-            return 0
-        for path in paths:
-            match = pattern.match(path.stem)
-            if match:
-                highest = max(highest, int(match.group(1)))
-        return highest
-
-    def _load_sequences(self) -> dict[str, int]:
-        if not self._sequences_path.exists():
-            return {}
-        try:
-            loaded = json.loads(self._sequences_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {}
-        if not isinstance(loaded, dict):
-            return {}
-        return {str(k): int(v) for k, v in loaded.items() if isinstance(v, int)}
-
-    def _save_sequences(self, sequences: dict[str, int]) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._sequences_path.write_text(
-            json.dumps(sequences, indent=2, sort_keys=True), encoding="utf-8"
+        return EntityId(
+            SequenceAllocator(
+                Namespace(
+                    prefix=prefix,
+                    records=directory,
+                    counter=self._sequences_path,
+                    policy=IdentityPolicy.RUNTIME_HYBRID,
+                    recursive=False,
+                )
+            ).allocate()
         )
+
+    def _next_content_id(self) -> EntityId:
+        return self._next_id(_CONTENT_PREFIX, self._content_dir)
 
 
 class GrowthStore:

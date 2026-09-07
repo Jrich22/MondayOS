@@ -220,24 +220,35 @@ class TestConversationStore(unittest.TestCase):
             store.create("alpha", "a1", now=T0)
             store.create("alpha", "a2", now=T0)
             first_beta = store.create("beta", "b1", now=T0)
-            self.assertEqual(first_beta.id, "CONV-0001")
+            # The sequence restarts per project; the suffix differs per record.
+            self.assertTrue(first_beta.id.startswith("CONV-0001-"), first_beta.id)
 
     def test_the_same_id_in_two_projects_returns_two_different_conversations(self):
         """
-        Per-project counters mean CONV-0001 exists in every project.
+        Project scoping is load-bearing, not decorative.
 
-        That is deliberate (it stops one project inferring another's volume), and
-        it makes project scoping load-bearing rather than decorative: an id alone
-        does not identify a conversation, so a read that forgot its project could
-        not silently return the wrong one — it would have nothing to open.
+        Per-project counters mean the *sequence* restarts in every project, so an
+        id's numeric part alone does not identify a conversation: a read that
+        forgot its project would have nothing to open. Conversations are
+        gitignored runtime records, so the full id also carries a random suffix —
+        which is why this constructs the shared-id case explicitly rather than
+        relying on two projects happening to produce the same string.
         """
         with TemporaryDirectory() as tmp:
             store = ConversationStore(Path(tmp))
             alpha = store.create("alpha", "alpha topic", now=T0)
             beta = store.create("beta", "beta topic", now=T0)
-            self.assertEqual(alpha.id, beta.id)
-            self.assertEqual(store.get("alpha", "CONV-0001").title, "alpha topic")
-            self.assertEqual(store.get("beta", "CONV-0001").title, "beta topic")
+
+            # Same sequence number, different projects, different full ids.
+            self.assertEqual(alpha.id.split("-")[1], beta.id.split("-")[1])
+            self.assertNotEqual(alpha.id, beta.id)
+
+            self.assertEqual(store.get("alpha", alpha.id).title, "alpha topic")
+            self.assertEqual(store.get("beta", beta.id).title, "beta topic")
+
+            # And a project cannot open the other's conversation by id.
+            with self.assertRaises(ConversationNotFoundError):
+                store.get("beta", alpha.id)
 
     def test_a_project_cannot_read_another_projects_conversation(self):
         with TemporaryDirectory() as tmp:

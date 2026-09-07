@@ -1,12 +1,13 @@
 """Task manager — create, read, update, and archive tasks."""
+
 from __future__ import annotations
 
-import json
-import re
 import warnings
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
+from core.atomic import write_atomic
+from core.sequence import IdentityPolicy, Namespace, SequenceAllocator
 from core.types import EntityId
 from tasks.errors import InvalidTransitionError, TaskNotFoundError, TaskValidationError
 from tasks.parser import TaskParser
@@ -40,8 +41,6 @@ class TaskManager:
         self._completed_dir = self._tasks_dir / "completed"
         self._sequences_path = self._tasks_dir / _SEQUENCES_FILENAME
         self._parser = TaskParser()
-        self._sequences: dict[str, int] = {}
-        self._load_sequences()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -70,7 +69,7 @@ class TaskManager:
         if not objective.strip():
             raise TaskValidationError("objective cannot be empty", field="objective")
 
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         task_id = self._next_id()
 
         initial_transition = StatusTransition(
@@ -136,14 +135,16 @@ class TaskManager:
         if not task.can_transition_to(new_status):
             raise InvalidTransitionError(task.status.value, new_status.value)
 
-        now = datetime.now(tz=timezone.utc)
-        task.status_history.append(StatusTransition(
-            from_status=task.status,
-            to_status=new_status,
-            changed_by=changed_by,
-            changed_at=now,
-            reason=reason,
-        ))
+        now = datetime.now(tz=UTC)
+        task.status_history.append(
+            StatusTransition(
+                from_status=task.status,
+                to_status=new_status,
+                changed_by=changed_by,
+                changed_at=now,
+                reason=reason,
+            )
+        )
         task.status = new_status
         task.updated = now
 
@@ -163,7 +164,7 @@ class TaskManager:
             reason=f"assigned to {assignee}",
         )
         task.assigned_to = assignee
-        task.updated = datetime.now(tz=timezone.utc)
+        task.updated = datetime.now(tz=UTC)
         self._write(task, directory=self._active_dir)
         return task
 
@@ -176,14 +177,14 @@ class TaskManager:
             reason=reason,
         )
         task.blocked_by = reason
-        task.updated = datetime.now(tz=timezone.utc)
+        task.updated = datetime.now(tz=UTC)
         self._write(task, directory=self._active_dir)
         return task
 
     def append_work_log(self, task_id: EntityId, entry: str, author: str) -> Task:
         """Append a dated work log entry to the task."""
         task = self.get(task_id)
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         date_str = now.strftime("%Y-%m-%d")
         task.work_log.append(f"{date_str} — {author}: {entry}")
         task.updated = now
@@ -286,72 +287,31 @@ class TaskManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _load_sequences(self) -> None:
-        if self._sequences_path.exists():
-            try:
-                self._sequences = json.loads(
-                    self._sequences_path.read_text(encoding="utf-8")
-                )
-            except (json.JSONDecodeError, OSError):
-                self._sequences = {}
-        else:
-            self._sequences = {}
-
-    def _save_sequences(self) -> None:
-        self._tasks_dir.mkdir(parents=True, exist_ok=True)
-        self._sequences_path.write_text(
-            json.dumps(self._sequences, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-
     def _next_id(self) -> EntityId:
         """
-        Allocate the next task ID, healing a stale counter.
+        Allocate the next task id.
 
-        The counter is the fast path, but it only reflects allocations made
-        through this process. Tasks written on another branch or checkout are
-        invisible to it, so a counter that lags behind disk would reissue a
-        live ID — main's counter read 50 while TASK-0051 and TASK-0052
-        existed, so the next task would have been issued TASK-0051. Taking
-        the max of the two makes the counter an optimisation rather than the
-        sole authority. Mirrors KnowledgeStore._next_id.
+        TRACKED_SEQUENTIAL: task records are committed, so two branches issuing
+        TASK-0080 produce an add/add merge conflict on the record path. The
+        duplicate remains possible and is guaranteed to surface, which is the
+        strongest guarantee sequential ids can offer across disconnected work.
         """
-        counter = self._sequences.get(_TASK_PREFIX, 0)
-        next_seq = max(counter, self._highest_id_on_disk()) + 1
-        self._sequences[_TASK_PREFIX] = next_seq
-        self._save_sequences()
-        return f"{_TASK_PREFIX}-{next_seq:04d}"
+        return EntityId(self._allocator().allocate())
 
-    def _highest_id_on_disk(self) -> int:
-        """
-        Highest sequence number among task files on disk.
-
-        Reads filenames rather than file contents: _write names every task
-        {ID}.md, so the filename is the record of which IDs are taken, and a
-        task whose body is malformed or unreadable still reserves its ID.
-        Scans tasks/ recursively, so both active/ and completed/ are counted
-        along with any other directory tasks come to be filed under.
-        """
-        if not self._tasks_dir.exists():
-            return 0
-
-        pattern = re.compile(rf"^{re.escape(_TASK_PREFIX)}-(\d+)$")
-        highest = 0
-        try:
-            paths = self._tasks_dir.rglob(f"{_TASK_PREFIX}-*.md")
-        except OSError:
-            return 0
-
-        for path in paths:
-            match = pattern.match(path.stem)
-            if match:
-                highest = max(highest, int(match.group(1)))
-        return highest
+    def _allocator(self) -> SequenceAllocator:
+        return SequenceAllocator(
+            Namespace(
+                prefix=_TASK_PREFIX,
+                records=self._tasks_dir,
+                counter=self._sequences_path,
+                policy=IdentityPolicy.TRACKED_SEQUENTIAL,
+            )
+        )
 
     def _write(self, task: Task, *, directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{task.id}.md"
-        path.write_text(self._parser.serialize(task), encoding="utf-8")
+        write_atomic(path, self._parser.serialize(task))
 
     def _archive(self, task: Task) -> None:
         """Move a terminal task from active/ to completed/."""
@@ -359,6 +319,6 @@ class TaskManager:
         active_path = self._active_dir / f"{task.id}.md"
         completed_path = self._completed_dir / f"{task.id}.md"
 
-        completed_path.write_text(self._parser.serialize(task), encoding="utf-8")
+        write_atomic(completed_path, self._parser.serialize(task))
         if active_path.exists():
             active_path.unlink()
