@@ -1,4 +1,5 @@
 """Tests for the Multi-Agent Runtime (agents/ + Monday.agent + monday agent CLI)."""
+
 from __future__ import annotations
 
 import contextlib
@@ -28,12 +29,11 @@ from orchestrator.report import ExecutionMode
 # Roles
 # ---------------------------------------------------------------------------
 
+
 class TestRoles(unittest.TestCase):
     def test_six_roles_defined(self):
         slugs = {r.slug for r in list_roles()}
-        self.assertEqual(
-            slugs, {"cpo", "lead-engineer", "qa", "security", "research", "reviewer"}
-        )
+        self.assertEqual(slugs, {"cpo", "lead-engineer", "qa", "security", "research", "reviewer"})
 
     def test_pinned_provider_defaults(self):
         self.assertEqual(
@@ -64,6 +64,7 @@ class TestRoles(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # ApprovalGate
 # ---------------------------------------------------------------------------
+
 
 class TestApprovalGate(unittest.TestCase):
     def setUp(self):
@@ -115,6 +116,7 @@ class TestApprovalGate(unittest.TestCase):
 # Adapters
 # ---------------------------------------------------------------------------
 
+
 class TestAdapters(unittest.TestCase):
     def test_build_fake_provider(self):
         prov = build_provider_for(FAKE_PROVIDER, role="qa")
@@ -137,6 +139,7 @@ class TestAdapters(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # AgentRegistry
 # ---------------------------------------------------------------------------
+
 
 class TestAgentRegistry(unittest.TestCase):
     def setUp(self):
@@ -165,8 +168,13 @@ class TestAgentRegistry(unittest.TestCase):
     def test_id_allocation_sequential(self):
         a = self.reg.register("First", "qa")
         b = self.reg.register("Second", "qa")
-        self.assertEqual(a.id, "AGENT-0001")
-        self.assertEqual(b.id, "AGENT-0002")
+        # Agent records are gitignored, so a duplicate would never reach a merge
+        # and would stay permanently invisible. They carry a random suffix for
+        # the uniqueness git cannot supply; the sequence still increments and
+        # still orders them.
+        self.assertTrue(a.id.startswith("AGENT-0001-"), a.id)
+        self.assertTrue(b.id.startswith("AGENT-0002-"), b.id)
+        self.assertNotEqual(a.id, b.id)
 
     def test_register_defaults_provider_from_role(self):
         a = self.reg.register("Custom QA", "qa")
@@ -201,6 +209,7 @@ class TestAgentRegistry(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # AgentRuntime / Monday.agent — end to end
 # ---------------------------------------------------------------------------
+
 
 class TestAgentRuntimeEndToEnd(unittest.TestCase):
     def setUp(self):
@@ -361,6 +370,7 @@ class TestAgentRuntimeEndToEnd(unittest.TestCase):
 # CLI smoke
 # ---------------------------------------------------------------------------
 
+
 class TestAgentCLI(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
@@ -387,7 +397,9 @@ class TestAgentCLI(unittest.TestCase):
         self.assertIn("ChatGPT", out)
 
     def test_register(self):
-        code, out = self._cli("agent", "register", "--name", "My QA", "--role", "qa", "--provider", "fake")
+        code, out = self._cli(
+            "agent", "register", "--name", "My QA", "--role", "qa", "--provider", "fake"
+        )
         self.assertEqual(code, 0)
         self.assertIn("AGENT-", out)
 
@@ -405,14 +417,24 @@ class TestAgentCLI(unittest.TestCase):
 
     def test_run_autonomous_blocked(self):
         tid = self._make_task()
-        code, out = self._cli("agent", "run", tid, "--role", "lead-engineer", "--provider", "fake", "--autonomous")
+        code, out = self._cli(
+            "agent", "run", tid, "--role", "lead-engineer", "--provider", "fake", "--autonomous"
+        )
         self.assertEqual(code, 1)  # blocked → non-zero
         self.assertIn("BLOCKED", out)
 
     def test_run_gated_commit_blocked(self):
         tid = self._make_task()
         code, out = self._cli(
-            "agent", "run", tid, "--role", "lead-engineer", "--provider", "fake", "--action", "commit"
+            "agent",
+            "run",
+            tid,
+            "--role",
+            "lead-engineer",
+            "--provider",
+            "fake",
+            "--action",
+            "commit",
         )
         self.assertEqual(code, 1)
         self.assertIn("BLOCKED", out)
@@ -425,7 +447,9 @@ class TestAgentCLI(unittest.TestCase):
     def test_review_flow(self):
         tid = self._make_task()
         # run, then parse run id from JSON output
-        code, out = self._cli("agent", "run", tid, "--role", "lead-engineer", "--provider", "fake", "--json")
+        code, out = self._cli(
+            "agent", "run", tid, "--role", "lead-engineer", "--provider", "fake", "--json"
+        )
         self.assertEqual(code, 0)
         run_id = json.loads(out)["run_id"]
         code, out = self._cli("agent", "review", run_id, "--approve")

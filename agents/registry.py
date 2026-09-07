@@ -10,12 +10,12 @@ Claude Code → Lead Engineer, and the QA / Security / Research / Reviewer agent
 so a fresh project has a working roster with no manual setup. Registering more
 agents — or new roles — never requires touching runtime code.
 """
+
 from __future__ import annotations
 
-import json
 import re
 import warnings
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,7 @@ import yaml
 
 from agents.roles import ROLES, get_role, normalize_role
 from agents.types import Agent
+from core.sequence import IdentityPolicy, Namespace, SequenceAllocator
 
 _AGENT_PREFIX = "AGENT"
 _SEQUENCES_FILENAME = ".sequences.json"
@@ -54,8 +55,6 @@ class AgentRegistry:
         self._dir = Path(project_root) / "agents"
         self._active_dir = self._dir / "active"
         self._sequences_path = self._dir / _SEQUENCES_FILENAME
-        self._sequences: dict[str, int] = {}
-        self._load_sequences()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -85,7 +84,7 @@ class AgentRegistry:
         if self._find_by_name(name) is not None:
             raise AgentExistsError(f"An agent named {name!r} already exists.")
 
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         agent = Agent(
             id=self._next_id(),
             name=name,
@@ -217,6 +216,32 @@ class AgentRegistry:
         )
         return f"---\n{fm_yaml}---\n"
 
+    def _next_id(self) -> str:
+        """
+        Allocate the next agent id.
+
+        RUNTIME_HYBRID: agent records live in the gitignored ``agents/active/``,
+        so a duplicate would never reach a merge and would stay permanently
+        invisible. The suffix supplies the uniqueness git cannot.
+
+        This allocator previously trusted its counter outright, with no disk
+        healing at all — the only one of the five that did not. Counter and
+        records are both ignored so they cannot diverge through git, but losing
+        or truncating the counter while the records survived would have reissued
+        AGENT-0001 straight over a live record.
+        """
+        return self._allocator().allocate()
+
+    def _allocator(self) -> SequenceAllocator:
+        return SequenceAllocator(
+            Namespace(
+                prefix=_AGENT_PREFIX,
+                records=self._dir,
+                counter=self._sequences_path,
+                policy=IdentityPolicy.RUNTIME_HYBRID,
+            )
+        )
+
     def _parse(self, raw: str) -> Agent:
         match = _FRONTMATTER_RE.match(raw)
         if not match:
@@ -239,35 +264,14 @@ class AgentRegistry:
             metadata=dict(fm.get("metadata") or {}),
         )
 
-    def _load_sequences(self) -> None:
-        if self._sequences_path.exists():
-            try:
-                self._sequences = json.loads(self._sequences_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                self._sequences = {}
-        else:
-            self._sequences = {}
-
-    def _save_sequences(self) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._sequences_path.write_text(
-            json.dumps(self._sequences, indent=2, sort_keys=True), encoding="utf-8"
-        )
-
-    def _next_id(self) -> str:
-        next_seq = self._sequences.get(_AGENT_PREFIX, 0) + 1
-        self._sequences[_AGENT_PREFIX] = next_seq
-        self._save_sequences()
-        return f"{_AGENT_PREFIX}-{next_seq:04d}"
-
 
 def _parse_dt(value: Any) -> datetime:
     if isinstance(value, datetime):
-        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
     if isinstance(value, str) and value:
-        return datetime.fromisoformat(value.rstrip("Z")).replace(tzinfo=timezone.utc)
-    return datetime.now(tz=timezone.utc)
+        return datetime.fromisoformat(value.rstrip("Z")).replace(tzinfo=UTC)
+    return datetime.now(tz=UTC)
 
 
 def _fmt_dt(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

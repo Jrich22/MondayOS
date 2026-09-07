@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from core.project import ProjectRegistry
 from growth import GrowthStore
 from growth.campaign import OPEN_STATES, Campaign, CampaignStatus
 from growth.content import ContentStatus
@@ -21,7 +22,6 @@ from growth.errors import (
     InvalidTransitionError,
 )
 from monday import Monday, MondayConfig
-from core.project import ProjectRegistry
 
 EPOCH = datetime(2026, 9, 1, 9, 0, tzinfo=UTC)
 
@@ -162,13 +162,13 @@ class TestCampaignStorage(CampaignCase):
             for _ in range(4):
                 store.open("alpha").create_campaign(name="x")
             first_beta = store.open("beta").create_campaign(name="y")
-            self.assertEqual(first_beta.id, "CAMPAIGN-0001")
+            self.assertTrue(first_beta.id.startswith("CAMPAIGN-0001-"), first_beta.id)
 
     def test_campaign_and_content_sequences_are_independent(self):
         self._content()
         c = self._campaign()
-        self.assertEqual(c.id, "CAMPAIGN-0001")
-        self.assertEqual(self.handle.list_content()[0].id, "CONTENT-0001")
+        self.assertTrue(c.id.startswith("CAMPAIGN-0001-"), c.id)
+        self.assertTrue(self.handle.list_content()[0].id.startswith("CONTENT-0001-"))
 
     def test_a_workspace_lists_only_its_own_campaigns(self):
         with TemporaryDirectory() as tmp:

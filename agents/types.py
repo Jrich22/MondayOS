@@ -6,6 +6,7 @@ These are plain dataclasses with dict round-tripping. Persistence lives in
 agents.registry (Agents → Markdown+frontmatter, mirroring tasks/) and
 agents.runtime (AgentRuns → JSON under logs/agents/, mirroring ExecutionReport).
 """
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -21,7 +22,7 @@ class Agent:
     A registered agent: a named binding of a role to a provider.
 
     Attributes:
-        id:           Stable identifier, e.g. "AGENT-0001".
+        id:           Stable identifier, e.g. "AGENT-0007-9p3d6xkw".
         name:         Human-readable name (e.g. "Claude Code").
         role:         Role slug this agent fulfils (see agents.roles).
         provider:     AI provider name ("anthropic" | "openai" | "ollama" |
@@ -81,7 +82,9 @@ class AgentRun:
     provider_used: str = ""
     provider_model: str = ""
     mode: str = ""
-    status: str = ""            # blocked | skipped | failed | validation-failed | review | completed | dry-run
+    status: str = (
+        ""  # blocked | skipped | failed | validation-failed | review | completed | dry-run
+    )
     success: bool = False
     created_at: str = ""
     duration_ms: float = 0.0

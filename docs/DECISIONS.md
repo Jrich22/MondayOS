@@ -848,3 +848,88 @@ alternatives that lost, with the reason each lost.
   cost of being able to reason about work that has not started.
 - Three scores per recommendation is more to read. They disagree often enough that
   collapsing them would lose the signal — which is the reason for the change.
+
+---
+
+## ADR-021: Identity Policy — Sequential for Tracked Records, Hybrid for Runtime
+
+**Status:** Accepted
+**Date:** 2026-09-07
+**Context:** Foundation hardening — identity allocation
+
+### Context
+
+MondayOS allocated sequential ids from a per-store JSON counter. Five stores each
+had their own implementation, and the design rested on an assumption that turned
+out to be false: that a counter plus a disk scan makes reuse impossible.
+
+It does not, and the gap is arithmetic rather than a bug. Two branches diverging
+from the same counter hold identical state; a deterministic allocator applied to
+identical state produces identical output. `flock` cannot see another machine,
+and atomic writes make a write durable rather than unique. Both collisions were
+reproduced before this work: two clones of one base each allocated `RES-0139`,
+and a fresh clone carrying this repository's stale committed counter (135, while
+local work had reached 138) allocated `RES-0136`, `RES-0137` and `RES-0138`
+straight over live records.
+
+A second fact turned out to matter more than expected. **Git already provides a
+collision-detection point, but only for records it tracks.** Two branches each
+writing `tasks/active/TASK-0080.md` produce an add/add merge conflict — the
+ambiguity surfaces exactly when the two histories first meet. Two branches each
+writing an ignored `knowledge/runtime/research/RES-0139.md` never meet at all.
+
+### Decision
+
+Identity policy is determined by **whether a record enters git**, and is declared
+explicitly on each namespace as `IdentityPolicy`.
+
+**`TRACKED_SEQUENTIAL`** — `TASK`, `DEC`, `DOC`, `PAT`, `SPR`. Ids stay short and
+sortable. Local uniqueness comes from an `flock` around allocation. Cross-branch
+duplicates remain possible and are **guaranteed to surface** at merge, which is
+the strongest guarantee a sequential id can offer across disconnected work.
+
+**`RUNTIME_HYBRID`** — `RES` (generated), `CONV`, `AGENT`, growth workspaces. The
+sequence is kept for readability and ordering; eight base32 characters of
+cryptographic randomness supply the uniqueness git cannot. `32**8 = 2**40`, about
+1.1 × 10¹² suffixes, so a contested allocation collides with probability ≈ 9 ×
+10⁻¹³.
+
+This is **coordination-free probabilistic uniqueness**, not a structural
+impossibility. The distinction is deliberate and is stated rather than glossed:
+an absolute guarantee requires a coordination point, and that would cost offline
+operation, which ADR-002 makes a premise of the system.
+
+The counter is a **monotonic high-water hint**, never authority. Allocation is
+`max(counter, highest_on_disk) + 1`, and the counter is never repaired downward.
+Disk proves an id is taken; it cannot prove one is free, because deletion is
+silent and references outlive records. In this repository `RES` has 34 records
+against a high-water of 138 — 104 were deleted, and 32 of those ids are still
+cited by tracked documentation.
+
+Allocation holds the lock; the record write happens outside it. A crash between
+the two leaves a **gap**. Gaps are free; reuse is not.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Keep sequential everywhere, heal from disk | Reproduced as failing. Disk is a lower bound and both branches see the same one. |
+| Derive the high-water from textual references | Measured: excluding tests, tracked references reach `RES-0125` — below the true 138. And a fixture citing `RES-9999` would burn 9,861 ids. |
+| Branch or machine range reservation | Needs a registry of ranges, which is coordination without admitting it. |
+| Central allocator service | The only absolute guarantee, and it ends offline operation (ADR-002). |
+| UUIDs everywhere | Destroys the ordering that directory listings and high-water scans rely on, and rewrites historical ids. |
+| Accept collisions, reconcile later | Already what git does for tracked records. For ignored ones there is no reconciliation point at all. |
+| Untrack `knowledge/.sequences.json` | It raises the persisted floor cheaply. Tracking does *not* preserve the true high-water — the file lags by construction — but a stale floor is still better than none. |
+
+### Consequences
+
+- Historical ids are never rewritten. Parsers accept both `RES-0138` and
+  `RES-0139-k3f2m8qp`, and a test pins that.
+- Next-id behaviour for tracked namespaces is unchanged.
+- Two ids in the same namespace can share a sequence number and differ by suffix.
+  Anything matching on the sequence alone must expect that.
+- `agents` gains disk healing it never had.
+- On a merge conflict in a counter file, **take the maximum** for each prefix.
+  Both sides are lower bounds; the larger one is the safer floor.
+- Runtime ids are longer. That is the price of the uniqueness, and the sequence
+  prefix keeps them readable and sortable.

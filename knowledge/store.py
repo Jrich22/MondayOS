@@ -1,11 +1,12 @@
 """Knowledge store — the only path to persisted knowledge entries."""
+
 from __future__ import annotations
 
-import json
-import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
+from core.atomic import write_atomic
+from core.sequence import IdentityPolicy, Namespace, SequenceAllocator
 from core.types import EntityId
 from knowledge.entry import KnowledgeEntry, KnowledgeType, LifecycleStatus
 from knowledge.errors import KnowledgeConflictError, KnowledgeNotFoundError
@@ -81,7 +82,6 @@ class KnowledgeStore:
         self._parser = KnowledgeParser()
         self._loader = KnowledgeLoader(self._knowledge_dir)
         self._index = KnowledgeIndex()
-        self._sequences: dict[str, int] = {}
         self._sequences_path = self._knowledge_dir / _SEQUENCES_FILENAME
         self._boot()
 
@@ -99,7 +99,7 @@ class KnowledgeStore:
         if entry.id and self._index.lookup(entry.id) is not None:
             raise KnowledgeConflictError(entry.id)
 
-        entry.id = self._next_id(entry.entry_type)
+        entry.id = EntityId(self._allocator(entry).allocate())
 
         if entry.updated_at is None:
             entry.updated_at = entry.created_at
@@ -179,7 +179,7 @@ class KnowledgeStore:
         old.status = LifecycleStatus.SUPERSEDED
         old.superseded_by = new_id
         old.version += 1
-        old.updated_at = datetime.now(tz=timezone.utc)
+        old.updated_at = datetime.now(tz=UTC)
 
         self._write_file(old)
         self._index.add(old)  # removes from ACTIVE secondary indexes, keeps in _by_id
@@ -217,78 +217,44 @@ class KnowledgeStore:
 
     def _boot(self) -> None:
         """Load existing entries from disk and build the in-memory index."""
-        self._load_sequences()
         entries = self._loader.load_all()
         self._index.build(entries)
 
-    def _load_sequences(self) -> None:
-        if self._sequences_path.exists():
-            try:
-                self._sequences = json.loads(
-                    self._sequences_path.read_text(encoding="utf-8")
-                )
-            except (json.JSONDecodeError, OSError):
-                self._sequences = {}
-        else:
-            self._sequences = {}
+    def _allocator(self, entry: KnowledgeEntry) -> SequenceAllocator:
+        """
+        The allocator for one entry, with its policy chosen by **provenance**.
 
-    def _save_sequences(self) -> None:
-        self._knowledge_dir.mkdir(parents=True, exist_ok=True)
-        self._sequences_path.write_text(
-            json.dumps(self._sequences, indent=2, sort_keys=True),
-            encoding="utf-8",
+        Knowledge routes by who wrote it, not by type: a human-authored research
+        record lives in the tracked ``knowledge/research/``, while an
+        orchestrator capture of the same type lives in the gitignored
+        ``knowledge/runtime/research/``. So the identity policy has to follow the
+        entry rather than the prefix — the same RES prefix needs sequential ids
+        in one case and hybrid ids in the other, because only one of the two ever
+        reaches a merge where a duplicate could surface.
+        """
+        prefix = _TYPE_PREFIXES[entry.entry_type]
+        policy = (
+            IdentityPolicy.RUNTIME_HYBRID
+            if _is_generated(entry)
+            else IdentityPolicy.TRACKED_SEQUENTIAL
         )
-
-    def _next_id(self, entry_type: KnowledgeType) -> EntityId:
-        """
-        Allocate the next ID for a type, healing a stale counter.
-
-        The counter is the fast path, but it only reflects allocations made
-        through this process. Entries written on another branch or checkout
-        are invisible to it, so a counter that lags behind disk would reissue
-        a live ID — this has produced two duplicate-ID incidents (see
-        knowledge/KNOWLEDGE_LEDGER_REPAIR.md and RES-0100). Taking the max of
-        the two makes the counter an optimisation rather than the sole
-        authority.
-        """
-        prefix = _TYPE_PREFIXES[entry_type]
-        counter = self._sequences.get(prefix, 0)
-        next_seq = max(counter, self._highest_id_on_disk(prefix)) + 1
-        self._sequences[prefix] = next_seq
-        self._save_sequences()
-        return f"{prefix}-{next_seq:04d}"
-
-    def _highest_id_on_disk(self, prefix: str) -> int:
-        """
-        Highest sequence number for `prefix` among entry files on disk.
-
-        Reads filenames rather than file contents: _write_file names every
-        entry {ID}.md, so the filename is the record of which IDs are taken,
-        and an entry whose body is malformed or unreadable still reserves its
-        ID. Scans recursively so entries filed under an unexpected directory
-        are still counted.
-        """
-        if not self._knowledge_dir.exists():
-            return 0
-
-        pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
-        highest = 0
-        try:
-            paths = self._knowledge_dir.rglob(f"{prefix}-*.md")
-        except OSError:
-            return 0
-
-        for path in paths:
-            match = pattern.match(path.stem)
-            if match:
-                highest = max(highest, int(match.group(1)))
-        return highest
+        return SequenceAllocator(
+            Namespace(
+                prefix=prefix,
+                # Scanned whole: an entry filed under an unexpected directory
+                # still holds its id, and provenance decides only where new ones
+                # are written.
+                records=self._knowledge_dir,
+                counter=self._sequences_path,
+                policy=policy,
+            )
+        )
 
     def _write_file(self, entry: KnowledgeEntry) -> None:
         type_dir = self._type_dir_for(entry)
         type_dir.mkdir(parents=True, exist_ok=True)
         file_path = type_dir / f"{entry.id}.md"
-        file_path.write_text(self._parser.serialize(entry), encoding="utf-8")
+        write_atomic(file_path, self._parser.serialize(entry))
 
     def _type_dir_for(self, entry: KnowledgeEntry) -> Path:
         """

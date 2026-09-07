@@ -165,3 +165,23 @@ the source tree.
 
 The lesson worth keeping: **a system that measures its own repository must not
 count its own runtime output as a defect.**
+
+---
+
+## Counter files and merge conflicts
+
+`knowledge/.sequences.json` is tracked while the records it counts under
+`knowledge/runtime/` are not. That asymmetry is deliberate but it is **not** a
+guarantee: the counter advances on every allocation and is committed only when
+someone happens to commit it, so it lags by construction. A fresh clone receives
+whatever was last pushed, which is a *floor*, not the true high-water mark.
+
+What makes that safe is the allocator, not the file. `core.sequence` takes
+`max(counter, highest_on_disk) + 1` and never repairs the counter downward, and
+runtime ids additionally carry a random suffix so a stale floor cannot produce a
+reused id. See [ADR-021](DECISIONS.md#adr-021-identity-policy--sequential-for-tracked-records-hybrid-for-runtime).
+
+**On a merge conflict in any `.sequences.json`, take the maximum value for each
+prefix.** Both sides are lower bounds on what has been issued; the larger one is
+the safer floor, and taking the smaller reintroduces exactly the reuse this
+policy exists to prevent.

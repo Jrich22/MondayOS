@@ -22,7 +22,6 @@ impossible to retrofit once ids are allocated.
 
 from __future__ import annotations
 
-import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +29,8 @@ from typing import Any
 
 import yaml
 
+from core.atomic import write_atomic
+from core.sequence import IdentityPolicy, Namespace, SequenceAllocator
 from workspace.errors import ConversationNotFoundError
 from workspace.models import (
     ArtifactRef,
@@ -92,42 +93,24 @@ class ConversationStore:
 
     def _next_id(self, project: str, prefix: str) -> str:
         """
-        Allocate the next id from this project's own counter.
+        Allocate the next conversation id for a project.
 
-        Recovers from a drifted counter by consulting what is actually on disk,
-        mirroring ``tasks/manager.py``: a counter that reads lower than reality
-        would otherwise reissue a live id and overwrite a real conversation.
+        RUNTIME_HYBRID: conversations live in the gitignored
+        ``workspace/conversations/``, so two machines could each write CONV-0018
+        and the two files would never meet in a merge. The suffix supplies the
+        uniqueness git cannot.
         """
         directory = self.project_dir(project)
         directory.mkdir(parents=True, exist_ok=True)
-        sequences_path = directory / _SEQUENCES_FILENAME
-
-        sequences: dict[str, int] = {}
-        if sequences_path.is_file():
-            try:
-                loaded = json.loads(sequences_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    sequences = {str(k): int(v) for k, v in loaded.items()}
-            except (OSError, ValueError):
-                sequences = {}
-
-        counter = max(sequences.get(prefix, 0), self._highest_on_disk(directory, prefix))
-        counter += 1
-        sequences[prefix] = counter
-        sequences_path.write_text(json.dumps(sequences, indent=2) + "\n", encoding="utf-8")
-        return f"{prefix}-{counter:04d}"
-
-    @staticmethod
-    def _highest_on_disk(directory: Path, prefix: str) -> int:
-        highest = 0
-        if not directory.is_dir():
-            return highest
-        for path in directory.glob(f"{prefix}-*.md"):
-            try:
-                highest = max(highest, int(path.stem.split("-")[-1]))
-            except ValueError:
-                continue
-        return highest
+        return SequenceAllocator(
+            Namespace(
+                prefix=prefix,
+                records=directory,
+                counter=directory / _SEQUENCES_FILENAME,
+                policy=IdentityPolicy.RUNTIME_HYBRID,
+                recursive=False,
+            )
+        ).allocate()
 
     def next_message_id(self, conversation: Conversation) -> str:
         """
@@ -169,7 +152,7 @@ class ConversationStore:
         """
         path = self._path(conversation.project, conversation.id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_serialize(conversation), encoding="utf-8")
+        write_atomic(path, _serialize(conversation))
         return path
 
     def delete(self, project: str, conversation_id: str) -> None:
