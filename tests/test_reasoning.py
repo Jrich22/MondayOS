@@ -617,7 +617,8 @@ class TestServiceIntegration(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             service = WorkspaceService(root=Path(tmp), assess=explode)
-            self.assertIsNone(service._assessment("p", "q", "", None))
+            conversation = service._store.create("p", "t")
+            self.assertIsNone(service._assessment(conversation, "q", None))
 
 
 class TestOptionsAndRisk(unittest.TestCase):

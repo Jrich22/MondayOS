@@ -21,6 +21,7 @@ produced its answers would no longer apply (ADR-017).
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -152,6 +153,270 @@ class Message:
         )
 
 
+# --------------------------------------------------------------------------- #
+# strategic continuity
+# --------------------------------------------------------------------------- #
+
+
+def recommendation_key(statement: str, initiative_slug: str = "") -> str:
+    """
+    A stable identifier for a recommendation, derived from what it says.
+
+    Recommendations are produced fresh on every assessment and have no id of
+    their own. Matching them by raw statement text is brittle -- a rewording
+    between builds would silently look like a different recommendation -- so the
+    key is a digest of the normalised statement plus the capability it lands in.
+
+    Derived rather than allocated on purpose. A counter would need a sequence
+    file, and two identical recommendations computed in different conversations
+    would get different ids, which is exactly backwards: the same advice about
+    the same capability is the same advice.
+    """
+    normalised = " ".join(statement.lower().split())
+    return hashlib.sha256(f"{normalised}|{initiative_slug.lower()}".encode()).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class EvidenceRef:
+    """One citation, in the shape a stored recommendation needs to point at it."""
+
+    kind: str
+    reference: str
+    path: str = ""
+    line: int = 0
+    because: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "reference": self.reference,
+            "path": self.path,
+            "line": self.line,
+            "because": self.because,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> EvidenceRef:
+        return cls(
+            kind=str(data.get("kind", "")),
+            reference=str(data.get("reference", "")),
+            path=str(data.get("path", "")),
+            line=int(data.get("line", 0) or 0),
+            because=str(data.get("because", "")),
+        )
+
+
+@dataclass(frozen=True)
+class AlternativeRef:
+    """An option that was shown to the user and not chosen."""
+
+    statement: str
+    why_not: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"statement": self.statement, "why_not": self.why_not}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AlternativeRef:
+        return cls(
+            statement=str(data.get("statement", "")),
+            why_not=str(data.get("why_not", "")),
+        )
+
+
+@dataclass(frozen=True)
+class Score:
+    """One of the three measures, as it was displayed."""
+
+    score: float = 0.0
+    band: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"score": round(self.score, 3), "band": self.band}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Score:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(score=float(data.get("score", 0.0) or 0.0), band=str(data.get("band", "")))
+
+
+# Caps. Strategic state is a continuity record, not a second transcript: it holds
+# what a follow-up needs to refer to and nothing more.
+MAX_ALTERNATIVES = 4
+MAX_EVIDENCE_REFS = 12
+MAX_INITIATIVES = 8
+
+
+@dataclass
+class StrategicState:
+    """
+    What Monday recommended, kept so a follow-up can refer to it.
+
+    Every field here was **visible in a completed answer**. That is the rule the
+    type exists to enforce: no prompts, no rendered assessment text, no model
+    reasoning, no rejected candidates that never reached the user, no retrieval
+    intermediates, no context snapshot. If a reader could not have seen it, it is
+    not continuity state -- it is hidden reasoning wearing a struct.
+
+    One per conversation and replaced wholesale, never appended. A list would
+    become a second transcript, and the conversation already is one.
+
+    Deliberately plain data: strings, floats and lists. It is a persistence
+    record read back by `ConversationStore`, and keeping reasoning types out of
+    it means a change to `Recommendation` cannot break loading a conversation
+    written last week.
+    """
+
+    question: str = ""
+    topic: str = ""
+    # The assistant turn this came from, and the context it was computed against.
+    source_message_id: str = ""
+    snapshot_id: str = ""
+    # The world-state digest at assessment time. A difference means the project
+    # moved, which is what makes stale detection possible without storing a copy
+    # of the project.
+    fingerprint: str = ""
+    # Redundant with Conversation.project by construction. Stored anyway and
+    # asserted on load: a strategic recommendation attributed to the wrong
+    # project would be worse than having none.
+    project: str = ""
+    created_at: datetime | None = None
+
+    recommendation_key: str = ""
+    recommendation: str = ""
+    rationale: str = ""
+    initiative_slug: str = ""
+    effort: str = ""
+
+    alternatives: list[AlternativeRef] = field(default_factory=list)
+    evidence_refs: list[EvidenceRef] = field(default_factory=list)
+    initiative_slugs: list[str] = field(default_factory=list)
+
+    evidence_strength: Score = field(default_factory=Score)
+    confidence: Score = field(default_factory=Score)
+    execution_risk: Score = field(default_factory=Score)
+
+    @property
+    def empty(self) -> bool:
+        return not self.recommendation
+
+    def alternative_at(self, ordinal: int) -> AlternativeRef | None:
+        """
+        The nth alternative as the user saw it, 1-based.
+
+        Order is the rendered order. "the second option" is only answerable if
+        storage preserves what was on screen, so nothing here re-sorts.
+        """
+        index = ordinal - 1
+        if 0 <= index < len(self.alternatives):
+            return self.alternatives[index]
+        return None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "question": self.question,
+            "topic": self.topic,
+            "source_message_id": self.source_message_id,
+            "snapshot_id": self.snapshot_id,
+            "fingerprint": self.fingerprint,
+            "project": self.project,
+            "created_at": iso(self.created_at) if self.created_at else "",
+            "recommendation_key": self.recommendation_key,
+            "recommendation": self.recommendation,
+            "rationale": self.rationale,
+            "initiative_slug": self.initiative_slug,
+            "effort": self.effort,
+            "alternatives": [a.to_dict() for a in self.alternatives],
+            "evidence_refs": [e.to_dict() for e in self.evidence_refs],
+            "initiative_slugs": list(self.initiative_slugs),
+            "evidence_strength": self.evidence_strength.to_dict(),
+            "confidence": self.confidence.to_dict(),
+            "execution_risk": self.execution_risk.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> StrategicState:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            question=str(data.get("question", "")),
+            topic=str(data.get("topic", "")),
+            source_message_id=str(data.get("source_message_id", "")),
+            snapshot_id=str(data.get("snapshot_id", "")),
+            fingerprint=str(data.get("fingerprint", "")),
+            project=str(data.get("project", "")),
+            # Absent means absent. parse_iso falls back to the epoch, which
+            # would read as "recorded in 1970" rather than "not recorded".
+            created_at=(
+                parse_iso(str(data["created_at"]))
+                if str(data.get("created_at", "")).strip()
+                else None
+            ),
+            recommendation_key=str(data.get("recommendation_key", "")),
+            recommendation=str(data.get("recommendation", "")),
+            rationale=str(data.get("rationale", "")),
+            initiative_slug=str(data.get("initiative_slug", "")),
+            effort=str(data.get("effort", "")),
+            alternatives=[
+                AlternativeRef.from_dict(a)
+                for a in (data.get("alternatives") or [])
+                if isinstance(a, dict)
+            ][:MAX_ALTERNATIVES],
+            evidence_refs=[
+                EvidenceRef.from_dict(e)
+                for e in (data.get("evidence_refs") or [])
+                if isinstance(e, dict)
+            ][:MAX_EVIDENCE_REFS],
+            initiative_slugs=[str(s) for s in (data.get("initiative_slugs") or [])][
+                :MAX_INITIATIVES
+            ],
+            evidence_strength=Score.from_dict(data.get("evidence_strength") or {}),
+            confidence=Score.from_dict(data.get("confidence") or {}),
+            execution_risk=Score.from_dict(data.get("execution_risk") or {}),
+        )
+
+    def render(self) -> str:
+        """
+        The stored decision, as material for a continuation answer.
+
+        Reads as a record of what was said rather than as a fresh conclusion,
+        because that is what it is -- and a follow-up that presented it as newly
+        computed would be claiming work it did not do.
+        """
+        lines = [
+            "# Prior recommendation (already given to the user in this conversation)",
+            f"Asked: {self.question}",
+            f"Recommended: {self.recommendation}",
+        ]
+        if self.rationale:
+            lines.append(f"Because: {self.rationale}")
+        if self.initiative_slug:
+            lines.append(f"Capability: {self.initiative_slug}")
+        if self.effort:
+            lines.append(f"Effort: {self.effort}")
+        if self.alternatives:
+            lines.append("Alternatives shown, in the order presented:")
+            for index, alternative in enumerate(self.alternatives, 1):
+                lines.append(f"  {index}. {alternative.statement}")
+                if alternative.why_not:
+                    lines.append(f"     not chosen because: {alternative.why_not}")
+        lines.append(
+            f"Scores as given: evidence strength {self.evidence_strength.band}"
+            f" ({int(round(self.evidence_strength.score * 100))}%),"
+            f" recommendation confidence {self.confidence.band}"
+            f" ({int(round(self.confidence.score * 100))}%),"
+            f" execution risk {self.execution_risk.band}"
+            f" ({int(round(self.execution_risk.score * 100))}%)"
+        )
+        if self.evidence_refs:
+            lines.append("Evidence cited:")
+            for ref in self.evidence_refs:
+                where = f"{ref.path}:{ref.line}" if ref.path and ref.line else ref.reference
+                lines.append(f"  {ref.kind}: {where} — {ref.because}")
+        return "\n".join(lines)
+
+
 @dataclass
 class Conversation:
     """
@@ -174,6 +439,14 @@ class Conversation:
     # requiring the operator to restate it is the difference between a tool and a
     # search box. Persisted so it survives a reload, like everything else here.
     subject: str = ""
+    # The strategic decision currently under discussion, when one is. Replaced
+    # wholesale by each new executive assessment rather than accumulated: a list
+    # would become a second transcript, and this file already is one.
+    #
+    # Separate from ``subject`` on purpose. ``subject`` is a short lexical term
+    # string the project index ranks against; this is a structured record of a
+    # judgement. Forcing one to carry the other would break whichever lost.
+    strategy: StrategicState | None = None
     messages: list[Message] = field(default_factory=list)
     artifact_refs: list[ArtifactRef] = field(default_factory=list)
     task_refs: list[str] = field(default_factory=list)

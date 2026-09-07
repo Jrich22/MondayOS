@@ -2890,21 +2890,56 @@ class Monday:
                 return None
             return engine.ask(question, carry=carry)
 
-        def assess(slug: str, question: str, subject: str, thin: bool) -> Any:
+        def assess(
+            slug: str,
+            question: str,
+            subject: str,
+            thin: bool,
+            strategy: Any = None,
+            fingerprint: str = "",
+        ) -> Any:
             """
             Reason about one turn, after retrieval and before generation.
+
+            Routing happens here rather than inside the engine because it needs
+            the conversation's strategic state, which the engine has no business
+            holding: the engine reasons about a project, and which register a
+            question belongs in is a fact about the dialogue.
 
             Fails the same way `ask_intelligence` does — silently and totally.
             A project whose index cannot be built produces no assessment and a
             grounded answer, which is the behaviour that shipped in increments
             1 to 3 and is a working conversation rather than a broken one.
             """
+            from reasoning.executive import route
+
             try:
                 engine = self._reasoning_engine(slug)
             except Exception:  # noqa: BLE001 — no reasoning beats no conversation
                 return None
             if engine is None:
                 return None
+
+            routing = route(question, strategy)
+            if routing.continuation and strategy is not None:
+                assessment = engine.continue_from(
+                    strategy,
+                    question,
+                    fingerprint=fingerprint,
+                    current_action=routing.current_action,
+                )
+                # A stale record cannot answer "what should I do now". The engine
+                # says so by returning a continuation-less assessment, and the
+                # honest response is to reassess rather than to answer from it.
+                if not assessment.continuation:
+                    fresh = engine.assess(question, subject=subject, thin_retrieval=thin)
+                    # Say why this is fresh. Otherwise it reads as an unprompted
+                    # new analysis and the model may assert the project is
+                    # unchanged on the very turn we reassessed because it wasn't.
+                    fresh.replaced_stale = True
+                    return fresh
+                return assessment
+
             return engine.assess(question, subject=subject, thin_retrieval=thin)
 
         responder = (

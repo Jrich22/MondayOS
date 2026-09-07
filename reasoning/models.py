@@ -300,6 +300,28 @@ class Assessment:
     # Why this question was routed to this mode, kept so a surprising register is
     # diagnosable rather than mysterious.
     mode_reason: str = ""
+    # True when this answers a follow-up about a decision already made rather
+    # than computing a new one. Same register and same budget as a fresh
+    # executive turn -- what differs is that the ranking is not re-run, so the
+    # flag travels rather than being inferred downstream.
+    continuation: bool = False
+    # The stored decision being continued, when there is one.
+    prior: Any = None
+    # Set when the project moved since the prior decision was computed. The
+    # recommendation is still reported, but never as though it were current:
+    # a stale recommendation presented as fresh is the failure mode that makes
+    # a strategic assistant untrustworthy.
+    stale: bool = False
+    # What changed, when that is known. Empty is honest, not a bug.
+    stale_because: str = ""
+    # True when a capability the prior decision named is no longer discovered.
+    obsolete: bool = False
+    # True when this fresh assessment was run *because* a stored decision had
+    # gone stale. Without it the answer reads as an unprompted new analysis, and
+    # a model that has seen an earlier "Status: Current" line in the transcript
+    # will cheerfully repeat it — asserting the project has not changed on the
+    # very turn we reassessed because it had.
+    replaced_stale: bool = False
 
     @property
     def has_reasoning(self) -> bool:
@@ -356,6 +378,10 @@ class Assessment:
         """
         The assessment as text for a responder to narrate.
 
+        A continuation leads with the stored decision and its status, because a
+        follow-up is about that decision and everything else is supporting
+        material.
+
         Deliberately terse and labelled. This is not shown to a user — it is the
         structured material a model is asked to explain — so it optimises for
         being unambiguous about what is fact and what is not, rather than for
@@ -364,6 +390,38 @@ class Assessment:
         fact.
         """
         blocks: list[str] = []
+
+        if self.replaced_stale:
+            blocks.append(
+                "# Reassessed\n"
+                "A recommendation was made earlier in this conversation, and the project "
+                "changed after it was computed. Because this question asks what to do now, "
+                "that recommendation was NOT reused — the analysis below is fresh. Say so, "
+                "and if the conclusion differs from the earlier one, name the difference. "
+                "Do not claim the project is unchanged."
+            )
+
+        if self.prior is not None:
+            lines = [self.prior.render()]
+            if self.obsolete:
+                lines.append(
+                    "\nSTATUS: obsolete — a capability this recommendation named is no "
+                    "longer present in the project. Report the recommendation as "
+                    "superseded rather than as advice to act on."
+                )
+            elif self.stale:
+                lines.append(
+                    "\nSTATUS: stale — the project changed after this recommendation was "
+                    "made. Report it as the prior recommendation, say plainly that the "
+                    "project has moved since, and name what changed if it is given below. "
+                    "Do not present it as current advice."
+                    + (f"\nWhat changed: {self.stale_because}" if self.stale_because else "")
+                )
+            else:
+                lines.append(
+                    "\nSTATUS: current — the project has not changed since this was computed."
+                )
+            blocks.append("\n".join(lines))
 
         if self.initiatives:
             # Capabilities lead. A reader who stops after the first block should
@@ -457,4 +515,9 @@ class Assessment:
             "drift": [d.to_dict() for d in self.drift],
             "overall_confidence": self.overall.to_dict(),
             "has_reasoning": self.has_reasoning,
+            "continuation": self.continuation,
+            "stale": self.stale,
+            "stale_because": self.stale_because,
+            "obsolete": self.obsolete,
+            "replaced_stale": self.replaced_stale,
         }

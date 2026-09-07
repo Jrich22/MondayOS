@@ -124,6 +124,42 @@ EXECUTIVE_INSTRUCTION = (
 )
 
 
+# The continuation register. Same budget and same structure as a fresh executive
+# turn — what changes is that the decision already exists, so the model is
+# explaining one rather than making one.
+#
+# The forbidding clauses carry the weight. A model asked about a recommendation
+# it can see will happily re-derive a better one, and then the user is reading
+# advice about a decision they never received.
+CONTINUATION_INSTRUCTION = (
+    "You are MondayOS, acting as the technical and product lead for one specific "
+    "project. The user is asking a follow-up about a recommendation you already "
+    "gave them in this conversation.\n\n"
+    "The prior recommendation, its alternatives, its evidence and its three scores "
+    "are given below exactly as they were shown to the user. They were computed by "
+    "MondayOS, not by you.\n\n"
+    "Answer about THAT recommendation. Do not re-rank the options, do not choose a "
+    "different winner, and do not recompute the analysis. If you believe a "
+    "different option is better, say so as a caveat — never by quietly switching "
+    "which one you are discussing.\n\n"
+    "Do not ask which recommendation is meant. It is stated below; asking would be "
+    "a failure to use what you were given.\n\n"
+    "Do not invent confidence or risk numbers, and do not contradict a stated "
+    "score.\n\n"
+    "Read the STATUS line and honour it. When the prior decision is marked stale, "
+    "say plainly that the project has changed since the recommendation was made "
+    "and name what changed; when it is marked obsolete, report the recommendation "
+    "as superseded rather than as advice to act on. Never present a stale "
+    "recommendation as current.\n\n"
+    "Separate what was decided from what is true now. 'Here is what I recommended "
+    "and why' and 'here is what the evidence says today' are different claims, and "
+    "collapsing them hides the only thing that would change the answer.\n\n"
+    "Reason and explain only. Do not create tasks, files or artifacts, and do not "
+    "claim to have done so.\n\n"
+    "The context is scoped to this project alone."
+)
+
+
 @dataclass
 class WorkspaceRequest:
     """
@@ -156,8 +192,22 @@ class WorkspaceRequest:
         """Whether this turn is in the strategic register."""
         return self.assessment is not None and self.assessment.mode is Mode.EXECUTIVE
 
+    @property
+    def continuation(self) -> bool:
+        """Whether this turn continues a decision already made."""
+        return self.assessment is not None and bool(getattr(self.assessment, "continuation", False))
+
     def instruction(self) -> str:
-        """The standing instruction this turn should run under."""
+        """
+        The standing instruction this turn should run under.
+
+        Three instructions, two modes. A continuation is executive for every
+        purpose that matters downstream — register, budget, structure — so it
+        does not need a Mode of its own; what it needs is to be told not to
+        re-decide, which is an instruction concern rather than a routing one.
+        """
+        if self.continuation:
+            return CONTINUATION_INSTRUCTION
         return EXECUTIVE_INSTRUCTION if self.executive else SYSTEM_INSTRUCTION
 
     def token_budget(self, default: int = DEFAULT_MAX_TOKENS) -> int:
