@@ -464,6 +464,162 @@ class TestEngineAgainstARealProject(unittest.TestCase):
         self.assertIn("Unblock", assessment.recommendations[0].statement)
 
 
+class TestResponderSeam(unittest.TestCase):
+    """
+    The wiring between reasoning and generation.
+
+    These are the tests that catch the failure where the whole layer computes
+    correctly and then reaches nothing — an assessment built and never passed is
+    indistinguishable, from the outside, from not having built one.
+    """
+
+    def _assessment(self, mode: Mode) -> Assessment:
+        assessment = Assessment(question="q", mode=mode)
+        assessment.facts = [
+            Claim(
+                kind=ClaimKind.FACT,
+                statement="a stated fact",
+                derivation="read",
+                confidence=Confidence(0.9, because=("test",)),
+                evidence=_evidence(CitationKind.FILE),
+            )
+        ]
+        assessment.recommendations = [
+            recommend.Recommendation(
+                statement="do the thing",
+                rationale="because",
+                confidence=Confidence(0.6, because=("test",)),
+            )
+        ]
+        return assessment
+
+    def test_a_strategic_turn_selects_the_executive_instruction(self):
+        from workspace.responder import (
+            EXECUTIVE_INSTRUCTION,
+            SYSTEM_INSTRUCTION,
+            WorkspaceRequest,
+        )
+
+        strategic = WorkspaceRequest(
+            project="p", message="what next?", assessment=self._assessment(Mode.EXECUTIVE)
+        )
+        self.assertTrue(strategic.executive)
+        self.assertEqual(strategic.instruction(), EXECUTIVE_INSTRUCTION)
+
+        lookup = WorkspaceRequest(
+            project="p", message="where is x?", assessment=self._assessment(Mode.GROUNDED)
+        )
+        self.assertFalse(lookup.executive)
+        self.assertEqual(lookup.instruction(), SYSTEM_INSTRUCTION)
+
+    def test_a_turn_with_no_assessment_keeps_the_grounded_instruction(self):
+        """Increments 1-3 behaviour survives untouched when reasoning is absent."""
+        from workspace.responder import SYSTEM_INSTRUCTION, WorkspaceRequest
+
+        request = WorkspaceRequest(project="p", message="hello")
+        self.assertFalse(request.executive)
+        self.assertEqual(request.instruction(), SYSTEM_INSTRUCTION)
+
+    def test_the_assessment_reaches_the_rendered_context(self):
+        from workspace.responder import WorkspaceRequest
+
+        request = WorkspaceRequest(
+            project="p", message="q", assessment=self._assessment(Mode.EXECUTIVE)
+        )
+        rendered = request.render_context()
+        self.assertIn("MondayOS assessment", rendered)
+        self.assertIn("a stated fact", rendered)
+        self.assertIn("do the thing", rendered)
+
+    def test_the_executive_instruction_forbids_inventing_confidence(self):
+        """
+        A model-supplied percentage looks identical to a computed one and means
+        nothing. If it could appear, the one signal telling a reader how much to
+        trust the answer would be silently destroyed.
+        """
+        from workspace.responder import EXECUTIVE_INSTRUCTION
+
+        lowered = EXECUTIVE_INSTRUCTION.lower()
+        self.assertIn("do not invent additional confidence", lowered)
+        self.assertIn("computed by", lowered)
+
+    def test_the_grounded_instruction_no_longer_leads_with_absence(self):
+        """
+        The regression this increment exists to prevent.
+
+        The old instruction told the model to report what the context lacked,
+        which is why Monday read as a search engine. Grounding is kept; leading
+        with the absence is not.
+        """
+        from workspace.responder import SYSTEM_INSTRUCTION
+
+        lowered = SYSTEM_INSTRUCTION.lower()
+        self.assertIn("do not open by listing what the context lacks", lowered)
+        self.assertIn("do not stop", lowered)
+        # Grounding itself must survive: inference stays labelled.
+        self.assertIn("never present an inference as a documented fact", lowered)
+
+
+class TestServiceIntegration(unittest.TestCase):
+    def test_thin_retrieval_is_detected_from_the_snapshot(self):
+        from workspace.context.snapshot import ContextSnapshot, ContextSource
+        from workspace.service import _thin
+
+        self.assertTrue(_thin(None))
+
+        from datetime import datetime
+
+        empty = ContextSnapshot(id="s1", project="p", created_at=datetime(2026, 1, 1))
+        self.assertTrue(_thin(empty))
+
+        rich = ContextSnapshot(id="s2", project="p", created_at=datetime(2026, 1, 1))
+        rich.sources.append(
+            ContextSource(
+                name="intelligence",
+                label="Project intelligence",
+                origin="index",
+                items=[f"item {i}" for i in range(12)],
+            )
+        )
+        self.assertFalse(_thin(rich))
+
+    def test_a_snapshot_without_retrieved_evidence_counts_as_thin(self):
+        """
+        Other sources describe the project in general. A question only they can
+        reach is one nothing specific was found for, which is exactly when
+        reasoning should step in.
+        """
+        from datetime import datetime
+
+        from workspace.context.snapshot import ContextSnapshot, ContextSource
+        from workspace.service import _thin
+
+        snapshot = ContextSnapshot(id="s", project="p", created_at=datetime(2026, 1, 1))
+        snapshot.sources.append(
+            ContextSource(
+                name="tasks",
+                label="Tasks",
+                origin="TaskManager",
+                items=[f"task {i}" for i in range(20)],
+            )
+        )
+        self.assertTrue(_thin(snapshot))
+
+    def test_a_failing_reasoner_never_breaks_a_turn(self):
+        """
+        A reasoning layer that can take down a conversation is worse than one
+        that occasionally has nothing to add.
+        """
+        from workspace.service import WorkspaceService
+
+        def explode(*_args):
+            raise RuntimeError("boom")
+
+        with TemporaryDirectory() as tmp:
+            service = WorkspaceService(root=Path(tmp), assess=explode)
+            self.assertIsNone(service._assessment("p", "q", "", None))
+
+
 class TestOptionsAndRisk(unittest.TestCase):
     """
     The three scores, and the alternatives.
@@ -622,3 +778,176 @@ class TestInitiativeFirstReasoning(unittest.TestCase):
         engine._index = None  # type: ignore[assignment]
         engine._initiatives = None
         self.assertEqual(engine.initiatives(), [])
+
+    def test_the_executive_instruction_names_all_eight_sections(self):
+        from workspace.responder import EXECUTIVE_INSTRUCTION
+
+        for heading in (
+            "Facts",
+            "Inferences",
+            "Alternatives Considered",
+            "Tradeoffs",
+            "Recommendation",
+            "Evidence Strength",
+            "Recommendation Confidence",
+            "Execution Risk",
+        ):
+            self.assertIn(heading, EXECUTIVE_INSTRUCTION)
+
+    def test_the_executive_instruction_forbids_inventing_risk_numbers(self):
+        from workspace.responder import EXECUTIVE_INSTRUCTION
+
+        self.assertIn("do not invent additional confidence or risk", EXECUTIVE_INSTRUCTION.lower())
+
+
+class TestTruncationHonesty(unittest.TestCase):
+    """
+    A cut-off answer must never be presented as a finished one.
+
+    Regression: the first live run of the eight-section format stopped
+    mid-sentence inside its final heading and reported `incomplete: False`. The
+    provider was reporting `stop_reason == "max_tokens"` correctly; nothing
+    consumed it. A partial answer that claims to be complete is a correctness
+    failure, not a cosmetic one — the sections it drops are the last ones, which
+    here are exactly the scores that make the advice auditable.
+    """
+
+    def _provider(self, stop_reason: str):
+        from brain.providers.base import (
+            AIProvider,
+            ProviderAvailability,
+            ProviderChunk,
+            ProviderResponse,
+        )
+
+        class Fake(AIProvider):
+            @property
+            def name(self) -> str:
+                return "fake"
+
+            @property
+            def supports_streaming(self) -> bool:
+                return True
+
+            def availability(self) -> ProviderAvailability:
+                return ProviderAvailability(available=True, provider="fake")
+
+            def stream(self, prompt, context="", max_tokens=1024, **kw):
+                yield ProviderChunk(text="a partial answer that stops mid-")
+                yield ProviderChunk(done=True, model="m", provider="fake", stop_reason=stop_reason)
+
+            def ask(self, prompt, context="", max_tokens=1024, **kw):
+                return ProviderResponse(content="x", model="m", provider="fake")
+
+            def plan(self, objective, context="", max_tokens=2048, **kw):
+                return self.ask(objective)
+
+            def summarize(self, content, max_words=150, **kw):
+                return self.ask(content)
+
+            def review(self, content, criteria="", **kw):
+                return self.ask(content)
+
+        return Fake()
+
+    def _reply(self, stop_reason: str):
+        from workspace.responder import ProviderWorkspaceResponder, WorkspaceRequest
+
+        responder = ProviderWorkspaceResponder(self._provider(stop_reason))
+        chunks = list(responder.respond_stream(WorkspaceRequest(project="p", message="q")))
+        return chunks[-1].reply
+
+    def test_a_run_cut_off_at_max_tokens_is_marked_incomplete(self):
+        reply = self._reply("max_tokens")
+        self.assertTrue(reply.incomplete)
+        self.assertEqual(reply.metadata.get("stop_reason"), "max_tokens")
+
+    def test_a_run_that_finished_is_not_marked_incomplete(self):
+        reply = self._reply("end_turn")
+        self.assertFalse(reply.incomplete)
+
+    def test_the_partial_text_is_preserved_not_discarded(self):
+        """Whatever arrived is work the user watched arrive."""
+        self.assertIn("partial answer", self._reply("max_tokens").content)
+
+
+class TestTokenBudget(unittest.TestCase):
+    def test_a_strategic_turn_gets_a_larger_budget(self):
+        """
+        The eight-section format does not fit a conversational budget.
+
+        Raised rather than trimming the format: a truncated executive answer
+        drops its final sections, and those are evidence strength, confidence and
+        execution risk — the parts that make it auditable.
+        """
+        from workspace.responder import (
+            DEFAULT_MAX_TOKENS,
+            EXECUTIVE_MAX_TOKENS,
+            WorkspaceRequest,
+        )
+
+        strategic = WorkspaceRequest(
+            project="p", message="q", assessment=Assessment(question="q", mode=Mode.EXECUTIVE)
+        )
+        lookup = WorkspaceRequest(project="p", message="q")
+        self.assertEqual(strategic.token_budget(), EXECUTIVE_MAX_TOKENS)
+        self.assertEqual(lookup.token_budget(), DEFAULT_MAX_TOKENS)
+        self.assertGreater(EXECUTIVE_MAX_TOKENS, DEFAULT_MAX_TOKENS * 2)
+
+    def test_an_explicit_budget_still_wins(self):
+        from workspace.responder import WorkspaceRequest
+
+        request = WorkspaceRequest(
+            project="p",
+            message="q",
+            max_tokens=99,
+            assessment=Assessment(question="q", mode=Mode.EXECUTIVE),
+        )
+        self.assertEqual(request.token_budget(), 99)
+
+
+class TestDriftIsReportedNotRepaired(unittest.TestCase):
+    def test_the_assessment_surfaces_drift_in_its_own_block(self):
+        """
+        A claim about the record, not about the product.
+
+        The capability may be perfectly healthy and the number describing it
+        simply wrong. Folding drift into risks would send someone to fix code
+        when what needs fixing is a task status.
+        """
+        from initiatives.drift import Drift, DriftKind
+
+        assessment = Assessment(question="q", mode=Mode.EXECUTIVE)
+
+        class FakeInitiative:
+            name = "Growth BOT"
+            health = __import__("initiatives").models.Health.HEALTHY
+            drift = [
+                Drift(
+                    kind=DriftKind.SHIPPED_BUT_BACKLOG,
+                    initiative="Growth BOT",
+                    implementation="shipped",
+                    record="all 8 tasks are still backlog",
+                    consequence="recorded progress is understated",
+                )
+            ]
+
+            def summary_line(self):
+                return "Growth BOT: healthy, 0% (0/8 tasks)"
+
+        assessment.initiatives = [FakeInitiative()]
+        rendered = assessment.render()
+        self.assertIn("Record/reality drift", rendered)
+        self.assertIn("has NOT changed any task", rendered)
+        self.assertEqual(len(assessment.drift), 1)
+
+    def test_the_executive_instruction_forbids_implying_a_repair(self):
+        from workspace.responder import EXECUTIVE_INSTRUCTION
+
+        lowered = EXECUTIVE_INSTRUCTION.lower()
+        self.assertIn("record/reality drift", lowered)
+        self.assertIn("has not changed any task", lowered)
+
+
+if __name__ == "__main__":
+    unittest.main()

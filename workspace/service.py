@@ -63,6 +63,7 @@ class WorkspaceService:
         git_lines: Callable[[str], list[str]] | None = None,
         activity: ActivityRecorder | NullRecorder | None = None,
         summarizer: compaction.ConversationSummarizer | None = None,
+        assess: Callable[[str, str, str, bool], Any] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._root = Path(root)
@@ -75,6 +76,11 @@ class WorkspaceService:
         self._read_tasks = read_tasks
         self._read_completed = read_completed
         self._git_lines = git_lines
+        # Reasoning over a retrieved snapshot. Optional, and injected rather
+        # than constructed: without it every turn is exactly the grounded
+        # answer increments 1-3 produced, which is a working workspace and
+        # not a degraded one.
+        self._assess = assess
         # Defaults to a recorder that drops everything, so nothing in this class
         # is conditional on whether anyone is watching the activity feed.
         self._activity = activity or NullRecorder()
@@ -452,7 +458,33 @@ class WorkspaceService:
             history=plan.verbatim,
             conversation_id=conversation.id,
             history_digest=plan.digest,
+            assessment=self._assessment(conversation.project, text, conversation.subject, snapshot),
         )
+
+    def _assessment(
+        self,
+        project: str,
+        text: str,
+        subject: str,
+        snapshot: ContextSnapshot | None,
+    ) -> Any:
+        """
+        What MondayOS concludes about this turn, before the model is called.
+
+        Runs between retrieval and generation, which is the whole point: the
+        model receives conclusions to explain rather than documents to summarise.
+
+        Failure here is never fatal. A reasoning layer that can take down a
+        conversation is worse than one that occasionally has nothing to add, so
+        an exception yields no assessment and the turn proceeds as a grounded
+        answer.
+        """
+        if self._assess is None:
+            return None
+        try:
+            return self._assess(project, text, subject, _thin(snapshot))
+        except Exception:  # noqa: BLE001 — reasoning must never break a turn
+            return None
 
     def retry_message(self, project: str, conversation_id: str) -> dict[str, Any]:
         """
@@ -756,6 +788,29 @@ __all__ = [
     "ConversationNotFoundError",
     "WorkspaceService",
 ]
+
+
+# Below this many context items, retrieval counts as thin and reasoning is
+# attached to a grounded answer. Tuned to catch the case this layer exists for —
+# a question the project barely covers — without firing on every ordinary lookup,
+# which would attach a memo to "where is X defined".
+THIN_CONTEXT_ITEMS = 8
+
+
+def _thin(snapshot: ContextSnapshot | None) -> bool:
+    """
+    Whether retrieval came back with too little to answer from directly.
+
+    An absent snapshot is thin by definition. So is one where the deterministic
+    project index found nothing: the other sources describe the project in
+    general, and a question they alone can reach is one nothing specific was
+    retrieved for.
+    """
+    if snapshot is None:
+        return True
+    total = sum(len(source.items) for source in snapshot.sources)
+    intelligence = next((s for s in snapshot.sources if s.name == "intelligence"), None)
+    return total < THIN_CONTEXT_ITEMS or intelligence is None or not intelligence.items
 
 
 def _subject_of(snapshot: ContextSnapshot) -> str:

@@ -701,3 +701,150 @@ Two constraints make the seam real rather than decorative:
 - Tests inject a fake responder and never make a network call.
 - Provider identity and model are recorded on each assistant message, so routing decisions become auditable the moment routing exists.
 - One indirection is added for a capability not yet present. That is the intended trade: the seam costs a protocol now and saves a rewrite later.
+
+---
+
+## ADR-019: Reasoning is a deterministic layer between retrieval and generation
+
+**Status:** Accepted
+**Date:** 2026-09-03
+**Context:** TASK-0080 — reasoning layer
+
+### Context
+
+Retrieval worked. Grounding worked. Hallucinations were rare. And Monday still
+behaved like a document search engine: asked what to build next, it reported which
+documents it lacked.
+
+The cause was structural, not a prompting failure. Nothing in the system had the
+job of *concluding* anything. Retrieval produces documents; a model handed
+documents summarises them. There was no component between the two whose output was
+a judgement, so no amount of prompt tuning could produce one reliably.
+
+The obvious fix — instruct the model to be more strategic — was rejected. It would
+place the reasoning inside the generation step, where it is unobservable,
+untestable, and revised every time the model changes.
+
+### Decision
+
+Reasoning becomes a first-class layer, `reasoning/`, running after retrieval and
+before generation:
+
+```
+question -> retrieve -> understand -> reason -> recommend -> score -> narrate
+```
+
+It produces an `Assessment` — typed claims, ranked recommendations, gaps, and
+computed confidence — deterministically, from the existing project index,
+relationship graph, task store and git history. The model's remaining job is to
+**narrate** that assessment.
+
+Three commitments make this safe.
+
+**Every claim is typed.** `FACT`, `INFERENCE` and `RECOMMENDATION` are distinct
+kinds, and each carries the rule that produced it. The low hallucination rate came
+from an instruction never to infer; removing that instruction to gain a strategic
+voice would have cost the trust that made the voice worth having. Typing the claims
+is what lets inference happen safely — a labelled conclusion carrying its own
+derivation can be rejected by a reader, where an unmarked one must be trusted.
+
+**Confidence is computed, never requested from a model.** A model asked to rate
+itself produces a number tracking how confident the prose sounds, not how strong
+the evidence is — authority without measurement, failing hardest on a well-written
+answer built on nothing. Scores come from evidence: corroboration across
+independent source kinds, inference chain length, contradiction, recency. Every
+score carries its own reasons, because a percentage nobody can argue with is worse
+than no percentage.
+
+**The existing graph is reused, not replaced.** `intelligence.RelationshipGraph`
+already models tasks, decisions, files, symbols, tests, commits, PRs and knowledge.
+It was built in Increment 3 and used only as a lookup table. Reasoning reads it.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| A stronger system prompt | Puts reasoning where it cannot be tested or asserted, and silently drifts with every model change. The behaviour would be a tendency, not a capability. |
+| Ask the model for confidence scores | Produces a plausible number that measures nothing. Indistinguishable on screen from a computed one, which would destroy the only signal telling a reader how much to trust the rest. |
+| A second, purpose-built knowledge graph | ADR-017's rule against parallel storage. The graph already models every node kind the reasoning needs; the gap was that nothing reasoned over it. |
+| Let reasoning create tasks automatically | A layer that silently files work into a real backlog is one people stop asking questions of. Gaps propose payloads; a human approves the write. |
+| Embeddings to relate evidence | Same reason as ADR for the index: retrieval that cannot explain itself cannot be audited, and a similarity-derived edge is a claim the project never made. |
+
+### Consequences
+
+- Strategic answers are assertable in tests. The same repository produces the same
+  assessment, so "does Monday reason correctly" is a test rather than a vibe.
+- Reasoning survives model changes. Only the narration depends on the provider.
+- A failing rule costs its own conclusion, never the answer; a failing engine costs
+  the assessment, never the conversation.
+- Two registers now exist. Routing is pattern-based and deliberately narrow — a
+  lookup answered with strategy is worse than a strategic question answered
+  factually.
+- Confidence in this repository runs lower than a reader may expect. That is the
+  design working: file-count heuristics genuinely are weak evidence, and the score
+  says so rather than flattering the analysis.
+
+---
+
+## ADR-020: Initiatives are the unit of product reasoning
+
+**Status:** Accepted
+**Date:** 2026-09-03
+**Context:** TASK-0081 — initiative intelligence
+
+### Context
+
+ADR-019 gave MondayOS the ability to conclude things. It still concluded them
+about the wrong nouns. Every claim it could make was about a file, a task, a
+commit or a decision — the artefacts engineers touch — and none of those is what
+a product is made of. "How is Billing going?" has no answer at artefact level,
+because Billing is not a file.
+
+The gap showed up as advice that was locally correct and strategically useless:
+*"workspace/service.py is under-tested"* is true and may matter to nothing anyone
+is shipping.
+
+### Decision
+
+Introduce `initiatives/`: a first-class model of business capabilities, assembled
+from the work that builds them. Reasoning operates on initiatives first and drills
+into implementation only when it changes a decision.
+
+Initiatives are **discovered** from what the project already states — declaration,
+task-title prefixes, capability documents, packages — and never from similarity or
+clustering. Every membership carries the reason it was assigned, so a wrong
+grouping can be corrected rather than merely disbelieved.
+
+Initiatives may also be **declared** in `config/initiatives.json`. This is the only
+part of the subsystem that is a system of record, and it exists because discovery
+has a hard ceiling: a capability agreed in planning and never started is invisible
+to every repository signal. Declaration is what makes reasoning about a *roadmap*
+possible rather than reasoning about an inventory.
+
+Executive recommendations additionally split one score into three — **evidence
+strength**, **recommendation confidence** and **execution risk** — and carry the
+alternatives that lost, with the reason each lost.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Cluster artefacts by similarity | A grouping nobody can explain is one nobody can correct. The first misfiled capability would be unfixable, and every number computed from it silently wrong. |
+| Derive initiatives only, no declaration | Cannot see planned work. A roadmap layer that structurally cannot represent "committed but not started" is not a roadmap layer. |
+| Declaration only, no discovery | Accurate and unused. It requires maintenance nobody does, and goes stale exactly when the project moves fastest. |
+| Treat every package as an initiative | Produced 57 "initiatives" including `Runbook` and `Task 0051`. A roster that lists everything distinguishes nothing. |
+| One blended confidence per recommendation | Hides the case that matters most: strong evidence for a risky change. Averaging reports "rewrite the scheduler" and "add a test" as similar. |
+| Compute progress from file counts | A denominator that moves when someone splits a module in two. Reporting maturity signals is less satisfying and more honest. |
+
+### Consequences
+
+- Reasoning answers product questions. "What should we build next" is answered in
+  capabilities, with implementation as the drill-down.
+- Health leads on blockers rather than percentage, because a blocked capability at
+  80% needs attention more than a healthy one at 20%.
+- An initiative with no tasks reports no percentage. Some surfaces will want one
+  anyway; they should show the maturity signals instead of inventing it.
+- Declared initiatives put a small maintenance burden on the user. That is the
+  cost of being able to reason about work that has not started.
+- Three scores per recommendation is more to read. They disagree often enough that
+  collapsing them would lose the signal — which is the reason for the change.
