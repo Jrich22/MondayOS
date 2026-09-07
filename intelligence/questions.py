@@ -22,12 +22,11 @@ the difference between a tool and a search box.
 from __future__ import annotations
 
 import re
-import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
+from core.vcs import RepoScope, git, scope_for
 from intelligence.evidence import Citation, CitationKind, Evidence
 from intelligence.graph import RelationshipGraph
 from intelligence.index import STOPWORDS, ProjectIndex
@@ -200,6 +199,15 @@ class QuestionEngine:
         self._index = index
         self._graph = graph
         self._tasks = tasks or []
+        # Resolved lazily and cached: it shells out to git, and the project root
+        # is fixed at construction so the answer cannot change mid-engine.
+        self._repo_scope: RepoScope | None = None
+
+    def _scope(self) -> RepoScope:
+        """Where this project sits relative to version control."""
+        if self._repo_scope is None:
+            self._repo_scope = scope_for(self._index.root)
+        return self._repo_scope
 
     # ------------------------------------------------------------------ ask
 
@@ -519,13 +527,21 @@ class QuestionEngine:
             )
 
         if not commits:
-            return Answer(
-                question,
-                Intent.WHAT_CHANGED,
-                "",
-                f"No commits{f' since {window}' if window else ''}.",
-                evidence,
-            )
+            # Say why there is nothing, when the reason is the project boundary.
+            # "No commits" reads as "nothing happened"; for a nested project the
+            # truth is "nothing touched THIS project", and the difference matters
+            # when the enclosing repository is busy.
+            scope = self._scope()
+            if not scope.available:
+                finding = f"{scope.root.name} is not under version control, so there is no history."
+            elif scope.nested:
+                finding = (
+                    f"No commits{f' since {window}' if window else ''} touch this project. "
+                    f"{scope.describe()}."
+                )
+            else:
+                finding = f"No commits{f' since {window}' if window else ''}."
+            return Answer(question, Intent.WHAT_CHANGED, "", finding, evidence)
         finding = f"{len(commits)} commit(s){f' since {window}' if window else ''}:\n" + "\n".join(
             f"  {sha} {subject}" for sha, subject in commits
         )
@@ -636,10 +652,18 @@ class QuestionEngine:
         return out
 
     def _commits(self, limit: int, since: str = "") -> list[tuple[str, str]]:
+        """
+        Recent commits for THIS project.
+
+        Scoped to the project's own path, so a product nested inside MondayOS
+        reports its own history rather than the enclosing repository's. Before
+        this, "what changed recently?" answered for Cue App with MondayOS's
+        commits -- an identical citation list, confidently wrong.
+        """
         args = ["log", f"-{limit}", "--format=%h%x1f%s"]
         if since:
             args.insert(1, f"--since={since}")
-        out = _git(self._index.root, *args)
+        out = git(self._scope(), *args)
         commits: list[tuple[str, str]] = []
         for line in out.splitlines():
             sha, _, subject = line.partition("\x1f")
@@ -715,13 +739,3 @@ def _window_of(question: str) -> str:
         if phrase in lowered:
             return window
     return ""
-
-
-def _git(root: Path, *args: str) -> str:
-    try:
-        result = subprocess.run(
-            ["git", *args], cwd=root, capture_output=True, text=True, timeout=15, check=False
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return result.stdout if result.returncode == 0 else ""

@@ -123,12 +123,25 @@ class TestLayering(unittest.TestCase):
     def test_core_depends_on_nothing(self):
         self.assertEqual(_dependencies().get("core", set()), set())
 
-    def test_intelligence_is_a_leaf(self):
+    def test_intelligence_depends_on_nothing_above_core(self):
         """
         Retrieval must not know about reasoning, initiatives, or the workspace.
-        Everything above it reads from it; it reads from nothing.
+
+        This previously asserted `intelligence` imported *nothing*. It now depends
+        on `core`, deliberately: the project/repository boundary lives there, and
+        the alternative was a second copy of the scoping logic inside
+        `intelligence` — which is precisely how the two unscoped `_git` helpers
+        came to exist and diverge from the workspace adapter that had it right.
+
+        `core` is the designated universal base with no dependencies of its own,
+        so depending on it is the intended direction rather than a layering
+        violation. What the test actually protects is unchanged: retrieval knows
+        nothing about the layers above it.
         """
-        self.assertEqual(_dependencies().get("intelligence", set()), set())
+        deps = _dependencies().get("intelligence", set())
+        self.assertLessEqual(deps, {"core"}, f"intelligence gained: {deps - {'core'}}")
+        for forbidden in ("reasoning", "initiatives", "workspace", "monday", "growth"):
+            self.assertNotIn(forbidden, deps)
 
     def test_reasoning_does_not_depend_on_the_workspace(self):
         """

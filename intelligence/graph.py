@@ -23,13 +23,13 @@ providers" returns a neighbourhood rather than the whole graph.
 from __future__ import annotations
 
 import re
-import subprocess
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.vcs import git, scope_for
 from intelligence.index import ProjectIndex
 from intelligence.models import Edge, EdgeKind, FileKind, Node, NodeKind
 
@@ -358,8 +358,13 @@ def _add_history(graph: RelationshipGraph, index: ProjectIndex, limit: int) -> N
     and total: a project without a repository simply has no commit nodes, rather
     than an index that refuses to build.
     """
-    log = _git(
-        index.root,
+    # Scoped to the project's own path. A nested project -- a product living
+    # inside MondayOS -- would otherwise get the enclosing repository's commits,
+    # and every COMMIT and PULL_REQUEST node in its graph would describe work
+    # that has nothing to do with it.
+    scope = scope_for(index.root)
+    log = git(
+        scope,
         "log",
         f"-{limit}",
         "--name-only",
@@ -410,13 +415,3 @@ def _add_history(graph: RelationshipGraph, index: ProjectIndex, limit: int) -> N
                 graph.add_edge(
                     Edge(commit_node, f"file:{path}", EdgeKind.TOUCHES, f"{short} touched {path}")
                 )
-
-
-def _git(root: Path, *args: str) -> str:
-    try:
-        result = subprocess.run(
-            ["git", *args], cwd=root, capture_output=True, text=True, timeout=20, check=False
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return result.stdout if result.returncode == 0 else ""
