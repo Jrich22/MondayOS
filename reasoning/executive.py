@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 
 class Topic(Enum):
@@ -143,44 +144,270 @@ _NOT_STRATEGIC = re.compile(
 )
 
 
+# Retrieval verbs and code nouns. A question phrased this way wants a file and a
+# line, and answering it with strategy is worse than useless -- it buries the
+# answer. This guard runs FIRST and unconditionally, which is what keeps executive
+# framing from leaking into ordinary code questions inside a strategic thread.
+_LOOKUP = re.compile(
+    r"\bwhere (?:is|are|does|do|was|were)\b"
+    r"|\bshow (?:me|us|the)\b"
+    r"|\bfind (?:every|all|the|any)\b"
+    r"|\b(?:which|what) file\b"
+    r"|\bwhat (?:module|package|class|function|method)\b"
+    r"|\bopen the\b"
+    r"|\blist (?:the|all|every)\b"
+    r"|\breferences? to\b"
+    r"|\bdefined in\b"
+    r"|\bimplemented (?:in|at)\b"
+    r"|\bwhat changed\b"
+    r"|\bwhat did (?:we|i|you) (?:change|commit|ship|build)\b"
+    r"|\blast \w+ commits?\b",
+    re.I,
+)
+
+# Words that only an assessment produces. A follow-up naming one of these is
+# talking about a recommendation rather than about code.
+_STRATEGIC_VOCAB = re.compile(
+    r"\brecommendation\b|\brecommend(?:ed|ing)?\b"
+    r"|\bevidence\b"
+    r"|\bconfiden(?:ce|t)\b"
+    r"|\brisk(?:s|y)?\b"
+    r"|\balternative(?:s)?\b|\brunner[- ]?up\b"
+    r"|\btrade[- ]?offs?\b"
+    r"|\boption(?:s)?\b"
+    r"|\bchange your mind\b|\bchanged your mind\b"
+    r"|\bhow (?:sure|certain)\b"
+    r"|\bpick(?:ed)? that\b|\bchose\b|\bchosen\b"
+    r"|\bthat one\b"
+    r"|\bbest option\b|\bstill (?:the )?best\b",
+    re.I,
+)
+
+# Phrases that can only be about a decision already made. "How confident are
+# you?" has no other possible referent in a conversation, and demanding a pronoun
+# alongside it would reject the most natural way to ask. These are sufficient on
+# their own; the general vocabulary below is not.
+_ASSESSMENT_DEICTIC = re.compile(
+    r"\bchange[d]? your mind\b"
+    r"|\bhow (?:confident|sure|certain) are you\b"
+    r"|\bhow confident\b"
+    r"|\brunner[- ]?up\b"
+    r"|\bsecond (?:option|choice|best|place)\b"
+    r"|\bstill (?:the )?best\b"
+    r"|\bwhy (?:did|do) you (?:pick|choose|recommend|prefer)\b"
+    # "Should we still build that?" asks whether a prior call holds. Narrow on
+    # purpose: bare "still" would catch "is that still cached?", which is a code
+    # question that happens to share a word.
+    r"|\bshould (?:we|i) still\b"
+    r"|\bdo you still (?:recommend|think|stand by)\b"
+    r"|\bwhat (?:else|other options?) did you consider\b",
+    re.I,
+)
+
+# A directive applied to what was just said. With a strategic decision in play,
+# "turn that into a plan" has one plausible referent. Kept narrow -- an imperative
+# plus a back-reference, not any sentence containing "plan".
+_APPLY_TO_PRIOR = re.compile(
+    r"\b(?:turn|make|write|expand|break|flesh|spell)\b[^.?!]{0,24}\b(?:that|it|this|those)\b"
+    r"|\b(?:that|it|this)\b[^.?!]{0,24}\binto a (?:plan|roadmap|sequence|breakdown)\b",
+    re.I,
+)
+
+# Pronouns that make a sentence a follow-up. Same set the question engine uses for
+# grounded carry-over -- the signal is identical, only the referent differs.
+_BACK_REFERENCE = re.compile(r"\b(?:it|its|that|this|them|those|these|the same)\b", re.I)
+
+# "the second option", "the first two", "the runner-up".
+_ORDINAL = re.compile(
+    r"\b(?:first|second|third|1st|2nd|3rd|runner[- ]?up|top two|first two)\b", re.I
+)
+
+# A follow-up with no subject of its own. "Why?" is unambiguously about whatever
+# was just said, and it is the shortest question a user actually asks.
+_BARE_FOLLOWUP = re.compile(r"^\s*(?:so\s+)?why(?:\s+(?:that|is|not))?\s*\??\s*$", re.I)
+
+# Asks what to do now, or whether the prior call still holds. These are the
+# follow-ups that must not be answered from a stale record: acting on an
+# out-of-date recommendation is a different failure from describing one.
+_CURRENT_ACTION = re.compile(
+    r"\bstill\b"
+    r"|\b(?:what|which) (?:should|do) (?:we|i) (?:do|build|start|ship|tackle) (?:now|next|first)"
+    r"|\bwhat should (?:i|we) do (?:now|first|next)\b"
+    r"|\bshould we (?:still |now )?(?:build|do|start|ship|proceed|go)"
+    r"|\bgo ahead\b|\bproceed\b"
+    r"|\bwhat (?:do we|should we) do now\b"
+    r"|\bright now\b",
+    re.I,
+)
+
+
 @dataclass(frozen=True)
 class Routing:
-    """Which register a question belongs in, and why it was routed there."""
+    """
+    Which register a question belongs in, and why it was routed there.
+
+    ``continuation`` distinguishes a fresh strategic question from a follow-up
+    about one already answered. Both are executive -- same budget, same register
+    -- but a continuation must not re-rank, so the distinction travels rather
+    than being inferred downstream.
+    """
 
     executive: bool
     topic: Topic | None = None
     reason: str = ""
+    continuation: bool = False
+    # True when the follow-up asks what to do now rather than what was decided.
+    # Only meaningful for a continuation, and only load-bearing when the stored
+    # state is stale.
+    current_action: bool = False
 
 
-def route(question: str) -> Routing:
+def is_continuation(question: str, state: Any = None) -> tuple[bool, str]:
     """
-    Decide whether a question deserves the executive register.
+    Whether this question refers to a strategic decision already made.
 
-    Returns the topic as well as the verdict, because the topic selects which
-    analysis runs — a boolean would force every strategic question through one
-    generic path and answer "what worries you" with a roadmap.
+    Requires **two independent signals**, because false positives are worse than
+    misses here: answering "what's the risk of that migration?" during a code
+    review with a roadmap memo is jarring and unhelpful, while missing a genuine
+    follow-up merely returns the grounded answer MondayOS already gave.
+
+    The signals:
+
+    - **referential** — a pronoun, an ordinal, or a bare "why?"; what makes the
+      sentence a follow-up rather than a question in its own right
+    - **strategic vocabulary** — a word only an assessment produces, or the name
+      of a capability the stored state actually mentions
+
+    A bare follow-up is accepted on its own. "Why?" has no subject to supply and
+    cannot mean anything except the thing just said.
+
+    Deliberately no fuzzy matching. Every signal is a literal pattern or a lookup
+    against stored slugs, so a routing decision can be explained by pointing at
+    the word that caused it.
+    """
+    if state is None:
+        return False, "no strategic state"
+
+    text = (question or "").strip()
+    if not text:
+        return False, "empty question"
+
+    if _BARE_FOLLOWUP.match(text):
+        return True, "bare follow-up with no subject of its own"
+
+    # Self-referential by construction: no pronoun needed because no other
+    # referent is possible.
+    if _ASSESSMENT_DEICTIC.search(text):
+        return True, "phrase can only refer to a decision already made"
+
+    # An imperative aimed at what was just said.
+    if _APPLY_TO_PRIOR.search(text):
+        return True, "directive applied to the prior answer"
+
+    referential = bool(_BACK_REFERENCE.search(text)) or bool(_ORDINAL.search(text))
+    vocab = bool(_STRATEGIC_VOCAB.search(text))
+
+    # Naming a capability the stored decision is about counts as strategic
+    # vocabulary: "is Cue App still the right call" is unambiguous.
+    named = ""
+    lowered = text.lower()
+    for slug in list(getattr(state, "initiative_slugs", []) or []) + [
+        getattr(state, "initiative_slug", "") or ""
+    ]:
+        candidate = str(slug).strip().lower()
+        if candidate and (candidate in lowered or candidate.replace("-", " ") in lowered):
+            named = candidate
+            break
+
+    if referential and (vocab or named):
+        detail = f"names '{named}'" if named else "strategic vocabulary"
+        return True, f"back-reference plus {detail}"
+    if vocab and named:
+        return True, f"strategic vocabulary naming '{named}'"
+
+    if referential:
+        return False, "back-reference without strategic vocabulary"
+    if vocab:
+        return False, "strategic vocabulary without a back-reference"
+    return False, "no continuation signal"
+
+
+def is_current_action(question: str) -> bool:
+    """
+    Whether a follow-up asks what to do now rather than what was decided.
+
+    The distinction only matters when the stored state is stale, and then it
+    matters a great deal: describing a past recommendation accurately is always
+    safe, while acting on one computed against a repository that has since moved
+    is how a system gives confidently obsolete advice.
+    """
+    return bool(_CURRENT_ACTION.search(question or ""))
+
+
+def route(question: str, state: Any = None) -> Routing:
+    """
+    Decide the register for a question, given any strategic state in play.
+
+    Precedence is explicit and ordered, and the order is the design:
+
+    1. **Grounded lookup override.** Unconditional. A question asking where
+       something lives gets a file and a line even mid-strategy.
+    2. **Fresh executive.** An explicit strategic question starts a new
+       assessment, replacing whatever was stored.
+    3. **Continuation.** A follow-up referring to the stored decision.
+    4. **Grounded.** Everything else, unchanged from before.
+
+    Putting the lookup guard first is what prevents executive framing leaking
+    into ordinary code questions. It is checked before the strategic patterns
+    rather than after, so no amount of widening those patterns can undo it.
     """
     text = (question or "").strip()
     if not text:
         return Routing(executive=False, reason="empty question")
 
-    # A lookup that happens to contain a strategic-sounding word stays a lookup.
-    # Checked first so "what did we build next to the parser" is not a roadmap
-    # request.
-    if _NOT_STRATEGIC.search(text):
-        # ...unless it *also* matches a strategic pattern strongly enough that the
-        # question is genuinely both, e.g. "where should we focus next".
+    if _LOOKUP.search(text):
+        return Routing(executive=False, reason="phrased as a retrieval lookup")
+
+    # A question that can only be a follow-up is never a fresh one, however much
+    # strategic vocabulary it happens to share with the fresh patterns.
+    #
+    # "Is that still the best option?" matched the fresh next-work pattern on
+    # "best ... option" and was answered as a brand-new prioritisation, silently
+    # discarding the decision it was asking about. The back-reference is what
+    # settles it: nothing referring to a prior answer can be starting a new one.
+    only_a_followup = state is not None and (
+        bool(_BARE_FOLLOWUP.match(text))
+        or bool(_ASSESSMENT_DEICTIC.search(text))
+        or bool(_APPLY_TO_PRIOR.search(text))
+    )
+
+    if not only_a_followup:
         for topic, pattern in _PATTERNS:
             if pattern.search(text):
-                return Routing(
-                    executive=True,
-                    topic=topic,
-                    reason=f"matched {topic.value} despite lookup phrasing",
-                )
+                return Routing(executive=True, topic=topic, reason=f"matched {topic.value}")
+
+    continues, why = is_continuation(text, state)
+    if continues:
+        return Routing(
+            executive=True,
+            topic=_topic_of(state),
+            reason=f"continues the prior assessment: {why}",
+            continuation=True,
+            current_action=is_current_action(text),
+        )
+
+    if _NOT_STRATEGIC.search(text):
         return Routing(executive=False, reason="phrased as a factual lookup")
 
-    for topic, pattern in _PATTERNS:
-        if pattern.search(text):
-            return Routing(executive=True, topic=topic, reason=f"matched {topic.value}")
+    return Routing(
+        executive=False, reason=why if state is not None else "no strategic pattern matched"
+    )
 
-    return Routing(executive=False, reason="no strategic pattern matched")
+
+def _topic_of(state: Any) -> Topic | None:
+    """The stored topic, so a continuation reasons in the same register."""
+    raw = str(getattr(state, "topic", "") or "")
+    for topic in Topic:
+        if topic.value == raw:
+            return topic
+    return None
