@@ -437,3 +437,141 @@ class TestRecordRealityDrift(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEvidenceModel(unittest.TestCase):
+    """
+    What may create a capability, and what may only describe one.
+
+    Discovery used to let the highest-authority *name* win a merge, which meant a
+    document outranked the package it was written about. `safety/` -- sixteen
+    files of real code -- was reported as "Safety Implementation Plan", and
+    `research/` as "Research Roadmap". Both are plans about work, presented as
+    the work itself.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, *paths: str) -> None:
+        for path in paths:
+            target = self.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# generated\nvalue = 1\n" if path.endswith(".py") else "# doc\n")
+
+    def _discover(self, project: str = "demo") -> list[Initiative]:
+        index = build_index(project, self.root, cache_root=self.root / ".idx")
+        return discover(index, build_graph(index, tasks=[], knowledge=[]), [])
+
+    def _names(self, project: str = "demo") -> set[str]:
+        return {i.name for i in self._discover(project)}
+
+    def test_a_document_alone_creates_nothing(self):
+        self._write("safety/rails.py", "safety/limits.py", "safety/caps.py", "safety/halt.py")
+        self._write("docs/ROADMAP.md", "docs/DELIVERY_PLAN.md")
+        names = self._names()
+        self.assertIn("safety", names)
+        self.assertNotIn("Roadmap", names)
+        self.assertNotIn("Delivery Plan", names)
+
+    def test_a_plan_document_does_not_rename_the_work_it_plans(self):
+        """The exact WeatherBot regression: `safety/` is not a plan."""
+        self._write("safety/rails.py", "safety/limits.py", "safety/caps.py", "safety/halt.py")
+        self._write("docs/SAFETY_IMPLEMENTATION_PLAN.md")
+        self.assertIn("safety", self._names())
+
+    def test_a_scope_word_does_not_rename_the_work_it_scopes(self):
+        self._write(
+            "workflows/run.py", "workflows/step.py", "workflows/gate.py", "workflows/state.py"
+        )
+        self._write("docs/TEAM_WORKFLOW.md")
+        self.assertIn("workflows", self._names())
+
+    def test_a_document_may_still_improve_a_name(self):
+        """`reasoning/` plus REASONING_ENGINE.md is what people call it."""
+        self._write(
+            "reasoning/engine.py", "reasoning/claim.py", "reasoning/score.py", "reasoning/rank.py"
+        )
+        self._write("docs/REASONING_ENGINE.md")
+        self.assertIn("Reasoning Engine", self._names())
+
+    def test_two_added_qualifiers_are_a_document_title_not_a_name(self):
+        self._write("safety/rails.py", "safety/limits.py", "safety/caps.py", "safety/halt.py")
+        self._write("docs/TRADING_SAFETY_RAILS.md")
+        self.assertIn("safety", self._names())
+
+    def test_the_document_that_supplies_the_name_is_the_one_cited(self):
+        """
+        Provenance must be inspectable and exact.
+
+        Two documents describe `knowledge/`; only one names it, and citing the
+        other would leave the name unverifiable at the moment someone checks.
+        """
+        self._write(
+            "knowledge/store.py", "knowledge/query.py", "knowledge/index.py", "knowledge/tag.py"
+        )
+        self._write("docs/KNOWLEDGE_RUNTIME_POLICY.md", "docs/KNOWLEDGE_SYSTEM.md")
+        found = {i.name: i for i in self._discover()}
+        self.assertIn("Knowledge System", found)
+        because = found["Knowledge System"].because
+        self.assertIn("named by docs/KNOWLEDGE_SYSTEM.md", because)
+        self.assertNotIn("named by docs/KNOWLEDGE_RUNTIME_POLICY.md", because)
+
+    def test_a_modest_directory_is_a_capability(self):
+        """
+        Six files was below the old threshold of ten.
+
+        That number was measured on this repository's packages and silently
+        deleted WeatherBot's `archive/` and `ops/`.
+        """
+        self._write(*[f"archive/mod{i}.py" for i in range(6)])
+        self.assertIn("archive", self._names())
+
+    def test_a_container_never_becomes_a_capability(self):
+        for container in ("src", "source", "app"):
+            with self.subTest(container=container):
+                self._tmp.cleanup()
+                self._tmp = TemporaryDirectory()
+                self.root = Path(self._tmp.name)
+                self._write(
+                    *[f"{container}/billing/mod{i}.py" for i in range(5)],
+                    *[f"{container}/checkin/mod{i}.py" for i in range(5)],
+                )
+                names = self._names()
+                self.assertNotIn(container, names)
+                self.assertIn("billing", names)
+
+    def test_a_transport_is_folded_into_the_capability_it_serves(self):
+        self._write(*[f"dashboard/mod{i}.py" for i in range(6)])
+        self._write(*[f"dashboard_api/route{i}.py" for i in range(5)])
+        names = self._names()
+        self.assertIn("dashboard", names)
+        self.assertNotIn("dashboard_api", names)
+
+    def test_the_projects_own_namespace_is_not_one_of_its_capabilities(self):
+        self._write(*[f"monday/mod{i}.py" for i in range(6)])
+        self._write(*[f"growth/mod{i}.py" for i in range(6)])
+        names = self._names(project="mondayos")
+        self.assertNotIn("monday", names)
+        self.assertIn("growth", names)
+
+    def test_a_nested_project_contributes_no_capabilities(self):
+        self._write(*[f"growth/mod{i}.py" for i in range(6)])
+        self._write("projects/other-app/package.json")
+        self._write(*[f"projects/other-app/src/checkin/mod{i}.ts" for i in range(6)])
+        names = self._names()
+        self.assertIn("growth", names)
+        self.assertNotIn("checkin", names)
+        self.assertNotIn("projects", names)
+
+    def test_a_declared_initiative_survives_with_no_code_at_all(self):
+        """Unchanged by S3, and the reason the evidence gate exempts declarations."""
+        self._write("growth/mod0.py")
+        index = build_index("demo", self.root, cache_root=self.root / ".idx")
+        seed = Seed(name="Planned Thing", because="declared", declared=True)
+        found = discover(index, build_graph(index, tasks=[], knowledge=[]), [], [seed])
+        self.assertIn("Planned Thing", {i.name for i in found})

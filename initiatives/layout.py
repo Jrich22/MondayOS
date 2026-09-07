@@ -236,10 +236,23 @@ def singular(slug: str) -> str:
 _STRUCTURAL_FORMS = STRUCTURAL | {singular(word) for word in STRUCTURAL}
 
 
+_TEST_SUFFIX = re.compile(r"\.(test|spec)$", re.I)
+
+
 def normalise(token: str) -> str:
-    """A path segment reduced to a comparable slug."""
-    cleaned = re.sub(r"[^a-z0-9]+", "-", token.lower()).strip("-")
-    return cleaned
+    """
+    A path segment reduced to a comparable slug.
+
+    camelCase is split before lowercasing, because most of a TypeScript project's
+    capability names live in file names: `CandidateWorkspace.tsx` is evidence for
+    `candidate`, and folding the case first would leave one opaque word. The
+    `.test`/`.spec` suffix goes too, so a test file counts towards the thing it
+    tests rather than towards a capability called "test".
+    """
+    token = _TEST_SUFFIX.sub("", token)
+    token = re.sub(r"[_\-]+", " ", token)
+    token = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", token)
+    return re.sub(r"\s+", "-", token.strip().lower())
 
 
 def is_structural(slug: str) -> bool:

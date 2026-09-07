@@ -216,6 +216,11 @@ class Seed:
     # package that also has a document or a task prefix is a capability; a
     # package alone is usually just a module.
     corroborated: bool = False
+    # Whether concrete work stands behind this seed -- a directory, a name
+    # recurring across layers, or a task prefix. A document alone does not
+    # qualify: `RESEARCH_ROADMAP.md` is somebody planning research, and reporting
+    # it as a capability is how a plan title ends up on the roster.
+    work: bool = False
 
     @property
     def slug(self) -> str:
