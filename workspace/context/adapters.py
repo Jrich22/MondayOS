@@ -27,12 +27,12 @@ skip failed.
 
 from __future__ import annotations
 
-import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from core import redaction
+from core.vcs import git, scope_for
 from workspace.context import relevance
 from workspace.context.snapshot import ContextSource
 
@@ -329,28 +329,26 @@ def git_source(project: str, root: Path, commit_limit: int = 10, query: str = ""
     """
 
     def build() -> list[str]:
-        toplevel = git_command(root, "rev-parse", "--show-toplevel")
-        if not toplevel:
+        # One implementation of the project/repository boundary, shared with the
+        # project index. This adapter got the scoping right first and the two
+        # copies in intelligence/ did not, which is what let a nested project
+        # answer "what changed?" with its parent's commits.
+        scope = scope_for(root)
+        if not scope.available:
             return []
 
-        repo = Path(toplevel)
-        # A project may be its own repository, or a directory inside a larger one
-        # (as the managed products are inside MondayOS). Both are reported, but
-        # never conflated: for a nested project every query is scoped to its own
-        # path, because reporting the parent repo's whole state as the project's
-        # is a plausible, confident, wrong answer.
-        nested = repo.resolve() != root.resolve()
-        scope = ["--", str(root)] if nested else []
-
         items: list[str] = []
-        if nested:
-            items.append(f"Lives inside the {repo.name} repository at {root.name}/")
+        if scope.nested and scope.toplevel is not None:
+            items.append(f"Lives inside the {scope.toplevel.name} repository at {root.name}/")
 
-        branch = git_command(root, "rev-parse", "--abbrev-ref", "HEAD")
+        # A path argument is meaningless for rev-parse, and a nested project
+        # genuinely shares its parent's branch, so reporting it is accurate.
+        branch = git(scope, "rev-parse", "--abbrev-ref", "HEAD", pathspec=False)
         if branch:
             items.append(f"Current branch: {branch}")
 
-        porcelain = git_command(root, "status", "--porcelain", *scope)
+        nested = scope.nested
+        porcelain = git(scope, "status", "--porcelain")
         changed = [line for line in porcelain.splitlines() if line.strip()]
         if changed:
             where = "in this project" if nested else ""
@@ -360,12 +358,17 @@ def git_source(project: str, root: Path, commit_limit: int = 10, query: str = ""
         else:
             items.append("Working tree: clean")
 
-        log = git_command(root, "log", f"-{commit_limit}", "--format=%h %s", *scope)
+        log = git(scope, "log", f"-{commit_limit}", "--format=%h %s")
         commits = [line for line in log.splitlines() if line.strip()]
         if commits:
             label = "touching this project" if nested else ""
             items.append(f"Recent commits ({len(commits)}) {label}:".replace(" :", ":"))
             items.extend(f"  {c}" for c in commits)
+        elif nested:
+            # Absence stated, never substituted. "No recent commits" reads as
+            # "nothing happened"; for a nested project the truth is "nothing
+            # touched THIS project", which is different when the parent is busy.
+            items.append("No recent commits touch this project.")
         return items
 
     return safe_source(
@@ -376,27 +379,6 @@ def git_source(project: str, root: Path, commit_limit: int = 10, query: str = ""
         query=query,
         baseline_reason=relevance.REASON_RECENT,
     )
-
-
-def git_command(root: Path, *args: str) -> str:
-    """
-    Run one git command in a project directory.
-
-    Timed out and non-raising: a hung or broken repository must degrade context,
-    never block a conversation.
-    """
-    try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return result.stdout.strip() if result.returncode == 0 else ""
 
 
 # --------------------------------------------------------------------------- #

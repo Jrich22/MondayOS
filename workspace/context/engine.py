@@ -27,6 +27,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from core.vcs import git, scope_for
 from workspace.context import adapters, budget, relevance
 from workspace.context.snapshot import ContextSnapshot, ContextSource, snapshot_id
 
@@ -164,8 +165,13 @@ class ContextEngine:
         try:
             parts: list[str] = [slug]
 
-            head = adapters.git_command(root, "rev-parse", "HEAD")
-            status = adapters.git_command(root, "status", "--porcelain", "--", str(root))
+            # Scoped through the shared boundary helper: for a nested project the
+            # fingerprint must move when *this* project changes, not when the
+            # enclosing repository does, or every snapshot would invalidate on
+            # unrelated parent activity.
+            scope = scope_for(root)
+            head = git(scope, "rev-parse", "HEAD", pathspec=False)
+            status = git(scope, "status", "--porcelain")
             parts.append(f"git:{head}:{hashlib.sha256(status.encode()).hexdigest()[:16]}")
 
             if self._read_tasks is not None:
