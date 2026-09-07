@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from core.identity import slug
 from intelligence.models import NodeKind
 
 
@@ -328,11 +329,12 @@ class Initiative:
 
 
 def slugify(name: str) -> str:
-    """A stable id for an initiative name."""
-    out = []
-    for char in name.strip().lower():
-        if char.isalnum():
-            out.append(char)
-        elif out and out[-1] != "-":
-            out.append("-")
-    return "".join(out).strip("-")
+    """
+    A stable id for an initiative name.
+
+    Uses the canonical transformation without path validation: an initiative slug
+    is a logical identifier -- a dictionary key and a cross-reference -- and never
+    becomes a directory. Validating it as a path would reject capability names
+    that are perfectly good identifiers.
+    """
+    return slug(name)

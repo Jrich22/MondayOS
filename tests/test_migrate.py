@@ -232,7 +232,9 @@ class TestKnowledgeCandidate:
         assert c.summary == "My summary"
 
     def test_slugify(self):
-        assert slugify("Sprint 1.2: Knowledge Capture") == "sprint-12-knowledge-capture"
+        # Canonical folds a period to a separator rather than deleting it, so
+        # "1.2" stays distinguishable from "12". The old behaviour conflated them.
+        assert slugify("Sprint 1.2: Knowledge Capture") == "sprint-1-2-knowledge-capture"
         assert slugify("ADR-001: Use Markdown") == "adr-001-use-markdown"
         assert slugify("") == ""
 

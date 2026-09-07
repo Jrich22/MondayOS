@@ -22,11 +22,12 @@ produced its answers would no longer apply (ADR-017).
 from __future__ import annotations
 
 import hashlib
-import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
+
+from core.identity import require_slug
 
 
 # The visible roles. `EVENT` records something that happened *to* the
@@ -518,18 +519,22 @@ def derive_title(text: str, fallback: str = "New conversation") -> str:
     return cleaned[: _TITLE_MAX - 1].rsplit(" ", 1)[0] + "…"
 
 
-_SLUG_RE = re.compile(r"[^a-z0-9-]+")
-
-
 def slugify(value: str) -> str:
     """
-    Normalise a project name to a filesystem-safe slug.
+    The project slug used as a conversation directory name.
 
-    This is the isolation primitive: a slug can contain no path separators and
-    no traversal, so a project name can never escape its own directory.
+    Delegates to the canonical transformation and then validates it as a
+    filesystem identity, because that is exactly what it becomes: a path segment
+    under ``workspace/conversations/``. This used to be a local regex that
+    stripped non-ASCII, which meant a project named in a non-Latin script slugged
+    to the empty string and its conversations resolved to the parent directory.
+
+    Raises ``InvalidSlugError`` for a name that cannot be a directory. That is a
+    behaviour change from silent degradation, and the right one: a project whose
+    name cannot be stored is a problem to report at registration, not to discover
+    as a missing folder.
     """
-    slug = _SLUG_RE.sub("-", (value or "").strip().lower().replace(" ", "-"))
-    return slug.strip("-")
+    return require_slug(value)
 
 
 def iso(value: datetime) -> str:

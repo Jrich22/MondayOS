@@ -16,22 +16,16 @@ Two rules make the boundary hold:
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.identity import InvalidSlugError, require_slug
 from growth.errors import (
     AmbiguousProjectError,
     InvalidProjectSlugError,
     ProjectNotRegisteredError,
 )
 from monday.project import ProjectRegistry
-
-# A slug is the name of exactly one directory. Anchored, no dots, no separators —
-# which is what makes path traversal a rejected *name* rather than a path to sanitize.
-_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
-
-_MAX_SLUG_LENGTH = 64
 
 
 @dataclass(frozen=True)
@@ -45,24 +39,23 @@ class ResolvedProject:
 
 def normalize_project_slug(name: str) -> str:
     """
-    Normalize a project name to its workspace slug.
+    Normalize a project name to its Growth workspace slug.
 
-    Lower-cases, and folds underscores and spaces to hyphens. Raises
-    InvalidProjectSlugError if the result is not a single safe path segment.
+    Delegates the transformation to `core.identity` and keeps Growth's own
+    stricter acceptance: ASCII only. That split matters. A subsystem may reject a
+    name for its own safety reasons; it may not turn a name into a *different*
+    identity than the rest of MondayOS uses, or the same project becomes two
+    projects depending on which component asked. Growth accepts fewer names than
+    the workspace does, and for every name it accepts the slug is byte-identical.
+
+    Raises InvalidProjectSlugError for anything that cannot be a single safe path
+    segment, which is what makes traversal a rejected *name* rather than a path
+    to sanitize (ADR-011).
     """
-    candidate = (name or "").strip().lower().replace("_", "-").replace(" ", "-")
-
-    if not candidate:
-        raise InvalidProjectSlugError(name, "name is empty")
-    if len(candidate) > _MAX_SLUG_LENGTH:
-        raise InvalidProjectSlugError(name, f"longer than {_MAX_SLUG_LENGTH} characters")
-    if not _SLUG_RE.match(candidate):
-        raise InvalidProjectSlugError(
-            name,
-            "must be lower-case letters, digits, and hyphens only, starting with a "
-            "letter or digit (path separators and '.' are not permitted)",
-        )
-    return candidate
+    try:
+        return require_slug(name, ascii_only=True)
+    except InvalidSlugError as exc:
+        raise InvalidProjectSlugError(name, exc.reason) from exc
 
 
 def resolve_project(name: str, registry: ProjectRegistry) -> ResolvedProject:
