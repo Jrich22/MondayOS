@@ -452,15 +452,23 @@ class TestBaselineGate(unittest.TestCase):
     def test_the_baseline_records_todays_weaknesses_rather_than_hiding_them(self):
         """
         The baseline is only useful if it describes what MondayOS actually does,
-        including what it does badly. If these ever pass, S3/S4 landed and the
+        including what it does badly. If these ever pass, S4 landed and the
         baseline must be re-recorded deliberately.
+
+        The discovery half of this test has already served its purpose. It
+        asserted that cue-app reported one initiative called "src" -- a weakness
+        recorded rather than hidden -- and S3 fixed it. What replaces it is the
+        property that made the old assertion worth writing: a container is not a
+        capability, so whatever cue-app reports, it is not that.
         """
         self._require_corpora()
         corpora = self.baseline.get("corpora", {})
         cue = corpora.get("cue-app")
         if cue and cue.get("available"):
             names = [i["name"] for i in cue["observations"]["initiatives"]]
-            self.assertEqual(names, ["src"], "cue-app discovery weakness is no longer recorded")
+            self.assertNotEqual(names, ["src"], "the S3 discovery fix is not recorded")
+            self.assertNotIn("src", names)
+            self.assertGreater(len(names), 1)
 
         for slug, corpus in corpora.items():
             if not corpus.get("available"):

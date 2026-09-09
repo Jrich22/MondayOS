@@ -248,6 +248,23 @@ class Initiative:
     # Why MondayOS believes this initiative exists at all.
     because: str = ""
 
+    @property
+    def implementation_size(self) -> int:
+        """
+        How much of this capability has been built, in members.
+
+        Commits and pull requests are excluded. They are evidence about a
+        capability and worth showing, but their number grows every time somebody
+        writes a commit message containing the capability's name -- so ranking by
+        total members ranks by how often a name is mentioned, and the roster's
+        order drifts with chatter rather than with code. `benchmark` and `brain`
+        traded places purely because of the commit that recorded a benchmark
+        baseline.
+        """
+        return sum(
+            1 for m in self.members if m.kind not in (NodeKind.COMMIT, NodeKind.PULL_REQUEST)
+        )
+
     # ------------------------------------------------------------- assessment
     progress: Progress = field(default_factory=Progress)
     health: Health = Health.NOT_STARTED

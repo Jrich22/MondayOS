@@ -236,13 +236,26 @@ def run_isolation(corpus: Corpus, own_markers: bool) -> list[str]:
 
 def run_discovery(corpus: Corpus) -> list[dict[str, str]]:
     """
-    The full ordered initiative set — names and slugs, not a count.
+        The full ordered initiative set — names and slugs, not a count.
 
-    Order and identity both matter: S3 has to be able to show exactly which
-    capability appeared or disappeared, and a count alone would hide a rename.
+        Order and identity both matter: S3 has to be able to show exactly which
+        capability appeared or disappeared, and a count alone would hide a rename.
+
+    `implementation_size` excludes commits and pull requests, which is what makes
+        this recordable at all. History grows: an initiative gains a member every
+        time someone writes a commit message containing its name, so both the count
+        and the ordering used to drift with the git log — recording a baseline was
+        itself enough to invalidate it, because the commit that recorded it mentioned
+        `benchmark`. That is the same reason file counts and timings live in
+        `volatile`.
     """
     return [
-        {"name": i.name, "slug": i.slug, "health": i.health.value, "members": str(len(i.members))}
+        {
+            "name": i.name,
+            "slug": i.slug,
+            "health": i.health.value,
+            "members": str(i.implementation_size),
+        }
         for i in corpus.initiatives()
     ]
 

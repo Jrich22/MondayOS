@@ -623,5 +623,8 @@ def discover(
                 members=members,
             )
         )
-    out.sort(key=lambda i: (not i.declared, -len(i.members), i.slug))
+    # Ranked by how much is built, not by how many members were gathered:
+    # counting commits would let the roster reorder itself every time someone
+    # wrote a commit message naming a capability.
+    out.sort(key=lambda i: (not i.declared, -i.implementation_size, i.slug))
     return out
