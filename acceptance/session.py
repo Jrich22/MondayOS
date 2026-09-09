@@ -1,0 +1,384 @@
+"""
+One project's run through the journey.
+
+The pipeline under test is the real one: `Monday.workspace("send-message", ...)`,
+the same call the dashboard makes. Nothing here re-implements routing, retrieval
+or reasoning -- if it did, the benchmark would be testing a copy of MondayOS
+rather than MondayOS.
+
+Isolation is by construction. Each run gets a temporary `project_root` holding a
+copy of the project registry, whose `source_path` entries are absolute, so
+projects resolve to the real corpora while conversations are written into the
+temporary tree. The user's own `workspace/conversations/` is never touched, and
+no corpus repository is written to at all.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from acceptance.journeys import COLD_TURN, DETERMINISM_TURN, JOURNEY, STALE_TURN, Turn
+from acceptance.observe import check_citations, cited_decisions, named_initiatives, quoted_scores
+from acceptance.pacing import Incident, Outcome, Pacing, classify
+
+# Fields a persisted conversation may legitimately contain. Anything else in a
+# strategy record is hidden reasoning wearing a struct, which is the failure
+# gate 12 exists to catch.
+_ALLOWED_STRATEGY_KEYS = frozenset(
+    {
+        "question",
+        "topic",
+        "source_message_id",
+        "snapshot_id",
+        "fingerprint",
+        "project",
+        "created_at",
+        "recommendation_key",
+        "recommendation",
+        "rationale",
+        "initiative_slug",
+        "effort",
+        "alternatives",
+        "evidence_refs",
+        "initiative_slugs",
+        "evidence_strength",
+        "confidence",
+        "execution_risk",
+    }
+)
+
+
+@dataclass
+class TurnRecord:
+    """Everything measured about one turn. All of it mechanical."""
+
+    project: str
+    turn_id: str
+    question: str
+    expect_register: str
+    observed_register: str = ""
+    mode_reason: str = ""
+    outcome: str = Outcome.OK.value
+    error: str = ""
+    attempts: int = 1
+    answer_chars: int = 0
+    answer_excerpt: str = ""
+    tokens_used: int = 0
+    incomplete: bool = False
+    stop_reason: str = ""
+    latency_ms: int = 0
+    recommendation_key: str = ""
+    scores: dict[str, float] = field(default_factory=dict)
+    quoted_scores: dict[str, float] = field(default_factory=dict)
+    citations: dict[str, Any] = field(default_factory=dict)
+    initiatives: dict[str, list[str]] = field(default_factory=dict)
+    invented_decisions: list[str] = field(default_factory=list)
+    foreign_history: list[str] = field(default_factory=list)
+    skipped: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "turn": self.turn_id,
+            "question": self.question,
+            "register": {
+                "expected": self.expect_register,
+                "observed": self.observed_register,
+                "reason": self.mode_reason,
+            },
+            "reply": {
+                "chars": self.answer_chars,
+                "tokens_used": self.tokens_used,
+                "incomplete": self.incomplete,
+                "stop_reason": self.stop_reason,
+                "error": self.error[:300],
+                "outcome": self.outcome,
+                "attempts": self.attempts,
+            },
+            "recommendation_key": self.recommendation_key,
+            "scores": self.scores,
+            "quoted_scores": self.quoted_scores,
+            "citations": self.citations,
+            "initiatives": self.initiatives,
+            "invented_decisions": self.invented_decisions,
+            "foreign_history": self.foreign_history,
+            "latency_ms": self.latency_ms,
+            "skipped": self.skipped,
+            "excerpt": self.answer_excerpt,
+        }
+
+
+def isolated_root(registry: Path, into: Path) -> Path:
+    """
+    A MondayOS root that resolves the real projects but stores nothing in them.
+
+    The registry's `source_path` entries are absolute, so copying it is enough:
+    projects point at the real corpora while every conversation this run creates
+    is written under `into`.
+    """
+    into.mkdir(parents=True, exist_ok=True)
+    (into / "config").mkdir(exist_ok=True)
+    shutil.copy2(registry, into / "config" / "projects.json")
+    return into
+
+
+class ProjectSession:
+    """Runs the journey for one project and records what came back."""
+
+    def __init__(
+        self,
+        monday: Any,
+        project: str,
+        corpus_root: Path,
+        monday_root: Path,
+        boundaries: frozenset[str],
+        discovered: list[str],
+        own_decisions: list[str],
+        pacing: Pacing,
+        clock: Any = time.perf_counter,
+    ) -> None:
+        self._monday = monday
+        self.project = project
+        self._root = corpus_root
+        # Where this run's conversations are written -- a temporary tree, passed
+        # in rather than read off the Monday instance so the session never
+        # reaches into another object's internals to find out where it is.
+        self._monday_root = monday_root
+        self._boundaries = boundaries
+        self._discovered = discovered
+        self._own_decisions = {d.upper() for d in own_decisions}
+        self._pacing = pacing
+        self._clock = clock
+        self.turns: list[TurnRecord] = []
+        self.incidents: list[Incident] = []
+        self.strategy_keys_seen: set[str] = set()
+
+    # ------------------------------------------------------------------ send
+
+    def _send(self, conversation_id: str, turn: Turn, question: str) -> TurnRecord:
+        """One turn, retried only for provider trouble."""
+        record = TurnRecord(
+            project=self.project,
+            turn_id=turn.id,
+            question=question,
+            expect_register=turn.expect_register,
+        )
+        started = self._clock()
+        payload: dict[str, Any] | None = None
+
+        for attempt in range(self._pacing.attempts):
+            record.attempts = attempt + 1
+            try:
+                response = self._monday.workspace(
+                    "send-message",
+                    project=self.project,
+                    conversation_id=conversation_id,
+                    content=question,
+                )
+            except Exception as exc:  # noqa: BLE001 — a product crash must be recorded, not raised
+                record.outcome = Outcome.PRODUCT.value
+                record.error = f"{type(exc).__name__}: {exc}"
+                break
+
+            payload = getattr(response, "data", None) or {}
+            message = payload.get("assistant_message") or {}
+            error = str(message.get("error", "") or "")
+            outcome = classify(error)
+            record.outcome = outcome.value
+            record.error = error
+            if outcome is not Outcome.PROVIDER_TRANSIENT:
+                break
+            if attempt + 1 < self._pacing.attempts:
+                self._pacing.wait_before_retry(attempt)
+
+        record.latency_ms = int((self._clock() - started) * 1000)
+        if payload:
+            self._measure(record, payload)
+        if record.outcome in (Outcome.PROVIDER_TRANSIENT.value, Outcome.PROVIDER_FATAL.value):
+            self.incidents.append(
+                Incident(self.project, turn.id, record.outcome, record.error, record.attempts)
+            )
+        return record
+
+    def _measure(self, record: TurnRecord, payload: dict[str, Any]) -> None:
+        message = payload.get("assistant_message") or {}
+        answer = str(message.get("content", "") or "")
+        record.answer_chars = len(answer)
+        record.answer_excerpt = _excerpt(answer)
+        record.tokens_used = int(message.get("tokens_used", 0) or 0)
+        record.incomplete = bool(message.get("incomplete", False))
+
+        observed = payload.get("assessment") or {}
+        record.stop_reason = str((observed.get("metadata") or {}).get("stop_reason", "") or "")
+        # The register as the product decided it, not as this harness would.
+        mode = str(observed.get("mode", "") or "")
+        record.observed_register = "continuation" if observed.get("continuation") else mode
+        record.mode_reason = str(observed.get("mode_reason", "") or "")
+        record.recommendation_key = str(observed.get("recommendation_key", "") or "")
+        record.scores = {
+            name: float(observed.get(name, 0.0) or 0.0)
+            for name in ("evidence_strength", "confidence", "execution_risk")
+            if observed.get(name) is not None
+        }
+
+        record.citations = check_citations(answer, self._root, self._boundaries).to_dict()
+        record.initiatives = named_initiatives(answer, self._discovered)
+        record.quoted_scores = quoted_scores(answer)
+        record.invented_decisions = [
+            adr for adr in cited_decisions(answer) if adr.upper() not in self._own_decisions
+        ]
+        conversation = payload.get("conversation") or {}
+        strategy = conversation.get("strategy") or {}
+        self.strategy_keys_seen |= set(strategy)
+
+    # --------------------------------------------------------------- journey
+
+    def run(self, nouns: dict[str, str]) -> dict[str, Any]:
+        """The full journey, in order, plus the cold, stale and repeat cases."""
+        main = self._monday.workspace(
+            "create-conversation", project=self.project, title="acceptance"
+        )
+        conversation_id = (getattr(main, "data", {}) or {}).get("id", "")
+
+        anchor = ""
+        for turn in JOURNEY:
+            question = turn.question.format(**nouns) if "{" in turn.question else turn.question
+            if turn.requires_prior_strategy and not anchor:
+                self.turns.append(
+                    TurnRecord(
+                        project=self.project,
+                        turn_id=turn.id,
+                        question=question,
+                        expect_register=turn.expect_register,
+                        skipped="no recommendation was produced by the strategic turn",
+                    )
+                )
+                continue
+            record = self._send(conversation_id, turn, question)
+            self.turns.append(record)
+            if turn.id == "B.next" and record.recommendation_key:
+                anchor = record.recommendation_key
+            self._pacing.pause(record.observed_register in ("executive", "continuation"))
+
+        cold = self._cold_conversation()
+        stale = self._stale_scenario(nouns, anchor)
+        repeat = self._determinism(anchor)
+
+        hidden = sorted(self.strategy_keys_seen - _ALLOWED_STRATEGY_KEYS)
+        completed = all(
+            t.outcome == Outcome.OK.value or t.skipped or t.outcome.startswith("provider")
+            for t in self.turns
+        )
+        return {
+            "available": True,
+            "completed": completed,
+            "recommendation_key": anchor,
+            "hidden_reasoning_keys": hidden,
+            "determinism": repeat,
+            "stale_scenario": stale,
+            "cold_elaboration": cold,
+        }
+
+    def _cold_conversation(self) -> dict[str, Any]:
+        """ "Say more" with nothing before it, in a conversation of its own."""
+        created = self._monday.workspace(
+            "create-conversation", project=self.project, title="acceptance-cold"
+        )
+        conversation_id = (getattr(created, "data", {}) or {}).get("id", "")
+        record = self._send(conversation_id, COLD_TURN, COLD_TURN.question)
+        self.turns.append(record)
+        self._pacing.pause(False)
+        return {"register": record.observed_register, "outcome": record.outcome}
+
+    def _stale_scenario(self, nouns: dict[str, str], anchor: str) -> dict[str, Any]:
+        """
+        Ask again after the stored decision stops describing the world.
+
+        Nothing on disk is touched. The conversation's own fingerprint is
+        rewritten, which is precisely what staleness is -- a decision computed
+        against a world that has since moved -- and it is reversible, local to a
+        temporary tree, and does not require editing anybody's repository.
+        """
+        if not anchor:
+            return {"exercised": False, "reason": "no recommendation to make stale"}
+        created = self._monday.workspace(
+            "create-conversation", project=self.project, title="acceptance-stale"
+        )
+        conversation_id = (getattr(created, "data", {}) or {}).get("id", "")
+        seed = self._send(conversation_id, JOURNEY[1], JOURNEY[1].question)
+        self.turns.append(seed)
+        if not seed.recommendation_key:
+            return {"exercised": False, "reason": "the strategic turn produced no decision"}
+
+        moved = self._move_fingerprint(conversation_id)
+        self._pacing.pause(True)
+        record = self._send(conversation_id, STALE_TURN, STALE_TURN.question)
+        self.turns.append(record)
+        return {
+            "exercised": moved,
+            "register": record.observed_register,
+            "reason": record.mode_reason,
+            "outcome": record.outcome,
+        }
+
+    def _move_fingerprint(self, conversation_id: str) -> bool:
+        """Rewrite the stored fingerprint so the recorded decision reads as stale."""
+        for path in (self._monday_root / "workspace" / "conversations").rglob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if data.get("id") != conversation_id:
+                continue
+            strategy = data.get("strategy")
+            if not strategy or not strategy.get("fingerprint"):
+                return False
+            strategy["fingerprint"] = "acceptance-moved-world"
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            return True
+        return False
+
+    def _determinism(self, anchor: str) -> dict[str, tuple[Any, Any]]:
+        """
+        The same strategic question again, in a fresh conversation.
+
+        Wording may differ -- that is the model's business. Identity may not: an
+        unchanged project that recommends something different the second time
+        cannot be relied on for anything.
+        """
+        if not anchor:
+            return {}
+        created = self._monday.workspace(
+            "create-conversation", project=self.project, title="acceptance-repeat"
+        )
+        conversation_id = (getattr(created, "data", {}) or {}).get("id", "")
+        record = self._send(conversation_id, DETERMINISM_TURN, DETERMINISM_TURN.question)
+        self.turns.append(record)
+        if record.outcome != Outcome.OK.value:
+            return {}
+        first = next((t for t in self.turns if t.turn_id == "B.next"), None)
+        if first is None:
+            return {}
+        return {
+            "recommendation_key": (first.recommendation_key, record.recommendation_key),
+            "mode": (first.observed_register, record.observed_register),
+            "evidence_strength": (
+                first.scores.get("evidence_strength"),
+                record.scores.get("evidence_strength"),
+            ),
+            "confidence": (first.scores.get("confidence"), record.scores.get("confidence")),
+            "execution_risk": (
+                first.scores.get("execution_risk"),
+                record.scores.get("execution_risk"),
+            ),
+        }
+
+
+def _excerpt(answer: str, limit: int = 700) -> str:
+    """Enough of an answer for a human to judge it, without pasting an essay."""
+    text = " ".join((answer or "").split())
+    return text if len(text) <= limit else f"{text[:limit]}…"
