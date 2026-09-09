@@ -62,6 +62,11 @@ class OpenAIProvider(AIProvider):
     def capability_tier(self) -> int:
         return 2
 
+    @property
+    def reports_stop_reason(self) -> bool:
+        """This provider reports why generation stopped, so truncation is detectable."""
+        return True
+
     def availability(self) -> ProviderAvailability:
         """Ready only when the `openai` SDK is importable and a key is set."""
         import importlib

@@ -97,6 +97,11 @@ class AnthropicProvider(AIProvider):
         )
 
     @property
+    def reports_stop_reason(self) -> bool:
+        """This provider reports why generation stopped, so truncation is detectable."""
+        return True
+
+    @property
     def supports_streaming(self) -> bool:
         """Claude streams token deltas natively."""
         return True

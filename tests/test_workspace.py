@@ -17,6 +17,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from brain.providers.base import AIProvider, ProviderAvailability, ProviderError, ProviderResponse
+from reasoning.models import Mode
 from workspace.context import ContextEngine, ContextSnapshot
 from workspace.context import adapters as ctx_adapters
 from workspace.context import budget as ctx_budget
@@ -1673,3 +1674,98 @@ class TestSubjectCarryOver(unittest.TestCase):
             second = WorkspaceService(root=root)
             loaded = second.get_conversation("alpha", conversation["id"])
             self.assertIn("contextengine", loaded["subject"])
+
+
+class TestObservedAssessment(unittest.TestCase):
+    """
+    The register a turn was routed to, readable after the fact.
+
+    `Message` records provider, model, tokens and `incomplete`; strategic state
+    is written only for executive turns. So a grounded turn left no trace of why
+    it was grounded, and anything checking that routing behaved had to re-run the
+    router and compare its answer to itself -- measuring a reconstruction rather
+    than the execution path.
+
+    This is observational metadata. Nothing branches on it, and a caller that
+    ignores the key behaves exactly as before.
+    """
+
+    def test_a_turn_reports_the_register_it_was_routed_to(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alpha = _project_tree(root, "alpha")
+            service = WorkspaceService(
+                root=root,
+                engine=_engine(root, {"alpha": alpha}),
+                responder=ProviderWorkspaceResponder(FakeProvider()),
+            )
+            conversation = service.create_conversation("alpha", "a")
+            result = service.send_message("alpha", conversation["id"], "what is this project?")
+
+            self.assertIn("assessment", result)
+            observed = result["assessment"]
+            # Without a reasoning layer wired there is no assessment, which is a
+            # real outcome rather than a missing field.
+            if observed is not None:
+                self.assertIn(observed["mode"], ("grounded", "executive"))
+                self.assertIsInstance(observed["continuation"], bool)
+                self.assertIsInstance(observed["stale"], bool)
+
+    def test_existing_keys_are_untouched(self):
+        """Additive means additive: no caller loses anything."""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alpha = _project_tree(root, "alpha")
+            service = WorkspaceService(
+                root=root,
+                engine=_engine(root, {"alpha": alpha}),
+                responder=ProviderWorkspaceResponder(FakeProvider()),
+            )
+            conversation = service.create_conversation("alpha", "a")
+            result = service.send_message("alpha", conversation["id"], "hello")
+            for key in ("conversation", "user_message", "assistant_message", "context"):
+                self.assertIn(key, result)
+
+    def test_it_carries_no_prompt_or_hidden_reasoning(self):
+        """
+        Same rule as StrategicState: only what a reader could have seen.
+
+        A field here that was never on screen would be hidden reasoning wearing a
+        different struct, and it would travel to every API client.
+        """
+        from workspace.service import observed_assessment
+
+        class _Score:
+            value = 0.5
+
+        class _Rec:
+            statement = "Do the thing"
+            initiative_slug = "billing"
+            alternatives = ()
+            evidence_strength = _Score()
+            confidence = _Score()
+            execution_risk = _Score()
+
+        class _Assessment:
+            mode = Mode.EXECUTIVE
+            mode_reason = "matched next-work"
+            continuation = False
+            stale = False
+            stale_because = ""
+            obsolete = False
+            replaced_stale = False
+            has_reasoning = True
+            recommendations = [_Rec()]
+            initiatives: list[Any] = []
+
+        observed = observed_assessment(_Assessment())
+        assert observed is not None
+        for banned in ("prompt", "context", "snapshot", "instruction", "system", "reasoning_text"):
+            self.assertNotIn(banned, observed)
+        self.assertEqual(observed["mode"], "executive")
+        self.assertEqual(observed["confidence"], 0.5)
+
+    def test_no_assessment_is_a_real_outcome(self):
+        from workspace.service import observed_assessment
+
+        self.assertIsNone(observed_assessment(None))

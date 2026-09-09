@@ -302,6 +302,9 @@ class WorkspaceService:
             "user_message": user_message.to_dict(),
             "assistant_message": assistant_message.to_dict(),
             "context": snapshot.to_dict() if snapshot else None,
+            # Additive and observational: what the reasoning layer concluded, so
+            # the execution path can be inspected rather than reconstructed.
+            "assessment": observed_assessment(assessment),
         }
 
     def stream_message(
@@ -830,6 +833,67 @@ __all__ = [
 # a question the project barely covers — without firing on every ordinary lookup,
 # which would attach a memo to "where is X defined".
 THIN_CONTEXT_ITEMS = 8
+
+
+def observed_assessment(assessment: Any) -> dict[str, Any] | None:
+    """
+    What the reasoning layer concluded this turn, as plain data.
+
+    **Observational metadata.** Nothing in MondayOS branches on it and no
+    existing caller is affected; it is additive, and a client that ignores it
+    behaves exactly as before.
+
+    It exists because the register a turn was routed to was not recoverable
+    afterwards. `Message` records provider, model, tokens and `incomplete`, and
+    strategic state is written only for executive turns -- so a grounded turn
+    left no trace of *why* it was grounded. Anything checking that routing
+    behaved had to re-run the router and compare its own answer to itself, which
+    measures a reconstruction rather than the execution path. A harness that
+    cannot see what happened cannot report that something else did.
+
+    Only fields already visible in a completed answer appear here: the register
+    and why, whether this continued a prior decision, whether that decision had
+    gone stale, and the three scores the user was shown. No prompt, no context
+    snapshot, no rejected candidate, no model reasoning -- the same rule
+    `StrategicState` holds, for the same reason.
+    """
+    if assessment is None:
+        return None
+
+    top = assessment.recommendations[0] if getattr(assessment, "recommendations", None) else None
+    slug = ""
+    if top is not None:
+        slug = str(getattr(top, "initiative_slug", "") or "")
+
+    def _value(score: Any) -> float:
+        return round(float(getattr(score, "value", 0.0) or 0.0), 4)
+
+    return {
+        "mode": getattr(assessment.mode, "value", str(assessment.mode)),
+        "mode_reason": str(getattr(assessment, "mode_reason", "")),
+        "continuation": bool(getattr(assessment, "continuation", False)),
+        "stale": bool(getattr(assessment, "stale", False)),
+        "stale_because": str(getattr(assessment, "stale_because", "")),
+        "obsolete": bool(getattr(assessment, "obsolete", False)),
+        "replaced_stale": bool(getattr(assessment, "replaced_stale", False)),
+        "has_reasoning": bool(getattr(assessment, "has_reasoning", False)),
+        "recommendation": str(getattr(top, "statement", "")) if top is not None else "",
+        "recommendation_key": (
+            recommendation_key(str(top.statement), slug) if top is not None else ""
+        ),
+        "initiative_slug": slug,
+        "initiative_slugs": [
+            str(getattr(i, "slug", "")) for i in getattr(assessment, "initiatives", []) or []
+        ],
+        "alternatives": [
+            str(getattr(a, "statement", "")) for a in getattr(top, "alternatives", ()) or ()
+        ]
+        if top is not None
+        else [],
+        "evidence_strength": _value(getattr(top, "evidence_strength", None)) if top else 0.0,
+        "confidence": _value(getattr(top, "confidence", None)) if top else 0.0,
+        "execution_risk": _value(getattr(top, "execution_risk", None)) if top else 0.0,
+    }
 
 
 def _capture_strategy(

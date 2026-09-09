@@ -170,6 +170,25 @@ class AIProvider(ABC):
         return 2
 
     @property
+    def reports_stop_reason(self) -> bool:
+        """
+        True when this provider says *why* generation stopped.
+
+        Without it, an answer cut off at the token limit is indistinguishable
+        from one that finished: the text simply ends, and it reads as complete.
+        MondayOS marks such an answer `incomplete` only when the provider says
+        so, which means on a silent provider the distinction cannot be made at
+        all.
+
+        Declared as a capability rather than inferred from the provider's name,
+        so a caller can ask what is knowable here instead of keeping its own
+        table of which vendors report what. A checker that cannot verify a
+        property should say so -- asserting it against a provider that cannot
+        report it would be measuring nothing and calling it a pass.
+        """
+        return False
+
+    @property
     def supports_streaming(self) -> bool:
         """
         True when this provider emits incremental chunks.
