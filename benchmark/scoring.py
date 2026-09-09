@@ -29,7 +29,12 @@ from benchmark.probes import CorpusProbe
 # failure rather than a note, because these are the numbers the stabilization
 # increments exist to raise.
 NO_REGRESSION: frozenset[str] = frozenset(
-    {"routing_accuracy", "citation_navigability", "retrieval_grounded_rate"}
+    {
+        "routing_accuracy",
+        "citation_navigability",
+        "line_capable_navigability",
+        "retrieval_grounded_rate",
+    }
 )
 
 # Tolerance for float comparison only — not a slack allowance. Rates are computed
@@ -75,6 +80,10 @@ class Observations:
     retrieval_grounded_rate: float = 0.0
     why_decision_hit: bool = False
     citation_navigability: float = 0.0
+    # Navigability over the citations that could carry a line at all. The overall
+    # rate is what a reader experiences; this one is what the system controls,
+    # and a project whose answers lean on history is not penalised for it.
+    line_capable_navigability: float = 0.0
     citations: dict[str, Any] = field(default_factory=dict)
     initiatives: list[dict[str, str]] = field(default_factory=list)
     known_failing: list[dict[str, Any]] = field(default_factory=list)
@@ -87,6 +96,7 @@ class Observations:
             "retrieval_grounded_rate": round(self.retrieval_grounded_rate, 4),
             "why_decision_hit": self.why_decision_hit,
             "citation_navigability": round(self.citation_navigability, 4),
+            "line_capable_navigability": round(self.line_capable_navigability, 4),
             "citations": self.citations,
             "initiatives": self.initiatives,
             "known_failing": self.known_failing,
@@ -103,6 +113,7 @@ def score(probe: CorpusProbe) -> tuple[Assertions, Observations]:
     observations = Observations(
         citations=probe.citations.to_dict(),
         citation_navigability=probe.citations.to_dict()["navigability"],
+        line_capable_navigability=probe.citations.to_dict()["line_capable_navigability"],
         initiatives=probe.initiatives,
     )
 

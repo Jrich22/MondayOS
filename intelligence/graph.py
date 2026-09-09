@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.boundary import nested_roots
 from core.vcs import git, scope_for
 from intelligence.index import ProjectIndex
 from intelligence.models import Edge, EdgeKind, FileKind, Node, NodeKind
@@ -156,6 +157,22 @@ def _add_files(graph: RelationshipGraph, index: ProjectIndex) -> None:
         graph.add_node(Node(id=f"file:{path}", kind=kind, label=path, path=path))
 
 
+def project_boundaries(index: ProjectIndex) -> frozenset[str]:
+    """
+    The nested projects inside this index, by shape rather than by name.
+
+    Exposed because retrieval needs the same answer the graph used: a decision
+    belonging to a nested project must be unreachable when the question is about
+    the parent, not merely absent from what the model chose to mention.
+    """
+    source_dirs = frozenset(
+        path.rpartition("/")[0]
+        for path, entry in index.files.items()
+        if entry.kind is FileKind.SOURCE and "/" in path
+    )
+    return nested_roots(index.files, source_dirs)
+
+
 def _add_decisions(graph: RelationshipGraph, index: ProjectIndex) -> dict[str, dict[str, str]]:
     """
     ADR nodes, parsed from the project's own decision records.
@@ -171,6 +188,7 @@ def _add_decisions(graph: RelationshipGraph, index: ProjectIndex) -> dict[str, d
     log, so a sourcingBOT file naming ADR-017 links to sourcingBOT's ADR-017.
     """
     found: dict[str, dict[str, str]] = {}
+    roots = project_boundaries(index)
     for entry in index.files_of(FileKind.DECISION):
         try:
             text = (index.root / entry.path).read_text(encoding="utf-8", errors="replace")
@@ -182,7 +200,7 @@ def _add_decisions(graph: RelationshipGraph, index: ProjectIndex) -> dict[str, d
             status_match = _ADR_STATUS.search(text, match.end(), match.end() + 400)
             status = status_match.group(1).strip() if status_match else ""
             line = text.count("\n", 0, match.start()) + 1
-            scope = _scope_of(entry.path)
+            scope = _scope_of(entry.path, roots)
             node_id = f"adr:{scope}:{adr_id}" if scope else f"adr:{adr_id}"
             graph.add_node(
                 Node(
@@ -197,20 +215,29 @@ def _add_decisions(graph: RelationshipGraph, index: ProjectIndex) -> dict[str, d
     return found
 
 
-def _scope_of(path: str) -> str:
+def _scope_of(path: str, roots: frozenset[str] = frozenset()) -> str:
     """
-    Which sub-project a path belongs to, or "" for the root project.
+    Which nested project a path belongs to, or "" for the root project.
 
     `projects/sourcingbot/docs/DECISIONS.md` -> `projects/sourcingbot`.
-    Everything else -> "" (the repository's own decisions).
+
+    ``roots`` comes from `core.boundary`, which finds them by shape. The previous
+    version tested `parts[0] == "projects"` -- true of this repository and of
+    nothing else, so a repository nesting its projects anywhere but `projects/`
+    silently merged their decision logs with its own.
     """
-    parts = path.split("/")
-    if len(parts) >= 2 and parts[0] == "projects":
-        return f"{parts[0]}/{parts[1]}"
+    for root in roots:
+        if path == root or path.startswith(f"{root}/"):
+            return root
     return ""
 
 
-def _resolve_decision(decisions: dict[str, dict[str, str]], adr_id: str, from_path: str) -> str:
+def _resolve_decision(
+    decisions: dict[str, dict[str, str]],
+    adr_id: str,
+    from_path: str,
+    roots: frozenset[str] = frozenset(),
+) -> str:
     """
     The ADR node a reference means, given where the reference was written.
 
@@ -218,7 +245,7 @@ def _resolve_decision(decisions: dict[str, dict[str, str]], adr_id: str, from_pa
     project's. Returns "" when no log defines that id, so an unresolvable
     reference produces no edge rather than a wrong one.
     """
-    scope = _scope_of(from_path)
+    scope = _scope_of(from_path, roots)
     if scope and adr_id in decisions.get(scope, {}):
         return decisions[scope][adr_id]
     return decisions.get("", {}).get(adr_id, "")
@@ -301,13 +328,14 @@ def _link_code_to_decisions(
     graph: RelationshipGraph, index: ProjectIndex, decisions: dict[str, dict[str, str]]
 ) -> None:
     """A file naming an ADR is the code pointing at the decision behind it."""
+    roots = project_boundaries(index)
     for path, entry in index.files.items():
         if entry.kind is FileKind.DECISION:
             continue
         for ref in sorted(entry.references):
             if not ref.startswith("ADR-"):
                 continue
-            node = _resolve_decision(decisions, ref, path)
+            node = _resolve_decision(decisions, ref, path, roots)
             if node:
                 graph.add_edge(
                     Edge(f"file:{path}", node, EdgeKind.REFERENCES, f"{path} names {ref}")

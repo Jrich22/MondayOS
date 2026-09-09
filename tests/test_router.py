@@ -258,3 +258,140 @@ class TestPathParity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStrategicPhrasingsS4(unittest.TestCase):
+    """
+    The five phrasings the S2 benchmark recorded as routing grounded.
+
+    Four were plain gaps: no pattern covered "what is blocking us", codebase
+    health, or a choice between two courses of action, and the priorities pattern
+    required a literal space where people write a hyphen. None of them was caught
+    by a guard — they simply fell through — which is why widening the patterns
+    cannot weaken the lookup override.
+    """
+
+    def test_blockers_route_executive(self):
+        for question in (
+            "What is blocking us?",
+            "What are the blockers?",
+            "What's blocking the release?",
+            "What is holding us back?",
+            "What's in our way?",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(ROUTER.route(question).executive, question)
+
+    def test_codebase_health_routes_executive(self):
+        for question in (
+            "How healthy is this codebase?",
+            "What is the overall health of the project?",
+            "How is the repo doing?",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(ROUTER.route(question).executive, question)
+
+    def test_a_choice_between_two_courses_routes_executive(self):
+        for question in (
+            "Should we refactor or ship?",
+            "Should we harden this or start the next feature?",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(ROUTER.route(question).executive, question)
+
+    def test_highest_leverage_survives_a_hyphen(self):
+        """The whole defect was one character."""
+        self.assertTrue(ROUTER.route("What is the highest-leverage thing to do?").executive)
+        self.assertTrue(ROUTER.route("What is the highest leverage thing to do?").executive)
+
+
+class TestElaborationIsContinuationOnly(unittest.TestCase):
+    """
+    "Say more" must never open Executive Mode.
+
+    It has no subject of its own. With a strategic decision in play it can only
+    mean "say more about that decision"; in a fresh or grounded thread it has no
+    referent at all, and answering it with a memo would be the router inventing a
+    conversation that never happened.
+    """
+
+    ELABORATIONS = (
+        "Say more about that.",
+        "Tell me more.",
+        "Go on.",
+        "Elaborate.",
+        "Expand on that.",
+    )
+
+    def test_grounded_without_prior_strategic_state(self):
+        for question in self.ELABORATIONS:
+            with self.subTest(question=question):
+                route = ROUTER.route(question)
+                self.assertIs(route.register, Register.GROUNDED, question)
+                self.assertFalse(route.executive, question)
+
+    def test_continuation_with_prior_strategic_state(self):
+        for question in self.ELABORATIONS:
+            with self.subTest(question=question):
+                route = ROUTER.route(question, strategy=_state(), fingerprint="FP-1")
+                self.assertIs(route.register, Register.CONTINUATION, question)
+
+    def test_elaboration_on_a_stale_decision_still_describes_rather_than_acts(self):
+        """
+        Describing a past recommendation is always safe; acting on a stale one is
+        not. "Say more" asks to describe, so it stays a continuation even when the
+        world has moved.
+        """
+        route = ROUTER.route("Say more about that.", strategy=_state(), fingerprint="FP-2")
+        self.assertIs(route.register, Register.CONTINUATION)
+        self.assertTrue(route.stale)
+        self.assertFalse(route.current_action)
+
+
+class TestStrategicWideningDidNotLeak(unittest.TestCase):
+    """
+    Adversarial near-misses: code questions that share a word with a strategic
+    pattern.
+
+    Each of these contains vocabulary the S4 patterns now match — blocker,
+    health, leverage — while asking for a file and a line. Answering any of them
+    with a memo would bury the answer, which is the failure the lookup override
+    exists to prevent.
+    """
+
+    MUST_STAY_GROUNDED = (
+        "Where is the blocker defined?",
+        "Show me the health check module.",
+        "How does the blocking queue work?",
+        "What file owns the health endpoint?",
+        "What changed in blocking.py?",
+        "Explain the highest-leverage module.",
+    )
+
+    def test_code_questions_sharing_strategic_vocabulary_stay_grounded(self):
+        for question in self.MUST_STAY_GROUNDED:
+            with self.subTest(question=question):
+                self.assertIs(ROUTER.route(question).register, Register.GROUNDED, question)
+
+    def test_they_stay_grounded_inside_a_strategic_thread_too(self):
+        """The lookup override is unconditional; a live decision must not change it."""
+        for question in self.MUST_STAY_GROUNDED:
+            with self.subTest(question=question):
+                route = ROUTER.route(question, strategy=_state(), fingerprint="FP-1")
+                self.assertIs(route.register, Register.GROUNDED, question)
+
+    def test_explain_is_a_lookup_by_rule_rather_than_by_accident(self):
+        """
+        `Explain X` used to reach grounded only by matching no strategic pattern.
+
+        That held until a strategic pattern grew wide enough to catch one, which
+        S4's priorities fix did: "Explain the highest-leverage module" contains a
+        priorities phrase. The guard now says so explicitly.
+        """
+        route = ROUTER.route("Explain the retention package.")
+        self.assertIs(route.register, Register.GROUNDED)
+        self.assertIn("lookup", route.reason)
+
+    def test_an_or_question_phrased_as_a_lookup_stays_grounded(self):
+        route = ROUTER.route("Show me whether we should use Redis or Postgres.")
+        self.assertIs(route.register, Register.GROUNDED)

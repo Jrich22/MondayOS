@@ -8,11 +8,13 @@
       },
       "available": true,
       "observations": {
-        "citation_navigability": 0.1667,
+        "citation_navigability": 0.6111,
         "citations": {
-          "file_only": 30,
-          "navigability": 0.1667,
-          "navigable": 6,
+          "file_only": 14,
+          "line_capable": 22,
+          "line_capable_navigability": 1.0,
+          "navigability": 0.6111,
+          "navigable": 22,
           "outside_root": 0,
           "total": 36,
           "unresolved": 0
@@ -93,51 +95,6 @@
         ],
         "known_failing": [
           {
-            "because": "routes grounded; no pattern matches this phrasing",
-            "case_id": "routing.strategic.blocking-us",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "cue-app",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; no pattern matches this phrasing",
-            "case_id": "routing.strategic.how-healthy",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "cue-app",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; no pattern matches this phrasing",
-            "case_id": "routing.strategic.refactor-or-ship",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "cue-app",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; 'leverage' pattern requires a different shape",
-            "case_id": "routing.strategic.highest-leverage",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "cue-app",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; no back-reference pattern covers it",
-            "case_id": "routing.strategic.say-more",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "cue-app",
-            "still_failing": true
-          },
-          {
             "because": "decision retrieval matches ADR titles only, not bodies",
             "case_id": "retrieval.why-decision",
             "dimension": "retrieval",
@@ -147,15 +104,10 @@
             "still_failing": true
           }
         ],
+        "line_capable_navigability": 1.0,
         "retrieval_grounded_rate": 0.8,
-        "routing_accuracy": 0.7222,
-        "routing_false_negatives": [
-          "routing.strategic.blocking-us",
-          "routing.strategic.highest-leverage",
-          "routing.strategic.how-healthy",
-          "routing.strategic.refactor-or-ship",
-          "routing.strategic.say-more"
-        ],
+        "routing_accuracy": 1.0,
+        "routing_false_negatives": [],
         "routing_false_positives": [],
         "why_decision_hit": false
       },
@@ -163,8 +115,8 @@
       "volatile": {
         "files": 150,
         "graph_nodes": 164,
-        "index_ms": 126,
-        "retrieval_ms": 11,
+        "index_ms": 160,
+        "retrieval_ms": 12,
         "symbols": 444
       }
     },
@@ -176,13 +128,15 @@
       },
       "available": true,
       "observations": {
-        "citation_navigability": 0.1159,
+        "citation_navigability": 0.7126,
         "citations": {
-          "file_only": 61,
-          "navigability": 0.1159,
-          "navigable": 8,
+          "file_only": 25,
+          "line_capable": 62,
+          "line_capable_navigability": 1.0,
+          "navigability": 0.7126,
+          "navigable": 62,
           "outside_root": 0,
-          "total": 69,
+          "total": 87,
           "unresolved": 0
         },
         "initiatives": [
@@ -303,51 +257,6 @@
         ],
         "known_failing": [
           {
-            "because": "routes grounded; no pattern matches this phrasing",
-            "case_id": "routing.strategic.blocking-us",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "mondayos",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; no pattern matches this phrasing",
-            "case_id": "routing.strategic.how-healthy",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "mondayos",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; no pattern matches this phrasing",
-            "case_id": "routing.strategic.refactor-or-ship",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "mondayos",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; 'leverage' pattern requires a different shape",
-            "case_id": "routing.strategic.highest-leverage",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "mondayos",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; no back-reference pattern covers it",
-            "case_id": "routing.strategic.say-more",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "mondayos",
-            "still_failing": true
-          },
-          {
             "because": "decision retrieval matches ADR titles only, not bodies",
             "case_id": "retrieval.why-decision",
             "dimension": "retrieval",
@@ -357,25 +266,20 @@
             "still_failing": false
           }
         ],
+        "line_capable_navigability": 1.0,
         "retrieval_grounded_rate": 1.0,
-        "routing_accuracy": 0.7222,
-        "routing_false_negatives": [
-          "routing.strategic.blocking-us",
-          "routing.strategic.highest-leverage",
-          "routing.strategic.how-healthy",
-          "routing.strategic.refactor-or-ship",
-          "routing.strategic.say-more"
-        ],
+        "routing_accuracy": 1.0,
+        "routing_false_negatives": [],
         "routing_false_positives": [],
         "why_decision_hit": true
       },
       "reason": "",
       "volatile": {
-        "files": 733,
-        "graph_nodes": 992,
-        "index_ms": 976,
-        "retrieval_ms": 12,
-        "symbols": 5585
+        "files": 737,
+        "graph_nodes": 1004,
+        "index_ms": 1023,
+        "retrieval_ms": 19,
+        "symbols": 5643
       }
     },
     "sourcingbot": {
@@ -386,13 +290,15 @@
       },
       "available": true,
       "observations": {
-        "citation_navigability": 0.0833,
+        "citation_navigability": 0.3846,
         "citations": {
-          "file_only": 11,
-          "navigability": 0.0833,
-          "navigable": 1,
+          "file_only": 8,
+          "line_capable": 5,
+          "line_capable_navigability": 1.0,
+          "navigability": 0.3846,
+          "navigable": 5,
           "outside_root": 0,
-          "total": 12,
+          "total": 13,
           "unresolved": 0
         },
         "initiatives": [
@@ -441,51 +347,6 @@
         ],
         "known_failing": [
           {
-            "because": "routes grounded; no pattern matches this phrasing",
-            "case_id": "routing.strategic.blocking-us",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "sourcingbot",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; no pattern matches this phrasing",
-            "case_id": "routing.strategic.how-healthy",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "sourcingbot",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; no pattern matches this phrasing",
-            "case_id": "routing.strategic.refactor-or-ship",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "sourcingbot",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; 'leverage' pattern requires a different shape",
-            "case_id": "routing.strategic.highest-leverage",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "sourcingbot",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; no back-reference pattern covers it",
-            "case_id": "routing.strategic.say-more",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "sourcingbot",
-            "still_failing": true
-          },
-          {
             "because": "decision retrieval matches ADR titles only, not bodies",
             "case_id": "retrieval.why-decision",
             "dimension": "retrieval",
@@ -495,15 +356,10 @@
             "still_failing": false
           }
         ],
+        "line_capable_navigability": 1.0,
         "retrieval_grounded_rate": 1.0,
-        "routing_accuracy": 0.7222,
-        "routing_false_negatives": [
-          "routing.strategic.blocking-us",
-          "routing.strategic.highest-leverage",
-          "routing.strategic.how-healthy",
-          "routing.strategic.refactor-or-ship",
-          "routing.strategic.say-more"
-        ],
+        "routing_accuracy": 1.0,
+        "routing_false_negatives": [],
         "routing_false_positives": [],
         "why_decision_hit": true
       },
@@ -511,8 +367,8 @@
       "volatile": {
         "files": 69,
         "graph_nodes": 96,
-        "index_ms": 86,
-        "retrieval_ms": 10,
+        "index_ms": 84,
+        "retrieval_ms": 12,
         "symbols": 192
       }
     },
@@ -524,11 +380,13 @@
       },
       "available": true,
       "observations": {
-        "citation_navigability": 0.0984,
+        "citation_navigability": 0.5902,
         "citations": {
-          "file_only": 55,
-          "navigability": 0.0984,
-          "navigable": 6,
+          "file_only": 25,
+          "line_capable": 36,
+          "line_capable_navigability": 1.0,
+          "navigability": 0.5902,
+          "navigable": 36,
           "outside_root": 0,
           "total": 61,
           "unresolved": 0
@@ -561,51 +419,6 @@
         ],
         "known_failing": [
           {
-            "because": "routes grounded; no pattern matches this phrasing",
-            "case_id": "routing.strategic.blocking-us",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "weatherbot",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; no pattern matches this phrasing",
-            "case_id": "routing.strategic.how-healthy",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "weatherbot",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; no pattern matches this phrasing",
-            "case_id": "routing.strategic.refactor-or-ship",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "weatherbot",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; 'leverage' pattern requires a different shape",
-            "case_id": "routing.strategic.highest-leverage",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "weatherbot",
-            "still_failing": true
-          },
-          {
-            "because": "routes grounded; no back-reference pattern covers it",
-            "case_id": "routing.strategic.say-more",
-            "dimension": "routing",
-            "expected": "executive",
-            "observed": "grounded",
-            "project": "weatherbot",
-            "still_failing": true
-          },
-          {
             "because": "decision retrieval matches ADR titles only, not bodies",
             "case_id": "retrieval.why-decision",
             "dimension": "retrieval",
@@ -615,15 +428,10 @@
             "still_failing": true
           }
         ],
+        "line_capable_navigability": 1.0,
         "retrieval_grounded_rate": 0.8,
-        "routing_accuracy": 0.7222,
-        "routing_false_negatives": [
-          "routing.strategic.blocking-us",
-          "routing.strategic.highest-leverage",
-          "routing.strategic.how-healthy",
-          "routing.strategic.refactor-or-ship",
-          "routing.strategic.say-more"
-        ],
+        "routing_accuracy": 1.0,
+        "routing_false_negatives": [],
         "routing_false_positives": [],
         "why_decision_hit": false
       },
@@ -631,8 +439,8 @@
       "volatile": {
         "files": 207,
         "graph_nodes": 259,
-        "index_ms": 197,
-        "retrieval_ms": 10,
+        "index_ms": 233,
+        "retrieval_ms": 13,
         "symbols": 818
       }
     }

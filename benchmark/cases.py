@@ -42,6 +42,12 @@ class Case:
     expect_register: str = ""
     expect_grounded: bool | None = None
     expect_cites_kind: str = ""
+    # Whether this case is asked with a strategic decision already in play. Some
+    # questions have no fixed register: "Say more" is a follow-up when there is
+    # something to follow up on and an ordinary question when there is not, and a
+    # benchmark that can only ask statelessly has to pick one and be wrong half
+    # the time.
+    with_prior_state: bool = False
     known_failing: bool = False
     because: str = ""
 
@@ -73,37 +79,32 @@ _STRATEGIC = [
     ("biggest-risk", "What is our biggest technical risk?", False, ""),
     ("demo-ready", "Are we ready for a demo?", False, ""),
     ("investor", "What would an investor ask?", False, ""),
-    # The five strategic phrasings that route grounded today. Declared, measured,
-    # and left alone: S2 records the weakness, S4 fixes it.
+    # The strategic phrasings S2 recorded as routing grounded. S4 fixed them, so
+    # they are ordinary cases now -- kept because a fixed bug is worth a
+    # permanent test, and a phrasing that regressed would fail here first.
     (
         "blocking-us",
         "What is blocking us?",
-        True,
-        "routes grounded; no pattern matches this phrasing",
+        False,
+        "",
     ),
     (
         "how-healthy",
         "How healthy is this codebase?",
-        True,
-        "routes grounded; no pattern matches this phrasing",
+        False,
+        "",
     ),
     (
         "refactor-or-ship",
         "Should we refactor or ship?",
-        True,
-        "routes grounded; no pattern matches this phrasing",
+        False,
+        "",
     ),
     (
         "highest-leverage",
         "What is the highest-leverage thing to do?",
-        True,
-        "routes grounded; 'leverage' pattern requires a different shape",
-    ),
-    (
-        "say-more",
-        "Say more about that.",
-        True,
-        "routes grounded; no back-reference pattern covers it",
+        False,
+        "",
     ),
 ]
 
@@ -127,6 +128,25 @@ ROUTING_CASES: tuple[Case, ...] = tuple(
             because=because,
         )
         for name, question, failing, because in _STRATEGIC
+    ]
+    # "Say more" is the whole contract in two cases. It must never open Executive
+    # Mode on its own -- in a fresh or grounded thread it has no referent, and
+    # answering it with a memo would invent a conversation that never happened.
+    # With a decision in play it can only mean that decision.
+    + [
+        Case(
+            id="routing.elaboration.say-more-cold",
+            dimension=Dimension.ROUTING,
+            question="Say more about that.",
+            expect_register="grounded",
+        ),
+        Case(
+            id="routing.elaboration.say-more-warm",
+            dimension=Dimension.ROUTING,
+            question="Say more about that.",
+            expect_register="continuation",
+            with_prior_state=True,
+        ),
     ]
 )
 

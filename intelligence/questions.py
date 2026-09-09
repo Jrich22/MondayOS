@@ -22,15 +22,16 @@ the difference between a tool and a search box.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
+from core.boundary import outside
 from core.vcs import RepoScope, git, scope_for
 from intelligence.evidence import Citation, CitationKind, Evidence
-from intelligence.graph import RelationshipGraph
+from intelligence.graph import RelationshipGraph, project_boundaries
 from intelligence.index import STOPWORDS, ProjectIndex
-from intelligence.models import FileKind, Node, NodeKind, Symbol
+from intelligence.models import FileKind, IndexedFile, Node, NodeKind, Symbol
 
 
 class Intent(Enum):
@@ -202,6 +203,9 @@ class QuestionEngine:
         # Resolved lazily and cached: it shells out to git, and the project root
         # is fixed at construction so the answer cannot change mid-engine.
         self._repo_scope: RepoScope | None = None
+        # The nested projects inside this one. Same reasoning: fixed at
+        # construction, consulted by every retrieval path.
+        self._nested: frozenset[str] | None = None
 
     def _scope(self) -> RepoScope:
         """Where this project sits relative to version control."""
@@ -307,10 +311,21 @@ class QuestionEngine:
                     because=reason,
                 )
             )
-            # What implements the decision is part of why it still holds.
+            # What implements the decision is part of why it still holds. These
+            # files are here because they name the ADR, so the line where they
+            # name it is exactly where a reader should land -- a real occurrence,
+            # not a guess.
+            adr = _adr_id(node.label)
             for other, edge in self._graph.related(node.id, depth=1, limit=6):
                 if other.kind in (NodeKind.FILE, NodeKind.TASK):
-                    evidence.add(self._cite_node(other, edge.because))
+                    citation = self._cite_node(other, edge.because)
+                    if not citation.line and other.kind is NodeKind.FILE and adr:
+                        line = self._line_for(
+                            other.path, self._index.files.get(other.path), [adr.lower()]
+                        )
+                        if line:
+                            citation = replace(citation, line=line)
+                    evidence.add(citation)
 
         if not found:
             # No ADR covers this — say so, and still show what the subject *is*.
@@ -322,10 +337,8 @@ class QuestionEngine:
             # written down, but here is the implementation and its docs" is both
             # true and useful; bare silence is neither.
             for path, reason in self._files_matching(terms, kinds={FileKind.DOCUMENTATION})[:4]:
-                evidence.add(self._cite_file(path, reason))
-            for symbol in [s for t in terms[:2] for s in self._index.search_symbols(t, limit=3)][
-                :4
-            ]:
+                evidence.add(self._cite_file(path, reason, terms=terms))
+            for symbol in [s for t in terms[:2] for s in self._symbols(t, 3)][:4]:
                 evidence.add(
                     Citation(
                         kind=CitationKind.SYMBOL,
@@ -363,7 +376,7 @@ class QuestionEngine:
         evidence = Evidence()
         definitions: list[Symbol] = []
         for term in terms[:3]:
-            definitions.extend(self._index.search_symbols(term, limit=8))
+            definitions.extend(self._symbols(term, 8))
 
         seen: set[tuple[str, int]] = set()
         unique: list[Symbol] = []
@@ -389,7 +402,7 @@ class QuestionEngine:
         # Files that mention it but do not define it — the usage sites.
         mentions = self._files_matching(terms, exclude={s.path for s in unique})
         for path, reason in mentions[:8]:
-            evidence.add(self._cite_file(path, reason))
+            evidence.add(self._cite_file(path, reason, terms=terms))
 
         if not unique and not mentions:
             return Answer(
@@ -416,7 +429,7 @@ class QuestionEngine:
         evidence = Evidence()
         buckets: dict[str, list[str]] = {}
 
-        for symbol in [s for t in terms[:2] for s in self._index.search_symbols(t, limit=6)][:10]:
+        for symbol in [s for t in terms[:2] for s in self._symbols(t, 6)][:10]:
             evidence.add(
                 Citation(
                     kind=CitationKind.SYMBOL,
@@ -446,11 +459,11 @@ class QuestionEngine:
             buckets.setdefault("Decisions", []).append(node.label)
 
         for path, reason in self._files_matching(terms, kinds={FileKind.TEST})[:6]:
-            evidence.add(self._cite_file(path, reason, kind=CitationKind.TEST))
+            evidence.add(self._cite_file(path, reason, kind=CitationKind.TEST, terms=terms))
             buckets.setdefault("Tests", []).append(path)
 
         for path, reason in self._files_matching(terms, kinds={FileKind.DOCUMENTATION})[:6]:
-            evidence.add(self._cite_file(path, reason))
+            evidence.add(self._cite_file(path, reason, terms=terms))
             buckets.setdefault("Documentation", []).append(path)
 
         for task in self._tasks_matching(terms)[:5]:
@@ -551,7 +564,7 @@ class QuestionEngine:
         evidence = Evidence()
         docs = self._files_matching(terms, kinds={FileKind.DOCUMENTATION, FileKind.DECISION})
         for path, reason in docs[:10]:
-            evidence.add(self._cite_file(path, reason))
+            evidence.add(self._cite_file(path, reason, terms=terms))
 
         if not docs:
             return Answer(
@@ -573,7 +586,7 @@ class QuestionEngine:
         that this was a broad match rather than a targeted one.
         """
         evidence = Evidence()
-        for symbol in [s for t in terms[:2] for s in self._index.search_symbols(t, limit=4)][:6]:
+        for symbol in [s for t in terms[:2] for s in self._symbols(t, 4)][:6]:
             evidence.add(
                 Citation(
                     kind=CitationKind.SYMBOL,
@@ -586,7 +599,7 @@ class QuestionEngine:
                 )
             )
         for path, reason in self._files_matching(terms)[:8]:
-            evidence.add(self._cite_file(path, reason))
+            evidence.add(self._cite_file(path, reason, terms=terms))
 
         if evidence.empty:
             return Answer(
@@ -615,7 +628,7 @@ class QuestionEngine:
         hits: dict[str, int] = {}
         for term in terms[:5]:
             for path in self._index.files_with(term):
-                if path in excluded:
+                if path in excluded or not self._own(path):
                     continue
                 entry = self._index.files.get(path)
                 if kinds and (entry is None or entry.kind not in kinds):
@@ -626,20 +639,132 @@ class QuestionEngine:
         used = min(len(terms), 5)
         return [(path, f"matches {count}/{used} term(s)") for path, count in ordered]
 
+    @property
+    def _boundaries(self) -> frozenset[str]:
+        """
+        The nested projects inside this one, computed once per engine.
+
+        Cached because every retrieval path consults it and the answer cannot
+        change while the index is fixed.
+        """
+        if self._nested is None:
+            self._nested = project_boundaries(self._index)
+        return self._nested
+
+    def _own(self, path: str) -> bool:
+        """
+        Whether a path belongs to this project rather than one nested inside it.
+
+        Applied to every retrieval path, not only to decisions. A question about
+        MondayOS answered with Cue App's source is the same failure as one
+        answered with sourcingBOT's ADR, and both were reachable: the filesystem
+        assertion cannot see it, because a nested project genuinely lives inside
+        the parent's root.
+        """
+        return not outside(path, self._boundaries)
+
+    def _symbols(self, term: str, limit: int) -> list[Symbol]:
+        """Symbol definitions in this project, excluding nested ones."""
+        return [s for s in self._index.search_symbols(term, limit=limit * 2) if self._own(s.path)][
+            :limit
+        ]
+
+    def _own_decisions(self) -> list[Node]:
+        """
+        This project's decision records, with nested projects' excluded.
+
+        MondayOS's index contains sourcingBOT's `docs/DECISIONS.md`, so its
+        decision graph holds all nineteen of sourcingBOT's ADRs alongside its own
+        forty-one. Both logs define an ADR-001. Without this filter, asking
+        MondayOS why something was decided can return another project's reasoning
+        as MondayOS's own.
+
+        The filter is here, at retrieval, rather than in the answer text: the
+        requirement is that the wrong evidence is *unavailable*, not that it goes
+        unmentioned. `citations_outside_root` never caught this because
+        `projects/sourcingbot/docs/DECISIONS.md` is genuinely inside MondayOS's
+        root -- the boundary that matters is the project's, not the filesystem's.
+        """
+        return [n for n in self._graph.of_kind(NodeKind.DECISION) if self._own(n.path)]
+
     def _decisions_matching(self, question: str, terms: list[str]) -> list[tuple[Node, str]]:
-        """ADR nodes matching an explicit id, else matching the subject terms."""
-        nodes = self._graph.of_kind(NodeKind.DECISION)
+        """
+        ADR nodes matching an explicit id, else the subject terms — title first.
+
+        Two tiers, in this order and never interleaved:
+
+        1. **Title.** `ADR-017: Project Context Isolation` answers a question
+           about context isolation, and the title is the decision's own statement
+           of what it is about.
+        2. **Body.** A decision can settle a question its title never names —
+           "why do we cache this way" may be argued inside an ADR called
+           something else entirely. Matching titles alone made that reasoning
+           unreachable, which is a retrieval gap rather than a wording problem.
+
+        Tier 2 is appended after every tier-1 hit, so a title match can never be
+        displaced by a body match. That ordering is the guarantee, not a ranking
+        heuristic that usually works out.
+        """
+        nodes = self._own_decisions()
         explicit = {m.group(1).upper() for m in _ADR_REF.finditer(question)}
         if explicit:
             return [(n, "named in the question") for n in nodes if _adr_id(n.label) in explicit]
 
-        found = []
+        by_title: list[tuple[Node, str]] = []
+        seen: set[str] = set()
         for node in nodes:
-            label = node.label.lower()
-            matched = [t for t in terms if _mentions(label, t)]
+            matched = [t for t in terms if _mentions(node.label.lower(), t)]
             if matched:
-                found.append((node, f"decision title mentions {', '.join(matched)}"))
-        return found[:6]
+                seen.add(node.id)
+                by_title.append((node, f"decision title mentions {', '.join(matched)}"))
+
+        by_body = [
+            (node, reason)
+            for node, reason in self._decision_bodies(nodes, terms)
+            if node.id not in seen
+        ]
+        return (by_title + by_body)[:6]
+
+    def _decision_bodies(self, nodes: list[Node], terms: list[str]) -> list[tuple[Node, str]]:
+        """
+        Decisions whose *text* discusses the subject, cited at the line it starts.
+
+        A decision log holds many ADRs in one file, so the question is which one
+        contains the match. Each node knows the line its heading sits on; the
+        section runs from there to the next heading, and a term found inside that
+        span belongs to that decision. The citation therefore points at a real
+        heading a reader can open, rather than at the top of a long file.
+        """
+        if not terms:
+            return []
+        by_file: dict[str, list[Node]] = {}
+        for node in nodes:
+            by_file.setdefault(node.path, []).append(node)
+
+        found: list[tuple[Node, str]] = []
+        for path, group in sorted(by_file.items()):
+            entry = self._index.files.get(path)
+            # The index already knows which words a file contains. Reading a file
+            # that cannot match would be work done to learn nothing.
+            if entry is None or not any(t in entry.terms for t in terms):
+                continue
+            try:
+                lines = (
+                    (self._index.root / path)
+                    .read_text(encoding="utf-8", errors="replace")
+                    .splitlines()
+                )
+            except OSError:
+                continue
+            ordered = sorted(group, key=lambda n: n.line)
+            for position, node in enumerate(ordered):
+                start = node.line
+                end = ordered[position + 1].line - 1 if position + 1 < len(ordered) else len(lines)
+                body = " ".join(lines[start:end]).lower()
+                matched = [t for t in terms if _mentions(body, t)]
+                if matched:
+                    found.append((node, f"decision body discusses {', '.join(matched)}"))
+        return found
 
     def _tasks_matching(self, terms: list[str]) -> list[dict[str, Any]]:
         if not terms:
@@ -672,13 +797,51 @@ class QuestionEngine:
         return commits
 
     def _cite_file(
-        self, path: str, because: str, kind: CitationKind = CitationKind.FILE
+        self,
+        path: str,
+        because: str,
+        kind: CitationKind = CitationKind.FILE,
+        terms: list[str] | None = None,
     ) -> Citation:
+        """
+        A citation for a file, carrying a line when the file can honestly supply one.
+
+        "workspace/service.py" is a hint; "workspace/service.py:82" is checkable.
+        Two sources of a line, in order, and both are evidence that already
+        exists rather than a number chosen to look precise:
+
+        1. a symbol the index recorded, when one is named by the subject — the
+           definition is where a reader wants to land;
+        2. the line where a subject term actually occurs in the file.
+
+        When neither applies the citation stays file-only. A line nobody can
+        check is worse than no line at all, because it looks like precision.
+        """
         entry = self._index.files.get(path)
         actual = kind
         if entry and entry.kind is FileKind.TEST:
             actual = CitationKind.TEST
-        return Citation(kind=actual, reference=path, label=path, path=path, because=because)
+        line = self._line_for(path, entry, terms or [])
+        return Citation(
+            kind=actual, reference=path, label=path, path=path, line=line, because=because
+        )
+
+    def _line_for(self, path: str, entry: IndexedFile | None, terms: list[str]) -> int:
+        """The line this file's match sits on, or 0 when none can be established."""
+        if not terms:
+            return 0
+        for symbol in entry.symbols if entry else []:
+            if any(_mentions(symbol.name.lower(), t) for t in terms):
+                return symbol.line
+        try:
+            text = (self._index.root / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return 0
+        for number, content in enumerate(text.splitlines(), 1):
+            lowered = content.lower()
+            if any(t in lowered for t in terms):
+                return number
+        return 0
 
     def _cite_node(self, node: Node, because: str) -> Citation:
         mapping = {

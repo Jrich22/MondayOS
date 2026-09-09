@@ -61,6 +61,10 @@ LAYERS = {
 # Documents that describe work rather than being it.
 PLAN_DOCUMENTS = ("Roadmap", "Delivery Plan")
 
+# A word argued inside a decision but named in no decision title. Retrieval can
+# only reach it by reading the body.
+BODY_ONLY_TOPIC = "idempotent"
+
 
 def build(root: Path) -> Path:
     """Write the corpus under `root` and return it. Creates a git repository."""
@@ -100,6 +104,32 @@ def build(root: Path) -> Path:
     # Depth, so bounded recursion is exercised rather than assumed.
     write("source/handlers/deep/nested/deeper/thing.py", "class Thing:\n    pass\n")
     write("source/handlers/deep/nested/deeper/other.py", "class Other:\n    pass\n")
+
+    # A decision log whose ADR titles deliberately do not name everything they
+    # settle. ADR-002's title is about scheduling; the reasoning it records is
+    # about idempotency, which appears nowhere in any title. That is what makes
+    # body-level decision retrieval testable: a question about idempotency can
+    # only be answered by reading the decision, never by matching its heading.
+    write(
+        "docs/DECISIONS.md",
+        """
+        # Decisions
+
+        ## ADR-001: Billing charges are recorded before they are sent
+
+        **Status:** Accepted
+
+        Writing the ledger entry first means a crash cannot lose money.
+
+        ## ADR-002: Scheduling runs on a single worker
+
+        **Status:** Accepted
+
+        One worker keeps ordering simple. Every job is therefore written to be
+        idempotent, so a retry after a crash repeats work without repeating
+        effects.
+        """,
+    )
 
     write("docs/ROADMAP.md", "# Roadmap\n\nWhat we intend to ship.\n")
     write("docs/DELIVERY_PLAN.md", "# Delivery Plan\n\nPhases and dates.\n")
