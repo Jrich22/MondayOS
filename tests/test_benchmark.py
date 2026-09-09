@@ -71,17 +71,19 @@ class TestCaseInventory(unittest.TestCase):
         """
         A benchmark with no failing cases is evidence the questions were chosen
         to pass. Today's real weaknesses must be represented.
+
+        S4 fixed the five routing phrasings this used to name, so naming them
+        here would now assert that a fixed bug is still broken. What remains
+        genuinely unsolved is `retrieval.why-decision`, and for a reason no
+        amount of retrieval work can change: Cue App has no decision records at
+        all, and WeatherBot's three ADRs are about script layout, smoke tests and
+        runtime artefacts rather than its forecast pipeline. The honest answer on
+        those corpora is that nothing was written down.
         """
         failing = [c.id for c in ALL_CASES if c.known_failing]
         self.assertTrue(failing, "no known failures declared — were the cases chosen to pass?")
         self.assertIn("retrieval.why-decision", failing)
-        for name in (
-            "blocking-us",
-            "how-healthy",
-            "refactor-or-ship",
-            "highest-leverage",
-            "say-more",
-        ):
+        for name in ():
             self.assertIn(f"routing.strategic.{name}", failing)
 
     def test_every_known_failure_says_why(self):
@@ -405,16 +407,24 @@ class TestBaselineGate(unittest.TestCase):
         self.assertTrue(result.ok, result.render())
 
     def test_a_regression_fails(self):
+        """
+        A real run measured against a baseline claiming better must fail.
+
+        Measured on navigability rather than routing accuracy: routing is at
+        1.0 after S4, and a baseline cannot claim better than perfect. Overall
+        navigability cannot reach 1.0 while any answer cites a commit, so this
+        stays a real comparison rather than one that quietly stops testing.
+        """
         self._require_corpora()
         import copy
 
         worse = copy.deepcopy(self.baseline)
         for corpus in worse.get("corpora", {}).values():
             if corpus.get("available"):
-                corpus["observations"]["routing_accuracy"] = 1.0
+                corpus["observations"]["citation_navigability"] = 1.0
         result = verdict(self.report, worse)
         self.assertFalse(result.ok)
-        self.assertTrue(any("routing_accuracy fell" in f for f in result.failures))
+        self.assertTrue(any("citation_navigability fell" in f for f in result.failures))
 
     def test_an_improvement_fails_with_an_explicit_stale_baseline_message(self):
         """

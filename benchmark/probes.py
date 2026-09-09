@@ -82,6 +82,12 @@ class CitationBreakdown:
     file_only: int = 0  # a real file, but no line
     unresolved: int = 0  # names something that is not on disk
     outside_root: int = 0  # points outside the project — an isolation failure
+    # Citations that could carry a line at all. A commit is evidence about a
+    # change, not a place in a file; counting it against navigability measures
+    # how much history an answer cited rather than how well it pointed. Both
+    # rates are reported, because the overall one is what a reader experiences
+    # and the scoped one is what the system can actually control.
+    line_capable: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -90,7 +96,11 @@ class CitationBreakdown:
             "file_only": self.file_only,
             "unresolved": self.unresolved,
             "outside_root": self.outside_root,
+            "line_capable": self.line_capable,
             "navigability": round(self.navigable / self.total, 4) if self.total else 0.0,
+            "line_capable_navigability": (
+                round(self.navigable / self.line_capable, 4) if self.line_capable else 0.0
+            ),
         }
 
 
@@ -108,6 +118,23 @@ class CorpusProbe:
     volatile: dict[str, Any] = field(default_factory=dict)
 
 
+class _PriorDecision:
+    """
+    A strategic decision already on the record.
+
+    The minimum the router reads: a topic, and a fingerprint matching the one the
+    probe passes, so the decision is current rather than stale. Staleness is its
+    own behaviour with its own tests; this fixture is about whether a follow-up
+    has anything to follow.
+    """
+
+    topic = "next-work"
+    fingerprint = "benchmark"
+
+
+_PRIOR_STATE = _PriorDecision()
+
+
 def run_routing(corpus: Corpus) -> list[CaseResult]:
     """
     Route every routing case and record the register.
@@ -121,7 +148,12 @@ def run_routing(corpus: Corpus) -> list[CaseResult]:
         if case.dimension is not Dimension.ROUTING:
             continue
         question = case.render(corpus.nouns)
-        register = ROUTER.route(question).register.value
+        # A case that names a prior state is routed with one. The state is a
+        # fixture rather than the corpus's own, so routing stays a pure function
+        # of the question and the state it is given -- which is what lets the
+        # same cases run against every project.
+        strategy = _PRIOR_STATE if case.with_prior_state else None
+        register = ROUTER.route(question, strategy=strategy, fingerprint="benchmark").register.value
         out.append(
             CaseResult(
                 case_id=case.id,
@@ -181,6 +213,11 @@ def run_retrieval(corpus: Corpus) -> tuple[list[CaseResult], CitationBreakdown]:
 def _classify_citations(answer: Any, root: Path | None, breakdown: CitationBreakdown) -> None:
     for citation in answer.evidence.citations:
         breakdown.total += 1
+        # A commit or pull request names a change, not a place in a file. It is
+        # counted in the total a reader sees, and excluded from the rate that
+        # measures how well the system points at code.
+        if citation.kind.value not in ("commit", "pull-request"):
+            breakdown.line_capable += 1
         if not citation.path:
             # Artefact references — a commit sha, a task id — name something real
             # without being a file. Counted, but not as a path failure.
