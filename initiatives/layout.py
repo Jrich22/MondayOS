@@ -37,6 +37,7 @@ import collections
 import re
 from dataclasses import dataclass
 
+from core.boundary import nested_roots as core_nested_roots
 from intelligence.index import ProjectIndex
 from intelligence.models import FileKind, IndexedFile
 
@@ -141,22 +142,6 @@ STRUCTURAL = frozenset(
         "schema",
         "widget",
         "field",
-    }
-)
-
-# Files marking the root of a project. Every ecosystem already has one, which is
-# why this needs no knowledge of which projects a given repository vendors.
-PROJECT_MARKERS = frozenset(
-    {
-        "package.json",
-        "pyproject.toml",
-        "setup.py",
-        "Cargo.toml",
-        "go.mod",
-        "pom.xml",
-        "build.gradle",
-        "Gemfile",
-        "composer.json",
     }
 )
 
@@ -282,28 +267,21 @@ def nested_roots(files: dict[str, IndexedFile]) -> frozenset[str]:
     """
     Directories that *hold* other projects, as opposed to being one.
 
-    `dashboard/` has a package.json and is MondayOS's own frontend; `projects/`
-    has no source of its own and every child under it is a project root. Only the
-    second is a boundary. Asking "does this directory contain projects, or is it
-    one?" is structural, so it stays true for a monorepo, a vendored dependency
-    tree, or a repository with no nested projects at all.
-    """
-    holders: dict[str, set[str]] = collections.defaultdict(set)
-    has_own_source: set[str] = set()
-    for path, entry in files.items():
-        segments = path.split("/")
-        if len(segments) > 1 and segments[-1] in PROJECT_MARKERS:
-            holders["/".join(segments[:-2])].add("/".join(segments[:-1]))
-        if entry.kind is FileKind.SOURCE and len(segments) > 1:
-            has_own_source.add("/".join(segments[:-1]))
+    The rule itself lives in `core.boundary`, which `intelligence` also uses to
+    scope retrieval. This function only supplies the shape that rule needs: the
+    paths, and which directories have source of their own.
 
-    roots: set[str] = set()
-    for parent, children in holders.items():
-        # A directory with source of its own is doing work, not merely holding
-        # other people's. The repository root is never a boundary.
-        if parent and parent not in has_own_source:
-            roots |= children
-    return frozenset(roots)
+    It used to carry its own copy of both the marker set and the algorithm. The
+    two agreed, and nothing made them agree -- a change applied to one would have
+    left discovery and retrieval disagreeing about where a project ends, which is
+    the exact class of bug S1 and S4 existed to remove.
+    """
+    source_dirs = frozenset(
+        path.rpartition("/")[0]
+        for path, entry in files.items()
+        if entry.kind is FileKind.SOURCE and "/" in path
+    )
+    return core_nested_roots(files, source_dirs)
 
 
 def _source_share(files: dict[str, IndexedFile]) -> dict[str, int]:

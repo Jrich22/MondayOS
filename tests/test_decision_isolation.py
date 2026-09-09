@@ -26,7 +26,7 @@ from core.boundary import nested_roots, outside
 from intelligence.graph import build as build_graph
 from intelligence.graph import project_boundaries
 from intelligence.index import build as build_index
-from intelligence.models import NodeKind
+from intelligence.models import FileKind, NodeKind
 from intelligence.questions import QuestionEngine
 
 PARENT_ADRS = """# Decisions
@@ -169,3 +169,124 @@ class TestDecisionsAreScopedToTheirProject(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBoundaryHasExactlyOneImplementation(unittest.TestCase):
+    """
+    RC1/ACC-005. The rule that decides where a project ends is written once.
+
+    `core/boundary.py` and `initiatives/layout.py` each carried their own
+    `PROJECT_MARKERS` and their own `nested_roots`. Retrieval used one copy,
+    discovery the other. They agreed, and nothing made them agree: a marker added
+    to one and not the other would leave discovery and retrieval disagreeing
+    about where a project ends, which is the exact class of bug S1 and S4 existed
+    to remove. The S4 commit that introduced `core/boundary.py` claimed the two
+    could not drift; that claim was false as shipped.
+
+    These tests assert the property structurally rather than behaviourally.
+    Checking that the two agree *today* is what a duplicated implementation
+    passes right up until the day it does not; checking that there is only one
+    is what makes drift impossible.
+    """
+
+    SOURCE_ROOT = Path(__file__).resolve().parent.parent
+
+    def _modules_defining(self, name: str) -> list[str]:
+        """Every module in the repository that assigns or defines ``name``."""
+        import ast
+
+        found: list[str] = []
+        for path in sorted(self.SOURCE_ROOT.glob("*/*.py")):
+            if any(part.startswith(".") or part == "tests" for part in path.parts):
+                continue
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (OSError, SyntaxError):
+                continue
+            for node in tree.body:
+                defines = (
+                    isinstance(node, ast.FunctionDef)
+                    and node.name == name
+                    # A body that only delegates is not a second implementation.
+                    and not _is_delegating(node)
+                ) or (
+                    isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+                )
+                if defines:
+                    found.append(str(path.relative_to(self.SOURCE_ROOT)))
+        return found
+
+    def test_project_markers_are_defined_once(self):
+        defining = self._modules_defining("PROJECT_MARKERS")
+        self.assertEqual(defining, ["core/boundary.py"], defining)
+
+    def test_the_boundary_rule_is_implemented_once(self):
+        """
+        `initiatives.layout.nested_roots` may exist, but only as a delegation.
+
+        It adapts an index into the shape the rule needs and calls the rule. What
+        it must not do is decide anything itself.
+        """
+        defining = self._modules_defining("nested_roots")
+        self.assertEqual(defining, ["core/boundary.py"], defining)
+
+    def test_the_adapter_really_delegates(self):
+        """Behavioural backstop for the structural assertion above."""
+        from core.boundary import nested_roots as core_rule
+        from initiatives.layout import nested_roots as adapter
+
+        files = {
+            "engine/run.py": _entry(FileKind.SOURCE),
+            "projects/web/package.json": _entry(FileKind.CONFIG),
+            "projects/web/src/app.tsx": _entry(FileKind.SOURCE),
+        }
+        source_dirs = frozenset({"engine", "projects/web/src"})
+        self.assertEqual(adapter(files), core_rule(files, source_dirs))
+        self.assertEqual(adapter(files), frozenset({"projects/web"}))
+
+    def test_discovery_and_retrieval_agree_on_the_same_project(self):
+        """
+        The two callers, asked about one tree, must answer identically.
+
+        This is the property the duplication endangered: `intelligence.graph`
+        scopes retrieval and `initiatives.layout` scopes discovery, and a project
+        boundary they disagreed about would let one of them reach evidence the
+        other had ruled out.
+        """
+        from initiatives.layout import nested_roots as discovery_rule
+        from intelligence.graph import project_boundaries
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for relative, text in (
+                ("pyproject.toml", "[project]\nname='parent'\n"),
+                ("engine/a.py", "x = 1\n"),
+                ("engine/b.py", "x = 2\n"),
+                ("projects/nested/package.json", '{"name":"n"}\n'),
+                ("projects/nested/src/app.ts", "export const x = 1;\n"),
+            ):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            index = build_index("parent", root, cache_root=root / ".idx")
+            self.assertEqual(project_boundaries(index), discovery_rule(index.files))
+
+
+def _is_delegating(node) -> bool:
+    """Whether a function body ends in a call to something imported as the rule."""
+    import ast
+
+    for statement in ast.walk(node):
+        if isinstance(statement, ast.Return) and isinstance(statement.value, ast.Call):
+            called = statement.value.func
+            name = getattr(called, "id", "") or getattr(called, "attr", "")
+            if "nested_roots" in name:
+                return True
+    return False
+
+
+def _entry(kind):
+    from intelligence.models import IndexedFile
+
+    return IndexedFile(path="x", kind=kind, size=0, mtime=0, lines=0, digest="")
