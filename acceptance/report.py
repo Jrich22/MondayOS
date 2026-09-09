@@ -166,6 +166,18 @@ class AcceptanceReport:
 
     # --------------------------------------------------------- readiness copy
 
+    def _answered(self) -> int:
+        """
+        Turns that actually produced text.
+
+        Reported next to the total because a run where the provider was down
+        completes every turn without answering any of them, and gate 13 passes
+        -- correctly, since nothing asked for clarification. "13 turns recorded"
+        would read as thirteen answers; it is not the gate's job to say so, but
+        it is the readiness page's.
+        """
+        return sum(1 for t in self.turns if getattr(t, "answer_chars", 0) > 0)
+
     def readiness_markdown(self) -> str:
         """The release checklist."""
         exercised = sorted(s for s, r in self.projects.items() if r.get("available"))
@@ -183,7 +195,7 @@ class AcceptanceReport:
             f" · reports stop reason: {self.provider.get('reports_stop_reason', False)}",
             f"- **Projects exercised:** {', '.join(exercised) or 'none'}",
             f"- **Projects skipped:** {', '.join(skipped) or 'none'}",
-            f"- **Turns recorded:** {len(self.turns)}",
+            f"- **Turns recorded:** {len(self.turns)} ({self._answered()} produced an answer)",
             f"- **Provider incidents:** {len(self.incidents)}"
             " (reported, never counted as product failures)",
             "",
