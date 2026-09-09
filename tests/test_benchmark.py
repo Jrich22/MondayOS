@@ -465,11 +465,20 @@ class TestBaselineGate(unittest.TestCase):
         including what it does badly. If these ever pass, S4 landed and the
         baseline must be re-recorded deliberately.
 
-        The discovery half of this test has already served its purpose. It
-        asserted that cue-app reported one initiative called "src" -- a weakness
-        recorded rather than hidden -- and S3 fixed it. What replaces it is the
-        property that made the old assertion worth writing: a container is not a
+        Both halves have now served their purpose, and both are replaced by the
+        property that made them worth writing rather than deleted.
+
+        The discovery half asserted cue-app reported one initiative called "src".
+        S3 fixed that; what remains asserted is that a container is not a
         capability, so whatever cue-app reports, it is not that.
+
+        The routing half named five strategic phrasings recorded as failing. S4
+        fixed all five, so naming them would now assert that a fixed bug is still
+        broken. What remains is `retrieval.why-decision`, which is still failing
+        and will stay failing for a reason no retrieval work can change: Cue App
+        has no decision records at all, and WeatherBot's three ADRs are about
+        script layout, smoke tests and runtime artefacts rather than its forecast
+        pipeline. A benchmark that recorded those as passing would be lying.
         """
         self._require_corpora()
         corpora = self.baseline.get("corpora", {})
@@ -489,14 +498,14 @@ class TestBaselineGate(unittest.TestCase):
                     for k in corpus["observations"]["known_failing"]
                     if k.get("still_failing")
                 }
-                for name in (
-                    "blocking-us",
-                    "how-healthy",
-                    "refactor-or-ship",
-                    "highest-leverage",
-                    "say-more",
-                ):
-                    self.assertIn(f"routing.strategic.{name}", failing)
+                # Routing is solved: no routing case may still be failing.
+                self.assertFalse(
+                    {c for c in failing if c.startswith("routing.")},
+                    f"{slug} records a routing failure S4 was meant to fix",
+                )
+                # Retrieval is not, on the two corpora with no matching ADR.
+                if slug in ("cue-app", "weatherbot"):
+                    self.assertIn("retrieval.why-decision", failing)
 
     def test_the_baseline_records_zero_leaks_and_zero_false_positives(self):
         self._require_corpora()
