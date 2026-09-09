@@ -45,7 +45,7 @@ from initiatives import layout as layout_model
 from initiatives.models import Initiative, Member, Seed, slugify
 from intelligence.graph import RelationshipGraph
 from intelligence.index import ProjectIndex
-from intelligence.models import FileKind, NodeKind
+from intelligence.models import FileKind, IndexedFile, NodeKind
 
 # Which directories are infrastructure is no longer a list. `initiatives.layout`
 # decides it by shape -- a directory with no source in it is not a capability,
@@ -62,9 +62,52 @@ _ARTEFACT_STEM = re.compile(r"^[a-z]{2,12}[-_ ]?\d{2,}$", re.I)
 # Directories that hold one document per artefact rather than per capability.
 # Deliberately not the package exclusion set: `docs/` belongs there and must not
 # be filtered here, since it is where capability documents actually live.
-_ARTEFACT_DOC_DIRS = frozenset(
-    {"tasks", "knowledge", "logs", "agents", "conversations", "screenshots", "workspace"}
-)
+def record_stores(index: ProjectIndex) -> frozenset[str]:
+    """
+    Directories whose contents are filed records rather than work.
+
+    A store is recognised by what is in it: most of its files are named after an
+    identifier rather than a subject. `tasks/active/` holds TASK-0020.md and
+    nothing else; `knowledge/decisions/` holds DEC-0001.md. Reading the shape
+    rather than the name means a project whose real capability happens to be
+    called `tasks` keeps it, and a project that files its records somewhere this
+    one has never heard of still has them recognised.
+    """
+    counts: dict[str, list[bool]] = {}
+    for path in index.files:
+        directory, _, filename = path.rpartition("/")
+        if not directory:
+            continue
+        stem = filename.rsplit(".", 1)[0]
+        counts.setdefault(directory, []).append(bool(_ARTEFACT_STEM.match(stem.replace("_", "-"))))
+    return frozenset(
+        directory
+        for directory, flags in counts.items()
+        if len(flags) >= 2 and sum(flags) * 2 > len(flags)
+    )
+
+
+def _is_record(path: str, entry: IndexedFile, stores: frozenset[str]) -> bool:
+    """
+    Whether a file is a filed record rather than part of a capability.
+
+    Code and tests are never records: they are the implementation, whatever they
+    are named or wherever they sit. Everything else is a record if its name is an
+    identifier, or if it lives in a store.
+
+    This is what keeps `Task System` from reporting eighty-nine members when six
+    of them are the code and the rest are the tasks it tracks. A member list is
+    the implementation surface a user inspects, and it feeds health, progress and
+    the roster's own ordering -- inflating it with the contents of a store makes
+    the capability that owns the store look like the biggest thing in the
+    project.
+    """
+    if entry.kind in (FileKind.SOURCE, FileKind.TEST):
+        return False
+    stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    if _ARTEFACT_STEM.match(stem.replace("_", "-")):
+        return True
+    return path.rpartition("/")[0] in stores
 
 
 # A task title of the form "Cue App: Roll Call". The prefix names the capability.
@@ -137,12 +180,6 @@ _DOCUMENT_QUALIFIERS = frozenset(
     }
 )
 
-# Transport words. A capability reached over one of these is the same capability:
-# `dashboard_api` is how `dashboard` is served, not a second thing the product
-# does.
-_TRANSPORT = frozenset({"api", "service", "server", "client", "cli", "rpc", "http", "web"})
-
-
 # Short all-caps tokens are acronyms and must survive naming intact. Title-casing
 # them produces "Ai Workspace", which is not what anyone calls it and makes the
 # derived name look broken in exactly the place a user first sees it.
@@ -182,16 +219,16 @@ def seeds_from_tasks(tasks: list[dict[str, Any]]) -> list[Seed]:
 
 def seeds_from_docs(index: ProjectIndex) -> list[Seed]:
     out: list[Seed] = []
+    stores = record_stores(index)
     for path, entry in sorted(index.files.items()):
         if entry.kind is not FileKind.DOCUMENTATION:
             continue
-        # A document inside an infrastructure directory describes work, not a
-        # capability. Every file under tasks/ is documentation by file kind, and
-        # without this each one becomes an initiative named after a task id.
-        if any(segment in _ARTEFACT_DOC_DIRS for segment in path.split("/")[:-1]):
-            continue
-        stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-        if _ARTEFACT_STEM.match(stem.replace("_", "-")):
+        # A filed record describes one unit of work inside a capability, not a
+        # capability. Recognised by the shape of its name and by living in a
+        # store, rather than by which directories this repository happens to keep
+        # its records in -- a project with a real capability called `workspace`
+        # or `tasks` must not lose it to another project's filing habits.
+        if _is_record(path, entry, stores):
             continue
         name = _doc_name(path)
         out.append(
@@ -366,24 +403,6 @@ def _merge(seeds: list[Seed]) -> list[Seed]:
     return merged
 
 
-def _is_transport_of(seed: Seed, others: list[Seed]) -> str:
-    """
-    The capability this seed is merely a transport for, if any.
-
-    `dashboard_api` beside `dashboard` is one capability and the protocol it is
-    reached over, not two things the product does.
-    """
-    parts = [layout_model.singular(p) for p in seed.slug.split("-")]
-    for other in others:
-        if other is seed or not other.work:
-            continue
-        head = [layout_model.singular(p) for p in other.slug.split("-")]
-        if parts[: len(head)] == head and parts[len(head) :]:
-            if all(part in _TRANSPORT for part in parts[len(head) :]):
-                return other.name
-    return ""
-
-
 def _is_fragment_of(seed: Seed, others: list[Seed]) -> str:
     """
     The longer capability this seed is a broken-off piece of, if any.
@@ -454,6 +473,9 @@ def _gather(
 ) -> list[Member]:
     members: list[Member] = []
     seen: set[str] = set()
+    # Membership is the capability's implementation surface plus the documents
+    # that genuinely describe it -- not everything filed beneath the same path.
+    stores = record_stores(index)
 
     def add(node_id: str, kind: NodeKind, label: str, because: str) -> None:
         if node_id in seen:
@@ -464,6 +486,8 @@ def _gather(
     # Files, by owned path prefix. The strongest signal available: a path is not
     # a guess about what something is for.
     for path, entry in sorted(index.files.items()):
+        if _is_record(path, entry, stores):
+            continue
         for prefix in seed.paths:
             if path.startswith(prefix):
                 kind = NodeKind.TEST if entry.kind is FileKind.TEST else NodeKind.FILE
@@ -523,9 +547,12 @@ def _gather(
         if hit:
             add(node.id, NodeKind.PULL_REQUEST, node.label, f"pull request names '{hit}'")
 
-    # Documentation naming the initiative, wherever it lives.
+    # Documentation naming the initiative, wherever it lives. Records are
+    # excluded here too: a task whose title happens to contain the capability's
+    # name is evidence about one unit of work, and it reaches the initiative as a
+    # task node below rather than as implementation surface.
     for path, entry in sorted(index.files.items()):
-        if entry.kind is not FileKind.DOCUMENTATION:
+        if entry.kind is not FileKind.DOCUMENTATION or _is_record(path, entry, stores):
             continue
         hit = _matches(path.replace("_", " ").replace("-", " "), seed.keywords)
         if hit:
@@ -561,8 +588,6 @@ def discover(
         # namespace, and a capability's transport. Both are recognised by shape,
         # so neither needs a list of names to exclude.
         if not seed.declared and _is_project_namespace(seed, index.project):
-            continue
-        if not seed.declared and _is_transport_of(seed, merged):
             continue
         if not seed.declared and _is_fragment_of(seed, merged):
             continue

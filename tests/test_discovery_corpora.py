@@ -38,6 +38,10 @@ REPO = Path(__file__).resolve().parent.parent
 # of these reaches the roster, a document has been mistaken for the work.
 PLAN_WORDS = ("roadmap", "plan", "vision", "implementation", "proposal", "checklist")
 
+# An identifier-shaped filename: TASK-0020, DEC-0001, RES-0138. The same shape
+# discovery uses to tell a filed record from a capability document.
+ARTEFACT = re.compile(r"^[a-z]{2,12}[-_ ]?\d{2,}$", re.I)
+
 # Layout conventions. None of these is a capability in any project.
 CONTAINERS = ("src", "source", "app", "lib", "packages", "components", "pages")
 
@@ -122,6 +126,16 @@ class TestSyntheticCorpus(unittest.TestCase, DiscoveryInvariants):
     def test_every_initiative_rests_on_work(self):
         self.assert_every_initiative_has_work(self.found, "synthetic")
 
+    def test_the_set_is_exactly_the_three_planted_capabilities(self):
+        """
+        Pinned exactly, unlike the real corpora.
+
+        This one is safe to pin because the fixture is the specification: it
+        plants three capabilities, so anything else appearing is a defect rather
+        than a discovery.
+        """
+        self.assertEqual({n.lower() for n in self.names}, set(CAPABILITIES))
+
     def test_nothing_is_named_after_a_nested_directory(self):
         """Bounded recursion: depth must not turn leaf directories into capabilities."""
         for leaf in ("deep", "nested", "deeper", "thing", "other"):
@@ -191,6 +205,43 @@ class TestRealCorpora(unittest.TestCase, DiscoveryInvariants):
     def test_sourcingbot_has_capabilities_rather_than_one_container(self):
         found = self._for("sourcingbot")
         self.assertGreaterEqual(len(found), 3, [i.name for i in found])
+
+    def test_no_record_becomes_a_member_on_any_corpus(self):
+        """
+        A filed record is evidence about one unit of work, not implementation.
+
+        `Task System` once reported 89 members, 79 of them the tasks it tracks.
+        Member counts order the roster and feed health and progress, so a store
+        beside the code made its manager the biggest capability in the project.
+        """
+        for slug in sorted(self.corpora):
+            corpus = self.corpora[slug]
+            if not corpus.available or corpus.root is None:
+                continue
+            with self.subTest(corpus=slug):
+                found = initiatives_for(slug, corpus.root, Path(self._tmp.name) / f"rec-{slug}")
+                for initiative in found:
+                    for member in initiative.members:
+                        if not member.node_id.startswith("file:"):
+                            continue
+                        stem = member.label.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                        self.assertIsNone(
+                            ARTEFACT.match(stem.replace("_", "-")),
+                            f"{slug}: '{initiative.name}' counts the record {member.label}",
+                        )
+
+    def test_no_member_resolves_outside_its_project_root(self):
+        for slug in sorted(self.corpora):
+            corpus = self.corpora[slug]
+            if not corpus.available or corpus.root is None:
+                continue
+            with self.subTest(corpus=slug):
+                found = initiatives_for(slug, corpus.root, Path(self._tmp.name) / f"out-{slug}")
+                for initiative in found:
+                    for member in initiative.members:
+                        if member.node_id.startswith("file:"):
+                            self.assertFalse(member.label.startswith("/"), member.label)
+                            self.assertNotIn("..", member.label)
 
     def test_weatherbot_reports_code_capabilities_not_document_titles(self):
         """

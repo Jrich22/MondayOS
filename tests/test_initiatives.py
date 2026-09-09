@@ -545,12 +545,26 @@ class TestEvidenceModel(unittest.TestCase):
                 self.assertNotIn(container, names)
                 self.assertIn("billing", names)
 
-    def test_a_transport_is_folded_into_the_capability_it_serves(self):
+    def test_a_transport_is_folded_in_by_the_general_merge(self):
+        """
+        `dashboard` and `dashboard_api` are one capability and its transport.
+
+        There is no transport rule. They merge because `{dashboard}` is a subset
+        of `{dashboard, api}`, which is the same rule that joins `workspace/` to
+        `AI_WORKSPACE.md`. An earlier draft added a dedicated `_is_transport_of`
+        check; it was unreachable, because the merge always ran first, and code
+        that looks like it enforces an architectural rule while doing nothing is
+        worse than no code. This test asserts the merge, not the special case --
+        both directories must appear in the surviving evidence.
+        """
         self._write(*[f"dashboard/mod{i}.py" for i in range(6)])
         self._write(*[f"dashboard_api/route{i}.py" for i in range(5)])
-        names = self._names()
-        self.assertIn("dashboard", names)
-        self.assertNotIn("dashboard_api", names)
+        found = {i.name: i for i in self._discover()}
+        self.assertIn("dashboard", found)
+        self.assertNotIn("dashboard_api", found)
+        because = found["dashboard"].because
+        self.assertIn("under dashboard/", because)
+        self.assertIn("under dashboard_api/", because)
 
     def test_the_projects_own_namespace_is_not_one_of_its_capabilities(self):
         self._write(*[f"monday/mod{i}.py" for i in range(6)])
@@ -575,3 +589,136 @@ class TestEvidenceModel(unittest.TestCase):
         seed = Seed(name="Planned Thing", because="declared", declared=True)
         found = discover(index, build_graph(index, tasks=[], knowledge=[]), [], [seed])
         self.assertIn("Planned Thing", {i.name for i in found})
+
+
+class TestMembershipIsImplementation(unittest.TestCase):
+    """
+    What counts as part of a capability, and what merely sits near it.
+
+    Membership is gathered by path prefix, which is the right signal for code and
+    the wrong one for a store. MondayOS keeps its task records in `tasks/` beside
+    the six modules that manage them, so `Task System` reported eighty-nine
+    members, seventy-nine of which were tasks it tracks rather than code that
+    implements it. The roster sorts by member count, so the capability that owned
+    the biggest store became the biggest thing in the project, and health and
+    progress were computed from the same inflated list.
+
+    A record is recognised by the shape of its name and by living in a store --
+    never by the directory being on a list. A project whose real capability is
+    called `tasks` must keep it.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, *paths: str) -> None:
+        for path in paths:
+            target = self.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# generated\nvalue = 1\n" if path.endswith(".py") else "# doc\n")
+
+    def _discover(self, project: str = "demo") -> dict[str, Initiative]:
+        index = build_index(project, self.root, cache_root=self.root / ".idx")
+        found = discover(index, build_graph(index, tasks=[], knowledge=[]), [])
+        return {i.name: i for i in found}
+
+    def _labels(self, initiative: Initiative) -> list[str]:
+        return [m.label for m in initiative.members]
+
+    def test_task_records_do_not_inflate_the_capability_that_manages_them(self):
+        self._write(*[f"tasks/mod{i}.py" for i in range(5)])
+        self._write(*[f"tasks/active/TASK-{i:04d}.md" for i in range(40)])
+        found = self._discover()
+        self.assertIn("tasks", found)
+        labels = self._labels(found["tasks"])
+        self.assertFalse([label for label in labels if "TASK-" in label], labels[:5])
+        self.assertLess(len(labels), 10, labels)
+
+    def test_knowledge_records_do_not_inflate_the_capability_either(self):
+        self._write(*[f"knowledge/mod{i}.py" for i in range(5)])
+        for prefix in ("DEC", "DOC", "PAT", "RES", "SPR"):
+            self._write(*[f"knowledge/{prefix.lower()}/{prefix}-{i:04d}.md" for i in range(8)])
+        found = self._discover()
+        self.assertIn("knowledge", found)
+        labels = self._labels(found["knowledge"])
+        for prefix in ("DEC-", "DOC-", "PAT-", "RES-", "SPR-"):
+            self.assertFalse([label for label in labels if prefix in label], prefix)
+
+    def test_a_record_store_is_recognised_by_shape_not_by_name(self):
+        """A store the author called something else is still a store."""
+        self._write(*[f"ledger/mod{i}.py" for i in range(5)])
+        self._write(*[f"ledger/filed/ENTRY-{i:04d}.md" for i in range(20)])
+        labels = self._labels(self._discover()["ledger"])
+        self.assertFalse([label for label in labels if "ENTRY-" in label], labels[:5])
+
+    def test_source_and_tests_remain_members(self):
+        self._write(*[f"billing/mod{i}.py" for i in range(5)])
+        self._write("tests/test_billing.py")
+        labels = self._labels(self._discover()["billing"])
+        self.assertIn("billing/mod0.py", labels)
+        self.assertIn("tests/test_billing.py", labels)
+
+    def test_capability_documentation_remains_a_member(self):
+        """A README beside the code is somebody explaining the capability."""
+        self._write(*[f"billing/mod{i}.py" for i in range(5)])
+        self._write("billing/README.md")
+        self.assertIn("billing/README.md", self._labels(self._discover()["billing"]))
+
+    def test_no_member_resolves_outside_the_project_root(self):
+        self._write(*[f"billing/mod{i}.py" for i in range(5)])
+        for initiative in self._discover().values():
+            for member in initiative.members:
+                if member.node_id.startswith("file:"):
+                    self.assertFalse(member.label.startswith("/"), member.label)
+                    self.assertNotIn("..", member.label)
+
+    def test_discovery_is_deterministic(self):
+        self._write(*[f"billing/mod{i}.py" for i in range(5)])
+        self._write(*[f"scheduling/mod{i}.py" for i in range(5)])
+        self._write("docs/BILLING.md", "docs/ROADMAP.md")
+        first = [(i.slug, i.name, len(i.members)) for i in self._discover().values()]
+        second = [(i.slug, i.name, len(i.members)) for i in self._discover().values()]
+        self.assertEqual(first, second)
+
+
+class TestStoreNamesAreNotReserved(unittest.TestCase):
+    """
+    The names MondayOS uses for its stores are not forbidden to anyone else.
+
+    Discovery used to carry a list -- tasks, knowledge, logs, agents,
+    conversations, screenshots, workspace -- naming the directories this one
+    repository files things in. Another project with a real `workspace/`
+    capability lost it to a habit of this one. The list is gone; a store is
+    recognised by holding records.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _names_for(self, directory: str) -> set[str]:
+        for i in range(6):
+            path = self.root / directory / f"mod{i}.py"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("value = 1\n")
+        index = build_index("demo", self.root, cache_root=self.root / ".idx")
+        return {i.name for i in discover(index, build_graph(index, tasks=[], knowledge=[]), [])}
+
+    def test_a_real_capability_called_workspace_is_discoverable(self):
+        self.assertIn("workspace", self._names_for("workspace"))
+
+    def test_a_real_capability_called_agents_is_discoverable(self):
+        self.assertIn("agents", self._names_for("agents"))
+
+    def test_a_real_capability_called_tasks_is_discoverable(self):
+        self.assertIn("tasks", self._names_for("tasks"))
+
+    def test_a_real_capability_called_conversations_is_discoverable(self):
+        self.assertIn("conversations", self._names_for("conversations"))

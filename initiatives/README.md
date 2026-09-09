@@ -56,12 +56,14 @@ A missing member is a gap a user can point out. A wrong member is Monday
 confidently misdescribing their product, and it corrupts every number computed
 from it. So the filters are deliberately aggressive:
 
-- documents inside artefact directories are records, not capabilities
-- `TASK-0051.md` is one unit of work inside something, not a something
+- a filed record (`TASK-0051.md`, `DEC-0001.md`) is one unit of work inside
+  something, not a something — recognised by the shape of its name and by living
+  in a store, never by which directories this repository files things in
 - a directory with no source in it is not a capability, whatever it is called
 - an initiative whose only member is its own markdown file is a document
 - a container (`src/`, `app/`) holds capabilities rather than being one
-- a transport (`dashboard_api`) is folded into what it serves
+- a transport (`dashboard_api`) folds into what it serves, by the ordinary
+  token-subset merge rather than by a rule of its own
 - the project's own namespace (`monday/`) is the product, not a part of it
 
 Without these, MondayOS reported 57 initiatives including "Runbook" and
@@ -89,3 +91,16 @@ seeing, so the bands answer *"should I worry"* rather than *"how much is done"*.
 Two initiatives depend on each other when they share an artefact — a fact. Nothing
 is derived from similarity: an invented dependency is a constraint the project
 never agreed to, and it would be acted on as though it had.
+
+## Membership is implementation, not adjacency
+
+Members are gathered by path prefix, which is right for code and wrong for a
+store. MondayOS keeps its task records in `tasks/` beside the six modules that
+manage them, so `Task System` once reported 89 members — 79 of them tasks it
+tracks rather than code implementing it. Because the roster sorts by member
+count and health and progress are computed from the same list, the capability
+that owned the largest store became the largest thing in the project.
+
+So code and tests are always members, and everything else is a member only if it
+is not a filed record. Tasks and decisions still reach an initiative as
+structured evidence; they just do not count as implementation surface.
