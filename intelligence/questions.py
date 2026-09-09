@@ -677,19 +677,83 @@ class QuestionEngine:
         return [n for n in self._graph.of_kind(NodeKind.DECISION) if self._own(n.path)]
 
     def _decisions_matching(self, question: str, terms: list[str]) -> list[tuple[Node, str]]:
-        """ADR nodes matching an explicit id, else matching the subject terms."""
+        """
+        ADR nodes matching an explicit id, else the subject terms — title first.
+
+        Two tiers, in this order and never interleaved:
+
+        1. **Title.** `ADR-017: Project Context Isolation` answers a question
+           about context isolation, and the title is the decision's own statement
+           of what it is about.
+        2. **Body.** A decision can settle a question its title never names —
+           "why do we cache this way" may be argued inside an ADR called
+           something else entirely. Matching titles alone made that reasoning
+           unreachable, which is a retrieval gap rather than a wording problem.
+
+        Tier 2 is appended after every tier-1 hit, so a title match can never be
+        displaced by a body match. That ordering is the guarantee, not a ranking
+        heuristic that usually works out.
+        """
         nodes = self._own_decisions()
         explicit = {m.group(1).upper() for m in _ADR_REF.finditer(question)}
         if explicit:
             return [(n, "named in the question") for n in nodes if _adr_id(n.label) in explicit]
 
-        found = []
+        by_title: list[tuple[Node, str]] = []
+        seen: set[str] = set()
         for node in nodes:
-            label = node.label.lower()
-            matched = [t for t in terms if _mentions(label, t)]
+            matched = [t for t in terms if _mentions(node.label.lower(), t)]
             if matched:
-                found.append((node, f"decision title mentions {', '.join(matched)}"))
-        return found[:6]
+                seen.add(node.id)
+                by_title.append((node, f"decision title mentions {', '.join(matched)}"))
+
+        by_body = [
+            (node, reason)
+            for node, reason in self._decision_bodies(nodes, terms)
+            if node.id not in seen
+        ]
+        return (by_title + by_body)[:6]
+
+    def _decision_bodies(self, nodes: list[Node], terms: list[str]) -> list[tuple[Node, str]]:
+        """
+        Decisions whose *text* discusses the subject, cited at the line it starts.
+
+        A decision log holds many ADRs in one file, so the question is which one
+        contains the match. Each node knows the line its heading sits on; the
+        section runs from there to the next heading, and a term found inside that
+        span belongs to that decision. The citation therefore points at a real
+        heading a reader can open, rather than at the top of a long file.
+        """
+        if not terms:
+            return []
+        by_file: dict[str, list[Node]] = {}
+        for node in nodes:
+            by_file.setdefault(node.path, []).append(node)
+
+        found: list[tuple[Node, str]] = []
+        for path, group in sorted(by_file.items()):
+            entry = self._index.files.get(path)
+            # The index already knows which words a file contains. Reading a file
+            # that cannot match would be work done to learn nothing.
+            if entry is None or not any(t in entry.terms for t in terms):
+                continue
+            try:
+                lines = (
+                    (self._index.root / path)
+                    .read_text(encoding="utf-8", errors="replace")
+                    .splitlines()
+                )
+            except OSError:
+                continue
+            ordered = sorted(group, key=lambda n: n.line)
+            for position, node in enumerate(ordered):
+                start = node.line
+                end = ordered[position + 1].line - 1 if position + 1 < len(ordered) else len(lines)
+                body = " ".join(lines[start:end]).lower()
+                matched = [t for t in terms if _mentions(body, t)]
+                if matched:
+                    found.append((node, f"decision body discusses {', '.join(matched)}"))
+        return found
 
     def _tasks_matching(self, terms: list[str]) -> list[dict[str, Any]]:
         if not terms:
