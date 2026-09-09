@@ -81,7 +81,19 @@ _PATTERNS: tuple[tuple[Topic, re.Pattern[str]], ...] = (
             # "What are you least confident about" asks which conclusions are
             # weakest — a question about the assessment's own soft spots.
             r"|\bleast (?:confident|certain|sure)\b"
-            r"|\bwhat(?:'s| is| are)?\b.{0,30}\bweakest\b",
+            r"|\bwhat(?:'s| is| are)?\b.{0,30}\bweakest\b"
+            # "What is blocking us?" asks what stands between here and done. It
+            # is a risk question asked from the other side.
+            r"|\bwhat(?:'s| is| are)?\s+blocking\b"
+            r"|\bwhat(?:'s| is| are)?\s+(?:the\s+)?blockers?\b"
+            r"|\bwhat(?:'s| is)\s+(?:in (?:the|our) way|holding (?:us|me) (?:back|up))\b"
+            # Health is the same question about the whole rather than a part.
+            # Anchored to the project as a subject, so "the health endpoint" and
+            # "the health check module" are untouched -- those are code.
+            r"|\bhow healthy\b"
+            r"|\bhealth of (?:the|this|our)\b"
+            r"|\bwhat(?:'s| is) the (?:overall |general )?health\b"
+            r"|\bhow (?:is|are) (?:the |this |our )?(?:codebase|project|repo)\s+doing\b",
             re.I,
         ),
     ),
@@ -114,14 +126,23 @@ _PATTERNS: tuple[tuple[Topic, re.Pattern[str]], ...] = (
             # a property of the work rather than as an instruction to choose.
             r"|\bwhat\b.{0,60}\b(?:could|should) (?:we|i) (?:do|build|ship|tackle)\b"
             r"|\b(?:safest|highest[- ]value|best|smartest)\b.{0,40}"
-            r"\b(?:thing|move|next|step|option|bet)\b",
+            r"\b(?:thing|move|next|step|option|bet)\b"
+            # "Should we refactor or ship?" -- a choice between two courses of
+            # action, which is a recommendation request whatever the two are.
+            # Bounded and question-final so it cannot swallow a sentence that
+            # merely contains "or"; the lookup guard still runs first, so an
+            # or-question phrased as a lookup stays grounded.
+            r"|\bshould (?:we|i)\b[^?]{0,44}\bor\b[^?]{0,24}\?",
             re.I,
         ),
     ),
     (
         Topic.PRIORITIES,
         re.compile(
-            r"\b(?:highest|top|most) (?:leverage|impact|important|valuable)\b"
+            # `[- ]` rather than a literal space: "highest-leverage" is how
+            # people actually write it, and the hyphen alone was enough to make
+            # this pattern miss the question it exists for.
+            r"\b(?:highest|top|most)[- ](?:leverage|impact|important|valuable)\b"
             r"|\b(?:three|top|most important)\b.{0,30}\binitiatives?\b"
             r"|\bwhat matters most\b"
             r"|\bhow should (?:we|i) prioriti[sz]e\b"
@@ -161,7 +182,14 @@ _LOOKUP = re.compile(
     r"|\bimplemented (?:in|at)\b"
     r"|\bwhat changed\b"
     r"|\bwhat did (?:we|i|you) (?:change|commit|ship|build)\b"
-    r"|\blast \w+ commits?\b",
+    r"|\blast \w+ commits?\b"
+    # "Explain X" and "walk me through X" are requests to be shown the thing.
+    # Previously these reached grounded only by matching no strategic pattern at
+    # all, which held until a strategic pattern grew wide enough to catch one --
+    # "Explain the highest-leverage module" is a code question containing a
+    # priorities phrase. Making it explicit is what keeps that safe.
+    r"|\bexplain\b"
+    r"|\bwalk me through\b",
     re.I,
 )
 
@@ -209,7 +237,15 @@ _ASSESSMENT_DEICTIC = re.compile(
 # plus a back-reference, not any sentence containing "plan".
 _APPLY_TO_PRIOR = re.compile(
     r"\b(?:turn|make|write|expand|break|flesh|spell)\b[^.?!]{0,24}\b(?:that|it|this|those)\b"
-    r"|\b(?:that|it|this)\b[^.?!]{0,24}\binto a (?:plan|roadmap|sequence|breakdown)\b",
+    r"|\b(?:that|it|this)\b[^.?!]{0,24}\binto a (?:plan|roadmap|sequence|breakdown)\b"
+    # "Say more." "Go on." A request to continue, with no subject of its own.
+    # Anchored to the start so it is an opening move rather than a phrase buried
+    # in a longer question. This lives here, among the self-referential forms,
+    # precisely because everything here is only ever consulted when a strategic
+    # state exists: in a fresh or grounded thread "say more" has no referent and
+    # must stay grounded.
+    r"|^\s*(?:say|tell me) more\b"
+    r"|^\s*(?:go on|elaborate|expand)\b",
     re.I,
 )
 
