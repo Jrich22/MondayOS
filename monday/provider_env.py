@@ -26,6 +26,7 @@ discover.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import urllib.error
@@ -117,16 +118,51 @@ def load_env_file(path: Path, environ: MutableMapping[str, str] | None = None) -
     return loaded
 
 
-def ollama_available(host: str = "", timeout: float = 1.0) -> bool:
-    """Whether a local Ollama daemon is answering. Never raises."""
+def ollama_models(host: str = "", timeout: float = 1.0) -> list[str] | None:
+    """
+    The models a local Ollama daemon has installed, or None if it is not answering.
+
+    None and [] mean different things and the caller needs both: no daemon is a
+    reason to try something else, a daemon with nothing pulled is a reason to say
+    which command fixes it.
+    """
     base = host or os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
     if not base.startswith("http"):
         base = f"http://{base}"
     try:
         with urllib.request.urlopen(f"{base.rstrip('/')}/api/tags", timeout=timeout) as response:
-            return bool(200 <= response.status < 300)
+            if not 200 <= response.status < 300:
+                return None
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
     except (urllib.error.URLError, OSError, ValueError):
+        return None
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return []
+    return [str(m.get("name", "")) for m in models if isinstance(m, dict) and m.get("name")]
+
+
+def ollama_has_model(model: str, installed: list[str]) -> bool:
+    """
+    Whether a model name matches something installed.
+
+    Ollama names carry a tag: `llama3.1:8b`. A request for `llama3.1` means the
+    default tag of that model, so a bare name matches any tag of it; a name that
+    already has a tag must match exactly, because `llama3.1:8b` and
+    `llama3.1:70b` are not interchangeable.
+    """
+    if not model:
         return False
+    if model in installed:
+        return True
+    if ":" in model:
+        return False
+    return any(name.split(":", 1)[0] == model for name in installed)
+
+
+def ollama_available(host: str = "", timeout: float = 1.0) -> bool:
+    """Whether a local Ollama daemon is answering. Never raises."""
+    return ollama_models(host, timeout) is not None
 
 
 def _sdk_available(module: str) -> bool:
@@ -155,8 +191,9 @@ def choose(environ: Mapping[str, str] | None = None) -> ProviderChoice:
         return _describe("anthropic", env, reason="ANTHROPIC_API_KEY is set")
     if env.get("OPENAI_API_KEY") and _sdk_available("openai"):
         return _describe("openai", env, reason="OPENAI_API_KEY is set")
-    if ollama_available():
-        return _describe("ollama", env, reason="a local Ollama daemon is responding")
+    installed = ollama_models()
+    if installed is not None:
+        return _describe_ollama(env, installed)
 
     return ProviderChoice(
         provider="",
@@ -165,6 +202,42 @@ def choose(environ: Mapping[str, str] | None = None) -> ProviderChoice:
             "set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run a local Ollama daemon. "
             "See docs/PROVIDERS.md."
         ),
+    )
+
+
+DEFAULT_OLLAMA_MODEL = "llama3"
+
+
+def _describe_ollama(env: Mapping[str, str], installed: list[str]) -> ProviderChoice:
+    """
+    Ollama, but only if it can actually answer.
+
+    A responding daemon used to be enough to report `configured`. It is not: the
+    daemon answers `/api/tags` whether or not the model MondayOS intends to use
+    has been pulled, so a default install with a different model reported ready
+    and then returned HTTP 404 on every single generation.
+
+    This module already refuses to accept a placeholder API key for exactly this
+    reason -- "it makes a provider look configured and fail at the first call" --
+    and the same standard now applies to the model name. What is checked before
+    the first call cannot surprise anyone during it.
+    """
+    model = (env.get(MODEL_ENV["ollama"], "") or "").strip() or DEFAULT_OLLAMA_MODEL
+    if ollama_has_model(model, installed):
+        return _describe("ollama", env, reason="a local Ollama daemon is responding")
+
+    if not installed:
+        detail = f"it has no models installed. Run: ollama pull {model}"
+    else:
+        available = ", ".join(sorted(installed)[:6])
+        detail = (
+            f"it does not have {model!r} installed. "
+            f"Run `ollama pull {model}`, or set MONDAYOS_OLLAMA_MODEL to one of: {available}"
+        )
+    return ProviderChoice(
+        provider="",
+        model="",
+        reason=f"a local Ollama daemon is responding but {detail}. See docs/PROVIDERS.md.",
     )
 
 
