@@ -115,8 +115,8 @@
       "volatile": {
         "files": 150,
         "graph_nodes": 164,
-        "index_ms": 160,
-        "retrieval_ms": 12,
+        "index_ms": 129,
+        "retrieval_ms": 11,
         "symbols": 444
       }
     },
@@ -209,6 +209,12 @@
           {
             "health": "healthy",
             "members": "10",
+            "name": "acceptance",
+            "slug": "acceptance"
+          },
+          {
+            "health": "healthy",
+            "members": "10",
             "name": "initiatives",
             "slug": "initiatives"
           },
@@ -275,11 +281,11 @@
       },
       "reason": "",
       "volatile": {
-        "files": 737,
-        "graph_nodes": 1004,
-        "index_ms": 1023,
-        "retrieval_ms": 19,
-        "symbols": 5643
+        "files": 747,
+        "graph_nodes": 1019,
+        "index_ms": 973,
+        "retrieval_ms": 18,
+        "symbols": 5740
       }
     },
     "sourcingbot": {
@@ -368,7 +374,7 @@
         "files": 69,
         "graph_nodes": 96,
         "index_ms": 84,
-        "retrieval_ms": 12,
+        "retrieval_ms": 11,
         "symbols": 192
       }
     },
@@ -439,7 +445,7 @@
       "volatile": {
         "files": 207,
         "graph_nodes": 259,
-        "index_ms": 233,
+        "index_ms": 203,
         "retrieval_ms": 13,
         "symbols": 818
       }
