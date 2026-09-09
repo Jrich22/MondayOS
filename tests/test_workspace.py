@@ -1735,8 +1735,11 @@ class TestObservedAssessment(unittest.TestCase):
         """
         from workspace.service import observed_assessment
 
+        # `.score` is the real attribute. This stub previously said `.value`,
+        # which is exactly the mistake the implementation made -- so the test
+        # agreed with the bug and could never have caught it.
         class _Score:
-            value = 0.5
+            score = 0.5
 
         class _Rec:
             statement = "Do the thing"
@@ -1769,3 +1772,115 @@ class TestObservedAssessment(unittest.TestCase):
         from workspace.service import observed_assessment
 
         self.assertIsNone(observed_assessment(None))
+
+    def test_the_three_scores_are_the_computed_ones(self):
+        """
+        RC1/ACC-002. The regression this class did not have.
+
+        `observed_assessment` read each score with `getattr(score, "value", 0.0)`.
+        `Confidence` and `Risk` both expose `.score`, so every field silently
+        took the default and the key reported three zeros on every turn while the
+        real numbers sat one attribute away. The original tests asserted the
+        fields *existed* and were the right type -- which they were, and 0.0 is a
+        float.
+        """
+        from reasoning.models import Confidence, Recommendation
+        from reasoning.options import Risk
+        from workspace.service import observed_assessment
+
+        recommendation = Recommendation(
+            statement="Harden the scheduler",
+            rationale="because",
+            confidence=Confidence(score=0.64),
+            evidence_strength=Confidence(score=0.91),
+            execution_risk=Risk(score=0.30),
+        )
+
+        class _Assessment:
+            mode = Mode.EXECUTIVE
+            mode_reason = "matched next-work"
+            continuation = False
+            stale = False
+            stale_because = ""
+            obsolete = False
+            replaced_stale = False
+            has_reasoning = True
+            recommendations = [recommendation]
+            initiatives: list[Any] = []
+
+        observed = observed_assessment(_Assessment())
+        assert observed is not None
+        self.assertEqual(observed["confidence"], 0.64)
+        self.assertEqual(observed["evidence_strength"], 0.91)
+        self.assertEqual(observed["execution_risk"], 0.30)
+
+    def test_a_missing_score_is_zero_rather_than_a_crash(self):
+        """A recommendation without a strength must not take a turn down."""
+        from reasoning.models import Confidence, Recommendation
+        from workspace.service import observed_assessment
+
+        class _Assessment:
+            mode = Mode.EXECUTIVE
+            mode_reason = ""
+            continuation = False
+            stale = False
+            stale_because = ""
+            obsolete = False
+            replaced_stale = False
+            has_reasoning = True
+            recommendations = [
+                Recommendation(statement="s", rationale="r", confidence=Confidence(score=0.5))
+            ]
+            initiatives: list[Any] = []
+
+        observed = observed_assessment(_Assessment())
+        assert observed is not None
+        self.assertEqual(observed["confidence"], 0.5)
+        self.assertEqual(observed["execution_risk"], 0.0)
+
+    def test_the_reported_key_is_the_key_the_product_persists(self):
+        """
+        The identifier must identify the record it names.
+
+        `Recommendation` carries `initiative`, not `initiative_slug`. Reading the
+        latter returned "" and produced a key derived from a different slug than
+        `_capture_strategy` used, so the observational key could disagree with the
+        stored one. Both now call `_slug_for`, and this asserts they agree.
+        """
+        from reasoning.models import Confidence, Recommendation
+        from workspace.models import recommendation_key
+        from workspace.service import _slug_for, observed_assessment
+
+        class _Initiative:
+            name = "Billing"
+            slug = "billing"
+
+        recommendation = Recommendation(
+            statement="Add tests to Billing",
+            rationale="because",
+            confidence=Confidence(score=0.7),
+            initiative="Billing",
+        )
+
+        class _Assessment:
+            mode = Mode.EXECUTIVE
+            mode_reason = ""
+            continuation = False
+            stale = False
+            stale_because = ""
+            obsolete = False
+            replaced_stale = False
+            has_reasoning = True
+            recommendations = [recommendation]
+            initiatives = [_Initiative()]
+
+        assessment = _Assessment()
+        observed = observed_assessment(assessment)
+        assert observed is not None
+        expected_slug = _slug_for(assessment, recommendation.initiative)
+        self.assertEqual(observed["initiative_slug"], expected_slug)
+        self.assertEqual(observed["initiative_slug"], "billing")
+        self.assertEqual(
+            observed["recommendation_key"],
+            recommendation_key(recommendation.statement, expected_slug),
+        )

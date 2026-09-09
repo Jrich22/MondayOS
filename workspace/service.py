@@ -861,12 +861,23 @@ def observed_assessment(assessment: Any) -> dict[str, Any] | None:
         return None
 
     top = assessment.recommendations[0] if getattr(assessment, "recommendations", None) else None
-    slug = ""
-    if top is not None:
-        slug = str(getattr(top, "initiative_slug", "") or "")
+    # Derived exactly as `_capture_strategy` derives it, by calling the same
+    # helper. `Recommendation` carries `initiative` (a display name) and no
+    # `initiative_slug`, so reading the latter yielded "" and produced a
+    # recommendation key that disagreed with the one actually persisted -- an
+    # identifier that does not match the record it identifies is worse than none.
+    slug = _slug_for(assessment, str(getattr(top, "initiative", "") or "")) if top else ""
 
     def _value(score: Any) -> float:
-        return round(float(getattr(score, "value", 0.0) or 0.0), 4)
+        """
+        A score as a fraction.
+
+        `Confidence` and `Risk` both expose `.score`. Reading `.value` -- which
+        neither has -- silently returned the 0.0 default for every field, so this
+        key reported three zeros on every turn while the real numbers sat one
+        attribute away.
+        """
+        return round(float(getattr(score, "score", 0.0) or 0.0), 4)
 
     return {
         "mode": getattr(assessment.mode, "value", str(assessment.mode)),
