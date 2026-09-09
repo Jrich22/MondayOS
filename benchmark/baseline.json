@@ -20,9 +20,75 @@
         "initiatives": [
           {
             "health": "healthy",
-            "members": "141",
-            "name": "src",
-            "slug": "src"
+            "members": "21",
+            "name": "people",
+            "slug": "people"
+          },
+          {
+            "health": "healthy",
+            "members": "20",
+            "name": "comms",
+            "slug": "comms"
+          },
+          {
+            "health": "healthy",
+            "members": "10",
+            "name": "guests",
+            "slug": "guests"
+          },
+          {
+            "health": "healthy",
+            "members": "10",
+            "name": "mission",
+            "slug": "mission"
+          },
+          {
+            "health": "healthy",
+            "members": "9",
+            "name": "rollcall",
+            "slug": "rollcall"
+          },
+          {
+            "health": "healthy",
+            "members": "8",
+            "name": "checkin",
+            "slug": "checkin"
+          },
+          {
+            "health": "healthy",
+            "members": "6",
+            "name": "invitation",
+            "slug": "invitation"
+          },
+          {
+            "health": "at-risk",
+            "members": "5",
+            "name": "dashboard",
+            "slug": "dashboard"
+          },
+          {
+            "health": "healthy",
+            "members": "5",
+            "name": "planning",
+            "slug": "planning"
+          },
+          {
+            "health": "at-risk",
+            "members": "2",
+            "name": "branding",
+            "slug": "branding"
+          },
+          {
+            "health": "at-risk",
+            "members": "2",
+            "name": "classification",
+            "slug": "classification"
+          },
+          {
+            "health": "at-risk",
+            "members": "2",
+            "name": "event",
+            "slug": "event"
           }
         ],
         "known_failing": [
@@ -97,8 +163,8 @@
       "volatile": {
         "files": 150,
         "graph_nodes": 164,
-        "index_ms": 128,
-        "retrieval_ms": 10,
+        "index_ms": 126,
+        "retrieval_ms": 11,
         "symbols": 444
       }
     },
@@ -122,45 +188,63 @@
         "initiatives": [
           {
             "health": "healthy",
-            "members": "85",
+            "members": "76",
             "name": "dashboard",
             "slug": "dashboard"
           },
           {
             "health": "healthy",
-            "members": "83",
+            "members": "64",
             "name": "Growth BOT",
             "slug": "growth-bot"
           },
           {
             "health": "healthy",
-            "members": "53",
+            "members": "24",
             "name": "AI Workspace",
             "slug": "ai-workspace"
           },
           {
             "health": "healthy",
-            "members": "20",
+            "members": "17",
             "name": "Reasoning Engine",
             "slug": "reasoning-engine"
           },
           {
             "health": "healthy",
-            "members": "18",
-            "name": "brain",
-            "slug": "brain"
-          },
-          {
-            "health": "healthy",
-            "members": "16",
+            "members": "14",
             "name": "doctor",
             "slug": "doctor"
           },
           {
             "health": "healthy",
-            "members": "15",
+            "members": "14",
             "name": "migrate",
             "slug": "migrate"
+          },
+          {
+            "health": "healthy",
+            "members": "13",
+            "name": "brain",
+            "slug": "brain"
+          },
+          {
+            "health": "healthy",
+            "members": "12",
+            "name": "Agents",
+            "slug": "agents"
+          },
+          {
+            "health": "healthy",
+            "members": "12",
+            "name": "benchmark",
+            "slug": "benchmark"
+          },
+          {
+            "health": "healthy",
+            "members": "12",
+            "name": "Knowledge System",
+            "slug": "knowledge-system"
           },
           {
             "health": "at-risk",
@@ -170,27 +254,51 @@
           },
           {
             "health": "healthy",
+            "members": "10",
+            "name": "initiatives",
+            "slug": "initiatives"
+          },
+          {
+            "health": "healthy",
+            "members": "10",
+            "name": "retention",
+            "slug": "retention"
+          },
+          {
+            "health": "healthy",
+            "members": "9",
+            "name": "intelligence",
+            "slug": "intelligence"
+          },
+          {
+            "health": "healthy",
             "members": "9",
             "name": "Memory System",
             "slug": "memory-system"
           },
           {
             "health": "healthy",
-            "members": "8",
+            "members": "9",
+            "name": "Task System",
+            "slug": "task-system"
+          },
+          {
+            "health": "healthy",
+            "members": "9",
             "name": "Workflows",
             "slug": "workflows"
           },
           {
             "health": "healthy",
-            "members": "5",
-            "name": "Vision",
-            "slug": "vision"
+            "members": "7",
+            "name": "orchestrator",
+            "slug": "orchestrator"
           },
           {
             "health": "healthy",
-            "members": "2",
-            "name": "Approval Gates",
-            "slug": "approval-gates"
+            "members": "5",
+            "name": "advisor",
+            "slug": "advisor"
           }
         ],
         "known_failing": [
@@ -263,11 +371,11 @@
       },
       "reason": "",
       "volatile": {
-        "files": 727,
-        "graph_nodes": 977,
-        "index_ms": 932,
+        "files": 733,
+        "graph_nodes": 992,
+        "index_ms": 976,
         "retrieval_ms": 12,
-        "symbols": 5454
+        "symbols": 5585
       }
     },
     "sourcingbot": {
@@ -290,15 +398,45 @@
         "initiatives": [
           {
             "health": "healthy",
-            "members": "56",
-            "name": "src",
-            "slug": "src"
+            "members": "9",
+            "name": "candidate",
+            "slug": "candidate"
+          },
+          {
+            "health": "healthy",
+            "members": "8",
+            "name": "session",
+            "slug": "session"
+          },
+          {
+            "health": "healthy",
+            "members": "7",
+            "name": "dashboard",
+            "slug": "dashboard"
+          },
+          {
+            "health": "healthy",
+            "members": "7",
+            "name": "workspace",
+            "slug": "workspace"
           },
           {
             "health": "healthy",
             "members": "4",
-            "name": "Vision",
-            "slug": "vision"
+            "name": "authoring",
+            "slug": "authoring"
+          },
+          {
+            "health": "healthy",
+            "members": "4",
+            "name": "capture",
+            "slug": "capture"
+          },
+          {
+            "health": "healthy",
+            "members": "4",
+            "name": "readiness",
+            "slug": "readiness"
           }
         ],
         "known_failing": [
@@ -373,7 +511,7 @@
       "volatile": {
         "files": 69,
         "graph_nodes": 96,
-        "index_ms": 83,
+        "index_ms": 86,
         "retrieval_ms": 10,
         "symbols": 192
       }
@@ -398,15 +536,27 @@
         "initiatives": [
           {
             "health": "healthy",
-            "members": "34",
-            "name": "Safety Implementation Plan",
-            "slug": "safety-implementation-plan"
+            "members": "28",
+            "name": "safety",
+            "slug": "safety"
+          },
+          {
+            "health": "at-risk",
+            "members": "10",
+            "name": "archive",
+            "slug": "archive"
           },
           {
             "health": "healthy",
-            "members": "17",
-            "name": "Research Roadmap",
-            "slug": "research-roadmap"
+            "members": "10",
+            "name": "ops",
+            "slug": "ops"
+          },
+          {
+            "health": "healthy",
+            "members": "10",
+            "name": "research",
+            "slug": "research"
           }
         ],
         "known_failing": [
@@ -481,8 +631,8 @@
       "volatile": {
         "files": 207,
         "graph_nodes": 259,
-        "index_ms": 203,
-        "retrieval_ms": 11,
+        "index_ms": 197,
+        "retrieval_ms": 10,
         "symbols": 818
       }
     }

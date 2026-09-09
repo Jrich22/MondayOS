@@ -216,6 +216,11 @@ class Seed:
     # package that also has a document or a task prefix is a capability; a
     # package alone is usually just a module.
     corroborated: bool = False
+    # Whether concrete work stands behind this seed -- a directory, a name
+    # recurring across layers, or a task prefix. A document alone does not
+    # qualify: `RESEARCH_ROADMAP.md` is somebody planning research, and reporting
+    # it as a capability is how a plan title ends up on the roster.
+    work: bool = False
 
     @property
     def slug(self) -> str:
@@ -242,6 +247,23 @@ class Initiative:
     members: list[Member] = field(default_factory=list)
     # Why MondayOS believes this initiative exists at all.
     because: str = ""
+
+    @property
+    def implementation_size(self) -> int:
+        """
+        How much of this capability has been built, in members.
+
+        Commits and pull requests are excluded. They are evidence about a
+        capability and worth showing, but their number grows every time somebody
+        writes a commit message containing the capability's name -- so ranking by
+        total members ranks by how often a name is mentioned, and the roster's
+        order drifts with chatter rather than with code. `benchmark` and `brain`
+        traded places purely because of the commit that recorded a benchmark
+        baseline.
+        """
+        return sum(
+            1 for m in self.members if m.kind not in (NodeKind.COMMIT, NodeKind.PULL_REQUEST)
+        )
 
     # ------------------------------------------------------------- assessment
     progress: Progress = field(default_factory=Progress)
