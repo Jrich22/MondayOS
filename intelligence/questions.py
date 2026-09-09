@@ -22,7 +22,7 @@ the difference between a tool and a search box.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -31,7 +31,7 @@ from core.vcs import RepoScope, git, scope_for
 from intelligence.evidence import Citation, CitationKind, Evidence
 from intelligence.graph import RelationshipGraph, project_boundaries
 from intelligence.index import STOPWORDS, ProjectIndex
-from intelligence.models import FileKind, Node, NodeKind, Symbol
+from intelligence.models import FileKind, IndexedFile, Node, NodeKind, Symbol
 
 
 class Intent(Enum):
@@ -311,10 +311,21 @@ class QuestionEngine:
                     because=reason,
                 )
             )
-            # What implements the decision is part of why it still holds.
+            # What implements the decision is part of why it still holds. These
+            # files are here because they name the ADR, so the line where they
+            # name it is exactly where a reader should land -- a real occurrence,
+            # not a guess.
+            adr = _adr_id(node.label)
             for other, edge in self._graph.related(node.id, depth=1, limit=6):
                 if other.kind in (NodeKind.FILE, NodeKind.TASK):
-                    evidence.add(self._cite_node(other, edge.because))
+                    citation = self._cite_node(other, edge.because)
+                    if not citation.line and other.kind is NodeKind.FILE and adr:
+                        line = self._line_for(
+                            other.path, self._index.files.get(other.path), [adr.lower()]
+                        )
+                        if line:
+                            citation = replace(citation, line=line)
+                    evidence.add(citation)
 
         if not found:
             # No ADR covers this — say so, and still show what the subject *is*.
@@ -326,7 +337,7 @@ class QuestionEngine:
             # written down, but here is the implementation and its docs" is both
             # true and useful; bare silence is neither.
             for path, reason in self._files_matching(terms, kinds={FileKind.DOCUMENTATION})[:4]:
-                evidence.add(self._cite_file(path, reason))
+                evidence.add(self._cite_file(path, reason, terms=terms))
             for symbol in [s for t in terms[:2] for s in self._symbols(t, 3)][:4]:
                 evidence.add(
                     Citation(
@@ -391,7 +402,7 @@ class QuestionEngine:
         # Files that mention it but do not define it — the usage sites.
         mentions = self._files_matching(terms, exclude={s.path for s in unique})
         for path, reason in mentions[:8]:
-            evidence.add(self._cite_file(path, reason))
+            evidence.add(self._cite_file(path, reason, terms=terms))
 
         if not unique and not mentions:
             return Answer(
@@ -448,11 +459,11 @@ class QuestionEngine:
             buckets.setdefault("Decisions", []).append(node.label)
 
         for path, reason in self._files_matching(terms, kinds={FileKind.TEST})[:6]:
-            evidence.add(self._cite_file(path, reason, kind=CitationKind.TEST))
+            evidence.add(self._cite_file(path, reason, kind=CitationKind.TEST, terms=terms))
             buckets.setdefault("Tests", []).append(path)
 
         for path, reason in self._files_matching(terms, kinds={FileKind.DOCUMENTATION})[:6]:
-            evidence.add(self._cite_file(path, reason))
+            evidence.add(self._cite_file(path, reason, terms=terms))
             buckets.setdefault("Documentation", []).append(path)
 
         for task in self._tasks_matching(terms)[:5]:
@@ -553,7 +564,7 @@ class QuestionEngine:
         evidence = Evidence()
         docs = self._files_matching(terms, kinds={FileKind.DOCUMENTATION, FileKind.DECISION})
         for path, reason in docs[:10]:
-            evidence.add(self._cite_file(path, reason))
+            evidence.add(self._cite_file(path, reason, terms=terms))
 
         if not docs:
             return Answer(
@@ -588,7 +599,7 @@ class QuestionEngine:
                 )
             )
         for path, reason in self._files_matching(terms)[:8]:
-            evidence.add(self._cite_file(path, reason))
+            evidence.add(self._cite_file(path, reason, terms=terms))
 
         if evidence.empty:
             return Answer(
@@ -786,13 +797,51 @@ class QuestionEngine:
         return commits
 
     def _cite_file(
-        self, path: str, because: str, kind: CitationKind = CitationKind.FILE
+        self,
+        path: str,
+        because: str,
+        kind: CitationKind = CitationKind.FILE,
+        terms: list[str] | None = None,
     ) -> Citation:
+        """
+        A citation for a file, carrying a line when the file can honestly supply one.
+
+        "workspace/service.py" is a hint; "workspace/service.py:82" is checkable.
+        Two sources of a line, in order, and both are evidence that already
+        exists rather than a number chosen to look precise:
+
+        1. a symbol the index recorded, when one is named by the subject — the
+           definition is where a reader wants to land;
+        2. the line where a subject term actually occurs in the file.
+
+        When neither applies the citation stays file-only. A line nobody can
+        check is worse than no line at all, because it looks like precision.
+        """
         entry = self._index.files.get(path)
         actual = kind
         if entry and entry.kind is FileKind.TEST:
             actual = CitationKind.TEST
-        return Citation(kind=actual, reference=path, label=path, path=path, because=because)
+        line = self._line_for(path, entry, terms or [])
+        return Citation(
+            kind=actual, reference=path, label=path, path=path, line=line, because=because
+        )
+
+    def _line_for(self, path: str, entry: IndexedFile | None, terms: list[str]) -> int:
+        """The line this file's match sits on, or 0 when none can be established."""
+        if not terms:
+            return 0
+        for symbol in entry.symbols if entry else []:
+            if any(_mentions(symbol.name.lower(), t) for t in terms):
+                return symbol.line
+        try:
+            text = (self._index.root / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return 0
+        for number, content in enumerate(text.splitlines(), 1):
+            lowered = content.lower()
+            if any(t in lowered for t in terms):
+                return number
+        return 0
 
     def _cite_node(self, node: Node, because: str) -> Citation:
         mapping = {
