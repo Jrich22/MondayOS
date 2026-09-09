@@ -26,9 +26,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from core.boundary import outside
 from core.vcs import RepoScope, git, scope_for
 from intelligence.evidence import Citation, CitationKind, Evidence
-from intelligence.graph import RelationshipGraph
+from intelligence.graph import RelationshipGraph, project_boundaries
 from intelligence.index import STOPWORDS, ProjectIndex
 from intelligence.models import FileKind, Node, NodeKind, Symbol
 
@@ -202,6 +203,9 @@ class QuestionEngine:
         # Resolved lazily and cached: it shells out to git, and the project root
         # is fixed at construction so the answer cannot change mid-engine.
         self._repo_scope: RepoScope | None = None
+        # The nested projects inside this one. Same reasoning: fixed at
+        # construction, consulted by every retrieval path.
+        self._nested: frozenset[str] | None = None
 
     def _scope(self) -> RepoScope:
         """Where this project sits relative to version control."""
@@ -323,9 +327,7 @@ class QuestionEngine:
             # true and useful; bare silence is neither.
             for path, reason in self._files_matching(terms, kinds={FileKind.DOCUMENTATION})[:4]:
                 evidence.add(self._cite_file(path, reason))
-            for symbol in [s for t in terms[:2] for s in self._index.search_symbols(t, limit=3)][
-                :4
-            ]:
+            for symbol in [s for t in terms[:2] for s in self._symbols(t, 3)][:4]:
                 evidence.add(
                     Citation(
                         kind=CitationKind.SYMBOL,
@@ -363,7 +365,7 @@ class QuestionEngine:
         evidence = Evidence()
         definitions: list[Symbol] = []
         for term in terms[:3]:
-            definitions.extend(self._index.search_symbols(term, limit=8))
+            definitions.extend(self._symbols(term, 8))
 
         seen: set[tuple[str, int]] = set()
         unique: list[Symbol] = []
@@ -416,7 +418,7 @@ class QuestionEngine:
         evidence = Evidence()
         buckets: dict[str, list[str]] = {}
 
-        for symbol in [s for t in terms[:2] for s in self._index.search_symbols(t, limit=6)][:10]:
+        for symbol in [s for t in terms[:2] for s in self._symbols(t, 6)][:10]:
             evidence.add(
                 Citation(
                     kind=CitationKind.SYMBOL,
@@ -573,7 +575,7 @@ class QuestionEngine:
         that this was a broad match rather than a targeted one.
         """
         evidence = Evidence()
-        for symbol in [s for t in terms[:2] for s in self._index.search_symbols(t, limit=4)][:6]:
+        for symbol in [s for t in terms[:2] for s in self._symbols(t, 4)][:6]:
             evidence.add(
                 Citation(
                     kind=CitationKind.SYMBOL,
@@ -615,7 +617,7 @@ class QuestionEngine:
         hits: dict[str, int] = {}
         for term in terms[:5]:
             for path in self._index.files_with(term):
-                if path in excluded:
+                if path in excluded or not self._own(path):
                     continue
                 entry = self._index.files.get(path)
                 if kinds and (entry is None or entry.kind not in kinds):
@@ -626,9 +628,57 @@ class QuestionEngine:
         used = min(len(terms), 5)
         return [(path, f"matches {count}/{used} term(s)") for path, count in ordered]
 
+    @property
+    def _boundaries(self) -> frozenset[str]:
+        """
+        The nested projects inside this one, computed once per engine.
+
+        Cached because every retrieval path consults it and the answer cannot
+        change while the index is fixed.
+        """
+        if self._nested is None:
+            self._nested = project_boundaries(self._index)
+        return self._nested
+
+    def _own(self, path: str) -> bool:
+        """
+        Whether a path belongs to this project rather than one nested inside it.
+
+        Applied to every retrieval path, not only to decisions. A question about
+        MondayOS answered with Cue App's source is the same failure as one
+        answered with sourcingBOT's ADR, and both were reachable: the filesystem
+        assertion cannot see it, because a nested project genuinely lives inside
+        the parent's root.
+        """
+        return not outside(path, self._boundaries)
+
+    def _symbols(self, term: str, limit: int) -> list[Symbol]:
+        """Symbol definitions in this project, excluding nested ones."""
+        return [s for s in self._index.search_symbols(term, limit=limit * 2) if self._own(s.path)][
+            :limit
+        ]
+
+    def _own_decisions(self) -> list[Node]:
+        """
+        This project's decision records, with nested projects' excluded.
+
+        MondayOS's index contains sourcingBOT's `docs/DECISIONS.md`, so its
+        decision graph holds all nineteen of sourcingBOT's ADRs alongside its own
+        forty-one. Both logs define an ADR-001. Without this filter, asking
+        MondayOS why something was decided can return another project's reasoning
+        as MondayOS's own.
+
+        The filter is here, at retrieval, rather than in the answer text: the
+        requirement is that the wrong evidence is *unavailable*, not that it goes
+        unmentioned. `citations_outside_root` never caught this because
+        `projects/sourcingbot/docs/DECISIONS.md` is genuinely inside MondayOS's
+        root -- the boundary that matters is the project's, not the filesystem's.
+        """
+        return [n for n in self._graph.of_kind(NodeKind.DECISION) if self._own(n.path)]
+
     def _decisions_matching(self, question: str, terms: list[str]) -> list[tuple[Node, str]]:
         """ADR nodes matching an explicit id, else matching the subject terms."""
-        nodes = self._graph.of_kind(NodeKind.DECISION)
+        nodes = self._own_decisions()
         explicit = {m.group(1).upper() for m in _ADR_REF.finditer(question)}
         if explicit:
             return [(n, "named in the question") for n in nodes if _adr_id(n.label) in explicit]
