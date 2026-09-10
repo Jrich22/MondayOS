@@ -44,7 +44,8 @@ class OpenAIProvider(AIProvider):
         self._api_key = config.api_key or os.environ.get("OPENAI_API_KEY", "")
         self._base_url = config.base_url or None
         self._max_tokens = config.max_tokens
-        self._timeout = config.timeout
+        self._connect_timeout = config.connect_timeout
+        self._generation_timeout = config.generation_timeout
 
     @property
     def name(self) -> str:
@@ -57,6 +58,36 @@ class OpenAIProvider(AIProvider):
     @property
     def cost_tier(self) -> int:
         return 2  # hosted, but defaults to an economical model (gpt-4o-mini)
+
+    def _request_timeout(self, max_tokens: int) -> Any:
+        """
+        Connect and read deadlines for one request.
+
+        The SDK speaks httpx, so connect and read bind separately and correctly.
+        **`read` is an inter-chunk deadline, not a total one**: it bounds silence,
+        not the whole answer, so a stream that keeps producing may run longer than
+        `read` seconds in total. That is a different guarantee from Ollama's, and
+        it is the right one here -- a hosted stream that goes quiet is dead, while
+        one still emitting tokens is working.
+
+        Falls back to a single float when httpx is absent, which loses the
+        separation but keeps the deadline.
+        """
+        deadline = self.generation_deadline(max_tokens, self._generation_timeout)
+        try:
+            import httpx
+        except ImportError:
+            return deadline
+        return httpx.Timeout(
+            deadline, connect=self._connect_timeout, write=self._connect_timeout
+        )
+
+    @property
+    def tokens_per_second(self) -> float:
+        """
+        Conservative for a hosted model, which is faster in practice.
+        """
+        return 25.0
 
     @property
     def capability_tier(self) -> int:
@@ -181,7 +212,7 @@ class OpenAIProvider(AIProvider):
                 model=self._model,
                 messages=messages,  # type: ignore[arg-type]
                 max_tokens=max_tokens,
-                timeout=self._timeout,
+                timeout=self._request_timeout(max_tokens),
             )
             choice = response.choices[0] if response.choices else None
             content = choice.message.content or "" if choice else ""
