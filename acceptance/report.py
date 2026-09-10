@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from acceptance.gates import GateResult, Verdict, overall
+from acceptance.gates import Evaluation, Verdict, overall
 
 
 @dataclass
@@ -62,7 +62,7 @@ class AcceptanceReport:
     started_at: str
     projects: dict[str, Any] = field(default_factory=dict)
     turns: list[Any] = field(default_factory=list)
-    gates: list[GateResult] = field(default_factory=list)
+    gates: list[Evaluation] = field(default_factory=list)
     incidents: list[Any] = field(default_factory=list)
     defects: list[Defect] = field(default_factory=list)
 
@@ -182,9 +182,9 @@ class AcceptanceReport:
         """The release checklist."""
         exercised = sorted(s for s, r in self.projects.items() if r.get("available"))
         skipped = sorted(s for s, r in self.projects.items() if not r.get("available"))
-        failed = [g for g in self.gates if g.verdict is Verdict.FAILED]
+        failed = [g for g in self.gates if g.verdict is Verdict.FAIL]
         unverifiable = [g for g in self.gates if g.verdict is Verdict.UNVERIFIABLE]
-        not_run = [g for g in self.gates if g.verdict is Verdict.NOT_EXERCISED]
+        not_run = [g for g in self.gates if g.verdict is Verdict.INCONCLUSIVE]
 
         out = [
             "# MondayOS release readiness",
@@ -201,14 +201,15 @@ class AcceptanceReport:
             "",
             "## Gates",
             "",
-            "| # | Gate | Verdict | Notes |",
-            "|---|---|---|---|",
+            "| # | Gate | Verdict | Opportunities | Exercised | Passed | Failed | Why |",
+            "|---|---|---|---|---|---|---|---|",
         ]
         for gate in self.gates:
-            note = gate.reason or ("—" if gate.verdict is Verdict.PASSED else "")
-            if gate.violations:
-                note = f"{note} ({len(gate.violations)} violation(s))"
-            out.append(f"| {gate.number} | {gate.name} | **{gate.verdict.value}** | {note} |")
+            out.append(
+                f"| {gate.number} | {gate.name} | **{gate.verdict.value}** "
+                f"| {gate.opportunities} | {gate.exercised} | {gate.passed} "
+                f"| {gate.failed} | {gate.reason} |"
+            )
 
         out += ["", "## Known limitations", ""]
         if unverifiable:
@@ -216,7 +217,7 @@ class AcceptanceReport:
                 out.append(f"- Gate {gate.number} ({gate.name}) is **unverifiable**: {gate.reason}")
         if not_run:
             for gate in not_run:
-                out.append(f"- Gate {gate.number} ({gate.name}) was **not exercised** by this run.")
+                out.append(f"- Gate {gate.number} ({gate.name}) is **inconclusive**: {gate.reason}")
         if not unverifiable and not not_run:
             out.append("- None. Every gate was exercised and answerable.")
 
