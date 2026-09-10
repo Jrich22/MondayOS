@@ -15,7 +15,6 @@ no corpus repository is written to at all.
 
 from __future__ import annotations
 
-import json
 import re
 import shutil
 import time
@@ -288,37 +287,36 @@ class ProjectSession:
             self.strategy_persisted = True
             self.strategy_keys_seen |= set(strategy)
 
-    def _conversation_file(self, conversation_id: str) -> Path | None:
-        """The record on disk for one conversation, or None if it is not there."""
-        if not conversation_id:
-            return None
-        for path in (self._monday_root / "workspace" / "conversations").rglob("*.json"):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if data.get("id") == conversation_id:
-                return path
-        return None
-
     def _persisted_strategy(self, conversation_id: str) -> dict[str, Any]:
         """
-        The strategic state MondayOS actually wrote, read from the store.
+        The strategic state MondayOS actually wrote, read through its own store.
 
-        The store is the system of record for continuity; the API response is a
-        view for clients and carries no strategy. Reading the record is also what
-        lets gate 12 inspect the real persisted fields rather than a summary of
-        them.
+        Two wrong assumptions preceded this. The first read
+        `payload["conversation"]["strategy"]`, and the API response carries no
+        such key. The second read the record directly but globbed for `*.json`,
+        and conversations are Markdown with YAML frontmatter (ADR-003) -- so it
+        found nothing either, and the fix looked like it had worked while
+        changing nothing.
+
+        Using `ConversationStore` removes the guesswork: the product's own reader
+        knows where records live and how they are shaped, and a future change to
+        either cannot silently break this again.
         """
-        path = self._conversation_file(conversation_id)
-        if path is None:
+        if not conversation_id:
             return {}
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            conversation = self._store().get(self.project, conversation_id)
+        except Exception:  # noqa: BLE001 — a missing record is an answer, not a crash
             return {}
-        strategy = data.get("strategy")
-        return dict(strategy) if isinstance(strategy, dict) else {}
+        strategy = getattr(conversation, "strategy", None)
+        if strategy is None:
+            return {}
+        return dict(strategy.to_dict())
+
+    def _store(self) -> Any:
+        from workspace.store import ConversationStore
+
+        return ConversationStore(self._monday_root)
 
     def _is_own_commit(self, sha: str) -> bool:
         """Whether an abbreviated SHA belongs to this project's own history."""
@@ -422,19 +420,28 @@ class ProjectSession:
         }
 
     def _move_fingerprint(self, conversation_id: str) -> bool:
-        """Rewrite the stored fingerprint so the recorded decision reads as stale."""
-        path = self._conversation_file(conversation_id)
-        if path is None:
-            return False
+        """
+        Rewrite the stored fingerprint so the recorded decision reads as stale.
+
+        Nothing on disk in the *project* changes. The conversation's own
+        world-state digest is edited, which is exactly what staleness is -- a
+        decision computed against a world that has since moved -- and it is
+        local to a temporary tree.
+
+        Goes through the store for the same reason the read does: the record is
+        Markdown with frontmatter, and a harness that assumed otherwise silently
+        never exercised this scenario at all.
+        """
+        store = self._store()
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            conversation = store.get(self.project, conversation_id)
+        except Exception:  # noqa: BLE001
             return False
-        strategy = data.get("strategy")
-        if not strategy or not strategy.get("fingerprint"):
+        strategy = getattr(conversation, "strategy", None)
+        if strategy is None or not getattr(strategy, "fingerprint", ""):
             return False
-        strategy["fingerprint"] = "acceptance-moved-world"
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        strategy.fingerprint = "acceptance-moved-world"
+        store.save(conversation)
         return True
 
     def _determinism(self, anchor: str) -> dict[str, tuple[Any, Any]]:

@@ -531,22 +531,26 @@ if __name__ == "__main__":
 
 class TestStrategyIsReadFromTheStore(unittest.TestCase):
     """
-    RC1/H-6. Continuity state is read from the conversation record, not the API
-    response.
+    RC1/H-6. Continuity state is read through MondayOS's own store.
 
-    `Conversation.to_dict()` emits no `strategy` key, so the previous read
-    returned {} on every turn regardless of what MondayOS did. Four gates went
-    unexercised because of it while the product was persisting correctly the
-    whole time — the harness looked for the state in a place it was never put.
+    Two wrong assumptions preceded this, and the second is the instructive one.
+    The first read `payload["conversation"]["strategy"]`; the API response
+    carries no such key. The second read the record directly but globbed for
+    `*.json` -- and conversations are Markdown with YAML frontmatter (ADR-003),
+    so it found nothing either. The fix looked like it had worked while changing
+    nothing, and four gates stayed unexercised for a second run.
+
+    Using `ConversationStore` removes the guesswork: the product's own reader
+    knows where records live and how they are shaped.
     """
 
-    def _session(self, root: Path):
+    def _session(self, root: Path, project: str = "demo"):
         from acceptance.pacing import Pacing
         from acceptance.session import ProjectSession
 
         return ProjectSession(
             monday=None,
-            project="demo",
+            project=project,
             corpus_root=root,
             monday_root=root,
             boundaries=frozenset(),
@@ -556,28 +560,42 @@ class TestStrategyIsReadFromTheStore(unittest.TestCase):
             pacing=Pacing(sleep=lambda _s: None),
         )
 
-    def _write_conversation(self, root: Path, conversation_id: str, strategy) -> None:
-        directory = root / "workspace" / "conversations" / "demo"
-        directory.mkdir(parents=True, exist_ok=True)
-        record = {"id": conversation_id, "project": "demo", "messages": []}
-        if strategy is not None:
-            record["strategy"] = strategy
-        (directory / f"{conversation_id}.json").write_text(json.dumps(record))
+    def _conversation(self, root: Path, with_strategy: bool):
+        from datetime import UTC, datetime
 
-    def test_persisted_strategy_is_found_in_the_record(self):
+        from workspace.models import Conversation, StrategicState
+        from workspace.store import ConversationStore
+
+        store = ConversationStore(root)
+        now = datetime(2026, 9, 10, tzinfo=UTC)
+        conversation = Conversation(
+            id="CONV-0001", project="demo", title="t", created_at=now, updated_at=now
+        )
+        if with_strategy:
+            conversation.strategy = StrategicState(
+                question="What should we build next?",
+                topic="next-work",
+                project="demo",
+                fingerprint="FP-1",
+                recommendation="Harden the scheduler",
+                recommendation_key="k1",
+            )
+        store.save(conversation)
+        return store
+
+    def test_persisted_strategy_is_read_from_the_record(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self._write_conversation(
-                root, "CONV-1", {"recommendation_key": "k1", "confidence": 0.5}
-            )
-            strategy = self._session(root)._persisted_strategy("CONV-1")
+            self._conversation(root, with_strategy=True)
+            strategy = self._session(root)._persisted_strategy("CONV-0001")
             self.assertEqual(strategy["recommendation_key"], "k1")
+            self.assertEqual(strategy["fingerprint"], "FP-1")
 
     def test_a_conversation_without_strategy_reads_empty(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self._write_conversation(root, "CONV-2", None)
-            self.assertEqual(self._session(root)._persisted_strategy("CONV-2"), {})
+            self._conversation(root, with_strategy=False)
+            self.assertEqual(self._session(root)._persisted_strategy("CONV-0001"), {})
 
     def test_an_unknown_conversation_reads_empty_rather_than_raising(self):
         with TemporaryDirectory() as tmp:
@@ -585,13 +603,43 @@ class TestStrategyIsReadFromTheStore(unittest.TestCase):
             self.assertEqual(self._session(root)._persisted_strategy("nope"), {})
             self.assertEqual(self._session(root)._persisted_strategy(""), {})
 
-    def test_the_api_response_shape_is_not_relied_on(self):
+    def test_the_stale_scenario_can_actually_move_the_fingerprint(self):
         """
-        The defect, stated directly.
+        The scenario that had never once run.
 
-        `Conversation.to_dict()` has no `strategy` key. Any harness reading one
-        from the response gets {} forever, which is exactly what happened.
+        It used the same `*.json` glob, so every stale run silently did nothing
+        and reported `exercised: False`.
         """
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._conversation(root, with_strategy=True)
+            session = self._session(root)
+            self.assertTrue(session._move_fingerprint("CONV-0001"))
+            moved = store.get("demo", "CONV-0001")
+            self.assertEqual(moved.strategy.fingerprint, "acceptance-moved-world")
+
+    def test_moving_a_fingerprint_that_does_not_exist_reports_false(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._conversation(root, with_strategy=False)
+            self.assertFalse(self._session(root)._move_fingerprint("CONV-0001"))
+
+    def test_records_are_markdown_not_json(self):
+        """
+        The assumption that broke this, asserted so it cannot return.
+
+        A harness globbing `*.json` under the conversation directory finds only
+        `.sequences.json` and concludes nothing was ever persisted.
+        """
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._conversation(root, with_strategy=True)
+            directory = root / "workspace" / "conversations" / "demo"
+            self.assertTrue(list(directory.glob("CONV-*.md")))
+            self.assertEqual([p.name for p in directory.glob("CONV-*.json")], [])
+
+    def test_the_api_response_shape_carries_no_strategy(self):
+        """The first wrong assumption, also asserted."""
         from datetime import UTC, datetime
 
         from workspace.models import Conversation
