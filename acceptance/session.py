@@ -83,6 +83,17 @@ class TurnRecord:
     # Every score the assessment computed, not only the winning recommendation's.
     # A quote matching any of these is a recitation, not an invention (RC1/H-7).
     computed_values: list[float] = field(default_factory=list)
+    # The scores of the decision this turn is continuing, read from the persisted
+    # record. During a continuation these are authoritative: the responder puts
+    # them in front of the model "exactly as they were shown to the user" and
+    # forbids inventing others, so a quote must match these rather than the thin
+    # assessment a continuation computes (RC1/H-7).
+    persisted_values: list[float] = field(default_factory=list)
+    # The decision key still on record *after* this turn. A continuation returns
+    # no fresh key by design, so this is what shows whether the stored decision
+    # survived the follow-up unchanged (RC1/H-9).
+    persisted_key: str = ""
+    continuation: bool = False
     quoted_scores: dict[str, float] = field(default_factory=dict)
     citations: dict[str, Any] = field(default_factory=dict)
     initiatives: dict[str, list[str]] = field(default_factory=dict)
@@ -120,6 +131,9 @@ class TurnRecord:
             "recommendation_key": self.recommendation_key,
             "scores": self.scores,
             "computed_values": self.computed_values,
+            "persisted_values": self.persisted_values,
+            "persisted_key": self.persisted_key,
+            "continuation": self.continuation,
             "quoted_scores": self.quoted_scores,
             "citations": self.citations,
             "initiatives": self.initiatives,
@@ -256,6 +270,7 @@ class ProjectSession:
         }
 
         record.computed_values = [float(v) for v in observed.get("computed_values") or []]
+        record.continuation = bool(observed.get("continuation"))
         record.citations = check_citations(answer, self._root, self._boundaries).to_dict()
         record.initiatives = named_initiatives(answer, self._discovered)
         record.quoted_scores = quoted_scores(answer)
@@ -281,6 +296,8 @@ class ProjectSession:
         # product was persisting correctly all along (`workspace/store.py`).
         conversation = payload.get("conversation") or {}
         strategy = self._persisted_strategy(str(conversation.get("id", "")))
+        record.persisted_values = _scores_of(strategy)
+        record.persisted_key = str(strategy.get("recommendation_key", "") or "")
         if strategy.get("recommendation_key"):
             # MondayOS persists a decision only when the turn completed, so this
             # is the signal that a user-visible recommendation actually exists.
@@ -478,6 +495,24 @@ class ProjectSession:
                 record.scores.get("execution_risk"),
             ),
         }
+
+
+def _scores_of(strategy: dict[str, Any]) -> list[float]:
+    """
+    Every score in a persisted decision, as the user was shown them.
+
+    `StrategicState` stores each as a `Score` with a `score` field; the record
+    round-trips them as nested dicts. Read defensively -- a record written by an
+    older build should degrade to "no scores", not to a crash mid-run.
+    """
+    values: set[float] = set()
+    for name in ("evidence_strength", "confidence", "execution_risk"):
+        raw = strategy.get(name)
+        if isinstance(raw, dict) and raw.get("score") is not None:
+            values.add(round(float(raw["score"]), 4))
+        elif isinstance(raw, (int, float)):
+            values.add(round(float(raw), 4))
+    return sorted(values)
 
 
 def _looks_like_history(answer: str, sha: str) -> bool:

@@ -155,6 +155,21 @@ class TestAnswerReading(unittest.TestCase):
         self.assertEqual(found["named"], ["AI Workspace"])
         self.assertEqual(found["invented"], [])
 
+    def test_a_fragment_without_stopwords_is_still_not_a_name(self):
+        """
+        RC1/H-8 second pass. "took priority", "directly" and "s maturity" carry
+        no conjunctions or articles and are still fragments; gate 2 reported all
+        three as invented capabilities. A name looks like a name.
+        """
+        for fragment in ("took priority", "directly", "immediately", "s maturity"):
+            with self.subTest(fragment=fragment):
+                answer = f'the "{fragment}" initiative'
+                self.assertEqual(named_initiatives(answer, ["Billing"])["invented"], [])
+
+    def test_a_capitalised_two_word_invention_is_still_caught(self):
+        found = named_initiatives('The "Quantum Ledger" capability', ["Billing"])
+        self.assertEqual(found["invented"], ["Quantum Ledger"])
+
     def test_a_short_plausible_name_is_still_caught(self):
         """The gate must keep its teeth: a real invention is still reported."""
         found = named_initiatives('The "Telepathy" initiative is at risk.', ["Billing"])
@@ -221,23 +236,32 @@ class TestGates(unittest.TestCase):
                     self.assertIsNot(gate.verdict, Verdict.PASS, gate.name)
 
     def test_gate_5_cannot_pass_with_zero_key_comparisons(self):
-        follow = _turn(turn_id="C.evidence", recommendation_key="")
+        follow = _turn(turn_id="C.evidence", persisted_key="")
         gate = self._gate(5, [follow], self.STALLED)
         self.assertIs(gate.verdict, Verdict.INCONCLUSIVE)
         self.assertEqual(gate.exercised, 0)
 
-    def test_gate_5_passes_when_a_key_was_actually_compared(self):
-        follow = _turn(turn_id="C.evidence", recommendation_key="k1")
+    def test_gate_5_reads_the_persisted_key_not_the_turns_own(self):
+        """
+        RC1/H-9. A continuation returns no fresh recommendation by design.
+
+        Reading the transient field found nothing on every follow-up, so the gate
+        exercised zero observations across twelve opportunities while appearing to
+        check continuity. What survives the follow-up is the *stored* decision.
+        """
+        follow = _turn(
+            turn_id="C.evidence", recommendation_key="", persisted_key="k1", continuation=True
+        )
         gate = self._gate(5, [follow], self.LIVE)
         self.assertIs(gate.verdict, Verdict.PASS)
         self.assertEqual(gate.exercised, 1)
 
-    def test_gate_5_fails_on_a_silently_changed_recommendation(self):
-        follow = _turn(turn_id="C.evidence", recommendation_key="k2")
+    def test_gate_5_fails_when_the_stored_decision_changed(self):
+        follow = _turn(turn_id="C.evidence", persisted_key="k2", continuation=True)
         self.assertIs(self._gate(5, [follow], self.LIVE).verdict, Verdict.FAIL)
 
     def test_gate_5_allows_a_change_when_reassessment_was_requested(self):
-        follow = _turn(turn_id="D.change-mind", recommendation_key="k2", reassessed=True)
+        follow = _turn(turn_id="D.change-mind", persisted_key="k2", reassessed=True)
         self.assertIs(self._gate(5, [follow], self.LIVE).verdict, Verdict.PASS)
 
     def test_gate_8_cannot_pass_without_persisted_strategy(self):
@@ -318,6 +342,48 @@ class TestGates(unittest.TestCase):
     def test_gate_6_fails_on_a_number_the_assessment_never_computed(self):
         bad = _turn(computed_values=[0.64, 0.91], quoted_scores={"confidence": 0.12})
         self.assertIs(self._gate(6, [bad], self.LIVE).verdict, Verdict.FAIL)
+
+    def test_gate_6_compares_a_continuation_against_the_decision_it_continues(self):
+        """
+        RC1/H-7. The responder hands a continuation the prior decision's scores
+        "exactly as they were shown to the user" and forbids inventing others.
+
+        So the persisted record is authoritative, not the thin assessment a
+        continuation computes. Comparing against the latter reported eight exact
+        recitations as inventions -- MondayOS quoting its own numbers back.
+        """
+        turn = _turn(
+            turn_id="D.change-mind",
+            continuation=True,
+            computed_values=[0.88],
+            persisted_values=[0.47, 0.94, 0.43],
+            quoted_scores={"confidence": 0.47, "evidence_strength": 0.94},
+        )
+        gate = self._gate(6, [turn], self.LIVE)
+        self.assertIs(gate.verdict, Verdict.PASS)
+        self.assertEqual(gate.exercised, 2)
+
+    def test_gate_6_still_fails_a_continuation_that_invents_a_number(self):
+        """The gate keeps its teeth on continuations too."""
+        turn = _turn(
+            turn_id="D.change-mind",
+            continuation=True,
+            computed_values=[0.88],
+            persisted_values=[0.47, 0.94],
+            quoted_scores={"confidence": 0.11},
+        )
+        self.assertIs(self._gate(6, [turn], self.LIVE).verdict, Verdict.FAIL)
+
+    def test_gate_6_does_not_use_persisted_scores_on_a_fresh_turn(self):
+        """A fresh executive turn computes its own; the stored decision is not licence."""
+        turn = _turn(
+            turn_id="B.next",
+            continuation=False,
+            computed_values=[0.60],
+            persisted_values=[0.11],
+            quoted_scores={"confidence": 0.11},
+        )
+        self.assertIs(self._gate(6, [turn], self.LIVE).verdict, Verdict.FAIL)
 
     def test_gate_6_accepts_any_value_the_assessment_computed(self):
         """
@@ -443,7 +509,7 @@ class TestGates(unittest.TestCase):
                 quoted_scores={"confidence": 0.6},
                 recommendation_key="k1",
             ),
-            _turn(turn_id="C.evidence", recommendation_key="k1"),
+            _turn(turn_id="C.evidence", persisted_key="k1", continuation=True),
             _turn(
                 turn_id="I.say-more-cold", expect_register="grounded", observed_register="grounded"
             ),

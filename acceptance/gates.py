@@ -287,14 +287,22 @@ def _quoted_scores_match(e: Evaluation, scored: list[Any]) -> Evaluation:
     """
     e.offer(len(scored))
     for turn in scored:
-        computed = [float(v) for v in (turn.computed_values or [])]
-        if not computed or not turn.quoted_scores:
+        # A continuation explains a decision already made. The responder gives
+        # the model that decision's scores "exactly as they were shown to the
+        # user" and forbids inventing others, so the persisted record is what a
+        # quote must match -- a continuation deliberately does not re-rank, and
+        # its own assessment computes almost nothing.
+        authoritative = [float(v) for v in (turn.computed_values or [])]
+        if turn.continuation:
+            authoritative += [float(v) for v in (turn.persisted_values or [])]
+        if not authoritative or not turn.quoted_scores:
             continue
         for name, stated in turn.quoted_scores.items():
             e.observe(
-                any(abs(stated - value) <= 0.05 for value in computed),
+                any(abs(stated - value) <= 0.05 for value in authoritative),
                 f"{turn.project}/{turn.turn_id}: said {name}={stated}, "
-                f"which matches no computed value in {computed}",
+                f"which matches no value MondayOS computed or showed "
+                f"({sorted(set(authoritative))})",
             )
     if e.exercised == 0:
         e.note = "no answer quoted a score against an assessment that computed any"
@@ -370,13 +378,18 @@ def _followups_preserve_recommendation(
         if not anchor:
             continue
         for turn in followups:
-            if not turn.recommendation_key:
-                # A grounded follow-up carries no key. Nothing to compare, and
-                # nothing to conclude from its absence.
+            # The *persisted* key, not the turn's own. A continuation returns no
+            # fresh recommendation by design -- it explains the stored decision
+            # rather than making a new one -- so reading the transient field
+            # found nothing on every follow-up and the gate exercised zero
+            # observations while claiming to check continuity (RC1/H-9).
+            observed = turn.persisted_key
+            if not observed:
                 continue
             e.observe(
-                turn.recommendation_key == anchor or turn.reassessed,
-                f"{project}/{turn.turn_id}: {anchor!r} became {turn.recommendation_key!r}",
+                observed == anchor or turn.reassessed,
+                f"{project}/{turn.turn_id}: the stored decision changed from "
+                f"{anchor!r} to {observed!r} without a reassessment being asked for",
             )
     if e.exercised == 0:
         e.note = "no completed strategic turn produced an anchor to compare against"

@@ -249,19 +249,30 @@ _MAX_NAME_WORDS = 3
 
 def _is_name_shaped(candidate: str) -> bool:
     """
-    Whether a phrase could be a capability's name at all.
+    Whether a phrase is an entity name rather than a piece of a sentence.
 
-    Deliberately strict, and the strictness runs one way on purpose: a missed
-    invention is a gap in the report, a false one is an accusation. Gate 2 once
-    reported "and reduce the risk of future changes" as an invented initiative,
-    which is the accusation this exists to prevent.
+    Absence of stopwords is not enough. "took priority", "directly" and
+    "s maturity" carry none and are still fragments, and gate 2 reported all
+    three as invented capabilities. A name has to look like a name: every word
+    capitalised or an acronym, the way `Billing`, `AI Workspace`, `Growth BOT`
+    and `Knowledge System` are — which is also how discovery names them.
+
+    Deliberately strict, and the strictness runs one way. A missed invention is a
+    gap in the report; a false one is an accusation, and this has made three.
     """
     words = [w for w in re.split(r"[\s\-_]+", candidate.strip()) if w]
     if not words or len(words) > _MAX_NAME_WORDS:
         return False
     if any(w.lower() in _NOT_A_NAME for w in words):
         return False
-    return all(re.fullmatch(r"[A-Za-z][\w.]*", w) for w in words)
+    for word in words:
+        if not re.fullmatch(r"[A-Za-z][\w.]*", word):
+            return False
+        # Capitalised, or an all-caps acronym. A lowercase word in the middle of
+        # prose is prose.
+        if not (word[0].isupper() or word.isupper()):
+            return False
+    return True
 
 
 def named_initiatives(answer: str, discovered: list[str]) -> dict[str, list[str]]:
