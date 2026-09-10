@@ -32,8 +32,17 @@ _PATH = re.compile(
     r"(?::(\d+))?",
 )
 
-# `ADR-017`, however the answer punctuates it.
-_ADR = re.compile(r"\bADR[-_ ]?(\d{1,4})\b", re.I)
+# `ADR-017`, however the answer punctuates it. The width matches
+# `intelligence/index.py`, so the harness and the index agree on what an ADR
+# reference is; a looser pattern here made this over-eager (RC1/ACC-008).
+_ADR = re.compile(r"\bADR[-_ ]?(\d{3,4})\b", re.I)
+
+# An abbreviated git SHA as it appears in a commit line. Seven or more hex
+# characters, which is what `git log --format=%h` produces and what an answer
+# quoting history contains. Bounded below so ordinary words such as "deadbeef"
+# in prose are not mistaken for history -- and checked against the project's own
+# log before anything is concluded, so a false positive costs nothing.
+_COMMIT = re.compile(r"\b([0-9a-f]{7,40})\b")
 
 # A number quoted next to one of the three scores. Deliberately narrow: it looks
 # for a percentage or decimal within a short span of the score's own name, so a
@@ -134,6 +143,16 @@ def check_citations(answer: str, root: Path, boundaries: frozenset[str]) -> Cita
 def cited_decisions(answer: str) -> list[str]:
     """ADR identifiers the answer names, normalised."""
     return sorted({f"ADR-{int(m.group(1)):03d}" for m in _ADR.finditer(answer or "")})
+
+
+def cited_commits(answer: str) -> list[str]:
+    """
+    Commit-shaped tokens the answer names.
+
+    Candidates only. Whether one belongs to this project is decided against the
+    project's own git log, never guessed from the text.
+    """
+    return sorted({m.group(1).lower() for m in _COMMIT.finditer(answer or "")})
 
 
 def quoted_scores(answer: str) -> dict[str, float]:

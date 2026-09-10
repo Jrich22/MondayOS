@@ -16,6 +16,7 @@ no corpus repository is written to at all.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -23,7 +24,13 @@ from pathlib import Path
 from typing import Any
 
 from acceptance.journeys import COLD_TURN, DETERMINISM_TURN, JOURNEY, STALE_TURN, Turn
-from acceptance.observe import check_citations, cited_decisions, named_initiatives, quoted_scores
+from acceptance.observe import (
+    check_citations,
+    cited_commits,
+    cited_decisions,
+    named_initiatives,
+    quoted_scores,
+)
 from acceptance.pacing import Incident, Outcome, Pacing, classify
 
 # Fields a persisted conversation may legitimately contain. Anything else in a
@@ -77,8 +84,17 @@ class TurnRecord:
     quoted_scores: dict[str, float] = field(default_factory=dict)
     citations: dict[str, Any] = field(default_factory=dict)
     initiatives: dict[str, list[str]] = field(default_factory=dict)
+    cited_decisions: list[str] = field(default_factory=list)
     invented_decisions: list[str] = field(default_factory=list)
+    # Commit references the answer made, and the subset that do not belong to
+    # this project. Populated from the project's own git log -- this field was
+    # declared and read by gate 9 while no code ever wrote to it, so the gate
+    # could not fail (RC1/H-1).
+    cited_commits: list[str] = field(default_factory=list)
     foreign_history: list[str] = field(default_factory=list)
+    # True when the turn explicitly asked for a fresh assessment, so a changed
+    # recommendation is expected rather than a violation.
+    reassessed: bool = False
     skipped: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -104,8 +120,11 @@ class TurnRecord:
             "quoted_scores": self.quoted_scores,
             "citations": self.citations,
             "initiatives": self.initiatives,
+            "cited_decisions": self.cited_decisions,
             "invented_decisions": self.invented_decisions,
+            "cited_commits": self.cited_commits,
             "foreign_history": self.foreign_history,
+            "reassessed": self.reassessed,
             "latency_ms": self.latency_ms,
             "skipped": self.skipped,
             "excerpt": self.answer_excerpt,
@@ -138,6 +157,7 @@ class ProjectSession:
         boundaries: frozenset[str],
         discovered: list[str],
         own_decisions: list[str],
+        own_commits: frozenset[str],
         pacing: Pacing,
         clock: Any = time.perf_counter,
     ) -> None:
@@ -151,11 +171,18 @@ class ProjectSession:
         self._boundaries = boundaries
         self._discovered = discovered
         self._own_decisions = {d.upper() for d in own_decisions}
+        # Abbreviated SHAs from this project's own history, scoped by RepoScope.
+        # A cited commit outside this set is another project's work.
+        self._own_commits = own_commits
         self._pacing = pacing
         self._clock = clock
         self.turns: list[TurnRecord] = []
         self.incidents: list[Incident] = []
         self.strategy_keys_seen: set[str] = set()
+        # Whether a completed turn ever caused MondayOS to persist a decision.
+        # Gate 8 and gate 12 are meaningless without one, and saying so is the
+        # difference between "we looked and found nothing" and "we never looked".
+        self.strategy_persisted = False
 
     # ------------------------------------------------------------------ send
 
@@ -228,12 +255,32 @@ class ProjectSession:
         record.citations = check_citations(answer, self._root, self._boundaries).to_dict()
         record.initiatives = named_initiatives(answer, self._discovered)
         record.quoted_scores = quoted_scores(answer)
+        record.cited_decisions = cited_decisions(answer)
         record.invented_decisions = [
-            adr for adr in cited_decisions(answer) if adr.upper() not in self._own_decisions
+            adr for adr in record.cited_decisions if adr.upper() not in self._own_decisions
         ]
+        # History the answer named, checked against this project's own log. A
+        # candidate that matches no commit anywhere is prose that happens to look
+        # like a SHA, not evidence of a leak; only a commit belonging to a
+        # *different* project counts.
+        record.cited_commits = [
+            sha for sha in cited_commits(answer) if _looks_like_history(answer, sha)
+        ]
+        record.foreign_history = [
+            sha for sha in record.cited_commits if not self._is_own_commit(sha)
+        ]
+
         conversation = payload.get("conversation") or {}
         strategy = conversation.get("strategy") or {}
-        self.strategy_keys_seen |= set(strategy)
+        if strategy.get("recommendation_key"):
+            # MondayOS persists a decision only when the turn completed, so this
+            # is the signal that a user-visible recommendation actually exists.
+            self.strategy_persisted = True
+            self.strategy_keys_seen |= set(strategy)
+
+    def _is_own_commit(self, sha: str) -> bool:
+        """Whether an abbreviated SHA belongs to this project's own history."""
+        return any(own.startswith(sha) or sha.startswith(own) for own in self._own_commits)
 
     # --------------------------------------------------------------- journey
 
@@ -260,7 +307,13 @@ class ProjectSession:
                 continue
             record = self._send(conversation_id, turn, question)
             self.turns.append(record)
-            if turn.id == "B.next" and record.recommendation_key:
+            # RC1/ACC-004. The anchor comes from a turn the *user saw*, never
+            # from a recommendation computed before generation. MondayOS persists
+            # strategic state only for a completed turn, so anchoring on an
+            # unfinished one made the harness expect a continuation the product
+            # had correctly refused to offer -- and reported that refusal as a
+            # product failure.
+            if turn.id == "B.next" and self.strategy_persisted and record.outcome == "ok":
                 anchor = record.recommendation_key
             self._pacing.pause(record.observed_register in ("executive", "continuation"))
 
@@ -277,6 +330,7 @@ class ProjectSession:
             "available": True,
             "completed": completed,
             "recommendation_key": anchor,
+            "strategy_persisted": self.strategy_persisted,
             "hidden_reasoning_keys": hidden,
             "determinism": repeat,
             "stale_scenario": stale,
@@ -376,6 +430,25 @@ class ProjectSession:
                 record.scores.get("execution_risk"),
             ),
         }
+
+
+def _looks_like_history(answer: str, sha: str) -> bool:
+    """
+    Whether a hex token is being used as a commit reference.
+
+    A commit line reads `5c44663 sourcingBOT: define the roadmap` -- the SHA is
+    followed by a message. A bare hex string in prose, or one inside a longer
+    identifier, is not history. Requiring the shape keeps the gate honest in the
+    other direction too: it must be able to fail, but not on a coincidence.
+    """
+    for match in re.finditer(re.escape(sha), answer or "", re.I):
+        after = (answer[match.end() : match.end() + 2] or "").strip()
+        before = answer[max(0, match.start() - 1) : match.start()]
+        if before and (before.isalnum() or before in "/._-"):
+            continue
+        if after:
+            return True
+    return False
 
 
 def _excerpt(answer: str, limit: int = 700) -> str:

@@ -90,6 +90,7 @@ def run(
                 boundaries=project_boundaries(index),
                 discovered=[i.name for i in initiatives] + [i.slug for i in initiatives],
                 own_decisions=[_adr_of(n.label) for n in engine._own_decisions()],
+                own_commits=_own_commits(corpus.root),
                 pacing=pacing,
             )
             outcome = session.run(dict(corpus.nouns))
@@ -107,6 +108,26 @@ def run(
         {"reports_stop_reason": report.provider.get("reports_stop_reason", False)},
     )
     return report
+
+
+def _own_commits(root: Path) -> frozenset[str]:
+    """
+    This project's own commit SHAs, scoped the way S1 scoped every other
+    history read.
+
+    `RepoScope` confines the log to the project's own paths, so a nested project
+    does not inherit its parent's history and a parent does not claim its
+    children's. Without this the gate would have nothing truthful to compare a
+    cited commit against.
+    """
+    from core.vcs import git, scope_for
+
+    scope = scope_for(root)
+    try:
+        output = git(scope, "log", "--format=%H", "-n", "2000")
+    except Exception:  # noqa: BLE001 — a project without history simply has none
+        return frozenset()
+    return frozenset(line.strip().lower() for line in output.splitlines() if line.strip())
 
 
 def _adr_of(label: str) -> str:
