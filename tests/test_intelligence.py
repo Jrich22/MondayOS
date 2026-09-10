@@ -539,3 +539,98 @@ class TestEvidence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGeneratedReportsAreNotProjectEvidence(unittest.TestCase):
+    """
+    RC1/Part A. `reports/` holds output *about* MondayOS, not part of it.
+
+    Dropping `acceptance_report.json` into the repository root once added a
+    member to the `acceptance` initiative and drifted the benchmark: the
+    project's own measurements depended on whether a report happened to be
+    sitting in the tree.
+
+    Excluded by directory rather than by filename. A filename list needs a new
+    entry for every report anyone ever writes, and it was already wrong -- six
+    names were added and four were missed. These tests use names the scanner has
+    never seen, because that is the property that matters.
+    """
+
+    UNSEEN = (
+        "reports/quarterly_board_summary.md",
+        "reports/acceptance-2031-run-17.json",
+        "reports/whatever_someone_invents_next.md",
+        "reports/nested/deep/audit.md",
+        "reports/initiatives_and_capabilities.md",
+    )
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._write("pyproject.toml", "[project]\nname='demo'\n")
+        for i in range(6):
+            self._write(f"billing/mod{i}.py", "value = 1\n")
+        for relative in self.UNSEEN:
+            self._write(relative, "# a generated report\n\nBilling is mentioned here.\n")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, relative: str, text: str) -> None:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def _index(self):
+        from intelligence.index import build
+
+        return build("demo", self.root, cache_root=self.root / ".idx")
+
+    def test_no_report_enters_the_index_whatever_it_is_called(self):
+        indexed = self._index().files
+        for relative in self.UNSEEN:
+            with self.subTest(path=relative):
+                self.assertNotIn(relative, indexed)
+
+    def test_a_nested_report_is_excluded_too(self):
+        """The rule is the directory, so depth beneath it makes no difference."""
+        self.assertNotIn("reports/nested/deep/audit.md", self._index().files)
+
+    def test_reports_contribute_no_initiative_membership(self):
+        from initiatives.discover import discover
+        from intelligence.graph import build as build_graph
+
+        index = self._index()
+        found = discover(index, build_graph(index, tasks=[], knowledge=[]), [])
+        for initiative in found:
+            for member in initiative.members:
+                with self.subTest(initiative=initiative.name):
+                    self.assertFalse(
+                        member.label.startswith("reports/"),
+                        f"{initiative.name} counts {member.label}",
+                    )
+
+    def test_reports_do_not_create_an_initiative_of_their_own(self):
+        from initiatives.discover import discover
+        from intelligence.graph import build as build_graph
+
+        index = self._index()
+        found = discover(index, build_graph(index, tasks=[], knowledge=[]), [])
+        self.assertNotIn("reports", {i.name.lower() for i in found})
+
+    def test_the_real_project_is_still_indexed(self):
+        """The exclusion must be narrow: everything else still counts."""
+        indexed = self._index().files
+        self.assertIn("billing/mod0.py", indexed)
+
+    def test_the_exclusion_is_by_directory_not_by_filename(self):
+        """
+        The same filename inside and outside `reports/` must differ.
+
+        This is the property a filename list cannot give: it is the location that
+        decides, so no future report needs to be added anywhere.
+        """
+        self._write("audit.md", "# not generated\n")
+        indexed = self._index().files
+        self.assertIn("audit.md", indexed)
+        self.assertNotIn("reports/nested/deep/audit.md", indexed)

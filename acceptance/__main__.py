@@ -20,7 +20,11 @@ from acceptance.runner import run
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="acceptance", description=__doc__)
     parser.add_argument("--project", action="append", default=[], help="limit to these corpora")
-    parser.add_argument("--out", default="acceptance-report", help="output path prefix")
+    parser.add_argument(
+        "--out",
+        default="reports/acceptance-report",
+        help="output path prefix (default: under reports/, which the index excludes)",
+    )
     parser.add_argument("--pause", type=float, default=3.0, help="seconds between turns")
     parser.add_argument("--config", default="config", help="directory holding projects.json")
     args = parser.parse_args(argv)
@@ -49,15 +53,20 @@ def main(argv: list[str] | None = None) -> int:
         pacing=Pacing(between_turns=args.pause, after_executive=args.pause * 2),
     )
 
+    # Everything a run writes lands under `reports/`, which the scanner excludes
+    # by directory. A report about MondayOS is not part of MondayOS, and putting
+    # one where the index can see it changes the project's own measurements.
     prefix = Path(args.out)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    readiness = prefix.parent / "release_readiness.md"
     prefix.with_suffix(".json").write_text(report.to_json(), encoding="utf-8")
     Path(f"{prefix}-review.md").write_text(report.review_markdown(), encoding="utf-8")
-    Path("release_readiness.md").write_text(report.readiness_markdown(), encoding="utf-8")
+    readiness.write_text(report.readiness_markdown(), encoding="utf-8")
 
     print(f"\n{report.verdict}")
     for gate in report.gates:
         print(f"  gate {gate.number:>2}  {gate.verdict.value:<14} {gate.name}")
-    print(f"\nwrote {prefix}.json, {prefix}-review.md, release_readiness.md")
+    print(f"\nwrote {prefix}.json, {prefix}-review.md, {readiness}")
     return 0 if report.verdict != "NOT READY" else 1
 
 
