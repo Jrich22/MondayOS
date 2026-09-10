@@ -119,7 +119,15 @@ class TestCitationChecking(unittest.TestCase):
 
 class TestAnswerReading(unittest.TestCase):
     def test_adr_references_are_normalised(self):
-        self.assertEqual(cited_decisions("per ADR-17 and adr 002"), ["ADR-002", "ADR-017"])
+        self.assertEqual(cited_decisions("per ADR-017 and adr 002"), ["ADR-002", "ADR-017"])
+
+    def test_the_adr_width_matches_the_index(self):
+        """
+        RC1/ACC-008. The harness accepted `ADR-1`; the index requires three
+        digits, so the harness recognised references the index could never
+        resolve and gate 10 was marginally over-eager.
+        """
+        self.assertEqual(cited_decisions("per ADR-1 and ADR-17"), [])
 
     def test_quoted_scores_are_read_as_fractions(self):
         found = quoted_scores("Confidence is 72%, and execution risk is 0.30.")
@@ -142,134 +150,280 @@ class TestAnswerReading(unittest.TestCase):
 
 
 class TestGates(unittest.TestCase):
-    """Every gate, fired at a violation and at a clean run."""
+    """
+    Every gate, shown capable of failing and incapable of passing on nothing.
 
-    CLEAN_PROJECTS = {
+    The rule these enforce: a gate that evaluated zero observations reports
+    INCONCLUSIVE, never PASS. Three gates violated it in the RC1 run — 5 compared
+    no keys, 12 inspected no state, 9 read a field nothing ever wrote — and each
+    reported PASS in the document a release decision rested on.
+    """
+
+    # A project that got all the way through: a decision was shown and persisted.
+    LIVE = {
         "demo": {
             "available": True,
             "completed": True,
             "recommendation_key": "k1",
+            "strategy_persisted": True,
+            "hidden_reasoning_keys": [],
+            "determinism": {"recommendation_key": ("k1", "k1")},
+        }
+    }
+    # A project whose strategic turn never completed.
+    STALLED = {
+        "demo": {
+            "available": True,
+            "completed": True,
+            "recommendation_key": "",
+            "strategy_persisted": False,
             "hidden_reasoning_keys": [],
             "determinism": {},
         }
     }
 
-    def _verdict(self, number: int, turns, projects, caps=CAPABLE):
+    def _gate(self, number: int, turns, projects, caps=CAPABLE):
         return next(g for g in evaluate(turns, projects, caps) if g.number == number)
 
     def test_all_fourteen_gates_are_reported(self):
-        results = evaluate([_turn()], self.CLEAN_PROJECTS, CAPABLE)
+        results = evaluate([_turn()], self.LIVE, CAPABLE)
         self.assertEqual({g.number for g in results}, {n for n, _ in GATES})
 
-    def test_gate_1_cross_project_citation(self):
-        bad = _turn(citations={**_turn().citations, "outside_boundary": ["projects/x/a.ts"]})
-        self.assertIs(self._verdict(1, [bad], self.CLEAN_PROJECTS).verdict, Verdict.FAILED)
-        self.assertIs(self._verdict(1, [_turn()], self.CLEAN_PROJECTS).verdict, Verdict.PASSED)
+    # ------------------------------------------------ zero observations rule
 
-    def test_gate_2_invented_initiative(self):
+    def test_no_gate_can_pass_without_exercising_anything(self):
+        """The general form of the defect, asserted once over every gate."""
+        for gate in evaluate([], {}, CAPABLE):
+            with self.subTest(gate=gate.number):
+                if gate.exercised == 0:
+                    self.assertIsNot(gate.verdict, Verdict.PASS, gate.name)
+
+    def test_gate_5_cannot_pass_with_zero_key_comparisons(self):
+        follow = _turn(turn_id="C.evidence", recommendation_key="")
+        gate = self._gate(5, [follow], self.STALLED)
+        self.assertIs(gate.verdict, Verdict.INCONCLUSIVE)
+        self.assertEqual(gate.exercised, 0)
+
+    def test_gate_5_passes_when_a_key_was_actually_compared(self):
+        follow = _turn(turn_id="C.evidence", recommendation_key="k1")
+        gate = self._gate(5, [follow], self.LIVE)
+        self.assertIs(gate.verdict, Verdict.PASS)
+        self.assertEqual(gate.exercised, 1)
+
+    def test_gate_5_fails_on_a_silently_changed_recommendation(self):
+        follow = _turn(turn_id="C.evidence", recommendation_key="k2")
+        self.assertIs(self._gate(5, [follow], self.LIVE).verdict, Verdict.FAIL)
+
+    def test_gate_5_allows_a_change_when_reassessment_was_requested(self):
+        follow = _turn(turn_id="D.change-mind", recommendation_key="k2", reassessed=True)
+        self.assertIs(self._gate(5, [follow], self.LIVE).verdict, Verdict.PASS)
+
+    def test_gate_8_cannot_pass_without_persisted_strategy(self):
+        warm = _turn(turn_id="I.say-more-warm", observed_register="grounded")
+        gate = self._gate(8, [warm], self.STALLED)
+        self.assertIs(gate.verdict, Verdict.INCONCLUSIVE)
+        self.assertIn("nothing to continue", gate.reason + gate.note)
+
+    def test_gate_8_fails_when_state_exists_and_the_turn_grounds(self):
+        warm = _turn(turn_id="I.say-more-warm", observed_register="grounded")
+        self.assertIs(self._gate(8, [warm], self.LIVE).verdict, Verdict.FAIL)
+
+    def test_gate_8_passes_when_state_exists_and_the_turn_continues(self):
+        warm = _turn(turn_id="I.say-more-warm", observed_register="continuation")
+        self.assertIs(self._gate(8, [warm], self.LIVE).verdict, Verdict.PASS)
+
+    def test_gate_12_cannot_pass_when_nothing_was_persisted(self):
+        gate = self._gate(12, [_turn()], self.STALLED)
+        self.assertIs(gate.verdict, Verdict.INCONCLUSIVE)
+
+    def test_gate_12_fails_on_a_planted_hidden_field(self):
+        projects = {"demo": {**self.LIVE["demo"], "hidden_reasoning_keys": ["prompt"]}}
+        gate = self._gate(12, [_turn()], projects)
+        self.assertIs(gate.verdict, Verdict.FAIL)
+        self.assertIn("prompt", gate.failures[0])
+
+    def test_gate_12_passes_when_state_was_persisted_and_clean(self):
+        self.assertIs(self._gate(12, [_turn()], self.LIVE).verdict, Verdict.PASS)
+
+    def test_gate_9_fails_on_a_planted_foreign_commit(self):
+        """The gate that could not fail at all before."""
+        turn = _turn(cited_commits=["abc1234"], foreign_history=["abc1234"])
+        gate = self._gate(9, [turn], self.LIVE)
+        self.assertIs(gate.verdict, Verdict.FAIL)
+        self.assertIn("abc1234", gate.failures[0])
+
+    def test_gate_9_passes_only_when_commits_were_actually_cited(self):
+        cited = _turn(cited_commits=["5c44663"], foreign_history=[])
+        self.assertIs(self._gate(9, [cited], self.LIVE).verdict, Verdict.PASS)
+        silent = _turn(cited_commits=[], foreign_history=[])
+        self.assertIs(self._gate(9, [silent], self.LIVE).verdict, Verdict.INCONCLUSIVE)
+
+    def test_gate_14_cannot_pass_on_partial_coverage(self):
+        projects = {
+            "a": {**self.LIVE["demo"], "determinism": {"recommendation_key": ("k", "k")}},
+            "b": {**self.LIVE["demo"], "determinism": {}},
+            "c": {**self.LIVE["demo"], "determinism": {}},
+            "d": {**self.LIVE["demo"], "determinism": {}},
+        }
+        gate = self._gate(14, [_turn()], projects)
+        self.assertIs(gate.verdict, Verdict.INCONCLUSIVE)
+        self.assertEqual((gate.exercised, gate.opportunities), (1, 4))
+        self.assertIn("partial coverage", gate.reason)
+
+    def test_gate_14_fails_on_any_mismatch(self):
+        projects = {"demo": {**self.LIVE["demo"], "determinism": {"confidence": (0.5, 0.9)}}}
+        self.assertIs(self._gate(14, [_turn()], projects).verdict, Verdict.FAIL)
+
+    def test_gate_14_passes_on_full_matched_coverage(self):
+        self.assertIs(self._gate(14, [_turn()], self.LIVE).verdict, Verdict.PASS)
+
+    # -------------------------------------------------------- other gates
+
+    def test_gate_1_fails_on_a_cross_project_citation(self):
+        bad = _turn(
+            citations={**_turn().citations, "total": 1, "outside_boundary": ["projects/x/a.ts"]}
+        )
+        self.assertIs(self._gate(1, [bad], self.LIVE).verdict, Verdict.FAIL)
+
+    def test_gate_2_fails_on_an_invented_initiative(self):
         bad = _turn(initiatives={"named": ["Telepathy"], "invented": ["Telepathy"]})
-        self.assertIs(self._verdict(2, [bad], self.CLEAN_PROJECTS).verdict, Verdict.FAILED)
+        self.assertIs(self._gate(2, [bad], self.LIVE).verdict, Verdict.FAIL)
 
-    def test_gate_3_lookup_answered_strategically(self):
+    def test_gate_3_fails_when_a_lookup_answers_strategically(self):
         bad = _turn(turn_id="F.where", expect_register="grounded", observed_register="executive")
-        self.assertIs(self._verdict(3, [bad], self.CLEAN_PROJECTS).verdict, Verdict.FAILED)
+        self.assertIs(self._gate(3, [bad], self.LIVE).verdict, Verdict.FAIL)
+
+    def test_gate_6_fails_on_a_quoted_score_that_disagrees(self):
+        bad = _turn(scores={"confidence": 0.64}, quoted_scores={"confidence": 0.95})
+        self.assertIs(self._gate(6, [bad], self.LIVE).verdict, Verdict.FAIL)
+
+    def test_gate_7_fails_when_a_cold_elaboration_goes_executive(self):
+        bad = _turn(
+            turn_id="I.say-more-cold", expect_register="grounded", observed_register="executive"
+        )
+        self.assertIs(self._gate(7, [bad], self.LIVE).verdict, Verdict.FAIL)
+
+    def test_gate_10_fails_on_an_invented_decision(self):
+        bad = _turn(cited_decisions=["ADR-999"], invented_decisions=["ADR-999"])
+        self.assertIs(self._gate(10, [bad], self.LIVE).verdict, Verdict.FAIL)
+
+    def test_gate_11_fails_on_a_line_past_the_end_of_a_file(self):
+        bad = _turn(citations={**_turn().citations, "with_line": 1, "invalid_lines": ["a.py:900"]})
+        self.assertIs(self._gate(11, [bad], self.LIVE).verdict, Verdict.FAIL)
+
+    def test_gate_13_fails_when_a_corpus_did_not_finish(self):
+        projects = {"demo": {**self.LIVE["demo"], "completed": False}}
+        self.assertIs(self._gate(13, [_turn()], projects).verdict, Verdict.FAIL)
+
+    # --------------------------------------------- unverifiable vs inconclusive
 
     def test_gate_4_is_unverifiable_on_a_silent_provider(self):
-        """The point of the whole capability design: unanswerable is not passed."""
-        result = self._verdict(4, [_turn()], self.CLEAN_PROJECTS, SILENT)
-        self.assertIs(result.verdict, Verdict.UNVERIFIABLE)
-        self.assertIn("stop reason", result.reason)
+        gate = self._gate(4, [_turn()], self.LIVE, SILENT)
+        self.assertIs(gate.verdict, Verdict.UNVERIFIABLE)
+        self.assertIn("stop reason", gate.reason)
+
+    def test_unverifiable_is_distinct_from_inconclusive(self):
+        """
+        Different claims. UNVERIFIABLE says the environment cannot show this;
+        INCONCLUSIVE says this run did not. Collapsing them would hide the
+        difference between "we cannot look" and "we did not look".
+        """
+        capable = self._gate(4, [_turn()], self.LIVE, CAPABLE)
+        silent = self._gate(4, [_turn()], self.LIVE, SILENT)
+        self.assertIs(silent.verdict, Verdict.UNVERIFIABLE)
+        self.assertIs(capable.verdict, Verdict.INCONCLUSIVE)
+        self.assertNotEqual(silent.reason, capable.reason)
 
     def test_gate_4_fails_when_truncation_was_hidden(self):
         bad = _turn(stop_reason="max_tokens", incomplete=False)
-        self.assertIs(self._verdict(4, [bad], self.CLEAN_PROJECTS).verdict, Verdict.FAILED)
+        self.assertIs(self._gate(4, [bad], self.LIVE).verdict, Verdict.FAIL)
 
     def test_gate_4_passes_when_truncation_was_reported(self):
         good = _turn(stop_reason="max_tokens", incomplete=True)
-        self.assertIs(self._verdict(4, [good], self.CLEAN_PROJECTS).verdict, Verdict.PASSED)
+        self.assertIs(self._gate(4, [good], self.LIVE).verdict, Verdict.PASS)
 
-    def test_gate_5_a_follow_up_that_re_decided(self):
-        bad = _turn(turn_id="C.evidence", observed_register="continuation", recommendation_key="k2")
-        self.assertIs(self._verdict(5, [bad], self.CLEAN_PROJECTS).verdict, Verdict.FAILED)
-
-    def test_gate_6_a_quoted_score_that_disagrees(self):
-        bad = _turn(scores={"confidence": 0.64}, quoted_scores={"confidence": 0.95})
-        self.assertIs(self._verdict(6, [bad], self.CLEAN_PROJECTS).verdict, Verdict.FAILED)
-
-    def test_gate_6_tolerates_rounding(self):
-        good = _turn(scores={"confidence": 0.64}, quoted_scores={"confidence": 0.65})
-        self.assertIs(self._verdict(6, [good], self.CLEAN_PROJECTS).verdict, Verdict.PASSED)
-
-    def test_gates_7_and_8_are_the_two_halves_of_say_more(self):
-        cold_bad = _turn(
-            turn_id="I.say-more-cold", expect_register="grounded", observed_register="executive"
-        )
-        self.assertIs(self._verdict(7, [cold_bad], self.CLEAN_PROJECTS).verdict, Verdict.FAILED)
-        warm_bad = _turn(
-            turn_id="I.say-more-warm", expect_register="continuation", observed_register="grounded"
-        )
-        self.assertIs(self._verdict(8, [warm_bad], self.CLEAN_PROJECTS).verdict, Verdict.FAILED)
-
-    def test_gate_9_foreign_history(self):
-        bad = _turn(foreign_history=["abc123 another project's commit"])
-        self.assertIs(self._verdict(9, [bad], self.CLEAN_PROJECTS).verdict, Verdict.FAILED)
-
-    def test_gate_10_invented_decision(self):
-        bad = _turn(invented_decisions=["ADR-999"])
-        self.assertIs(self._verdict(10, [bad], self.CLEAN_PROJECTS).verdict, Verdict.FAILED)
-
-    def test_gate_11_invalid_line(self):
-        bad = _turn(citations={**_turn().citations, "invalid_lines": ["a.py:900"]})
-        self.assertIs(self._verdict(11, [bad], self.CLEAN_PROJECTS).verdict, Verdict.FAILED)
-
-    def test_gate_12_hidden_reasoning_persisted(self):
-        projects = {"demo": {**self.CLEAN_PROJECTS["demo"], "hidden_reasoning_keys": ["prompt"]}}
-        self.assertIs(self._verdict(12, [_turn()], projects).verdict, Verdict.FAILED)
-
-    def test_gate_13_incomplete_corpus(self):
-        projects = {"demo": {**self.CLEAN_PROJECTS["demo"], "completed": False}}
-        self.assertIs(self._verdict(13, [_turn()], projects).verdict, Verdict.FAILED)
-
-    def test_gate_14_recommendation_identity_must_be_stable(self):
-        projects = {
-            "demo": {
-                **self.CLEAN_PROJECTS["demo"],
-                "determinism": {"recommendation_key": ("k1", "k2")},
-            }
-        }
-        self.assertIs(self._verdict(14, [_turn()], projects).verdict, Verdict.FAILED)
-        same = {
-            "demo": {
-                **self.CLEAN_PROJECTS["demo"],
-                "determinism": {"recommendation_key": ("k1", "k1")},
-            }
-        }
-        self.assertIs(self._verdict(14, [_turn()], same).verdict, Verdict.PASSED)
+    # ------------------------------------------------- provider vs product
 
     def test_a_provider_failure_never_fails_a_gate(self):
-        """The load-bearing rule: someone else's outage is not a defect here."""
+        """Someone else's outage is not a defect here."""
         broken = _turn(
             outcome="provider_transient",
             error="529 overloaded",
             observed_register="",
-            initiatives={"named": [], "invented": ["Ghost"]},
+            initiatives={"named": ["Ghost"], "invented": ["Ghost"]},
+            cited_commits=["deadbee"],
+            foreign_history=["deadbee"],
         )
-        results = evaluate([broken], self.CLEAN_PROJECTS, CAPABLE)
-        self.assertFalse([g for g in results if g.verdict is Verdict.FAILED])
+        for gate in evaluate([broken], self.LIVE, CAPABLE):
+            with self.subTest(gate=gate.number):
+                self.assertIsNot(gate.verdict, Verdict.FAIL, gate.name)
+
+    def test_a_provider_failure_is_still_counted_as_an_opportunity(self):
+        """The report must show what the run could not reach."""
+        broken = _turn(outcome="provider_transient", observed_register="")
+        gate = self._gate(1, [broken], self.LIVE)
+        self.assertEqual(gate.opportunities, 1)
+        self.assertEqual(gate.exercised, 0)
+
+    def test_a_product_error_can_still_fail_a_gate(self):
+        """Only MondayOS raising is MondayOS's fault -- and it must count."""
+        crash = _turn(outcome="product_error", error="TypeError: boom")
+        projects = {"demo": {**self.LIVE["demo"], "completed": False}}
+        self.assertIs(self._gate(13, [crash], projects).verdict, Verdict.FAIL)
+
+    # --------------------------------------------------------------- overall
+
+    def test_a_fully_exercised_clean_run_passes_every_applicable_gate(self):
+        turns = [
+            _turn(
+                turn_id="A.overview",
+                expect_register="grounded",
+                observed_register="grounded",
+                citations={
+                    "total": 3,
+                    "resolved": 3,
+                    "with_line": 2,
+                    "unresolved": [],
+                    "outside_boundary": [],
+                    "invalid_lines": [],
+                },
+                cited_commits=["5c44663"],
+                cited_decisions=["ADR-017"],
+                initiatives={"named": ["Billing"], "invented": []},
+            ),
+            _turn(
+                turn_id="B.next",
+                scores={"confidence": 0.6},
+                quoted_scores={"confidence": 0.6},
+                recommendation_key="k1",
+            ),
+            _turn(turn_id="C.evidence", recommendation_key="k1"),
+            _turn(
+                turn_id="I.say-more-cold", expect_register="grounded", observed_register="grounded"
+            ),
+            _turn(turn_id="I.say-more-warm", observed_register="continuation"),
+            _turn(turn_id="X.truncated", stop_reason="max_tokens", incomplete=True),
+        ]
+        results = evaluate(turns, self.LIVE, CAPABLE)
+        for gate in results:
+            with self.subTest(gate=gate.number):
+                self.assertIsNot(gate.verdict, Verdict.FAIL, gate.name)
+                self.assertIsNot(gate.verdict, Verdict.UNVERIFIABLE, gate.name)
+        self.assertEqual(overall(results), "READY")
 
     def test_overall_verdicts(self):
-        clean = evaluate([_turn()], self.CLEAN_PROJECTS, CAPABLE)
+        clean = evaluate([_turn()], self.LIVE, CAPABLE)
         self.assertIn(overall(clean), ("READY", "READY WITH KNOWN LIMITATIONS"))
-        silent = evaluate([_turn()], self.CLEAN_PROJECTS, SILENT)
+        silent = evaluate([_turn()], self.LIVE, SILENT)
         self.assertEqual(overall(silent), "READY WITH KNOWN LIMITATIONS")
-        bad = _turn(invented_decisions=["ADR-999"])
-        self.assertEqual(overall(evaluate([bad], self.CLEAN_PROJECTS, CAPABLE)), "NOT READY")
+        bad = _turn(cited_decisions=["ADR-999"], invented_decisions=["ADR-999"])
+        self.assertEqual(overall(evaluate([bad], self.LIVE, CAPABLE)), "NOT READY")
 
 
 class TestReport(unittest.TestCase):
     def _report(self, caps=CAPABLE) -> AcceptanceReport:
         report = AcceptanceReport(provider={"name": "test", "model": "m"}, started_at="now")
-        report.projects = dict(TestGates.CLEAN_PROJECTS)
+        report.projects = dict(TestGates.LIVE)
         report.turns = [_turn(answer_excerpt="We should harden the scheduler.")]
         report.gates = evaluate(report.turns, report.projects, caps)
         return report
