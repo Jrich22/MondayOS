@@ -81,6 +81,9 @@ class TurnRecord:
     latency_ms: int = 0
     recommendation_key: str = ""
     scores: dict[str, float] = field(default_factory=dict)
+    # Every score the assessment computed, not only the winning recommendation's.
+    # A quote matching any of these is a recitation, not an invention (RC1/H-7).
+    computed_values: list[float] = field(default_factory=list)
     quoted_scores: dict[str, float] = field(default_factory=dict)
     citations: dict[str, Any] = field(default_factory=dict)
     initiatives: dict[str, list[str]] = field(default_factory=dict)
@@ -117,6 +120,7 @@ class TurnRecord:
             },
             "recommendation_key": self.recommendation_key,
             "scores": self.scores,
+            "computed_values": self.computed_values,
             "quoted_scores": self.quoted_scores,
             "citations": self.citations,
             "initiatives": self.initiatives,
@@ -252,6 +256,7 @@ class ProjectSession:
             if observed.get(name) is not None
         }
 
+        record.computed_values = [float(v) for v in observed.get("computed_values") or []]
         record.citations = check_citations(answer, self._root, self._boundaries).to_dict()
         record.initiatives = named_initiatives(answer, self._discovered)
         record.quoted_scores = quoted_scores(answer)
@@ -270,13 +275,50 @@ class ProjectSession:
             sha for sha in record.cited_commits if not self._is_own_commit(sha)
         ]
 
+        # RC1/H-6. Strategic state is read from the conversation *record*, not
+        # from the API response. `Conversation.to_dict()` emits no `strategy`
+        # key, so the previous read returned {} on every turn no matter what
+        # MondayOS did -- and four gates went unexercised because of it while the
+        # product was persisting correctly all along (`workspace/store.py`).
         conversation = payload.get("conversation") or {}
-        strategy = conversation.get("strategy") or {}
+        strategy = self._persisted_strategy(str(conversation.get("id", "")))
         if strategy.get("recommendation_key"):
             # MondayOS persists a decision only when the turn completed, so this
             # is the signal that a user-visible recommendation actually exists.
             self.strategy_persisted = True
             self.strategy_keys_seen |= set(strategy)
+
+    def _conversation_file(self, conversation_id: str) -> Path | None:
+        """The record on disk for one conversation, or None if it is not there."""
+        if not conversation_id:
+            return None
+        for path in (self._monday_root / "workspace" / "conversations").rglob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if data.get("id") == conversation_id:
+                return path
+        return None
+
+    def _persisted_strategy(self, conversation_id: str) -> dict[str, Any]:
+        """
+        The strategic state MondayOS actually wrote, read from the store.
+
+        The store is the system of record for continuity; the API response is a
+        view for clients and carries no strategy. Reading the record is also what
+        lets gate 12 inspect the real persisted fields rather than a summary of
+        them.
+        """
+        path = self._conversation_file(conversation_id)
+        if path is None:
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        strategy = data.get("strategy")
+        return dict(strategy) if isinstance(strategy, dict) else {}
 
     def _is_own_commit(self, sha: str) -> bool:
         """Whether an abbreviated SHA belongs to this project's own history."""
@@ -381,20 +423,19 @@ class ProjectSession:
 
     def _move_fingerprint(self, conversation_id: str) -> bool:
         """Rewrite the stored fingerprint so the recorded decision reads as stale."""
-        for path in (self._monday_root / "workspace" / "conversations").rglob("*.json"):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if data.get("id") != conversation_id:
-                continue
-            strategy = data.get("strategy")
-            if not strategy or not strategy.get("fingerprint"):
-                return False
-            strategy["fingerprint"] = "acceptance-moved-world"
-            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            return True
-        return False
+        path = self._conversation_file(conversation_id)
+        if path is None:
+            return False
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        strategy = data.get("strategy")
+        if not strategy or not strategy.get("fingerprint"):
+            return False
+        strategy["fingerprint"] = "acceptance-moved-world"
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return True
 
     def _determinism(self, anchor: str) -> dict[str, tuple[Any, Any]]:
         """

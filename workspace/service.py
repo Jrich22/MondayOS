@@ -904,7 +904,40 @@ def observed_assessment(assessment: Any) -> dict[str, Any] | None:
         "evidence_strength": _value(getattr(top, "evidence_strength", None)) if top else 0.0,
         "confidence": _value(getattr(top, "confidence", None)) if top else 0.0,
         "execution_risk": _value(getattr(top, "execution_risk", None)) if top else 0.0,
+        # Every score this assessment computed, not only the winning
+        # recommendation's three. An answer may legitimately quote the confidence
+        # of a fact, an inference or a rejected alternative -- those are numbers
+        # MondayOS produced and put in front of the model. Reporting only
+        # `recommendations[0]` made a faithful quotation look like an invention.
+        "computed_values": _computed_values(assessment),
     }
+
+
+def _computed_values(assessment: Any) -> list[float]:
+    """
+    Every confidence-like score in one assessment, deduplicated and sorted.
+
+    Observational only. Nothing branches on it; it exists so a reader -- human or
+    harness -- can tell a quoted number that MondayOS computed from one the model
+    made up. Those are different failures and only one of them is a defect.
+    """
+    values: set[float] = set()
+
+    def add(holder: Any, *names: str) -> None:
+        for name in names:
+            score = getattr(getattr(holder, name, None), "score", None)
+            if score is not None:
+                values.add(round(float(score), 4))
+
+    for claim in list(getattr(assessment, "facts", []) or []) + list(
+        getattr(assessment, "inferences", []) or []
+    ):
+        add(claim, "confidence")
+    for recommendation in getattr(assessment, "recommendations", []) or []:
+        add(recommendation, "confidence", "evidence_strength", "execution_risk")
+        for alternative in getattr(recommendation, "alternatives", ()) or ():
+            add(alternative, "confidence", "evidence_strength", "execution_risk")
+    return sorted(values)
 
 
 def _capture_strategy(

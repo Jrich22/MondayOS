@@ -177,21 +177,109 @@ def quoted_scores(answer: str) -> dict[str, float]:
     return found
 
 
+# Words that make a phrase a sentence rather than a name. A capability is called
+# "Billing" or "AI Workspace"; it is never called "and reduce the risk of future
+# changes". Any of these disqualifies a candidate outright.
+_NOT_A_NAME = frozenset(
+    {
+        "and",
+        "or",
+        "but",
+        "the",
+        "a",
+        "an",
+        "of",
+        "to",
+        "for",
+        "with",
+        "from",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "we",
+        "our",
+        "us",
+        "you",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "will",
+        "would",
+        "should",
+        "could",
+        "can",
+        "may",
+        "might",
+        "must",
+        "do",
+        "does",
+        "did",
+        "have",
+        "has",
+        "had",
+        "in",
+        "on",
+        "at",
+        "by",
+        "as",
+        "if",
+        "than",
+        "then",
+        "because",
+        "which",
+        "when",
+        "while",
+        "not",
+        "no",
+        "more",
+        "most",
+    }
+)
+
+# A capability name is short. Three words covers "AI Workspace", "Growth BOT",
+# "Knowledge System"; beyond that a phrase is prose.
+_MAX_NAME_WORDS = 3
+
+
+def _is_name_shaped(candidate: str) -> bool:
+    """
+    Whether a phrase could be a capability's name at all.
+
+    Deliberately strict, and the strictness runs one way on purpose: a missed
+    invention is a gap in the report, a false one is an accusation. Gate 2 once
+    reported "and reduce the risk of future changes" as an invented initiative,
+    which is the accusation this exists to prevent.
+    """
+    words = [w for w in re.split(r"[\s\-_]+", candidate.strip()) if w]
+    if not words or len(words) > _MAX_NAME_WORDS:
+        return False
+    if any(w.lower() in _NOT_A_NAME for w in words):
+        return False
+    return all(re.fullmatch(r"[A-Za-z][\w.]*", w) for w in words)
+
+
 def named_initiatives(answer: str, discovered: list[str]) -> dict[str, list[str]]:
     """
     Which discovered capabilities the answer names, and which it invented.
 
-    Invention is only claimed for a phrase the answer presents *as* an
-    initiative -- "the Billing initiative", "Initiative: Billing" -- because
-    otherwise every ordinary noun in a paragraph becomes a candidate and the gate
-    reports prose as fabrication. Under-claiming is the right direction: a missed
-    invention is a gap in the report, a false one is an accusation.
+    Discovery's own output is the canonical namespace: a phrase matching a known
+    initiative is a reference, and anything else has to clear `_is_name_shaped`
+    before it can be called an invention. Both filters push the same way --
+    towards missing a real invention rather than manufacturing a false one.
     """
     known = {d.lower() for d in discovered}
     claimed: set[str] = set()
     for match in _CLAIMED_INITIATIVE.finditer(answer or ""):
         name = (match.group(1) or match.group(2) or "").strip()
-        if name and name.lower() not in ("the", "this", "that", "a", "an"):
+        if not name:
+            continue
+        if name.lower() in known or _is_name_shaped(name):
             claimed.add(name)
     invented = sorted(n for n in claimed if n.lower() not in known)
     return {"named": sorted(claimed), "invented": invented}

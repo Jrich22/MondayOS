@@ -271,17 +271,33 @@ def _truncation_is_reported(
 
 
 def _quoted_scores_match(e: Evaluation, scored: list[Any]) -> Evaluation:
-    """A quoted number that disagrees is a failure; not quoting one is not."""
+    """
+    A number the answer states must be one MondayOS computed.
+
+    Checked against **every** score in the assessment -- facts, inferences,
+    recommendations and rejected alternatives -- rather than against the winning
+    recommendation's three. An answer may legitimately quote the confidence of an
+    inference it is explaining, and comparing that to `recommendations[0]` made a
+    faithful recitation look like an invention: sourcingBOT's assessment computed
+    eight distinct values and the harness knew one of them.
+
+    A turn whose assessment computed nothing is not compared at all. There is no
+    such thing as disagreeing with a number that was never produced, and grounded
+    turns have no recommendation to disagree with (RC1/H-7).
+    """
     e.offer(len(scored))
     for turn in scored:
-        for name, stated in (turn.quoted_scores or {}).items():
-            actual = (turn.scores or {}).get(name)
-            if actual is None:
-                continue
+        computed = [float(v) for v in (turn.computed_values or [])]
+        if not computed or not turn.quoted_scores:
+            continue
+        for name, stated in turn.quoted_scores.items():
             e.observe(
-                abs(stated - actual) <= 0.05,
-                f"{turn.project}/{turn.turn_id}: said {name}={stated}, computed {actual}",
+                any(abs(stated - value) <= 0.05 for value in computed),
+                f"{turn.project}/{turn.turn_id}: said {name}={stated}, "
+                f"which matches no computed value in {computed}",
             )
+    if e.exercised == 0:
+        e.note = "no answer quoted a score against an assessment that computed any"
     return e
 
 

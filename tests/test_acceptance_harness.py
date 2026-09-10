@@ -138,6 +138,28 @@ class TestAnswerReading(unittest.TestCase):
         """Not reciting the numbers is good writing, not a failure."""
         self.assertEqual(quoted_scores("We should harden the scheduler first."), {})
 
+    def test_a_sentence_fragment_is_never_an_invented_initiative(self):
+        """
+        RC1/H-8. Gate 2 accused the model of inventing an initiative called
+        "and reduce the risk of future changes".
+
+        A capability is named "Billing" or "AI Workspace". Anything carrying a
+        conjunction, an article or a verb is prose, and reporting prose as
+        fabrication is worse than missing a real one.
+        """
+        answer = 'the "and reduce the risk of future changes" initiative'
+        self.assertEqual(named_initiatives(answer, ["Billing"])["invented"], [])
+
+    def test_a_known_multi_word_initiative_is_recognised(self):
+        found = named_initiatives('the "AI Workspace" initiative', ["AI Workspace"])
+        self.assertEqual(found["named"], ["AI Workspace"])
+        self.assertEqual(found["invented"], [])
+
+    def test_a_short_plausible_name_is_still_caught(self):
+        """The gate must keep its teeth: a real invention is still reported."""
+        found = named_initiatives('The "Telepathy" initiative is at risk.', ["Billing"])
+        self.assertEqual(found["invented"], ["Telepathy"])
+
     def test_invention_is_only_claimed_for_a_phrase_presented_as_one(self):
         known = ["Billing", "Scheduling"]
         self.assertEqual(named_initiatives("Billing is going well.", known)["invented"], [])
@@ -293,9 +315,32 @@ class TestGates(unittest.TestCase):
         bad = _turn(turn_id="F.where", expect_register="grounded", observed_register="executive")
         self.assertIs(self._gate(3, [bad], self.LIVE).verdict, Verdict.FAIL)
 
-    def test_gate_6_fails_on_a_quoted_score_that_disagrees(self):
-        bad = _turn(scores={"confidence": 0.64}, quoted_scores={"confidence": 0.95})
+    def test_gate_6_fails_on_a_number_the_assessment_never_computed(self):
+        bad = _turn(computed_values=[0.64, 0.91], quoted_scores={"confidence": 0.12})
         self.assertIs(self._gate(6, [bad], self.LIVE).verdict, Verdict.FAIL)
+
+    def test_gate_6_accepts_any_value_the_assessment_computed(self):
+        """
+        RC1/H-7. An answer may quote the confidence of an inference it is
+        explaining, not only the winning recommendation's.
+
+        sourcingBOT's assessment computed eight distinct values; the harness knew
+        one of them and reported eleven faithful recitations as inventions.
+        """
+        good = _turn(
+            computed_values=[0.10, 0.34, 0.52, 0.66, 0.94],
+            quoted_scores={"confidence": 0.66, "evidence_strength": 0.94},
+        )
+        gate = self._gate(6, [good], self.LIVE)
+        self.assertIs(gate.verdict, Verdict.PASS)
+        self.assertEqual(gate.exercised, 2)
+
+    def test_gate_6_never_compares_against_an_assessment_that_computed_nothing(self):
+        """A grounded turn has no recommendation, so 0.0 is not a value to disagree with."""
+        grounded = _turn(computed_values=[], quoted_scores={"confidence": 0.92})
+        gate = self._gate(6, [grounded], self.LIVE)
+        self.assertEqual(gate.exercised, 0)
+        self.assertIs(gate.verdict, Verdict.INCONCLUSIVE)
 
     def test_gate_7_fails_when_a_cold_elaboration_goes_executive(self):
         bad = _turn(
@@ -394,6 +439,7 @@ class TestGates(unittest.TestCase):
             _turn(
                 turn_id="B.next",
                 scores={"confidence": 0.6},
+                computed_values=[0.6, 0.9],
                 quoted_scores={"confidence": 0.6},
                 recommendation_key="k1",
             ),
@@ -481,3 +527,77 @@ class TestIsolation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStrategyIsReadFromTheStore(unittest.TestCase):
+    """
+    RC1/H-6. Continuity state is read from the conversation record, not the API
+    response.
+
+    `Conversation.to_dict()` emits no `strategy` key, so the previous read
+    returned {} on every turn regardless of what MondayOS did. Four gates went
+    unexercised because of it while the product was persisting correctly the
+    whole time — the harness looked for the state in a place it was never put.
+    """
+
+    def _session(self, root: Path):
+        from acceptance.pacing import Pacing
+        from acceptance.session import ProjectSession
+
+        return ProjectSession(
+            monday=None,
+            project="demo",
+            corpus_root=root,
+            monday_root=root,
+            boundaries=frozenset(),
+            discovered=[],
+            own_decisions=[],
+            own_commits=frozenset(),
+            pacing=Pacing(sleep=lambda _s: None),
+        )
+
+    def _write_conversation(self, root: Path, conversation_id: str, strategy) -> None:
+        directory = root / "workspace" / "conversations" / "demo"
+        directory.mkdir(parents=True, exist_ok=True)
+        record = {"id": conversation_id, "project": "demo", "messages": []}
+        if strategy is not None:
+            record["strategy"] = strategy
+        (directory / f"{conversation_id}.json").write_text(json.dumps(record))
+
+    def test_persisted_strategy_is_found_in_the_record(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_conversation(
+                root, "CONV-1", {"recommendation_key": "k1", "confidence": 0.5}
+            )
+            strategy = self._session(root)._persisted_strategy("CONV-1")
+            self.assertEqual(strategy["recommendation_key"], "k1")
+
+    def test_a_conversation_without_strategy_reads_empty(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_conversation(root, "CONV-2", None)
+            self.assertEqual(self._session(root)._persisted_strategy("CONV-2"), {})
+
+    def test_an_unknown_conversation_reads_empty_rather_than_raising(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(self._session(root)._persisted_strategy("nope"), {})
+            self.assertEqual(self._session(root)._persisted_strategy(""), {})
+
+    def test_the_api_response_shape_is_not_relied_on(self):
+        """
+        The defect, stated directly.
+
+        `Conversation.to_dict()` has no `strategy` key. Any harness reading one
+        from the response gets {} forever, which is exactly what happened.
+        """
+        from datetime import UTC, datetime
+
+        from workspace.models import Conversation
+
+        now = datetime(2026, 9, 10, tzinfo=UTC)
+        keys = set(
+            Conversation(id="C", project="p", title="t", created_at=now, updated_at=now).to_dict()
+        )
+        self.assertNotIn("strategy", keys)
