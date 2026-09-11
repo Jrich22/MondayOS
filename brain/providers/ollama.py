@@ -50,7 +50,8 @@ class OllamaProvider(AIProvider):
     def __init__(self, config: "ProviderConfig") -> None:
         self._model = config.model or _DEFAULT_MODEL
         self._base_url = (config.base_url or _DEFAULT_BASE_URL).rstrip("/")
-        self._timeout = config.timeout
+        self._connect_timeout = config.connect_timeout
+        self._generation_timeout = config.generation_timeout
         self._options = config.extra.get("options", {})
 
     @property
@@ -64,6 +65,14 @@ class OllamaProvider(AIProvider):
     @property
     def cost_tier(self) -> int:
         return 0  # local — no per-token cost
+
+    @property
+    def tokens_per_second(self) -> float:
+        """
+        A local 8B model on ordinary hardware. Measured well above this
+        during acceptance runs; the floor is deliberately pessimistic.
+        """
+        return 10.0
 
     @property
     def capability_tier(self) -> int:
@@ -156,7 +165,15 @@ class OllamaProvider(AIProvider):
         body = json.dumps(payload).encode("utf-8")
         req = Request(url, data=body, headers={"Content-Type": "application/json"})
         try:
-            with urlopen(req, timeout=self._timeout) as resp:
+            # `urlopen` takes one socket timeout covering both connecting and
+            # reading, so connect and generation cannot be separated here. The
+            # generation deadline is the one that must hold -- Ollama sends
+            # nothing until the answer is complete, so the read blocks for the
+            # whole generation -- and the connection is to localhost, where the
+            # distinction has no practical value. `ollama_models()` already
+            # fails fast when no daemon is listening.
+            deadline = self.generation_deadline(max_tokens, self._generation_timeout)
+            with urlopen(req, timeout=deadline) as resp:
                 data: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
         except HTTPError as exc:
             raise ProviderError(f"Ollama HTTP {exc.code}: {exc.reason}") from exc

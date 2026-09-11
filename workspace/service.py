@@ -73,9 +73,15 @@ class WorkspaceService:
         summarizer: compaction.ConversationSummarizer | None = None,
         # (project, question, subject, thin_retrieval, strategic_state, fingerprint)
         assess: Callable[[str, str, str, bool, Any, str], Any] | None = None,
+        # The project answering about its own records, per slug. Injected rather
+        # than constructed so the service keeps no filesystem policy of its own,
+        # and separate from the context engine because the context budget must not
+        # be able to decide what MondayOS is allowed to verify.
+        authority_for: Callable[[str], Any] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._root = Path(root)
+        self._authority_for = authority_for
         self._store = ConversationStore(self._root)
         self._engine = engine
         self._responder = responder
@@ -302,6 +308,9 @@ class WorkspaceService:
             "user_message": user_message.to_dict(),
             "assistant_message": assistant_message.to_dict(),
             "context": snapshot.to_dict() if snapshot else None,
+            # Additive and observational: what the reasoning layer concluded, so
+            # the execution path can be inspected rather than reconstructed.
+            "assessment": observed_assessment(assessment),
         }
 
     def stream_message(
@@ -478,7 +487,23 @@ class WorkspaceService:
             conversation_id=conversation.id,
             history_digest=plan.digest,
             assessment=self._assessment(conversation, text, snapshot),
+            authority=self._authority(conversation.project),
         )
+
+    def _authority(self, project: str) -> Any:
+        """
+        The project's own records, or nothing.
+
+        Failure is silent and total, like every other evidence read: a project
+        whose records cannot be opened yields no authority, and every claim it
+        cannot confirm is then reported unverifiable rather than clean.
+        """
+        if self._authority_for is None:
+            return None
+        try:
+            return self._authority_for(project)
+        except Exception:  # noqa: BLE001 — an unavailable authority is not a failed turn
+            return None
 
     def _assessment(
         self,
@@ -830,6 +855,111 @@ __all__ = [
 # a question the project barely covers — without firing on every ordinary lookup,
 # which would attach a memo to "where is X defined".
 THIN_CONTEXT_ITEMS = 8
+
+
+def observed_assessment(assessment: Any) -> dict[str, Any] | None:
+    """
+    What the reasoning layer concluded this turn, as plain data.
+
+    **Observational metadata.** Nothing in MondayOS branches on it and no
+    existing caller is affected; it is additive, and a client that ignores it
+    behaves exactly as before.
+
+    It exists because the register a turn was routed to was not recoverable
+    afterwards. `Message` records provider, model, tokens and `incomplete`, and
+    strategic state is written only for executive turns -- so a grounded turn
+    left no trace of *why* it was grounded. Anything checking that routing
+    behaved had to re-run the router and compare its own answer to itself, which
+    measures a reconstruction rather than the execution path. A harness that
+    cannot see what happened cannot report that something else did.
+
+    Only fields already visible in a completed answer appear here: the register
+    and why, whether this continued a prior decision, whether that decision had
+    gone stale, and the three scores the user was shown. No prompt, no context
+    snapshot, no rejected candidate, no model reasoning -- the same rule
+    `StrategicState` holds, for the same reason.
+    """
+    if assessment is None:
+        return None
+
+    top = assessment.recommendations[0] if getattr(assessment, "recommendations", None) else None
+    # Derived exactly as `_capture_strategy` derives it, by calling the same
+    # helper. `Recommendation` carries `initiative` (a display name) and no
+    # `initiative_slug`, so reading the latter yielded "" and produced a
+    # recommendation key that disagreed with the one actually persisted -- an
+    # identifier that does not match the record it identifies is worse than none.
+    slug = _slug_for(assessment, str(getattr(top, "initiative", "") or "")) if top else ""
+
+    def _value(score: Any) -> float:
+        """
+        A score as a fraction.
+
+        `Confidence` and `Risk` both expose `.score`. Reading `.value` -- which
+        neither has -- silently returned the 0.0 default for every field, so this
+        key reported three zeros on every turn while the real numbers sat one
+        attribute away.
+        """
+        return round(float(getattr(score, "score", 0.0) or 0.0), 4)
+
+    return {
+        "mode": getattr(assessment.mode, "value", str(assessment.mode)),
+        "mode_reason": str(getattr(assessment, "mode_reason", "")),
+        "continuation": bool(getattr(assessment, "continuation", False)),
+        "stale": bool(getattr(assessment, "stale", False)),
+        "stale_because": str(getattr(assessment, "stale_because", "")),
+        "obsolete": bool(getattr(assessment, "obsolete", False)),
+        "replaced_stale": bool(getattr(assessment, "replaced_stale", False)),
+        "has_reasoning": bool(getattr(assessment, "has_reasoning", False)),
+        "recommendation": str(getattr(top, "statement", "")) if top is not None else "",
+        "recommendation_key": (
+            recommendation_key(str(top.statement), slug) if top is not None else ""
+        ),
+        "initiative_slug": slug,
+        "initiative_slugs": [
+            str(getattr(i, "slug", "")) for i in getattr(assessment, "initiatives", []) or []
+        ],
+        "alternatives": [
+            str(getattr(a, "statement", "")) for a in getattr(top, "alternatives", ()) or ()
+        ]
+        if top is not None
+        else [],
+        "evidence_strength": _value(getattr(top, "evidence_strength", None)) if top else 0.0,
+        "confidence": _value(getattr(top, "confidence", None)) if top else 0.0,
+        "execution_risk": _value(getattr(top, "execution_risk", None)) if top else 0.0,
+        # Every score this assessment computed, not only the winning
+        # recommendation's three. An answer may legitimately quote the confidence
+        # of a fact, an inference or a rejected alternative -- those are numbers
+        # MondayOS produced and put in front of the model. Reporting only
+        # `recommendations[0]` made a faithful quotation look like an invention.
+        "computed_values": _computed_values(assessment),
+    }
+
+
+def _computed_values(assessment: Any) -> list[float]:
+    """
+    Every confidence-like score in one assessment, deduplicated and sorted.
+
+    Observational only. Nothing branches on it; it exists so a reader -- human or
+    harness -- can tell a quoted number that MondayOS computed from one the model
+    made up. Those are different failures and only one of them is a defect.
+    """
+    values: set[float] = set()
+
+    def add(holder: Any, *names: str) -> None:
+        for name in names:
+            score = getattr(getattr(holder, name, None), "score", None)
+            if score is not None:
+                values.add(round(float(score), 4))
+
+    for claim in list(getattr(assessment, "facts", []) or []) + list(
+        getattr(assessment, "inferences", []) or []
+    ):
+        add(claim, "confidence")
+    for recommendation in getattr(assessment, "recommendations", []) or []:
+        add(recommendation, "confidence", "evidence_strength", "execution_risk")
+        for alternative in getattr(recommendation, "alternatives", ()) or ():
+            add(alternative, "confidence", "evidence_strength", "execution_risk")
+    return sorted(values)
 
 
 def _capture_strategy(

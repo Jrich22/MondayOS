@@ -10,6 +10,8 @@ the machine, so they are asserted directly rather than assumed from careful code
 from __future__ import annotations
 
 import json
+import random
+import subprocess
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +19,8 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from brain.providers.base import AIProvider, ProviderAvailability, ProviderError, ProviderResponse
+from reasoning.models import Mode
+from workspace.authority import ProjectAuthority, Resolution, TaskRecord
 from workspace.context import ContextEngine, ContextSnapshot
 from workspace.context import adapters as ctx_adapters
 from workspace.context import budget as ctx_budget
@@ -36,9 +40,15 @@ from workspace.models import (
     slugify,
 )
 from workspace.responder import (
+    EvidenceHandle,
+    EvidenceSet,
+    EvidenceVerdict,
     ProviderWorkspaceResponder,
     WorkspaceReply,
     WorkspaceRequest,
+    _normalise_id,
+    resolve_handles,
+    validate_evidence,
 )
 from workspace.service import WorkspaceService
 from workspace.store import ConversationStore
@@ -1673,3 +1683,1231 @@ class TestSubjectCarryOver(unittest.TestCase):
             second = WorkspaceService(root=root)
             loaded = second.get_conversation("alpha", conversation["id"])
             self.assertIn("contextengine", loaded["subject"])
+
+
+class TestObservedAssessment(unittest.TestCase):
+    """
+    The register a turn was routed to, readable after the fact.
+
+    `Message` records provider, model, tokens and `incomplete`; strategic state
+    is written only for executive turns. So a grounded turn left no trace of why
+    it was grounded, and anything checking that routing behaved had to re-run the
+    router and compare its answer to itself -- measuring a reconstruction rather
+    than the execution path.
+
+    This is observational metadata. Nothing branches on it, and a caller that
+    ignores the key behaves exactly as before.
+    """
+
+    def test_a_turn_reports_the_register_it_was_routed_to(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alpha = _project_tree(root, "alpha")
+            service = WorkspaceService(
+                root=root,
+                engine=_engine(root, {"alpha": alpha}),
+                responder=ProviderWorkspaceResponder(FakeProvider()),
+            )
+            conversation = service.create_conversation("alpha", "a")
+            result = service.send_message("alpha", conversation["id"], "what is this project?")
+
+            self.assertIn("assessment", result)
+            observed = result["assessment"]
+            # Without a reasoning layer wired there is no assessment, which is a
+            # real outcome rather than a missing field.
+            if observed is not None:
+                self.assertIn(observed["mode"], ("grounded", "executive"))
+                self.assertIsInstance(observed["continuation"], bool)
+                self.assertIsInstance(observed["stale"], bool)
+
+    def test_existing_keys_are_untouched(self):
+        """Additive means additive: no caller loses anything."""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alpha = _project_tree(root, "alpha")
+            service = WorkspaceService(
+                root=root,
+                engine=_engine(root, {"alpha": alpha}),
+                responder=ProviderWorkspaceResponder(FakeProvider()),
+            )
+            conversation = service.create_conversation("alpha", "a")
+            result = service.send_message("alpha", conversation["id"], "hello")
+            for key in ("conversation", "user_message", "assistant_message", "context"):
+                self.assertIn(key, result)
+
+    def test_it_carries_no_prompt_or_hidden_reasoning(self):
+        """
+        Same rule as StrategicState: only what a reader could have seen.
+
+        A field here that was never on screen would be hidden reasoning wearing a
+        different struct, and it would travel to every API client.
+        """
+        from workspace.service import observed_assessment
+
+        # `.score` is the real attribute. This stub previously said `.value`,
+        # which is exactly the mistake the implementation made -- so the test
+        # agreed with the bug and could never have caught it.
+        class _Score:
+            score = 0.5
+
+        class _Rec:
+            statement = "Do the thing"
+            initiative_slug = "billing"
+            alternatives = ()
+            evidence_strength = _Score()
+            confidence = _Score()
+            execution_risk = _Score()
+
+        class _Assessment:
+            mode = Mode.EXECUTIVE
+            mode_reason = "matched next-work"
+            continuation = False
+            stale = False
+            stale_because = ""
+            obsolete = False
+            replaced_stale = False
+            has_reasoning = True
+            recommendations = [_Rec()]
+            initiatives: list[Any] = []
+
+        observed = observed_assessment(_Assessment())
+        assert observed is not None
+        for banned in ("prompt", "context", "snapshot", "instruction", "system", "reasoning_text"):
+            self.assertNotIn(banned, observed)
+        self.assertEqual(observed["mode"], "executive")
+        self.assertEqual(observed["confidence"], 0.5)
+
+    def test_no_assessment_is_a_real_outcome(self):
+        from workspace.service import observed_assessment
+
+        self.assertIsNone(observed_assessment(None))
+
+    def test_the_three_scores_are_the_computed_ones(self):
+        """
+        RC1/ACC-002. The regression this class did not have.
+
+        `observed_assessment` read each score with `getattr(score, "value", 0.0)`.
+        `Confidence` and `Risk` both expose `.score`, so every field silently
+        took the default and the key reported three zeros on every turn while the
+        real numbers sat one attribute away. The original tests asserted the
+        fields *existed* and were the right type -- which they were, and 0.0 is a
+        float.
+        """
+        from reasoning.models import Confidence, Recommendation
+        from reasoning.options import Risk
+        from workspace.service import observed_assessment
+
+        recommendation = Recommendation(
+            statement="Harden the scheduler",
+            rationale="because",
+            confidence=Confidence(score=0.64),
+            evidence_strength=Confidence(score=0.91),
+            execution_risk=Risk(score=0.30),
+        )
+
+        class _Assessment:
+            mode = Mode.EXECUTIVE
+            mode_reason = "matched next-work"
+            continuation = False
+            stale = False
+            stale_because = ""
+            obsolete = False
+            replaced_stale = False
+            has_reasoning = True
+            recommendations = [recommendation]
+            initiatives: list[Any] = []
+
+        observed = observed_assessment(_Assessment())
+        assert observed is not None
+        self.assertEqual(observed["confidence"], 0.64)
+        self.assertEqual(observed["evidence_strength"], 0.91)
+        self.assertEqual(observed["execution_risk"], 0.30)
+
+    def test_a_missing_score_is_zero_rather_than_a_crash(self):
+        """A recommendation without a strength must not take a turn down."""
+        from reasoning.models import Confidence, Recommendation
+        from workspace.service import observed_assessment
+
+        class _Assessment:
+            mode = Mode.EXECUTIVE
+            mode_reason = ""
+            continuation = False
+            stale = False
+            stale_because = ""
+            obsolete = False
+            replaced_stale = False
+            has_reasoning = True
+            recommendations = [
+                Recommendation(statement="s", rationale="r", confidence=Confidence(score=0.5))
+            ]
+            initiatives: list[Any] = []
+
+        observed = observed_assessment(_Assessment())
+        assert observed is not None
+        self.assertEqual(observed["confidence"], 0.5)
+        self.assertEqual(observed["execution_risk"], 0.0)
+
+    def test_the_reported_key_is_the_key_the_product_persists(self):
+        """
+        The identifier must identify the record it names.
+
+        `Recommendation` carries `initiative`, not `initiative_slug`. Reading the
+        latter returned "" and produced a key derived from a different slug than
+        `_capture_strategy` used, so the observational key could disagree with the
+        stored one. Both now call `_slug_for`, and this asserts they agree.
+        """
+        from reasoning.models import Confidence, Recommendation
+        from workspace.models import recommendation_key
+        from workspace.service import _slug_for, observed_assessment
+
+        class _Initiative:
+            name = "Billing"
+            slug = "billing"
+
+        recommendation = Recommendation(
+            statement="Add tests to Billing",
+            rationale="because",
+            confidence=Confidence(score=0.7),
+            initiative="Billing",
+        )
+
+        class _Assessment:
+            mode = Mode.EXECUTIVE
+            mode_reason = ""
+            continuation = False
+            stale = False
+            stale_because = ""
+            obsolete = False
+            replaced_stale = False
+            has_reasoning = True
+            recommendations = [recommendation]
+            initiatives = [_Initiative()]
+
+        assessment = _Assessment()
+        observed = observed_assessment(assessment)
+        assert observed is not None
+        expected_slug = _slug_for(assessment, recommendation.initiative)
+        self.assertEqual(observed["initiative_slug"], expected_slug)
+        self.assertEqual(observed["initiative_slug"], "billing")
+        self.assertEqual(
+            observed["recommendation_key"],
+            recommendation_key(recommendation.statement, expected_slug),
+        )
+
+
+# The real evidence set from the acceptance turn that exposed this, and the six
+# identifiers the model invented while six real ones sat unused in its context.
+REAL_SHAS = ("5c44663", "4f3bb44", "fe92458", "7845950", "f153af7", "2b00654", "48b1283", "8546e13")
+FAKE_SHAS = ("6d23456", "98b4567", "7654321", "a123456", "c987654", "f901234")
+
+FABRICATED_ANSWER = "\n".join(
+    [f"{i}. `{sha} Some plausible commit message`" for i, sha in enumerate(REAL_SHAS[:2], 1)]
+    + [f"{i}. `{sha} Another plausible message`" for i, sha in enumerate(FAKE_SHAS, 3)]
+)
+CORRECTED_ANSWER = "\n".join(f"{i}. `{sha} A real commit`" for i, sha in enumerate(REAL_SHAS, 1))
+
+
+def _evidence(**kw) -> EvidenceSet:
+    return EvidenceSet(**{k: frozenset(v) for k, v in kw.items()})
+
+
+class _StubAuthority:
+    """
+    A project with a known, fixed set of records.
+
+    Stands in for git and the filesystem so the resolution *policy* can be tested
+    without a repository. Anything not listed is `UNKNOWN` -- the records were
+    consulted and it is not there -- which is the distinction that matters: an
+    authority that answered `UNAVAILABLE` would make every claim unverifiable and
+    prove nothing about how a fabrication is classified.
+    """
+
+    def __init__(
+        self, *, commits=(), decisions=(), tasks=(), prs=(), paths=(), symbols=(), unavailable=()
+    ):
+        self._known = {
+            "commit": {c.lower() for c in commits},
+            "decision": set(decisions),
+            "task": set(tasks),
+            "pull_request": set(prs),
+            "path": set(paths),
+            "symbol": set(symbols),
+        }
+        self._unavailable = set(unavailable)
+
+    def _answer(self, kind: str, value: str) -> Resolution:
+        if kind in self._unavailable:
+            return Resolution.UNAVAILABLE
+        known = self._known[kind]
+        if kind in ("decision", "task"):
+            # `ADR-003` and `ADR-3` are one record, as a real store would read them.
+            known = {_normalise_id(k) for k in known}
+            value = _normalise_id(value)
+        return (
+            Resolution.RESOLVED
+            if value.lower() in {k.lower() for k in known}
+            else Resolution.UNKNOWN
+        )
+
+    def commit(self, candidate):
+        # Abbreviation resolution, one-directional: a stored reference may be
+        # abbreviated by the answer, never extended by it.
+        if "commit" in self._unavailable:
+            return Resolution.UNAVAILABLE
+        matches = {c for c in self._known["commit"] if c.startswith(candidate.lower())}
+        if len(matches) == 1:
+            return Resolution.RESOLVED
+        return Resolution.UNKNOWN
+
+    def decision(self, i):
+        return self._answer("decision", i)
+
+    def task(self, i):
+        return self._answer("task", i)
+
+    def pull_request(self, i):
+        return self._answer("pull_request", i)
+
+    def path(self, i):
+        return self._answer("path", i)
+
+    def symbol(self, i):
+        return self._answer("symbol", i)
+
+    def available(self):
+        return {
+            k: k not in self._unavailable
+            for k in ("commit", "decision", "task", "pull_request", "path", "symbol")
+        }
+
+
+class TestEvidenceValidation(unittest.TestCase):
+    """
+    An answer may narrate and infer. It may not invent identifiers that look like
+    evidence.
+
+    MondayOS retrieved eight real commits for one acceptance turn. The model
+    reported eight, of which six were fabricated — patterned hashes with
+    plausible messages — while six real ones sat unused in the context it had
+    been given. The evidence was complete; the narration replaced it.
+    """
+
+    def _verdicts(self, answer, evidence=None, authority=None):
+        report = validate_evidence(
+            answer,
+            evidence if evidence is not None else _evidence(),
+            authority if authority is not None else _StubAuthority(commits=REAL_SHAS),
+        )
+        return {f.identifier.lower(): f.verdict.value for f in report.findings}
+
+    # ------------------------------------------------------- RT-01: forgery
+
+    def test_a_fabricated_sha_extending_a_real_prefix_is_rejected(self):
+        """
+        RT-01. The red-team bypass, and the reason prefix matching left this file.
+
+        Evidence held the seven-character `5c44663`, and resolution matched in
+        both directions, so *anything beginning with it* verified. A model could
+        append thirty-three characters and produce a full-length SHA that does not
+        exist and never did, presented as established fact.
+        """
+        forged = "5c44663deadbeefdeadbeefdeadbeefdeadbeef"
+        found = self._verdicts(f"Recent work: `{forged}` overhauled sourcing.")
+        self.assertEqual(found.get(forged), "unsupported")
+
+    def test_an_overlong_hex_run_is_still_a_claim(self):
+        """
+        Caught by an independent verifier, delivered end-to-end before the fix.
+
+        A git SHA is at most 40 characters, and "not a valid SHA" had been
+        treated as "not a claim" -- so a 55-character forgery in backticks was
+        shown to a reader as a commit without ever being checked.
+        """
+        forged = "5c44663" + "deadbeef" * 6
+        found = self._verdicts(f"Recent work landed in `{forged}`.")
+        self.assertEqual(found.get(forged), "unsupported")
+
+    def test_a_malformed_authority_blocks_rather_than_raising(self):
+        """
+        Every authority failure must have a deterministic outcome.
+
+        The fail-closed matrix found an exception propagating straight out of
+        validation, which loses the user's turn instead of refusing it.
+        """
+
+        class Exploding:
+            def commit(self, c):
+                raise RuntimeError("authority exploded")
+
+            decision = task = pull_request = path = symbol = commit
+
+            def available(self):
+                raise RuntimeError("availability exploded")
+
+        report = validate_evidence("Work landed in `6d23456`.", _evidence(), Exploding())
+        self.assertEqual([f.verdict for f in report.findings], [EvidenceVerdict.UNVERIFIABLE])
+        self.assertEqual(len(report.blocking), 1)
+        self.assertFalse(report.checked)
+
+    def test_the_project_overrules_retrieval(self):
+        """
+        Retrieval may not vouch for an identifier the project denies.
+
+        The order used to be the other way round, so anything that reached the
+        citation list was verified without the records ever being consulted.
+        """
+        authority = _StubAuthority(commits=REAL_SHAS)
+        found = self._verdicts(
+            "Work landed in `deadbee`.",
+            evidence=_evidence(commits=("deadbee",)),
+            authority=authority,
+        )
+        self.assertEqual(found.get("deadbee"), "unsupported")
+
+    def test_retrieval_still_settles_what_the_records_cannot_answer(self):
+        """With no authority, "we handed the model this" is real evidence."""
+        found = self._verdicts(
+            "Work landed in `deadbee`.",
+            evidence=_evidence(commits=("deadbee",)),
+            authority=_StubAuthority(unavailable=("commit",)),
+        )
+        self.assertEqual(found.get("deadbee"), "verified")
+
+    def test_a_real_abbreviation_still_resolves(self):
+        self.assertEqual(
+            self._verdicts("Recent work: `5c44663` landed.").get("5c44663"), "verified"
+        )
+
+    def test_an_abbreviation_matching_two_commits_is_rejected(self):
+        authority = _StubAuthority(commits=("5c44663aaa", "5c44663bbb"))
+        self.assertEqual(
+            self._verdicts("see `5c44663`", authority=authority).get("5c44663"), "unsupported"
+        )
+
+    def test_a_commit_from_another_project_is_rejected(self):
+        """Scoping is part of resolution: a parent's commit is not this project's."""
+        self.assertEqual(self._verdicts("see `1dcac30`").get("1dcac30"), "unsupported")
+
+    # ------------------------------------- RT-03: independence from retrieval
+
+    def test_commits_are_checked_even_when_retrieval_supplied_none(self):
+        """
+        RT-03. Validation used to be gated on the evidence set having that class,
+        and `git` is last in the context budget's priority -- so a crowded
+        snapshot silently disabled commit checking altogether.
+        """
+        found = self._verdicts(
+            "Recent work: `6d23456` rewrote the exporter.",
+            evidence=_evidence(paths=("docs/ARCHITECTURE.md",)),
+        )
+        self.assertEqual(found.get("6d23456"), "unsupported")
+
+    def test_a_claim_with_no_authority_is_unverifiable_not_clean(self):
+        """
+        RT-04. `UNAVAILABLE` must never read as a pass.
+
+        Returning nothing for an unknowable claim is what let a turn report a
+        clean bill of health having examined nothing.
+        """
+        found = self._verdicts(
+            "Recent work: `6d23456` landed.",
+            authority=_StubAuthority(unavailable=("commit",)),
+        )
+        self.assertEqual(found.get("6d23456"), "unverifiable")
+
+    # ------------------------------------------------- RT-02: renderings
+
+    def test_a_fabricated_sha_is_caught_in_every_rendering(self):
+        """
+        RT-02. Markdown emphasis defeated a rule built on bullet positions:
+        `**7654321**` is neither a delimiter the rule knew nor a list position.
+        """
+        renderings = (
+            "**7654321** rewrote scoring",
+            "*7654321* rewrote scoring",
+            "> **7654321** rewrote scoring",
+            "[7654321](http://example.com/x)",
+            "| 7654321 | rewrote scoring |",
+            "the commit (7654321) shipped",
+            "the commit [7654321] shipped",
+            "* 7654321 rewrote scoring",
+            "-   7654321 rewrote scoring",
+            "3. 7654321 rewrote scoring",
+            "  - `7654321` a message",
+            "7654321 rewrote scoring",
+            "- commit: 7654321 — recent commit",
+        )
+        for text in renderings:
+            with self.subTest(rendering=text):
+                self.assertEqual(self._verdicts(text).get("7654321"), "unsupported")
+
+    def test_a_real_all_digit_sha_is_verified_in_those_renderings(self):
+        """A false accusation is as much a failure as a missed fabrication."""
+        for text in (
+            "**7845950** was the WIP commit",
+            "| 7845950 | WIP |",
+            "- commit: 7845950 — recent commit",
+            "see `7845950` for the WIP",
+        ):
+            with self.subTest(rendering=text):
+                self.assertEqual(self._verdicts(text).get("7845950"), "verified")
+
+    def test_a_quantity_in_prose_is_never_a_citation(self):
+        for text in (
+            "We processed 7654321 records last quarter.",
+            "The build took 9876543 ms to finish.",
+            "It took 1234567 attempts, then 7654321 more.",
+            "confidence 0.47 and evidence 94%",
+            "roughly 0.8 of the work is done",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._verdicts(text), {})
+
+    def test_validation_reads_what_the_reader_will_see(self):
+        """
+        Found by an independent verifier that did not share the production parser.
+
+        Three ways the raw text and the rendered text disagreed, each hiding an
+        identifier from every pattern at once while a reader saw it plainly:
+        a Markdown escape, an HTML entity, and a soft hyphen. The rule is that
+        validation and display must agree on what the identifier is.
+        """
+        cases = {
+            "markdown escape": "Work landed in `6d2\\3456`.",
+            "html entity": "Work landed in <code>&#54;d23456</code>.",
+            "soft hyphen": "Work landed in `6d2\u00ad3456`.",
+            "zero width": "Work landed in `6d2\u200b3456`.",
+            "word joiner": "Work landed in `6d2\u20603456`.",
+            "bidi mark": "Work landed in `\u200f6d23456`.",
+        }
+        for name, text in cases.items():
+            with self.subTest(rendering=name):
+                self.assertEqual(self._verdicts(text).get("6d23456"), "unsupported")
+
+    def test_an_entity_encoded_record_id_is_still_read(self):
+        found = self._verdicts(
+            "This follows ADR&#45;9099.",
+            authority=_StubAuthority(decisions=("ADR-3",)),
+        )
+        self.assertEqual(found.get("adr-9099"), "unsupported")
+
+    def test_a_real_identifier_survives_the_same_normalisation(self):
+        """Normalising must not turn a genuine citation into an accusation."""
+        for text in ("Work landed in `5c44663`.", "Work landed in <code>5c44663</code>."):
+            with self.subTest(text=text):
+                self.assertEqual(self._verdicts(text).get("5c44663"), "verified")
+
+    def test_a_lookalike_hidden_behind_unicode_is_still_read(self):
+        """Fullwidth digits and a zero-width space both defeated the matchers."""
+        self.assertEqual(
+            self._verdicts("commit `\uff17\uff16\uff15\uff14\uff13\uff12\uff11` landed").get(
+                "7654321"
+            ),
+            "unsupported",
+        )
+        self.assertEqual(
+            self._verdicts("commit `765\u200b4321` landed").get("7654321"), "unsupported"
+        )
+
+    # ------------------------------------------------- the original failure
+
+    def test_the_six_fabricated_shas_are_rejected(self):
+        found = self._verdicts(FABRICATED_ANSWER)
+        for sha in FAKE_SHAS:
+            with self.subTest(sha=sha):
+                self.assertEqual(found.get(sha), "unsupported")
+
+    def test_real_abbreviated_shas_from_scoped_history_pass(self):
+        found = self._verdicts(CORRECTED_ANSWER)
+        for sha in REAL_SHAS:
+            with self.subTest(sha=sha):
+                self.assertEqual(found.get(sha), "verified")
+
+    # ---------------------------------------------------- other identifiers
+
+    def test_every_identifier_class_is_checked(self):
+        authority = _StubAuthority(
+            decisions=("ADR-3",),
+            tasks=("TASK-59",),
+            prs=("28",),
+            paths=("workspace/responder.py",),
+            symbols=("validate_evidence",),
+        )
+        cases = (
+            ("See ADR-003 for the rationale.", "adr-003", "verified"),
+            ("See ADR-017 for the rationale.", "adr-017", "unsupported"),
+            ("See ADR-10017 for details.", "adr-10017", "unsupported"),
+            ("TASK-0059 is done.", "task-0059", "verified"),
+            ("TASK-1234567 is open.", "task-1234567", "unsupported"),
+            ("See PR #28 for that.", "28", "verified"),
+            ("See PR-999 for that.", "999", "unsupported"),
+            ("see github.com/o/r/pull/999", "999", "unsupported"),
+            ("see workspace/responder.py", "workspace/responder.py", "verified"),
+            ("see workspace/ghost.rs", "workspace/ghost.rs", "unsupported"),
+        )
+        for text, ident, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(self._verdicts(text, authority=authority).get(ident), expected)
+
+    def test_a_web_address_is_not_a_repository_path(self):
+        """Citing a website must not fail a turn closed."""
+        found = self._verdicts("see https://example.com/docs/guide.html for background")
+        self.assertEqual(found.get("example.com/docs/guide.html"), None)
+
+    # ------------------------------------------------- RT-06: per-class truth
+
+    def test_a_class_that_was_never_checked_does_not_report_success(self):
+        """
+        RT-06. `checked: true` used to mean "an evidence set existed", so a turn
+        could report a clean bill of health having validated nothing at all.
+        """
+        report = validate_evidence(
+            "Recent work: `6d23456` landed.",
+            _evidence(),
+            _StubAuthority(unavailable=("commit",)),
+        )
+        self.assertFalse(report.classes["commit"].validated)
+        self.assertFalse(report.checked)
+        self.assertEqual(report.classes["commit"].unverifiable, 1)
+
+    def test_a_verified_class_reports_success(self):
+        report = validate_evidence(
+            "Recent work: `5c44663` landed.",
+            _evidence(),
+            _StubAuthority(commits=REAL_SHAS),
+        )
+        self.assertTrue(report.classes["commit"].validated)
+        self.assertTrue(report.checked)
+
+    def test_unverifiable_claims_block_just_like_unsupported_ones(self):
+        report = validate_evidence(
+            "Recent work: `6d23456` landed.",
+            _evidence(),
+            _StubAuthority(unavailable=("commit",)),
+        )
+        self.assertEqual(len(report.blocking), 1)
+
+    # --------------------------------------------- structured citations
+
+    def test_a_symbol_is_validated_when_cited_structurally(self):
+        """
+        RT-06. Symbols were collected into the evidence set, counted towards
+        "is there evidence", and never validated -- so a symbols-only answer
+        reported successful validation having checked nothing.
+
+        Free prose is still not scanned for symbols: every backticked word would
+        be a candidate and a project index that does not define `git status`
+        would report it fabricated. A handle states its kind, so the claim is
+        exact rather than guessed.
+        """
+        authority = _StubAuthority(symbols=("validate_evidence",))
+        report = validate_evidence(
+            "That work lives in validate_evidence.",
+            _evidence(),
+            authority,
+            extra_claims=[("symbol", "ghost_function")],
+        )
+        verdicts = {f.identifier: f.verdict.value for f in report.findings}
+        self.assertEqual(verdicts.get("ghost_function"), "unsupported")
+        self.assertEqual(report.classes["symbol"].claims_found, 1)
+
+    def test_a_symbol_with_no_index_is_unverifiable_not_verified(self):
+        report = validate_evidence(
+            "x",
+            _evidence(),
+            _StubAuthority(unavailable=("symbol",)),
+            extra_claims=[("symbol", "anything")],
+        )
+        self.assertEqual(report.classes["symbol"].unverifiable, 1)
+        self.assertFalse(report.classes["symbol"].validated)
+        self.assertFalse(report.checked)
+
+    def test_free_prose_is_not_scanned_for_symbols(self):
+        """The deliberate limitation, asserted so it cannot regress into guessing."""
+        report = validate_evidence(
+            "Run `git status` and read `README` before calling do_thing().",
+            _evidence(),
+            _StubAuthority(symbols=("validate_evidence",)),
+        )
+        self.assertEqual(report.classes["symbol"].claims_found, 0)
+
+    def test_a_cited_handle_resolves_to_the_real_identifier(self):
+        handles = {"E1": EvidenceHandle("E1", "commit", "5c44663", "the roadmap")}
+        text, cited, unknown = resolve_handles("Recent work landed [E1].", handles)
+        self.assertEqual(text, "Recent work landed 5c44663.")
+        self.assertEqual([h.label for h in cited], ["E1"])
+        self.assertEqual(unknown, [])
+
+    def test_a_handle_that_was_never_supplied_is_caught(self):
+        handles = {"E1": EvidenceHandle("E1", "commit", "5c44663")}
+        text, cited, unknown = resolve_handles("Work landed [E9].", handles)
+        self.assertEqual(unknown, ["E9"])
+        self.assertEqual(cited, [])
+        self.assertIn("[E9]", text, "an unresolved handle is never rendered as a fact")
+
+
+def _store_lookup(store: dict):
+    """
+    A task store that conforms to the lookup contract.
+
+    `None` means the store could not be consulted at all; a missing task is
+    `TaskRecord(exists=False)`. `dict.get` conflates the two, and conflating them
+    is what turns "we could not check" into "it is not there".
+    """
+    return lambda task_id: store.get(task_id, TaskRecord(exists=False))
+
+
+class TestProjectAuthorityAgainstRealGit(unittest.TestCase):
+    """
+    Commit resolution, against an actual repository.
+
+    RT-01 was fixed by deleting a hand-rolled prefix match and delegating to git,
+    so a stub would test the delegation and not the thing delegated to. This
+    builds a real repository in a temporary directory: it proves `rev-parse
+    --verify` rejects a forged extension and an ambiguous prefix, which is the
+    entire basis of the fix.
+    """
+
+    def _repo(self, tmp: str) -> tuple[Path, str]:
+        root = Path(tmp) / "repo"
+        root.mkdir()
+        run = lambda *a: subprocess.run(  # noqa: E731
+            ["git", *a], cwd=root, capture_output=True, text=True, check=True
+        )
+        run("init", "-q")
+        run("config", "user.email", "t@example.com")
+        run("config", "user.name", "Test")
+        (root / "file.txt").write_text("one\n")
+        run("add", "-A")
+        run("commit", "-qm", "first commit")
+        full = run("rev-parse", "HEAD").stdout.strip()
+        return root, full
+
+    def test_git_resolves_real_forms_and_rejects_forged_ones(self):
+        with TemporaryDirectory() as tmp:
+            root, full = self._repo(tmp)
+            authority = ProjectAuthority(root)
+
+            self.assertIs(authority.commit(full), Resolution.RESOLVED)
+            self.assertIs(authority.commit(full[:7]), Resolution.RESOLVED)
+            self.assertIs(authority.commit(full[:12]), Resolution.RESOLVED)
+
+            # The red-team forgery: a real prefix with fabricated characters
+            # appended. A prefix match accepted this; git does not.
+            forged = (full[:7] + "deadbeef" * 5)[:40]
+            self.assertIs(authority.commit(forged), Resolution.UNKNOWN)
+            self.assertIs(authority.commit("0" * 7), Resolution.UNKNOWN)
+
+    def test_task_authority_is_ownership_not_existence(self):
+        """
+        Tasks are managed centrally, so existence is the wrong question.
+
+        One store under the MondayOS root holds every project's tasks and each
+        records its owner as a registry slug. `TASK-0059` exists for somebody in
+        every case below; the only thing that differs is who. Accepting mere
+        existence would let a Cue App task substantiate a claim in sourcingBOT --
+        the cross-project leak this subsystem exists to prevent, arriving
+        through the front door.
+        """
+        store = {
+            "TASK-0059": TaskRecord(exists=True, project="sourcingbot"),
+            "TASK-0100": TaskRecord(exists=True, project="cue-app"),
+            "TASK-0200": TaskRecord(exists=True, project=""),
+            "TASK-9999": TaskRecord(exists=False),
+        }
+        authority = ProjectAuthority(Path("."), slug="sourcingbot", task_lookup=store.get)
+        cases = {
+            "TASK-0059": Resolution.RESOLVED,  # owned by this project
+            "TASK-0100": Resolution.UNKNOWN,  # owned by another project
+            "TASK-0200": Resolution.UNKNOWN,  # exists, no recorded owner
+            "TASK-9999": Resolution.UNKNOWN,  # does not exist
+        }
+        for task_id, expected in cases.items():
+            with self.subTest(task=task_id):
+                self.assertIs(authority.task(task_id), expected)
+
+    def test_an_unowned_task_belongs_to_no_project(self):
+        """
+        `unknown` is not `matches everything`.
+
+        The same rule `TaskManager.list_active(project=...)` already applies, and
+        for the same reason: guessing an owner is how a slug-in-title heuristic
+        once assigned tasks to projects that never claimed them.
+        """
+        store = {"TASK-0200": TaskRecord(exists=True, project="")}
+        for slug in ("sourcingbot", "cue-app", "mondayos"):
+            with self.subTest(project=slug):
+                authority = ProjectAuthority(Path("."), slug=slug, task_lookup=_store_lookup(store))
+                self.assertIs(authority.task("TASK-0200"), Resolution.UNKNOWN)
+
+    def test_an_unreachable_task_store_is_unavailable_not_absent(self):
+        """
+        A workspace with no task store has not established that a task is absent.
+
+        Reporting absence would fail a real answer closed for citing real work,
+        which is the false-accusation direction.
+        """
+        authority = ProjectAuthority(Path("."), slug="sourcingbot", task_lookup=lambda _: None)
+        self.assertIs(authority.task("TASK-0059"), Resolution.UNAVAILABLE)
+        self.assertFalse(authority.available()["task"])
+
+    def test_a_task_claim_for_the_owning_project_verifies_end_to_end(self):
+        """The case that was failing closed on legitimate answers."""
+        store = {"TASK-0059": TaskRecord(exists=True, project="sourcingbot")}
+        authority = ProjectAuthority(
+            Path("."), slug="sourcingbot", task_lookup=_store_lookup(store)
+        )
+        report = validate_evidence("Tracked as TASK-0059.", EvidenceSet(), authority)
+        self.assertEqual(
+            [(f.identifier, f.verdict) for f in report.findings],
+            [("TASK-0059", EvidenceVerdict.VERIFIED)],
+        )
+        self.assertEqual(report.blocking, [])
+        self.assertTrue(report.classes["task"].authority_available)
+
+    def test_a_foreign_task_claim_blocks(self):
+        store = {"TASK-0100": TaskRecord(exists=True, project="cue-app")}
+        authority = ProjectAuthority(
+            Path("."), slug="sourcingbot", task_lookup=_store_lookup(store)
+        )
+        report = validate_evidence("Tracked as TASK-0100.", EvidenceSet(), authority)
+        self.assertEqual(len(report.blocking), 1)
+
+    def test_a_project_without_git_reports_unavailable_not_absent(self):
+        """The distinction RT-04 turned on: cannot check is not the same as clean."""
+        with TemporaryDirectory() as tmp:
+            plain = Path(tmp) / "plain"
+            plain.mkdir()
+            authority = ProjectAuthority(plain)
+            self.assertIs(authority.commit("5c44663"), Resolution.UNAVAILABLE)
+            self.assertFalse(authority.available()["commit"])
+
+    def test_a_symbol_without_an_index_is_unavailable(self):
+        with TemporaryDirectory() as tmp:
+            authority = ProjectAuthority(Path(tmp))
+            self.assertIs(authority.symbol("anything"), Resolution.UNAVAILABLE)
+            self.assertFalse(authority.available()["symbol"])
+
+    def test_a_path_outside_the_project_never_resolves(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "proj"
+            (root / "src").mkdir(parents=True)
+            (root / "src" / "main.py").write_text("x = 1\n")
+            (Path(tmp) / "secret.txt").write_text("nope\n")
+            authority = ProjectAuthority(root)
+            self.assertIs(authority.path("src/main.py"), Resolution.RESOLVED)
+            self.assertIs(authority.path("../secret.txt"), Resolution.UNKNOWN)
+            self.assertIs(authority.path("src/ghost.py"), Resolution.UNKNOWN)
+
+
+class TestBackstopUnderFuzzing(unittest.TestCase):
+    """
+    The heuristic backstop, against renderings nobody wrote down.
+
+    Three rounds of live runs each found another Markdown shape the previous rule
+    missed -- a bulleted hash, a labelled one, an inline code span -- and each was
+    fixed by adding that shape to a list. A list of thirty delimiters proves
+    nothing about the thirty-first, so this generates them instead.
+
+    Seeded rather than random: a fuzz test that fails only on some runs is a test
+    nobody can act on. The seed is fixed, the corpus is therefore identical on
+    every machine, and a failure names the exact rendering that broke.
+    """
+
+    WRAPS = (
+        "`{0}`",
+        "**{0}**",
+        "*{0}*",
+        "_{0}_",
+        "~~{0}~~",
+        '"{0}"',
+        "'{0}'",
+        "({0})",
+        "[{0}]",
+        "`{0}`",
+        "**`{0}`**",
+    )
+    LEADS = (
+        "",
+        "- ",
+        "* ",
+        "+ ",
+        "1. ",
+        "2) ",
+        "  - ",
+        "    ",
+        "> ",
+        "> - ",
+        "| ",
+        "commit: ",
+        "- commit: ",
+        "sha: ",
+        "rev - ",
+    )
+    TAILS = (
+        "",
+        " rewrote the exporter",
+        ": rewrote the exporter",
+        " |",
+        " — recent commit",
+        ".",
+        ",",
+        ")",
+    )
+
+    def _corpus(self, token: str, count: int = 600) -> list[str]:
+        rng = random.Random(20260911)
+        out = []
+        for _ in range(count):
+            body = rng.choice(self.WRAPS).format(token) if rng.random() < 0.75 else token
+            lead = rng.choice(self.LEADS)
+            tail = rng.choice(self.TAILS)
+            line = f"{lead}{body}{tail}"
+            if rng.random() < 0.4:
+                line = f"Recent work touched this project:\n{line}"
+            out.append(line)
+        return out
+
+    def _formatted(self, rendering: str, token: str) -> bool:
+        """Whether the token is marked as an identifier rather than left bare in prose."""
+        index = rendering.index(token)
+        before = rendering[:index].rsplit("\n", 1)[-1]
+        after = rendering[index + len(token) :]
+        return bool(before.strip() or (before and after[:1] in "`*_~\"')]|"))
+
+    def test_a_fabricated_hex_sha_is_detected_in_every_rendering(self):
+        """A hash containing a letter is unambiguous, so this has no exceptions."""
+        authority = _StubAuthority(commits=REAL_SHAS)
+        for rendering in self._corpus("6d23456"):
+            with self.subTest(rendering=rendering):
+                found = validate_evidence(rendering, _evidence(), authority)
+                self.assertEqual(
+                    {f.verdict for f in found.findings if f.identifier == "6d23456"},
+                    {EvidenceVerdict.UNSUPPORTED},
+                )
+
+    def test_a_fabricated_all_digit_sha_is_detected_wherever_it_is_marked(self):
+        """
+        The narrower invariant, and the honest one.
+
+        An all-digit token in bare prose is indistinguishable from a quantity --
+        `We processed 7654321 records` -- so detection is claimed only where the
+        answer marks the token as an identifier. That residual is why the
+        structured citation protocol exists rather than a longer delimiter list.
+        """
+        authority = _StubAuthority(commits=REAL_SHAS)
+        for rendering in self._corpus("7654321"):
+            if not self._formatted(rendering, "7654321"):
+                continue
+            with self.subTest(rendering=rendering):
+                found = validate_evidence(rendering, _evidence(), authority)
+                self.assertEqual(
+                    {f.verdict for f in found.findings if f.identifier == "7654321"},
+                    {EvidenceVerdict.UNSUPPORTED},
+                )
+
+    def test_a_real_sha_is_never_accused_in_any_rendering(self):
+        """A false accusation fails a good answer closed, which is its own failure."""
+        authority = _StubAuthority(commits=REAL_SHAS)
+        for token in ("5c44663", "7845950"):
+            for rendering in self._corpus(token, count=300):
+                verdicts = {
+                    f.verdict
+                    for f in validate_evidence(rendering, _evidence(), authority).findings
+                    if f.identifier == token
+                }
+                with self.subTest(rendering=rendering):
+                    self.assertNotIn(EvidenceVerdict.UNSUPPORTED, verdicts)
+                    self.assertNotIn(EvidenceVerdict.UNVERIFIABLE, verdicts)
+
+    def test_a_quantity_is_never_read_as_a_citation(self):
+        authority = _StubAuthority(commits=REAL_SHAS)
+        rng = random.Random(9022)
+        units = ("records", "ms", "rows", "tokens", "bytes", "users", "attempts")
+        for _ in range(300):
+            number = rng.randrange(1_000_000, 99_999_999)
+            text = f"We processed {number} {rng.choice(units)} last quarter."
+            with self.subTest(text=text):
+                found = validate_evidence(text, _evidence(), authority)
+                self.assertEqual(found.findings, [])
+
+
+class _ScriptedProvider(AIProvider):
+    """A provider that returns prepared answers, so the flow can be tested offline."""
+
+    def __init__(self, *answers: str, fail_on: int = -1) -> None:
+        self._answers = list(answers)
+        self._fail_on = fail_on
+        self.calls: list[str] = []
+
+    @property
+    def name(self) -> str:
+        return "scripted"
+
+    def availability(self) -> ProviderAvailability:
+        return ProviderAvailability(available=True, provider="scripted")
+
+    def ask(self, prompt, context="", max_tokens=1024, **kwargs):
+        index = len(self.calls)
+        self.calls.append(prompt)
+        if index == self._fail_on:
+            raise ProviderError("provider died during correction")
+        answer = self._answers[min(index, len(self._answers) - 1)]
+        return ProviderResponse(content=answer, model="m", provider="scripted")
+
+    def plan(self, objective, context="", max_tokens=2048, **kwargs):
+        return self.ask(objective)
+
+    def summarize(self, content, max_words=150, **kwargs):
+        return self.ask(content)
+
+    def review(self, content, criteria="", **kwargs):
+        return self.ask(content)
+
+
+class TestCitationsSurviveToTheEvidenceSet(unittest.TestCase):
+    """
+    The allowlist is only worth having if it reaches the validator.
+
+    Validation was written, tested and correct, and inert on the very turn that
+    motivated it: the git adapter recorded no citations, and the budget rebuilt
+    every source without the ones that did exist. An empty evidence set makes
+    every fabricated identifier vacuously acceptable, so these are the two
+    joints that have to hold.
+    """
+
+    def test_the_git_adapter_cites_the_commits_it_supplied(self):
+        from workspace.context.adapters import _cite_commit
+
+        self.assertEqual(
+            _cite_commit("  5c44663 sourcingBOT: define shortlist-first sourcing roadmap"),
+            {"kind": "commit", "reference": "5c44663"},
+        )
+        self.assertIsNone(_cite_commit("Working tree: clean"))
+        self.assertIsNone(_cite_commit("Current branch: main"))
+
+    def test_a_citation_survives_when_its_reference_is_not_in_the_prose(self):
+        """
+        RT-05. The budget used to keep a citation only if its reference appeared
+        literally in the retained text, so a file citation attached to a prose
+        summary was discarded even though nothing had been trimmed. The allowlist
+        then shrank below what the model was actually shown -- or emptied, which
+        switched validation off entirely.
+        """
+        from workspace.context.budget import apply
+
+        source = ContextSource(
+            name="docs",
+            label="Docs",
+            items=["Architecture overview: the system has three layers."],
+            reasons=["r"],
+            citations=[{"kind": "file", "reference": "docs/ARCHITECTURE.md", "item": 0}],
+        )
+        kept = apply([source], total_cap=10_000).sources[0]
+        self.assertEqual([c["reference"] for c in kept.citations], ["docs/ARCHITECTURE.md"])
+
+    def test_the_budget_keeps_citations_for_items_it_kept(self):
+        from workspace.context.budget import apply
+
+        source = ContextSource(
+            name="git",
+            label="Git state",
+            items=["  5c44663 kept", "  4f3bb44 dropped"],
+            reasons=["recent", "recent"],
+            citations=[
+                {"kind": "commit", "reference": "5c44663", "item": 0},
+                {"kind": "commit", "reference": "4f3bb44", "item": 1},
+            ],
+        )
+        kept = apply([source], total_cap=len("  5c44663 kept")).sources[0]
+        self.assertEqual([c["reference"] for c in kept.citations], ["5c44663"])
+
+    def test_a_citation_whose_item_was_dropped_does_not_survive(self):
+        """
+        Evidence the model was never shown must not become evidence it may cite.
+
+        The budget trims to fit. A citation carried past the item that held it
+        would allowlist a commit that never reached the prompt.
+        """
+        from workspace.context.budget import apply
+
+        source = ContextSource(
+            name="git",
+            label="Git state",
+            items=["  5c44663 kept"],
+            reasons=["recent"],
+            citations=[{"kind": "commit", "reference": "deadbee", "item": 5}],
+        )
+        self.assertEqual(apply([source], total_cap=1000).sources[0].citations, [])
+
+
+class TestValidationPreservesTruncation(unittest.TestCase):
+    """
+    Checking an answer must not make a cut-off one look finished.
+
+    Validation was written as an early return, which skipped the
+    `stop_reason == "max_tokens"` branch below it. Every evidence-bearing turn
+    then reported `incomplete=False` no matter where the model stopped -- a
+    dishonest answer produced by the machinery built to enforce honesty.
+    """
+
+    def _reply(self, stop_reason: str, text: str):
+        from brain.providers.base import ProviderChunk
+
+        class Truncating(_ScriptedProvider):
+            @property
+            def supports_streaming(self) -> bool:
+                return True
+
+            def stream(self, prompt, context="", max_tokens=1024, **kwargs):
+                yield ProviderChunk(text=text)
+                yield ProviderChunk(
+                    done=True, model="m", provider="scripted", stop_reason=stop_reason
+                )
+
+        snapshot = ContextSnapshot(
+            id="snap",
+            project="sourcingbot",
+            created_at=T0,
+            citations=[{"kind": "commit", "reference": sha} for sha in REAL_SHAS],
+        )
+        request = WorkspaceRequest(
+            project="sourcingbot",
+            message="What changed recently?",
+            snapshot=snapshot,
+            authority=_StubAuthority(commits=REAL_SHAS),
+        )
+        responder = ProviderWorkspaceResponder(Truncating(CORRECTED_ANSWER))
+        return list(responder.respond_stream(request))[-1].reply
+
+    def test_a_verified_answer_cut_off_at_max_tokens_is_still_incomplete(self):
+        reply = self._reply("max_tokens", f"We landed {REAL_SHAS[0]} and then")
+        self.assertTrue(reply.incomplete)
+        self.assertEqual(reply.metadata.get("stop_reason"), "max_tokens")
+        self.assertTrue(reply.metadata["evidence_validation"]["checked"])
+
+    def test_a_verified_answer_that_finished_is_complete(self):
+        reply = self._reply("end_turn", f"We landed {REAL_SHAS[0]}.")
+        self.assertFalse(reply.incomplete)
+        self.assertEqual(reply.metadata["evidence_validation"]["unsupported_count"], 0)
+
+
+class TestEvidenceCorrectionFlow(unittest.TestCase):
+    """
+    Unsupported evidence never survives as a verified factual claim.
+
+    One correction, then fail closed. Never an endless loop, and never the
+    original fabrication returned because the retry did not work out.
+    """
+
+    def _request(self) -> WorkspaceRequest:
+        snapshot = ContextSnapshot(
+            id="snap",
+            project="sourcingbot",
+            created_at=T0,
+            citations=[{"kind": "commit", "reference": sha} for sha in REAL_SHAS],
+        )
+        return WorkspaceRequest(
+            project="sourcingbot",
+            message="What changed recently?",
+            snapshot=snapshot,
+            authority=_StubAuthority(commits=REAL_SHAS),
+        )
+
+    def test_a_clean_answer_passes_through_untouched(self):
+        provider = _ScriptedProvider(CORRECTED_ANSWER)
+        reply = ProviderWorkspaceResponder(provider).respond(self._request())
+        self.assertEqual(reply.content, CORRECTED_ANSWER)
+        self.assertEqual(len(provider.calls), 1)
+        validation = reply.metadata["evidence_validation"]
+        self.assertEqual(validation["unsupported_count"], 0)
+        self.assertFalse(validation["correction_attempted"])
+
+    def test_one_correction_is_attempted_and_can_succeed(self):
+        provider = _ScriptedProvider(FABRICATED_ANSWER, CORRECTED_ANSWER)
+        reply = ProviderWorkspaceResponder(provider).respond(self._request())
+        self.assertEqual(reply.content, CORRECTED_ANSWER)
+        self.assertEqual(len(provider.calls), 2, "exactly one correction")
+        validation = reply.metadata["evidence_validation"]
+        self.assertTrue(validation["correction_attempted"])
+        self.assertTrue(validation["correction_succeeded"])
+
+    def test_the_correction_names_the_unsupported_identifiers(self):
+        """MondayOS already knows which ones failed; the model is told, not asked."""
+        provider = _ScriptedProvider(FABRICATED_ANSWER, CORRECTED_ANSWER)
+        ProviderWorkspaceResponder(provider).respond(self._request())
+        correction = provider.calls[1]
+        for sha in FAKE_SHAS:
+            self.assertIn(sha, correction)
+        self.assertNotIn("check whether", correction.lower())
+
+    def test_a_second_failure_fails_closed(self):
+        provider = _ScriptedProvider(FABRICATED_ANSWER, FABRICATED_ANSWER)
+        reply = ProviderWorkspaceResponder(provider).respond(self._request())
+        self.assertEqual(len(provider.calls), 2, "never a third attempt")
+        self.assertTrue(reply.incomplete)
+        self.assertIn("could not verify", reply.content)
+        for sha in FAKE_SHAS:
+            self.assertNotIn(sha, reply.content, "the fabrication must not be re-shown")
+        validation = reply.metadata["evidence_validation"]
+        self.assertFalse(validation["correction_succeeded"])
+        self.assertEqual(sorted(validation["unsupported"]), sorted(FAKE_SHAS))
+
+    def test_a_provider_failure_during_correction_does_not_rescue_the_original(self):
+        provider = _ScriptedProvider(FABRICATED_ANSWER, fail_on=1)
+        reply = ProviderWorkspaceResponder(provider).respond(self._request())
+        self.assertNotIn("6d23456", reply.content)
+        self.assertTrue(reply.incomplete)
+        self.assertFalse(reply.metadata["evidence_validation"]["correction_succeeded"])
+
+    def test_the_diagnostic_metadata_is_deterministic(self):
+        first = ProviderWorkspaceResponder(
+            _ScriptedProvider(FABRICATED_ANSWER, FABRICATED_ANSWER)
+        ).respond(self._request())
+        second = ProviderWorkspaceResponder(
+            _ScriptedProvider(FABRICATED_ANSWER, FABRICATED_ANSWER)
+        ).respond(self._request())
+        self.assertEqual(
+            first.metadata["evidence_validation"], second.metadata["evidence_validation"]
+        )
+
+    def test_an_evidence_bearing_stream_emits_nothing_before_validation(self):
+        """
+        The streaming guarantee. No amount of post-generation checking un-shows a
+        citation someone has already read, so an evidence-bearing turn is held
+        back until it has been verified.
+        """
+        provider = _ScriptedProvider(FABRICATED_ANSWER, FABRICATED_ANSWER)
+        chunks = list(ProviderWorkspaceResponder(provider).respond_stream(self._request()))
+        deltas = [c.text for c in chunks if c.text]
+        for sha in FAKE_SHAS:
+            for delta in deltas:
+                self.assertNotIn(sha, delta, "a fabricated SHA reached the user")
+
+    def test_a_clean_buffered_response_is_emitted_after_validation(self):
+        provider = _ScriptedProvider(CORRECTED_ANSWER)
+        chunks = list(ProviderWorkspaceResponder(provider).respond_stream(self._request()))
+        deltas = "".join(c.text for c in chunks if c.text)
+        self.assertIn(REAL_SHAS[0], deltas)
+        self.assertTrue(chunks[-1].done)
+
+    def test_a_turn_without_evidence_still_streams_progressively(self):
+        """Conversational turns have no identifiers to get wrong; they are untouched."""
+        provider = _ScriptedProvider("Hello, nothing to cite here.")
+        request = WorkspaceRequest(project="p", message="hi")
+        chunks = list(ProviderWorkspaceResponder(provider).respond_stream(request))
+        self.assertTrue([c for c in chunks if c.text])
+
+    def test_validation_does_not_touch_scoring_or_state(self):
+        """
+        Observational only. Nothing downstream may depend on it.
+
+        A validator that changed a score or a register would make evidence
+        integrity a reasoning input, which is exactly the coupling the assessment
+        key was kept free of.
+        """
+        provider = _ScriptedProvider(FABRICATED_ANSWER, CORRECTED_ANSWER)
+        request = self._request()
+        reply = ProviderWorkspaceResponder(provider).respond(request)
+        self.assertIn("evidence_validation", reply.metadata)
+        self.assertIsNone(request.assessment)

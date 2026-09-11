@@ -47,7 +47,8 @@ class AnthropicProvider(AIProvider):
         self._model = config.model or _DEFAULT_MODEL
         self._api_key = config.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self._max_tokens = config.max_tokens
-        self._timeout = config.timeout
+        self._connect_timeout = config.connect_timeout
+        self._generation_timeout = config.generation_timeout
 
     @property
     def name(self) -> str:
@@ -60,6 +61,41 @@ class AnthropicProvider(AIProvider):
     @property
     def cost_tier(self) -> int:
         return 3  # frontier hosted model — highest cost tier
+
+    def _request_timeout(self, max_tokens: int) -> Any:
+        """
+        Connect and read deadlines for one request.
+
+        This provider previously stored `config.timeout` and never read it, so
+        the knob did nothing and the SDK's own default applied. It is honoured
+        now.
+
+        The SDK speaks httpx, so connect and read bind separately. **`read` is an
+        inter-chunk deadline, not a total one**: it bounds silence rather than the
+        whole answer, so a stream that keeps producing may exceed it in total.
+        That differs from Ollama, where the single socket timeout does bound the
+        whole generation, and the difference is inherent to streaming rather than
+        a choice made here. The intent is the same on both: fail quickly when the
+        provider cannot be reached, and allow generation time proportionate to the
+        tokens requested.
+
+        Falls back to a single float when httpx is absent.
+        """
+        deadline = self.generation_deadline(max_tokens, self._generation_timeout)
+        try:
+            import httpx
+        except ImportError:
+            return deadline
+        return httpx.Timeout(
+            deadline, connect=self._connect_timeout, write=self._connect_timeout
+        )
+
+    @property
+    def tokens_per_second(self) -> float:
+        """
+        Conservative for a hosted model, which is faster in practice.
+        """
+        return 25.0
 
     @property
     def capability_tier(self) -> int:
@@ -95,6 +131,11 @@ class AnthropicProvider(AIProvider):
             reason="ready",
             env_var="ANTHROPIC_API_KEY",
         )
+
+    @property
+    def reports_stop_reason(self) -> bool:
+        """This provider reports why generation stopped, so truncation is detectable."""
+        return True
 
     @property
     def supports_streaming(self) -> bool:
@@ -144,7 +185,9 @@ class AnthropicProvider(AIProvider):
         stop_reason = ""
 
         try:
-            client = _anthropic.Anthropic(api_key=self._api_key)
+            client = _anthropic.Anthropic(
+                api_key=self._api_key, timeout=self._request_timeout(max_tokens)
+            )
             # Kwargs bag, matching `_call` above: the SDK's typed signature wants
             # its own MessageParam, and the rest of this module already passes
             # plain dicts through a dict[str, Any].
@@ -243,7 +286,9 @@ class AnthropicProvider(AIProvider):
             ) from exc
 
         try:
-            client = _anthropic.Anthropic(api_key=self._api_key)
+            client = _anthropic.Anthropic(
+                api_key=self._api_key, timeout=self._request_timeout(max_tokens)
+            )
             call_kwargs: dict[str, Any] = {
                 "model": self._model,
                 "max_tokens": max_tokens,

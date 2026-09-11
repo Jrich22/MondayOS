@@ -1,17 +1,22 @@
 """Tests for the memory module."""
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
 
-from memory import AgentMemory, ProjectMemory, SessionMemory
+import memory
+from memory.agent import AgentMemory
 from memory.base import MemoryRecord, MemoryStore
+from memory.project import ProjectMemory
+from memory.session import SessionMemory
 
 
 class TestMemoryRecord:
     def _make_record(self, **kwargs) -> MemoryRecord:
         from datetime import datetime, timezone
+
         defaults = dict(
             key="k",
             value="v",
@@ -109,8 +114,58 @@ class TestSessionMemory:
         assert "dead" not in snap
 
 
+class TestPublicInterface:
+    """
+    RC1/ACC-006. The package exports only tiers that work.
+
+    `ProjectMemory` and `AgentMemory` raise `NotImplementedError` from every
+    method. While they were exported from `memory`, a caller could read three
+    working tiers in the docstring, annotate against them, and discover at
+    runtime that two were a plan. Import succeeded and the first call failed,
+    which is the worst arrangement available.
+    """
+
+    def test_only_implemented_tiers_are_exported(self) -> None:
+        assert memory.__all__ == ["SessionMemory", "MemoryRecord", "MemoryStore"]
+
+    def test_the_unimplemented_tiers_are_not_reachable_from_the_package(self) -> None:
+        assert not hasattr(memory, "ProjectMemory")
+        assert not hasattr(memory, "AgentMemory")
+
+    def test_the_modules_remain_for_whoever_finishes_them(self) -> None:
+        """Removed from the public interface, not deleted."""
+        from memory.agent import AgentMemory as Agent
+        from memory.project import ProjectMemory as Project
+
+        assert Agent.__name__ == "AgentMemory"
+        assert Project.__name__ == "ProjectMemory"
+
+    def test_no_exported_name_raises_not_implemented(self) -> None:
+        """
+        The general form of this blocker.
+
+        A future tier added to `__all__` before it works would reintroduce
+        exactly the same defect, and this fails when that happens rather than
+        waiting for a release run to notice.
+        """
+        import inspect
+
+        for name in memory.__all__:
+            exported = getattr(memory, name)
+            if not inspect.isclass(exported):
+                continue
+            for attribute, member in vars(exported).items():
+                if attribute.startswith("_") or not callable(member):
+                    continue
+                source = inspect.getsource(member)
+                assert "raise NotImplementedError" not in source, (
+                    f"memory.{name}.{attribute} is exported but unimplemented"
+                )
+
+
 class TestProjectMemory:
-    # TODO: These tests require file-based backend implementation.
+    # Kept as a record of the designed surface. These assert the placeholder
+    # behaves predictably, not that the tier works.
 
     def test_read_not_implemented(self, tmp_path: Path) -> None:
         mem = ProjectMemory(tmp_path)

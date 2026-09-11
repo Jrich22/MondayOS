@@ -16,11 +16,14 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from monday.provider_env import (
     ProviderChoice,
     choose,
     load_env_file,
+    ollama_available,
+    ollama_has_model,
     provider_config,
 )
 
@@ -101,14 +104,22 @@ class TestChoose(unittest.TestCase):
         choice = choose({"ANTHROPIC_API_KEY": SECRET, "MONDAYOS_ANTHROPIC_MODEL": "claude-x"})
         self.assertEqual(choice.model, "claude-x")
 
-    def test_no_key_and_no_daemon_reports_what_to_set(self):
-        # An empty mapping cannot reach a hosted provider; the local check may or
-        # may not find a daemon on the machine running the tests, so only the
-        # unconfigured branch is asserted here.
+    def test_no_usable_provider_reports_what_to_set(self):
+        """
+        Whatever the machine running this has, an unusable result must be actionable.
+
+        There are now three outcomes rather than two: no provider at all, a
+        daemon that cannot serve the requested model (RC1/ACC-001), or a working
+        provider. The first two say different things because they have different
+        fixes, so this asserts the property they share -- the reason names a
+        concrete next step and points at the documentation -- instead of assuming
+        which branch a given machine lands in.
+        """
         choice = choose({"MONDAYOS_PROVIDER": ""})
         if not choice.configured:
-            self.assertIn("ANTHROPIC_API_KEY", choice.reason)
             self.assertIn("PROVIDERS.md", choice.reason)
+            actionable = "ANTHROPIC_API_KEY" in choice.reason or "ollama pull" in choice.reason
+            self.assertTrue(actionable, choice.reason)
 
     def test_describe_never_contains_a_key(self):
         text = choose({"ANTHROPIC_API_KEY": SECRET}).describe()
@@ -203,3 +214,83 @@ class TestStreamingHonesty(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOllamaModelValidation(unittest.TestCase):
+    """
+    RC1/ACC-001. A provider that reports ready must be able to answer.
+
+    A responding Ollama daemon used to be enough to report `configured`. It is
+    not: the daemon answers `/api/tags` whether or not the model MondayOS intends
+    to use has been pulled. A default install with any other model set reported
+    ready and then returned HTTP 404 on every generation — thirteen consecutive
+    turns of the S5 acceptance run failed this way while selection insisted the
+    provider was fine.
+
+    This module already refuses a placeholder API key for precisely this reason,
+    and its own comment says why: such a value "makes a provider look configured
+    and fail at the first call". The model name now meets the same standard.
+    """
+
+    def test_a_bare_name_matches_any_tag(self):
+        """`llama3.1` means the default tag of that model."""
+        self.assertTrue(ollama_has_model("llama3.1", ["llama3.1:8b"]))
+        self.assertTrue(ollama_has_model("qwen2.5-coder", ["qwen2.5-coder:14b"]))
+
+    def test_an_explicit_tag_must_match_exactly(self):
+        """`llama3.1:8b` and `llama3.1:70b` are not interchangeable."""
+        self.assertTrue(ollama_has_model("llama3.1:8b", ["llama3.1:8b"]))
+        self.assertFalse(ollama_has_model("llama3.1:70b", ["llama3.1:8b"]))
+
+    def test_a_missing_model_does_not_match(self):
+        self.assertFalse(ollama_has_model("llama3", ["llama3.1:8b", "qwen2.5-coder:14b"]))
+        self.assertFalse(ollama_has_model("", ["llama3"]))
+
+    def test_a_daemon_without_the_model_is_not_configured(self):
+        """The exact S5 failure: daemon up, `llama3` absent, every call 404s."""
+        with patch("monday.provider_env.ollama_models", return_value=["llama3.1:8b"]):
+            choice = choose({"MONDAYOS_PROVIDER": ""})
+        self.assertFalse(choice.configured)
+
+    def test_the_reason_names_the_model_and_the_command_that_fixes_it(self):
+        """
+        An error a user can act on without reading the source.
+
+        "No provider configured" would be true and useless. The message has to
+        say which model is missing, how to install it, and what is already there.
+        """
+        with patch("monday.provider_env.ollama_models", return_value=["llama3.1:8b"]):
+            reason = choose({"MONDAYOS_PROVIDER": ""}).reason
+        self.assertIn("llama3", reason)
+        self.assertIn("ollama pull", reason)
+        self.assertIn("MONDAYOS_OLLAMA_MODEL", reason)
+        self.assertIn("llama3.1:8b", reason)
+
+    def test_a_daemon_with_the_model_is_configured(self):
+        with patch("monday.provider_env.ollama_models", return_value=["llama3.1:8b"]):
+            choice = choose({"MONDAYOS_PROVIDER": "", "MONDAYOS_OLLAMA_MODEL": "llama3.1:8b"})
+        self.assertTrue(choice.configured)
+        self.assertEqual(choice.provider, "ollama")
+
+    def test_a_daemon_with_nothing_installed_says_so(self):
+        with patch("monday.provider_env.ollama_models", return_value=[]):
+            reason = choose({"MONDAYOS_PROVIDER": ""}).reason
+        self.assertIn("no models installed", reason)
+        self.assertIn("ollama pull", reason)
+
+    def test_no_daemon_falls_through_to_the_unconfigured_message(self):
+        """A daemon that is not running is a different problem with a different fix."""
+        with patch("monday.provider_env.ollama_models", return_value=None):
+            reason = choose({"MONDAYOS_PROVIDER": ""}).reason
+        self.assertIn("ANTHROPIC_API_KEY", reason)
+
+    def test_availability_still_reports_only_whether_the_daemon_answers(self):
+        with patch("monday.provider_env.ollama_models", return_value=[]):
+            self.assertTrue(ollama_available())
+        with patch("monday.provider_env.ollama_models", return_value=None):
+            self.assertFalse(ollama_available())
+
+    def test_a_hosted_provider_is_unaffected(self):
+        """This check belongs to Ollama alone."""
+        choice = choose({"ANTHROPIC_API_KEY": SECRET})
+        self.assertEqual(choice.provider, "anthropic")

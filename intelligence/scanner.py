@@ -119,6 +119,16 @@ GENERATED_DIRS: tuple[str, ...] = (
     # The index's own cache, and runtime registries.
     ".index",
     "config",
+    # Generated operational output: acceptance runs, release readiness, audits.
+    # A report *about* MondayOS is not part of MondayOS, and indexing one makes
+    # the project's own measurements depend on whether a report happens to be
+    # sitting in the tree -- dropping `acceptance_report.json` into the root once
+    # added a member to the `acceptance` initiative and drifted the benchmark.
+    #
+    # Excluded by directory rather than by filename. The filename list below
+    # needs a new entry for every report anyone ever writes, and it was already
+    # wrong: six names were added and four were missed.
+    "reports",
 )
 
 # Individual generated artefacts that are tracked in git, so a git-ignore check
@@ -129,6 +139,17 @@ GENERATED_NAMES: frozenset[str] = frozenset(
         ".sequences.json",
         "knowledge_ledger_repair.md",
         "ledger_repair_report.md",
+        # Release-run artefacts. A report *about* MondayOS is not part of
+        # MondayOS, and indexing one makes the project's own measurements depend
+        # on whether a report happens to be sitting in the tree: dropping
+        # `acceptance_report.json` into the root added a member to the
+        # `acceptance` initiative and drifted the benchmark.
+        "acceptance_report.json",
+        "acceptance_review.md",
+        "findings.json",
+        "production_audit.md",
+        "release_readiness.md",
+        "rc1_release_report.md",
     }
 )
 

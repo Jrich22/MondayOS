@@ -125,6 +125,13 @@ class ProviderUnavailableError(ProviderError):
 # Abstract interface
 # ---------------------------------------------------------------------------
 
+# A generation deadline is never shorter than this, so a small request does not
+# get less headroom than it has today, and never longer than this, so a
+# pathological budget cannot hang a caller indefinitely.
+MIN_GENERATION_SECONDS = 30.0
+MAX_GENERATION_SECONDS = 900.0
+
+
 class AIProvider(ABC):
     """
     Abstract interface for all AI model providers.
@@ -168,6 +175,54 @@ class AIProvider(ABC):
     def capability_tier(self) -> int:
         """Relative capability: higher is more capable."""
         return 2
+
+    @property
+    def tokens_per_second(self) -> float:
+        """
+        A conservative floor on how fast this provider generates.
+
+        Used to turn a token budget into a deadline. Deliberately a static,
+        pessimistic constant rather than a measurement: a predictable deadline
+        can be explained and asserted, and an adaptive one would make every
+        timeout a function of whatever the machine was doing last week.
+
+        Too low merely wastes patience on a hung provider; too high fails a
+        healthy one mid-answer. So the numbers err low.
+        """
+        return 20.0
+
+    def generation_deadline(self, max_tokens: int, override: float = 0.0) -> float:
+        """
+        How long this provider may take to produce ``max_tokens``.
+
+        Scales with the budget, because that is what determines the duration. A
+        fixed wall-clock limit applied to a variable-size request is what made
+        Executive Mode's 6,000-token budget fail against the same 30 seconds that
+        comfortably fits a 2,000-token answer.
+        """
+        if override > 0:
+            return override
+        rate = self.tokens_per_second or 1.0
+        return min(MAX_GENERATION_SECONDS, max(MIN_GENERATION_SECONDS, max_tokens / rate))
+
+    @property
+    def reports_stop_reason(self) -> bool:
+        """
+        True when this provider says *why* generation stopped.
+
+        Without it, an answer cut off at the token limit is indistinguishable
+        from one that finished: the text simply ends, and it reads as complete.
+        MondayOS marks such an answer `incomplete` only when the provider says
+        so, which means on a silent provider the distinction cannot be made at
+        all.
+
+        Declared as a capability rather than inferred from the provider's name,
+        so a caller can ask what is knowable here instead of keeping its own
+        table of which vendors report what. A checker that cannot verify a
+        property should say so -- asserting it against a provider that cannot
+        report it would be measuring nothing and calling it a pass.
+        """
+        return False
 
     @property
     def supports_streaming(self) -> bool:
