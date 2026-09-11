@@ -61,6 +61,8 @@ def intelligence_source(
     down with it.
     """
 
+    retrieved: list[dict[str, Any]] = []
+
     def build() -> list[str]:
         answer = ask()
         if answer is None or not answer.grounded:
@@ -74,10 +76,21 @@ def intelligence_source(
             if line.strip():
                 items.append(line.rstrip())
 
+        # Kept structured as well as rendered. The model reads the prose; the
+        # responder checks its answer against these, and parsing our own prose
+        # back into identifiers would be a worse source of truth than simply not
+        # discarding them.
         items.append(answer.evidence.summary())
         for citation in answer.evidence.citations[:MAX_CITATIONS]:
             # Every reference is navigable: path plus line range where one
             # exists, artefact id otherwise.
+            #
+            # The citation records the index of the item that renders it. The
+            # budget trims items, and an allowlist entry has to travel with the
+            # line that showed it -- matching the two back up by searching the
+            # prose silently dropped citations whose reference does not appear
+            # literally in the text.
+            retrieved.append({**citation.to_dict(), "item": len(items)})
             items.append(f"  {citation.kind.value}: {citation.display()} — {citation.because}")
         return items
 
@@ -95,6 +108,7 @@ def intelligence_source(
     )
     if source.items:
         source.reasons = ["retrieved-evidence"] * len(source.items)
+    source.citations = retrieved
     return source
 
 

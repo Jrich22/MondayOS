@@ -27,6 +27,7 @@ skip failed.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,7 @@ def safe_source(
     query: str = "",
     baseline_reason: str = relevance.REASON_BASELINE,
     pin: Callable[[str], str] | None = None,
+    cite: Callable[[str], dict[str, Any] | None] | None = None,
 ) -> ContextSource:
     """
     Run an adapter body, failing closed, and rank what it produced.
@@ -107,6 +109,11 @@ def safe_source(
     Ranking happens here rather than in each adapter so every source records why
     its items were chosen, without five adapters each implementing attribution
     slightly differently.
+
+    ``cite`` turns a surviving item into a structured citation. It is applied
+    after ranking and truncation, not before, so the evidence recorded is exactly
+    what the model was shown -- an identifier that was ranked out of the context
+    was never supplied, and treating it as supplied would license citing it.
     """
     try:
         items = build()
@@ -121,6 +128,9 @@ def safe_source(
     pinned = {i: reason for i, text in enumerate(items) if (reason := (pin(text) if pin else ""))}
     ranked = relevance.rank(items, query, baseline_reason=baseline_reason, priority=pinned)
     texts, reasons = relevance.split(ranked[:_MAX_ITEMS])
+    citations = (
+        [{**c, "item": i} for i, text in enumerate(texts) if (c := cite(text))] if cite else []
+    )
     return ContextSource(
         name=name,
         label=label,
@@ -128,6 +138,7 @@ def safe_source(
         items=[redaction.redact_text(i) for i in texts],
         reasons=reasons,
         truncated=len(items) > _MAX_ITEMS,
+        citations=citations,
     )
 
 
@@ -378,7 +389,21 @@ def git_source(project: str, root: Path, commit_limit: int = 10, query: str = ""
         build,
         query=query,
         baseline_reason=relevance.REASON_RECENT,
+        cite=_cite_commit,
     )
+
+
+# The commit lines this adapter emits are `  <sha> <subject>`. Recording the SHA
+# as a citation is what makes "which commits was the model actually given?"
+# answerable downstream -- without it the answer to "what changed recently?" has
+# no allowlist to be checked against, which is how six invented hashes reached a
+# user.
+_COMMIT_LINE = re.compile(r"^\s*([0-9a-f]{7,40})\s+\S")
+
+
+def _cite_commit(text: str) -> dict[str, Any] | None:
+    match = _COMMIT_LINE.match(text)
+    return {"kind": "commit", "reference": match.group(1)} if match else None
 
 
 # --------------------------------------------------------------------------- #

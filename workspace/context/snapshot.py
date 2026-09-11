@@ -46,6 +46,10 @@ class ContextSource:
     error: str = ""
     # Where this actually came from, for the "why did Monday know this" answer.
     origin: str = ""
+    # The structured citations behind `items`, when a source has them. Kept off
+    # `to_dict` deliberately: this is for in-process validation, not for the API,
+    # and adding it there would change a response shape every client parses.
+    citations: list[dict[str, Any]] = field(default_factory=list)
     # Why each item survived selection, parallel to ``items``. Increment 1 could
     # answer "where did this come from"; ranking makes "why was this one chosen
     # over another" a separate question, and an unexplained ranking is exactly
@@ -140,6 +144,11 @@ class ContextSnapshot:
     fingerprint: str = ""
     # The request text this was ranked for, when it was ranked for one.
     query: str = ""
+    # The citations retrieval actually produced, kept structured alongside the
+    # rendered text. The rendered form is what the model reads; this is what the
+    # responder checks its answer against, and parsing our own prose back into
+    # identifiers would be a worse source of truth than never discarding them.
+    citations: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def token_estimate(self) -> int:

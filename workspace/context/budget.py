@@ -126,6 +126,13 @@ def apply(
                 # attribution ADR-016 exists to preserve — the budget would make
                 # a ranked snapshot indistinguishable from an unranked one.
                 reasons=source.reasons[: len(fitted)],
+                # Citations must be cut with the items too, and for a stronger
+                # reason than attribution: they are the allowlist an answer is
+                # checked against. The cut is by item index, never by searching
+                # the retained prose -- a citation whose reference is not spelled
+                # out in the text it belongs to is still evidence the model was
+                # shown, and matching by substring silently discarded it.
+                citations=[c for c in source.citations if int(c.get("item", 0)) < len(fitted)],
                 truncated=source.truncated or truncated,
                 error=source.error,
                 origin=source.origin,

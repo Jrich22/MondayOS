@@ -106,6 +106,7 @@ class ContextEngine:
             omitted=result.omitted,
             fingerprint=self._fingerprint(slug, root),
             query=query,
+            citations=[c for source in result.sources for c in source.citations],
         )
         self._cache[slug] = snapshot
         return snapshot
