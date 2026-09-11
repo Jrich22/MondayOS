@@ -370,7 +370,12 @@ def _followups_preserve_recommendation(
     for project, record in projects.items():
         if not record.get("available"):
             continue
-        anchor = record.get("recommendation_key", "")
+        # RC1/H-10. The anchor is whatever decision is *currently* on record, not
+        # the first one the conversation ever made. A fresh executive question --
+        # "What is the biggest risk?" -- legitimately produces a new decision
+        # mid-thread, and comparing later follow-ups against the original made
+        # correct behaviour look like a silent re-decision on two projects.
+        anchor = record.get("anchor_at_followup") or record.get("recommendation_key", "")
         followups = [
             t for t in scored if t.project == project and t.turn_id.startswith(_FOLLOW_UPS)
         ]
@@ -386,10 +391,11 @@ def _followups_preserve_recommendation(
             observed = turn.persisted_key
             if not observed:
                 continue
+            expected = turn.anchor_at_turn or anchor
             e.observe(
-                observed == anchor or turn.reassessed,
+                observed == expected or turn.reassessed,
                 f"{project}/{turn.turn_id}: the stored decision changed from "
-                f"{anchor!r} to {observed!r} without a reassessment being asked for",
+                f"{expected!r} to {observed!r} without a reassessment being asked for",
             )
     if e.exercised == 0:
         e.note = "no completed strategic turn produced an anchor to compare against"

@@ -256,6 +256,20 @@ class TestGates(unittest.TestCase):
         self.assertIs(gate.verdict, Verdict.PASS)
         self.assertEqual(gate.exercised, 1)
 
+    def test_gate_5_anchors_to_the_decision_current_at_the_follow_up(self):
+        """
+        RC1/H-10. A fresh executive question legitimately re-decides mid-thread.
+
+        Cue App's stored decision moved at `E.risk` -- "What is the biggest
+        risk?" -- and the follow-ups after it correctly continued the *new*
+        decision. Comparing them against the conversation's first recommendation
+        reported correct behaviour as a silent re-decision.
+        """
+        follow = _turn(
+            turn_id="I.say-more-warm", persisted_key="k2", anchor_at_turn="k2", continuation=True
+        )
+        self.assertIs(self._gate(5, [follow], self.LIVE).verdict, Verdict.PASS)
+
     def test_gate_5_fails_when_the_stored_decision_changed(self):
         follow = _turn(turn_id="C.evidence", persisted_key="k2", continuation=True)
         self.assertIs(self._gate(5, [follow], self.LIVE).verdict, Verdict.FAIL)

@@ -93,6 +93,10 @@ class TurnRecord:
     # no fresh key by design, so this is what shows whether the stored decision
     # survived the follow-up unchanged (RC1/H-9).
     persisted_key: str = ""
+    # The decision that was current when this turn ran. A fresh executive turn
+    # legitimately replaces it, so a follow-up is judged against the decision it
+    # was actually continuing (RC1/H-10).
+    anchor_at_turn: str = ""
     continuation: bool = False
     quoted_scores: dict[str, float] = field(default_factory=dict)
     citations: dict[str, Any] = field(default_factory=dict)
@@ -133,6 +137,7 @@ class TurnRecord:
             "computed_values": self.computed_values,
             "persisted_values": self.persisted_values,
             "persisted_key": self.persisted_key,
+            "anchor_at_turn": self.anchor_at_turn,
             "continuation": self.continuation,
             "quoted_scores": self.quoted_scores,
             "citations": self.citations,
@@ -370,8 +375,13 @@ class ProjectSession:
             # unfinished one made the harness expect a continuation the product
             # had correctly refused to offer -- and reported that refusal as a
             # product failure.
-            if turn.id == "B.next" and self.strategy_persisted and record.outcome == "ok":
-                anchor = record.recommendation_key
+            # The active anchor moves whenever a completed executive turn stores a
+            # new decision -- B.next makes the first, E.risk may legitimately
+            # replace it. Continuations are judged against whichever was current.
+            record.anchor_at_turn = anchor
+            if record.persisted_key and record.outcome == "ok" and not record.continuation:
+                anchor = record.persisted_key
+                record.anchor_at_turn = anchor
             self._pacing.pause(record.observed_register in ("executive", "continuation"))
 
         cold = self._cold_conversation()
