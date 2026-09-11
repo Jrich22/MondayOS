@@ -2938,6 +2938,50 @@ class Monday:
                 assessment.replaced_stale = True
             return assessment
 
+        def authority_for(project: str) -> Any:
+            """
+            One project's authoritative view of its own records.
+
+            Built from the resolved project root, so it is scoped at construction
+            and cannot be widened later. The symbol index is passed as a thunk and
+            only an *already built* engine is consulted -- validating a symbol must
+            never trigger a full project index build mid-conversation.
+            """
+            from tasks.errors import TaskNotFoundError
+            from workspace.authority import ProjectAuthority, TaskRecord
+            from workspace.models import slugify
+
+            slug, root, _ = resolve(project)
+
+            def symbol_index() -> Any:
+                engine = self.__question_engines.get(slugify(project))
+                return getattr(engine, "_index", None) if engine is not None else None
+
+            def task_owner(task_id: str) -> Any:
+                """
+                What the central task store says about one identifier.
+
+                Tasks are managed for every project in one place, so the store is
+                asked who owns the task and the authority compares that with this
+                project. `None` means the store could not be consulted at all --
+                a workspace with no `tasks/` directory has not established that
+                the task is absent, and reporting absence would fail real answers
+                closed for citing real work.
+                """
+                if not (Path(self._config.project_root) / "tasks").is_dir():
+                    return None
+                try:
+                    return TaskRecord(exists=True, project=self.__tasks.get(task_id).project)
+                except TaskNotFoundError:
+                    return TaskRecord(exists=False)
+
+            return ProjectAuthority(
+                Path(root),
+                slug=slug,
+                symbol_index=symbol_index,
+                task_lookup=task_owner,
+            )
+
         responder = (
             ProviderWorkspaceResponder(self.__provider) if self.__provider is not None else None
         )
@@ -2958,6 +3002,7 @@ class Monday:
             git_lines=git_lines,
             activity=activity,
             assess=assess,
+            authority_for=authority_for,
         )
 
     def _question_engine(self, project: str) -> Any:

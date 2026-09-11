@@ -492,24 +492,37 @@ class WorkspaceIncrement2RouteTests(DashboardApiBase):
         events = list(self.service.workspace_stream("CONV-0001", {"project": "alpha"}))
         self.assertEqual(events[0]["type"], "error")
 
-    def test_closing_the_stream_persists_a_partial(self):
-        conversation_id = self._create()
-        stream = self.service.workspace_stream(
-            conversation_id, {"project": "alpha", "content": "stop me"}
-        )
-        seen = 0
-        for event in stream:
-            if event["type"] == "delta":
-                seen += 1
-                if seen == 2:
-                    stream.close()
-                    break
+    def test_a_verifiable_turn_emits_no_deltas_before_validation(self):
+        """
+        The buffering guarantee, over the route a browser actually uses.
 
+        This test used to close the stream after two deltas and assert a partial
+        was persisted. There are no deltas to count any more, and that is the
+        point: a registered project can have its claims checked, so the answer is
+        held back until they have been. No amount of post-generation checking
+        un-shows a citation someone has already read.
+
+        Partial preservation is unchanged and still covered where streaming
+        genuinely happens -- see `test_stopping_persists_the_partial_marked_
+        incomplete` in tests/test_workspace.py, which runs without an authority.
+        """
+        conversation_id = self._create()
+        events = list(
+            self.service.workspace_stream(
+                conversation_id, {"project": "alpha", "content": "stop me"}
+            )
+        )
+        deltas = [e["text"] for e in events if e["type"] == "delta"]
         _status, _, body = self.GET(
             f"/workspace/conversations/{conversation_id}", {"project": "alpha"}
         )
         assistant = body["messages"][-1]
-        self.assertTrue(assistant["incomplete"])
+
+        # One delta, not four: the provider streams word by word, and every one of
+        # those pieces is withheld until validation has run. What reaches the
+        # client is the checked answer, released whole.
+        self.assertEqual(len(deltas), 1, "a verifiable turn must not stream progressively")
+        self.assertEqual("".join(deltas), assistant["content"])
         self.assertEqual(body["messages"][0]["content"], "stop me")
 
     def test_search_route_is_project_scoped_by_default(self):

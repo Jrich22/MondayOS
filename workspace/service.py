@@ -73,9 +73,15 @@ class WorkspaceService:
         summarizer: compaction.ConversationSummarizer | None = None,
         # (project, question, subject, thin_retrieval, strategic_state, fingerprint)
         assess: Callable[[str, str, str, bool, Any, str], Any] | None = None,
+        # The project answering about its own records, per slug. Injected rather
+        # than constructed so the service keeps no filesystem policy of its own,
+        # and separate from the context engine because the context budget must not
+        # be able to decide what MondayOS is allowed to verify.
+        authority_for: Callable[[str], Any] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._root = Path(root)
+        self._authority_for = authority_for
         self._store = ConversationStore(self._root)
         self._engine = engine
         self._responder = responder
@@ -481,7 +487,23 @@ class WorkspaceService:
             conversation_id=conversation.id,
             history_digest=plan.digest,
             assessment=self._assessment(conversation, text, snapshot),
+            authority=self._authority(conversation.project),
         )
+
+    def _authority(self, project: str) -> Any:
+        """
+        The project's own records, or nothing.
+
+        Failure is silent and total, like every other evidence read: a project
+        whose records cannot be opened yields no authority, and every claim it
+        cannot confirm is then reported unverifiable rather than clean.
+        """
+        if self._authority_for is None:
+            return None
+        try:
+            return self._authority_for(project)
+        except Exception:  # noqa: BLE001 — an unavailable authority is not a failed turn
+            return None
 
     def _assessment(
         self,
