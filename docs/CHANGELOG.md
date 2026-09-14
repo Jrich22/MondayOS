@@ -9,6 +9,90 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-09-14 — Verifiable Answers
+
+The release that makes MondayOS's answers checkable. No new surface area: one
+property, enforced end to end — when MondayOS states something you can verify it,
+and when it cannot verify itself it says so instead of guessing.
+
+Signed off against the fourteen acceptance gates on a 52-turn hosted run across
+four real projects (`anthropic · claude-sonnet-4-5`), plus a streaming journey per
+project. Full signoff and the adjudication of the one failing gate:
+`reports/v1_release_signoff.md`.
+
+### Added
+
+- **Evidence validation in the response pipeline.** Every identifier an answer
+  states — commit, ADR, task, file, symbol, PR — is checked against two
+  authorities: the project's own records and the evidence retrieval supplied.
+  One correction attempt naming the failures, then fail closed. The unproven
+  identifiers never appear in the refusal.
+- **Structured citation handles.** Retrieval supplies opaque `[E1]` labels and
+  resolves them after generation, so a handle naming nothing is caught as a
+  fabricated reference rather than rendered as one. Grouped citations
+  (`[E2, E3]`) resolve every member independently; one unknown member
+  invalidates the group.
+- **Score validation.** Confidence, evidence strength and execution risk are
+  computed by MondayOS and supplied to the model to explain. Numeric reasoning
+  claims in a generated answer are validated against that turn's authoritative
+  set — which differs by turn type, and excludes superseded values after a
+  reassessment. One correction naming the offending number, then fail closed.
+  The model is never asked whether its own score is valid.
+- **Observational validation metadata.** `evidence_validation` and
+  `score_validation` ride in the response payload, never in the stored message.
+- **Buffered streaming for evidence-bearing turns.** The answer is held until it
+  has been verified, then released whole.
+- **Two-phase provider timeouts.** A short fixed connect timeout, and a
+  generation deadline derived from the token budget and provider throughput.
+- **Acceptance harness** (`python -m acceptance`): a 52-turn journey over four
+  corpora scored by fourteen gates, with an independent score-audit cross-check
+  that reports any claim the product validator did not see.
+
+### Changed
+
+- Version `1.0.0b1` → `1.0.0`.
+- Gate 6 reads the product's authoritative `score_validation` rather than
+  re-deriving score claims from prose. One authority for the decision; the
+  harness observes the result.
+- The acceptance runner loads `.env` through `monday.provider_env.load_env_file`,
+  the same loader the dashboard uses. Exported variables still win; `.env` never
+  overrides one, and only variable names are ever reported.
+- A gate that evaluated nothing can never report PASS. Verdicts distinguish
+  UNVERIFIABLE (the environment cannot show this) from INCONCLUSIVE (this run did
+  not).
+
+### Fixed
+
+- The Anthropic provider is passed a plain numeric timeout. The SDK vendors its
+  transport as `httpx2`, and handing it an `httpx.Timeout` failed every hosted
+  call. See Known limitations for the `connect_timeout` consequence.
+- `stop_reason` survives the buffered path as well as the streaming one, and the
+  acceptance harness reads it from the assistant message rather than the
+  reasoning assessment.
+- Markdown headings are no longer read as invented initiative claims.
+- A score claim reached through a qualifying phrase, through a colon, or with the
+  number before the label is recognised; a heading that establishes one score
+  concept scopes the values in its block.
+
+### Known limitations
+
+Four documented behaviours, all deferred to v1.0.1 — see
+`docs/KNOWN_LIMITATIONS.md` and `docs/BACKLOG_v1.0.1.md`. Three are fail-closed:
+MondayOS refuses something that was actually fine, most notably a
+`ClassName.method_name` citation it does not yet resolve. One (D-10) is a
+fail-open gap in the score extractor that was never observed to deliver a wrong
+number.
+
+Score validation is a heuristic backstop behind a computed-score architecture,
+not a proof.
+
+
+### What ships inside 1.0.0
+
+Everything below accumulated under `[Unreleased]` between the `1.0.0b1` beta and
+this release. The `MondayOS vN.N` headings are product increments; they all ship
+in package version `1.0.0`.
+
 ### MondayOS v3.4 — AI Workspace: Deep Project Intelligence (2026-09-03)
 
 Increment 3 (TASK-0074). Monday can now answer questions *from the project* — what is being

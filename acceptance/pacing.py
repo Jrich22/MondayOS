@@ -33,6 +33,13 @@ class Outcome(Enum):
     PROVIDER_FATAL = "provider_fatal"
     # MondayOS raised. This is the only class that fails a gate.
     PRODUCT = "product_error"
+    # MondayOS declined to show an answer because its own evidence validation
+    # rejected it. Not a defect and not an outage -- it is the integrity
+    # guarantee firing, and it is the one outcome the harness previously had no
+    # word for. A hosted run recorded fourteen of these as provider outages,
+    # which both invented incidents that never happened and removed the turns
+    # from the gates they should have informed.
+    PRODUCT_FAIL_CLOSED = "product_fail_closed"
 
 
 # Signatures of a provider under load rather than a request that was wrong.
@@ -44,6 +51,14 @@ _TRANSIENT = re.compile(
     r"|overloaded|rate.?limit|too many requests|capacity"
     r"|timed? ?out|timeout|temporarily unavailable|connection reset"
     r"|connection aborted|remote end closed|service unavailable",
+    re.I,
+)
+
+# MondayOS refusing its own output. The message is ours, not a vendor's, so it
+# is matched before any provider pattern: an evidence refusal that happened to
+# mention a number must never be read as an HTTP status.
+_FAIL_CLOSED = re.compile(
+    r"unverified evidence|could not verify the evidence|evidence validation (?:failed|rejected)",
     re.I,
 )
 
@@ -61,6 +76,8 @@ def classify(error: str) -> Outcome:
     text = (error or "").strip()
     if not text:
         return Outcome.OK
+    if _FAIL_CLOSED.search(text):
+        return Outcome.PRODUCT_FAIL_CLOSED
     if _FATAL.search(text):
         return Outcome.PROVIDER_FATAL
     if _TRANSIENT.search(text):

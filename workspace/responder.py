@@ -24,7 +24,7 @@ from __future__ import annotations
 import html
 import re
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
@@ -70,6 +70,10 @@ DEFAULT_HISTORY_TURNS = 12
 # a conclusion, with its confidence attached, is safe in a way an unmarked one is
 # not, and MondayOS now computes both before the model is called (see `reasoning`).
 SYSTEM_INSTRUCTION = (
+    "Confidence, evidence strength and execution risk are computed by MondayOS and "
+    "supplied to you. Report them, round them, or describe them in words -- but never "
+    "invent, override or supplement them. If you want to express a judgement MondayOS "
+    "did not compute, say it in prose without attaching a number to it. "
     "When citing repository evidence -- a commit, file, decision, task or pull "
     "request -- cite the supplied evidence handle in square brackets, like [E1], "
     "rather than writing the identifier yourself. MondayOS resolves handles to real "
@@ -104,6 +108,10 @@ SYSTEM_INSTRUCTION = (
 # on screen and means nothing, which would quietly destroy the one signal telling
 # the reader how much to trust the rest.
 EXECUTIVE_INSTRUCTION = (
+    "Confidence, evidence strength and execution risk are computed by MondayOS and "
+    "supplied to you. Report them, round them, or describe them in words -- but never "
+    "invent, override or supplement them. If you want to express a judgement MondayOS "
+    "did not compute, say it in prose without attaching a number to it. "
     "When citing repository evidence -- a commit, file, decision, task or pull "
     "request -- cite the supplied evidence handle in square brackets, like [E1], "
     "rather than writing the identifier yourself. MondayOS resolves handles to real "
@@ -157,6 +165,10 @@ EXECUTIVE_INSTRUCTION = (
 # it can see will happily re-derive a better one, and then the user is reading
 # advice about a decision they never received.
 CONTINUATION_INSTRUCTION = (
+    "Confidence, evidence strength and execution risk are computed by MondayOS and "
+    "supplied to you. Report them, round them, or describe them in words -- but never "
+    "invent, override or supplement them. If you want to express a judgement MondayOS "
+    "did not compute, say it in prose without attaching a number to it. "
     "When citing repository evidence -- a commit, file, decision, task or pull "
     "request -- cite the supplied evidence handle in square brackets, like [E1], "
     "rather than writing the identifier yourself. MondayOS resolves handles to real "
@@ -278,7 +290,13 @@ class EvidenceSet:
 # Opaque on purpose: there is nothing in `[E3]` for a model to construct a
 # plausible-looking variant of, which is the failure every heuristic below exists
 # to catch after the fact.
-HANDLE = re.compile(r"\[\s*(E\d{1,3})\s*\]", re.I)
+# A citation group: one handle, or several in one bracket. Models write
+# `[E2, E3]` naturally, and the single-handle form matched nothing at all there --
+# so the group was neither resolved into real identifiers nor reported as unknown.
+# The reader saw `[E2, E3]`: prompt-internal labels, attached to a factual claim,
+# with the structured path silently bypassed.
+HANDLE = re.compile(r"\[\s*(E\d{1,3}(?:\s*,\s*E\d{1,3})*)\s*\]", re.I)
+_HANDLE_MEMBER = re.compile(r"E\d{1,3}", re.I)
 
 
 @dataclass(frozen=True)
@@ -394,6 +412,359 @@ class EvidenceReport:
             "unknown_handles": sorted(self.unknown_handles),
             "classes": {name: report.to_dict() for name, report in self.classes.items()},
         }
+
+
+# --------------------------------------------------------------------------- #
+# reasoning-score claims
+# --------------------------------------------------------------------------- #
+
+# MondayOS computes confidence, evidence strength and execution risk. A model may
+# explain those numbers; it may not invent new ones. On one hosted turn the
+# assessment computed `confidence=0.47` and the answer said:
+#
+#     **Recommendation confidence: 76% (high)** -- the assessment did not compute
+#     this number, but the reasoning is straightforward
+#
+# The disclaimer is honest and beside the point: the same answer also wrote
+# "Recommendation confidence: 47% (medium)" for values that *were* computed, in
+# the same format, so a reader cannot tell which number came from the product.
+# Computed-not-generated is the architecture; this enforces it.
+_SCORE_CONCEPT = {
+    "confidence": "confidence",
+    "recommendation confidence": "confidence",
+    "overall confidence": "confidence",
+    "evidence strength": "evidence_strength",
+    "evidence_strength": "evidence_strength",
+    "execution risk": "execution_risk",
+    "execution_risk": "execution_risk",
+}
+
+# Only a number *attached* to the concept is a claim. The connectors are a closed
+# list on purpose: a percentage reached through arbitrary prose is a different
+# quantity that happens to sit near the word. "concentrates risk -- holding 36% of
+# the codebase" is a share of the codebase, and "holding" is not a connector.
+_SCORE_CLAIM = re.compile(
+    r"\b(?P<label>recommendation\s+confidence|overall\s+confidence|confiden(?:ce|t)"
+    r"|evidence[\s_]+strength|execution[\s_]+risk)\b"
+    # ` \t` rather than `\s`: the gap must not cross a line. It did, and because
+    # blank lines and a `---` rule are made of nothing but permitted characters,
+    # "## Evidence Strength" reached a number two paragraphs later -- a proximity
+    # match dressed as a line-local one, and the exact association heading scope
+    # exists to make explicit.
+    r"(?P<gap>(?:[ \t:=~\u2248(\[\-\u2013\u2014*_,]|\b(?:is|of|at|was|rated|scored|about"
+    r"|approximately|around|high|medium|low|moderate|strong|weak|elevated|the|a|an"
+    r"|assessment|mondayos|says|said|puts|put|rates|reports|computed|score"
+    r"|value|level|sits|stands|remains|currently)\b){0,30}?)"
+    r"(?P<value>\d{1,3}(?:\.\d+)?)\s*(?P<pct>%)?",
+    re.I,
+)
+
+# The closed list is high-precision and, on its own, too narrow. A live Anthropic
+# run wrote "My recommendation confidence for prioritizing the acceptance fix
+# instead: 75%" -- a plainly invented score that the connector list could not
+# reach, because "for prioritizing the acceptance fix" is not a connector.
+#
+# A colon closes that gap without reopening D-4. Prose that merely mentions a
+# score and later contains a number almost never punctuates it that way, and the
+# value must still be score-shaped, so "The risk here: we have 3 open PRs" is a
+# count rather than an execution risk of 0.03.
+_SCORE_COLON = re.compile(
+    r"\b(?P<label>recommendation\s+confidence|overall\s+confidence|confiden(?:ce|t)"
+    r"|evidence[\s_]+strength|execution[\s_]+risk)\b"
+    r"(?P<gap>[^.:\n]{0,60})"
+    r":\s*[*_\s]*(?:about\s+|approximately\s+|around\s+|roughly\s+)?"
+    r"(?P<value>\d{1,3}(?:\.\d+)?)\s*(?P<pct>%)?",
+    re.I,
+)
+
+# The same claim with the words the other way round: "The 75% confidence reflects
+# that...". Only whitespace and markup may separate them -- a number further away
+# than that is a different quantity, which is what the gap rules above are for.
+_SCORE_AFTER = re.compile(
+    # Same line only. Across a newline the next label belongs to the next row of
+    # a table or list -- "0.61\n**Evidence Strength**: 0.88" would otherwise read
+    # the confidence as an evidence strength.
+    r"(?P<value>\d{1,3}(?:\.\d+)?)[ \t]*(?P<pct>%)?[)*_ \t]*"
+    r"(?:overall\s+|recommendation\s+|computed\s+|own\s+)?"
+    r"\b(?P<label>confiden(?:ce|t)|evidence[\s_]+strength|execution[\s_]+risk)\b",
+    re.I,
+)
+
+# A number that says what it is a share *of* is not a score. Same discriminator
+# the acceptance extractor uses, for the same reason.
+_SHARE = re.compile(r"^\s*%?\s*of\b", re.I)
+
+# --------------------------------------------------------------------------- #
+# heading scope (D-9)
+# --------------------------------------------------------------------------- #
+#
+# The three shapes above are line-local: each needs its label and its number
+# within one line or one short span. A live answer used neither --
+#
+#     ## Evidence Strength
+#
+#     - **Integrations recommendation**: 94% (high)
+#     - **Workspace and projects recommendations**: 95% (high)
+#
+# -- where the *heading* establishes the concept and the bullets beneath inherit
+# it. No line-local reader can see that, so the 95% was never recognised as a
+# claim at all. It happened to be a computed value; an invented number in the
+# same position would have been delivered unchecked.
+#
+# This is structural parsing, deliberately, rather than another widened window. A
+# heading either establishes exactly one concept or it establishes none, and its
+# block ends at the next heading, a horizontal rule, a fenced code block, or the
+# end of the document. Nothing is inferred across sections.
+
+_HEADING_LINE = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+_RULE_LINE = re.compile(r"^\s{0,3}([-*_])\s*(?:\1\s*){2,}$")
+_FENCE_LINE = re.compile(r"^\s{0,3}(?:```|~~~)")
+
+# A number that could be a score at all: a percentage, or a decimal on the 0-1
+# scale. A bare integer inside a scored block is a count -- "File count: 61" is
+# not an evidence strength of 0.61, and inheriting a concept must not change what
+# counts as a number in the first place.
+_SCOPED_VALUE = re.compile(r"(?<![\w.])(?P<value>\d{1,3}(?:\.\d+)?)\s*(?P<pct>%)?")
+
+
+def _heading_concept(title: str) -> str | None:
+    """
+    The single reasoning concept a heading establishes, or nothing.
+
+    Exactly one, by design. `## Confidence and Evidence` names a section, not a
+    score, and a heading that could mean two things means neither -- guessing
+    which is how a confidence became an evidence strength in the first place.
+    """
+    plain = re.sub(r"[^a-z\s_]+", " ", title.lower())
+    plain = re.sub(r"[\s_]+", " ", plain).strip()
+    found = {
+        concept
+        for label, concept in _SCORE_CONCEPT.items()
+        if re.search(rf"\b{re.escape(label)}\b", plain)
+    }
+    return found.pop() if len(found) == 1 else None
+
+
+def _heading_scoped_claims(text: str) -> list[tuple[int, str, float, str]]:
+    """Every score-shaped number inside a block whose heading named one concept."""
+    found: list[tuple[int, str, float, str]] = []
+    scope = ""
+    fenced = False
+    at = 0
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\n")
+        if _FENCE_LINE.match(body):
+            # A fence both ends the scope and hides what it contains. Numbers in
+            # a code block are code, whatever section they sit in.
+            fenced = not fenced
+            scope = ""
+        elif fenced:
+            pass
+        elif heading := _HEADING_LINE.match(body):
+            scope = _heading_concept(heading.group(2)) or ""
+        elif _RULE_LINE.match(body):
+            scope = ""
+        elif scope:
+            for match in _SCOPED_VALUE.finditer(body):
+                if not match.group("pct") and "." not in match.group("value"):
+                    continue
+                if _SHARE.match(body[match.end("value") :]):
+                    continue
+                raw = float(match.group("value"))
+                value = raw / 100.0 if match.group("pct") or raw > 1.0 else raw
+                found.append((at + match.start("value"), scope, round(value, 4), body.strip()))
+        at += len(line)
+    return found
+
+
+# A second number offered *against* MondayOS's own: "the assessment says 47%, but
+# I think it's really 70%". The first number is a faithful report and the second
+# is the model substituting its own judgement, which is the same defect as
+# inventing one outright -- and it would otherwise escape, because the label sits
+# on the number the model is disagreeing with.
+# A full stop, as opposed to a decimal point: a period that actually ends a
+# sentence is followed by whitespace or nothing.
+_SENTENCE_END = re.compile(r"\.(?=\s|$)")
+
+_OVERRIDE = re.compile(
+    r"\b(?:but|however|although|though|really|actually|personally|instead"
+    r"|i\s+(?:think|reckon|would\s+(?:say|put|call)|'d\s+(?:say|put|call))"
+    r"|my\s+own)\b[^\n]{0,60}?"
+    r"(?P<value>\d{1,3}(?:\.\d+)?)\s*(?P<pct>%)?",
+    re.I,
+)
+
+# How close a quoted number must be to an authoritative one. Half a percentage
+# point: "47%" and "0.47" are the same value, "46.9%" is a rounding of it, and
+# 76% is not a rounding of anything MondayOS produced. Stated as a constant
+# because "reasonable rounding" has to mean one specific thing to be testable.
+SCORE_TOLERANCE = 0.005
+
+
+@dataclass(frozen=True)
+class ScoreClaim:
+    """One numeric reasoning score an answer attributed to MondayOS."""
+
+    concept: str
+    value: float
+    text: str
+    supported: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "concept": self.concept,
+            "value": self.value,
+            "text": self.text,
+            "supported": self.supported,
+        }
+
+
+@dataclass(frozen=True)
+class ScoreReport:
+    """What score validation concluded about one answer."""
+
+    claims: list[ScoreClaim] = field(default_factory=list)
+    authoritative: tuple[float, ...] = ()
+
+    @property
+    def unsupported(self) -> list[ScoreClaim]:
+        return [c for c in self.claims if not c.supported]
+
+    @property
+    def checked(self) -> bool:
+        """Whether anything was actually judged."""
+        return bool(self.claims)
+
+    def to_metadata(self, *, attempted: bool, succeeded: bool) -> dict[str, Any]:
+        return {
+            "checked": self.checked,
+            "claims_found": len(self.claims),
+            "verified": len(self.claims) - len(self.unsupported),
+            "unsupported": len(self.unsupported),
+            # Every claim, not only the failures. A caller auditing this decision
+            # needs to know which numbers were *seen*: "the product found no
+            # claim here" and "the product found it and cleared it" are different
+            # statements, and only one of them is a reason to look closer.
+            "claims": [c.to_dict() for c in self.claims],
+            "unsupported_claims": [c.to_dict() for c in self.unsupported],
+            "authoritative": list(self.authoritative),
+            "correction_attempted": attempted,
+            "correction_succeeded": succeeded,
+        }
+
+
+def extract_score_claims(answer: str) -> list[tuple[str, float, str]]:
+    """
+    Every number an answer attaches to one of MondayOS's reasoning concepts.
+
+    Returns `(concept, value, phrase)`. A percentage is normalised to a fraction,
+    so `47%` and `0.47` are one value.
+
+    Three shapes, because one was demonstrably not enough. A label with a short
+    closed-list connector (`Confidence: 47%`); a label with any short qualifying
+    phrase and a colon (`recommendation confidence for the acceptance fix: 75%`);
+    and the number first (`the 75% confidence reflects...`). Each is narrow on a
+    different axis, and a claim found by more than one is counted once.
+
+    Numbers that merely sit near the word "risk" are still not claims -- see
+    `_SCORE_CLAIM` for why the connectors are a closed list, and `_SHARE` for the
+    discriminator that keeps "36% of the codebase" out of it.
+    """
+    text = canonical(answer)
+    # Keyed by where the number is, so the same claim reached by two patterns is
+    # one claim. Counting it twice would report an answer as making more score
+    # claims than it does, which is the kind of quiet inflation that makes a
+    # validation metric untrustworthy.
+    found: dict[int, tuple[str, float, str]] = {}
+
+    def concept_of(label: str) -> str | None:
+        name = re.sub(r"[\s_]+", " ", label.lower()).strip()
+        return _SCORE_CONCEPT.get(name) or ("confidence" if "confiden" in name else None)
+
+    def as_fraction(raw: float, pct: str | None) -> float:
+        # A bare number above 1 under a score label is not on MondayOS's scale at
+        # all; treat it as a percentage rather than silently accepting an
+        # out-of-range score.
+        return raw / 100.0 if pct or raw > 1.0 else raw
+
+    def record(match: re.Match[str], *, shaped: bool = False) -> None:
+        if _SHARE.match(text[match.end("value") :]):
+            return
+        if shaped and not (match.group("pct") or "." in match.group("value")):
+            return
+        concept = concept_of(match.group("label"))
+        if concept is None:
+            return
+        value = as_fraction(float(match.group("value")), match.group("pct"))
+        found[match.start("value")] = (concept, round(value, 4), match.group(0).strip())
+
+    for match in _SCORE_CLAIM.finditer(text):
+        record(match)
+
+        # Anything the model offers in place of that number, in the same
+        # sentence, is a claim about the same concept.
+        #
+        # The sentence ends at a full stop, which is not the same thing as the
+        # next "." character: `find(".")` stopped inside `0.71` and handed the
+        # rebuttal check a value of `0`, so "Confidence was 0.34, now I would say
+        # 0.71" reported only the legitimate number and let the invented one
+        # through -- the exact class of miss this validation exists to prevent.
+        concept = concept_of(match.group("label"))
+        stop = _SENTENCE_END.search(text, match.end())
+        tail_at = match.end()
+        tail = text[tail_at : stop.start() if stop else len(text)]
+        rebuttal = _OVERRIDE.search(tail)
+        # Score-shaped only: a percentage, or a decimal on MondayOS's 0-1 scale.
+        # A bare integer is a count -- "but only 12 files are covered" is not a
+        # competing confidence of 0.12.
+        if (
+            concept
+            and rebuttal
+            and (rebuttal.group("pct") or "." in rebuttal.group("value"))
+            and not _SHARE.match(tail[rebuttal.end("value") :])
+        ):
+            other = as_fraction(float(rebuttal.group("value")), rebuttal.group("pct"))
+            found[tail_at + rebuttal.start("value")] = (
+                concept,
+                round(other, 4),
+                rebuttal.group(0).strip(),
+            )
+
+    for match in _SCORE_COLON.finditer(text):
+        record(match, shaped=True)
+    for match in _SCORE_AFTER.finditer(text):
+        record(match, shaped=True)
+
+    # Last, and never overriding. A line that names its own concept has said what
+    # it means; the heading only speaks for numbers that would otherwise have no
+    # label at all. Under `## Confidence and Evidence`, the line
+    # `**Evidence Strength:** 0.88` keeps its own concept.
+    for at, concept, value, phrase in _heading_scoped_claims(text):
+        found.setdefault(at, (concept, value, phrase))
+
+    return [found[at] for at in sorted(found)]
+
+
+def validate_scores(answer: str, authoritative: Sequence[float]) -> ScoreReport:
+    """
+    Numeric reasoning scores in an answer, judged against what MondayOS produced.
+
+    The model may explain a score, round it, or describe it in words. It may not
+    introduce one. With no authoritative values for the turn -- a grounded
+    question that recalled no strategic state -- any attributed number is
+    unsupported, because there is nothing it could be reporting.
+    """
+    allowed = tuple(round(float(v), 4) for v in authoritative)
+    claims = [
+        ScoreClaim(
+            concept=concept,
+            value=value,
+            text=phrase,
+            supported=any(abs(value - a) <= SCORE_TOLERANCE for a in allowed),
+        )
+        for concept, value, phrase in extract_score_claims(answer)
+    ]
+    return ScoreReport(claims=claims, authoritative=allowed)
 
 
 # --------------------------------------------------------------------------- #
@@ -711,18 +1082,31 @@ def resolve_handles(
     cited: list[EvidenceHandle] = []
 
     def swap(match: re.Match[str]) -> str:
-        label = match.group(1).upper()
-        handle = handles.get(label)
-        if handle is None:
-            unknown.append(label)
+        labels = [m.group(0).upper() for m in _HANDLE_MEMBER.finditer(match.group(1))]
+        resolved = [handles.get(label) for label in labels]
+        missing = [label for label, h in zip(labels, resolved, strict=True) if h is None]
+        if missing:
+            # One unknown handle invalidates the whole group. Rendering the rest
+            # would show a citation that is partly real and partly not, which is
+            # harder to distrust than one that is plainly wrong.
+            unknown.extend(missing)
             return match.group(0)
-        cited.append(handle)
-        return handle.reference
+        seen: list[EvidenceHandle] = []
+        for handle in resolved:
+            assert handle is not None
+            cited.append(handle)
+            if handle.reference not in [h.reference for h in seen]:
+                seen.append(handle)
+        return ", ".join(h.reference for h in seen)
 
     return HANDLE.sub(swap, answer), cited, unknown
 
 
-def _correction_prompt(request: WorkspaceRequest, blocking: list[EvidenceFinding]) -> str:
+def _correction_prompt(
+    request: WorkspaceRequest,
+    blocking: list[EvidenceFinding],
+    bad_scores: Sequence[ScoreClaim] = (),
+) -> str:
     """
     A correction that states the finding rather than asking for one.
 
@@ -735,6 +1119,14 @@ def _correction_prompt(request: WorkspaceRequest, blocking: list[EvidenceFinding
         f.identifier for f in blocking if f.verdict is EvidenceVerdict.UNVERIFIABLE
     )
     lines = []
+    if bad_scores:
+        named = ", ".join(f"{c.concept} {c.value}" for c in bad_scores)
+        allowed = ", ".join(str(v) for v in request.authoritative_scores) or "none"
+        lines.append(
+            f"These reasoning scores are not MondayOS's: {named}. MondayOS computed "
+            f"{allowed} for this turn. Report only those numbers, or describe your "
+            "judgement in words without attaching a number to it."
+        )
     if unsupported:
         lines.append(
             "These identifiers do not exist in this project's records: "
@@ -800,6 +1192,12 @@ class WorkspaceRequest:
     # not decide what MondayOS can *verify*. Absent it, every claim retrieval did
     # not supply is unverifiable rather than clean.
     authority: EvidenceAuthority | None = None
+    # Every numeric reasoning score MondayOS computed or persisted for this turn.
+    # Supplied by the service, which is the only layer that can see both the
+    # freshly computed assessment and the strategic state a continuation is
+    # narrating. Empty means the turn has no score authority, and any number the
+    # answer attributes to a reasoning concept is therefore unsupported.
+    authoritative_scores: tuple[float, ...] = ()
 
     @property
     def executive(self) -> bool:
@@ -865,8 +1263,28 @@ class WorkspaceRequest:
         Buffering keys off this rather than off the evidence set. Streaming a turn
         because retrieval happened to supply nothing is how an answer with
         invented identifiers reached a reader before anything looked at it.
+
+        Score authority counts for the same reason. An invented confidence is as
+        unrecallable once displayed as an invented commit hash.
         """
-        return self.authority is not None or not self.evidence().empty
+        return self.authority is not None or not self.evidence().empty or self.checks_scores
+
+    @property
+    def checks_scores(self) -> bool:
+        """
+        Whether this turn's numbers are MondayOS's to account for.
+
+        A turn MondayOS reasoned about carries an assessment, and every reasoning
+        score in the answer then has to trace to something computed or persisted
+        -- including when the authoritative set is empty, which is precisely the
+        case where a number cannot be reporting anything.
+
+        Ordinary conversation is left alone. A turn with no assessment and no
+        stored decision is not making claims about MondayOS's reasoning, and
+        treating "I am 90% sure" in a chat as a fabricated score would be the
+        false-accusation failure in a new place.
+        """
+        return self.assessment is not None or bool(self.authoritative_scores)
 
     def evidence(self) -> EvidenceSet:
         """
@@ -1237,6 +1655,13 @@ class ProviderWorkspaceResponder:
             provider=response.provider or self._provider.name,
             model=response.model,
             tokens=response.tokens_used,
+            # The provider reported how generation ended; the streaming path
+            # threaded it and this one dropped it on the floor. `send_message`
+            # uses *this* path, so a hosted run against a provider that reports a
+            # stop reason recorded none on all fifty-two turns -- and the gate
+            # that exists to catch a truncated answer being shown as finished
+            # could never be exercised at all.
+            stop_reason=str(response.metadata.get("stop_reason", "") or ""),
         )
 
     def _verified(
@@ -1276,27 +1701,37 @@ class ProviderWorkspaceResponder:
         handles = request.handles()
         authority = request.authority
 
-        def assess(text: str) -> tuple[str, EvidenceReport]:
+        def assess(text: str) -> tuple[str, EvidenceReport, ScoreReport]:
             resolved, cited, unknown = resolve_handles(text, handles)
             # A cited handle states its own kind, which is the only way a symbol
             # claim is ever recognised: guessing symbols out of prose would
             # accuse every backticked word the index does not define.
             extra = [(_HANDLE_KIND[h.kind], h.reference) for h in cited if h.kind in _HANDLE_KIND]
             report = validate_evidence(resolved, evidence, authority, extra_claims=extra)
-            return resolved, EvidenceReport(
-                findings=report.findings
-                + [
-                    EvidenceFinding("handle", label, EvidenceVerdict.UNSUPPORTED, via="handle")
-                    for label in dict.fromkeys(unknown)
-                ],
-                classes=report.classes,
-                unknown_handles=unknown,
-                resolved_handles=len(cited),
+            scores = (
+                validate_scores(resolved, request.authoritative_scores)
+                if request.checks_scores
+                else ScoreReport()
+            )
+            return (
+                resolved,
+                EvidenceReport(
+                    findings=report.findings
+                    + [
+                        EvidenceFinding("handle", label, EvidenceVerdict.UNSUPPORTED, via="handle")
+                        for label in dict.fromkeys(unknown)
+                    ],
+                    classes=report.classes,
+                    unknown_handles=unknown,
+                    resolved_handles=len(cited),
+                ),
+                scores,
             )
 
         def reply(
             body: str,
             report: EvidenceReport,
+            scores: ScoreReport,
             *,
             error: str = "",
             incomplete: bool = False,
@@ -1308,6 +1743,10 @@ class ProviderWorkspaceResponder:
             metadata: dict[str, Any] = {
                 "evidence_validation": report.to_metadata(attempted=attempted, succeeded=succeeded)
             }
+            if request.checks_scores:
+                metadata["score_validation"] = scores.to_metadata(
+                    attempted=attempted, succeeded=succeeded
+                )
             if stop_reason:
                 metadata["stop_reason"] = stop_reason
             return WorkspaceReply(
@@ -1320,13 +1759,13 @@ class ProviderWorkspaceResponder:
                 metadata=metadata,
             )
 
-        shown, first = assess(content)
-        if not first.blocking:
-            return reply(shown, first, attempted=False, succeeded=False)
+        shown, first, first_scores = assess(content)
+        if not first.blocking and not first_scores.unsupported:
+            return reply(shown, first, first_scores, attempted=False, succeeded=False)
 
         try:
             corrected = self._provider.ask(
-                _correction_prompt(request, first.blocking),
+                _correction_prompt(request, first.blocking, first_scores.unsupported),
                 context=request.render_context(self._history_turns),
                 max_tokens=request.token_budget(self._max_tokens),
             )
@@ -1334,24 +1773,40 @@ class ProviderWorkspaceResponder:
         except Exception:  # noqa: BLE001 — a failed correction must not rescue the original
             retry = ""
 
-        report = first
+        report, score_report = first, first_scores
         if retry:
-            shown_again, second = assess(retry)
-            if not second.blocking:
-                return reply(shown_again, second, attempted=True, succeeded=True)
-            report = second
+            shown_again, second, second_scores = assess(retry)
+            if not second.blocking and not second_scores.unsupported:
+                return reply(shown_again, second, second_scores, attempted=True, succeeded=True)
+            report, score_report = second, second_scores
 
         # Fail closed. The unproven identifiers are reported in metadata for
         # diagnosis and deliberately kept out of the body: repeating them in the
         # answer would put the fabrication back in front of the reader, which is
         # the thing this exists to prevent.
+        # Name the check that failed. A reader told the evidence did not resolve,
+        # when what actually happened is that the answer invented a confidence
+        # score, has been told something false about their own system.
+        if report.blocking:
+            body = (
+                "MondayOS could not verify the evidence cited in this answer, so it has "
+                "not been shown. The references did not resolve against anything this "
+                "project records. Ask again, or narrow the question to something the "
+                "project records directly."
+            )
+            error = "unverified evidence in generated answer"
+        else:
+            body = (
+                "MondayOS could not verify the reasoning scores in this answer, so it "
+                "has not been shown. It attributed a confidence, evidence strength or "
+                "execution risk to MondayOS that MondayOS did not compute. Ask again."
+            )
+            error = "unverified evidence: unsupported reasoning score in generated answer"
         return reply(
-            "MondayOS could not verify the evidence cited in this answer, so it has "
-            "not been shown. The references did not resolve against anything this "
-            "project records. Ask again, or narrow the question to something the "
-            "project records directly.",
+            body,
             report,
-            error="unverified evidence in generated answer",
+            score_report,
+            error=error,
             incomplete=True,
             attempted=True,
             succeeded=False,

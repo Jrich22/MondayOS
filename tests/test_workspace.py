@@ -35,6 +35,7 @@ from workspace.models import (
     ArtifactKind,
     ArtifactRef,
     ConversationStatus,
+    Message,
     MessageRole,
     derive_title,
     slugify,
@@ -47,8 +48,10 @@ from workspace.responder import (
     WorkspaceReply,
     WorkspaceRequest,
     _normalise_id,
+    extract_score_claims,
     resolve_handles,
     validate_evidence,
+    validate_scores,
 )
 from workspace.service import WorkspaceService
 from workspace.store import ConversationStore
@@ -2911,3 +2914,699 @@ class TestEvidenceCorrectionFlow(unittest.TestCase):
         reply = ProviderWorkspaceResponder(provider).respond(request)
         self.assertIn("evidence_validation", reply.metadata)
         self.assertIsNone(request.assessment)
+
+
+class TestStopReasonSurvivesBothPaths(unittest.TestCase):
+    """
+    The provider said how generation ended; MondayOS must not lose it.
+
+    A hosted run against Anthropic recorded `stop_reason=""` on all fifty-two
+    turns, on a provider that reports one. The streaming path threaded it and
+    `respond()` dropped it -- and `send_message` uses `respond()`, so the gate
+    that exists to catch a truncated answer being presented as finished could
+    never be exercised on any provider.
+
+    The invariant: if the provider reports a stop reason, it survives the reply
+    *and* the persisted message, whichever generation path the caller used.
+    """
+
+    REAL = ("5c44663", "4f3bb44")
+
+    def _request(self):
+        snapshot = ContextSnapshot(
+            id="snap",
+            project="sourcingbot",
+            created_at=T0,
+            citations=[
+                {"kind": "commit", "reference": r, "item": i} for i, r in enumerate(self.REAL)
+            ],
+        )
+        return WorkspaceRequest(
+            project="sourcingbot",
+            message="What changed recently?",
+            snapshot=snapshot,
+            authority=_StubAuthority(commits=self.REAL),
+        )
+
+    class _Provider(AIProvider):
+        """Reports a stop reason both ways, as a hosted provider does."""
+
+        def __init__(self, stop_reason: str, text: str = "Work landed in `5c44663`."):
+            self.stop_reason = stop_reason
+            self.text = text
+
+        @property
+        def name(self):
+            return "stubthropic"
+
+        @property
+        def supports_streaming(self):
+            return True
+
+        @property
+        def reports_stop_reason(self):
+            return True
+
+        def availability(self):
+            return ProviderAvailability(available=True, provider="stubthropic")
+
+        def ask(self, prompt, context="", max_tokens=1024, **kw):
+            return ProviderResponse(
+                content=self.text,
+                model="m",
+                provider="stubthropic",
+                metadata={
+                    "stop_reason": self.stop_reason,
+                    "truncated": self.stop_reason == "max_tokens",
+                },
+            )
+
+        def stream(self, prompt, context="", max_tokens=1024, **kw):
+            from brain.providers.base import ProviderChunk
+
+            yield ProviderChunk(text=self.text)
+            yield ProviderChunk(
+                done=True, model="m", provider="stubthropic", stop_reason=self.stop_reason
+            )
+
+        def plan(self, o, context="", max_tokens=2048, **kw):
+            return self.ask(o)
+
+        def summarize(self, c, max_words=150, **kw):
+            return self.ask(c)
+
+        def review(self, c, criteria="", **kw):
+            return self.ask(c)
+
+    def _reply(self, stop_reason: str, streaming: bool = False):
+        responder = ProviderWorkspaceResponder(self._Provider(stop_reason))
+        if streaming:
+            return list(responder.respond_stream(self._request()))[-1].reply
+        return responder.respond(self._request())
+
+    def test_end_turn_survives_the_non_streaming_path(self):
+        """The exact defect: `respond()` discarding what the provider reported."""
+        reply = self._reply("end_turn")
+        self.assertEqual(reply.metadata.get("stop_reason"), "end_turn")
+        self.assertFalse(reply.incomplete)
+
+    def test_max_tokens_survives_through_the_reply(self):
+        self.assertEqual(self._reply("max_tokens").metadata.get("stop_reason"), "max_tokens")
+
+    def test_max_tokens_marks_the_reply_incomplete(self):
+        self.assertTrue(self._reply("max_tokens").incomplete)
+
+    def test_no_answer_reports_complete_when_the_provider_says_truncated(self):
+        """Gate 4's claim, asserted directly rather than through the harness."""
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                reply = self._reply("max_tokens", streaming=streaming)
+                self.assertTrue(reply.incomplete)
+                self.assertEqual(reply.metadata.get("stop_reason"), "max_tokens")
+
+    def test_both_paths_agree(self):
+        for stop_reason in ("end_turn", "max_tokens", ""):
+            with self.subTest(stop_reason=stop_reason):
+                direct = self._reply(stop_reason)
+                streamed = self._reply(stop_reason, streaming=True)
+                self.assertEqual(
+                    direct.metadata.get("stop_reason", ""),
+                    streamed.metadata.get("stop_reason", ""),
+                )
+                self.assertEqual(direct.incomplete, streamed.incomplete)
+
+    def test_a_provider_that_reports_nothing_stays_valid(self):
+        """Ollama exposes no stop reason; that is absence, not truncation."""
+        reply = self._reply("")
+        self.assertEqual(reply.metadata.get("stop_reason", ""), "")
+        self.assertFalse(reply.incomplete)
+
+    def test_the_persisted_message_carries_the_stop_reason(self):
+        message = Message(
+            id="MSG-0001",
+            role=MessageRole.ASSISTANT,
+            content="x",
+            created_at=T0,
+            incomplete=True,
+            stop_reason="max_tokens",
+        )
+        restored = Message.from_dict(message.to_dict())
+        self.assertEqual(restored.stop_reason, "max_tokens")
+        self.assertTrue(restored.incomplete)
+        self.assertEqual(message.to_dict()["stop_reason"], "max_tokens")
+
+
+# --------------------------------------------------------------------------- #
+# reasoning-score integrity
+# --------------------------------------------------------------------------- #
+
+# The exact text from the hosted v1.0 acceptance run that this suite exists for.
+# MondayOS computed `confidence 0.47 / evidence_strength 0.94 / execution_risk
+# 0.43` for that turn. The model reported those correctly *and* added a fourth
+# number of its own, in the same label and the same format.
+HOSTED_76 = """**Recommendation confidence: 47% (medium)** for the evidence work.
+
+**Recommendation confidence: 76% (high)** -- the assessment did not compute this
+number, but the reasoning is straightforward: you cannot confidently start new
+work with 14 uncommitted changes and a branch in flight."""
+
+# The D-4 answer that produced twelve false violations on the previous run. It
+# must keep passing: proximity to the word "risk" is not a claim about risk.
+HOSTED_D4 = """**Projects concentrates risk** -- holding 36% of the codebase in one
+package. Coverage sits at 88% of the tests, 15% of which are slow. The release
+on 2026-08-26 closed 12 of 19 tasks.
+
+Confidence is 47% (medium), evidence strength 94%, execution risk 43%."""
+
+
+class TestScoreClaimExtraction(unittest.TestCase):
+    """
+    Which numbers are claims about MondayOS's reasoning, and which are prose.
+
+    The discriminator has to be tight in both directions. Too loose and ordinary
+    percentages near the word "risk" become accusations -- that is exactly what
+    D-4 was. Too tight and the number this suite exists for slips through.
+    """
+
+    def _values(self, text: str, concept: str) -> list[float]:
+        return [v for c, v, _ in extract_score_claims(text) if c == concept]
+
+    def test_the_labelled_seventy_six_is_a_claim(self):
+        self.assertIn(0.76, self._values(HOSTED_76, "confidence"))
+
+    def test_a_share_of_something_is_not_a_score(self):
+        """`36% of the codebase` says what it is a share of. A score does not."""
+        self.assertNotIn(0.36, self._values(HOSTED_D4, "execution_risk"))
+        self.assertNotIn(0.88, self._values(HOSTED_D4, "confidence"))
+        self.assertNotIn(0.15, self._values(HOSTED_D4, "execution_risk"))
+
+    def test_counts_and_dates_are_not_scores(self):
+        for text in (
+            "The release on 2026-08-26 closed 12 of 19 tasks.",
+            "Confidence is high, and 14 files changed.",
+            "Execution depends on the 3 open PRs.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(extract_score_claims(text), [])
+
+    def test_percent_and_fraction_are_the_same_value(self):
+        self.assertEqual(self._values("Confidence: 47%", "confidence"), [0.47])
+        self.assertEqual(self._values("Confidence: 0.47", "confidence"), [0.47])
+
+    def test_all_three_concepts_are_recognised(self):
+        found = {c for c, _, _ in extract_score_claims(HOSTED_D4)}
+        self.assertEqual(found, {"confidence", "evidence_strength", "execution_risk"})
+
+    def test_a_competing_number_in_the_same_sentence_is_also_a_claim(self):
+        """ "Confidence is 47%, though I would call it 0.80" claims both."""
+        values = self._values("Confidence is 47%, though I would put it at 0.80.", "confidence")
+        self.assertIn(0.47, values)
+        self.assertIn(0.80, values)
+
+    def test_a_count_offered_after_a_score_is_not_a_second_score(self):
+        values = self._values("Confidence is 47%, but only 12 files are covered.", "confidence")
+        self.assertEqual(values, [0.47])
+
+    def test_extraction_is_deterministic(self):
+        self.assertEqual(extract_score_claims(HOSTED_76), extract_score_claims(HOSTED_76))
+
+
+class TestScoreValidation(unittest.TestCase):
+    """
+    The rule, stated once: MondayOS computes the scores, the model reports them.
+
+    Explaining, rounding and describing a computed value in words are all
+    allowed. Introducing a number is not, and no amount of candour about having
+    introduced it makes it allowed.
+    """
+
+    AUTHORITATIVE = (0.47, 0.94, 0.43)
+
+    def test_the_hosted_seventy_six_is_rejected(self):
+        report = validate_scores(HOSTED_76, self.AUTHORITATIVE)
+        self.assertEqual([c.value for c in report.unsupported], [0.76])
+
+    def test_the_computed_values_in_the_same_answer_are_accepted(self):
+        report = validate_scores(HOSTED_76, self.AUTHORITATIVE)
+        self.assertIn(0.47, [c.value for c in report.claims if c.supported])
+
+    def test_the_d4_answer_has_no_unsupported_scores(self):
+        """The false-positive case. It failed twelve times; it must never fail again."""
+        report = validate_scores(HOSTED_D4, self.AUTHORITATIVE)
+        self.assertEqual(report.unsupported, [], "D-4 regressed")
+
+    def test_a_fraction_matches_a_computed_percentage(self):
+        self.assertEqual(validate_scores("Confidence: 0.47", self.AUTHORITATIVE).unsupported, [])
+
+    def test_rounding_is_within_tolerance(self):
+        self.assertEqual(validate_scores("Confidence: 46.9%", self.AUTHORITATIVE).unsupported, [])
+
+    def test_a_number_outside_tolerance_is_not_rounding(self):
+        report = validate_scores("Confidence: 52%", self.AUTHORITATIVE)
+        self.assertEqual([c.value for c in report.unsupported], [0.52])
+
+    def test_describing_a_score_in_words_claims_nothing(self):
+        report = validate_scores("Confidence is high and the risk is moderate.", ())
+        self.assertEqual(report.claims, [])
+        self.assertFalse(report.checked)
+
+    def test_with_no_authority_any_attributed_number_is_unsupported(self):
+        """A grounded turn that recalled no state has nothing a number could report."""
+        report = validate_scores("Confidence: 47%", ())
+        self.assertEqual([c.value for c in report.unsupported], [0.47])
+
+    def test_several_valid_scores_all_pass(self):
+        text = "Confidence 47%, evidence strength 94%, execution risk 43%."
+        self.assertEqual(validate_scores(text, self.AUTHORITATIVE).unsupported, [])
+
+    def test_one_valid_and_one_invented_still_fails(self):
+        text = "Confidence 47%, and recommendation confidence 76%."
+        report = validate_scores(text, self.AUTHORITATIVE)
+        self.assertEqual(len(report.claims), 2)
+        self.assertEqual([c.value for c in report.unsupported], [0.76])
+
+    def test_a_persisted_continuation_score_is_authoritative(self):
+        """A continuation re-states the stored decision; those values are MondayOS's."""
+        self.assertEqual(validate_scores("Confidence: 0.34", (0.34, 0.91)).unsupported, [])
+
+    def test_a_continuation_that_invents_a_second_confidence_fails(self):
+        report = validate_scores("Confidence was 0.34, now I would say 0.71.", (0.34, 0.91))
+        self.assertEqual([c.value for c in report.unsupported], [0.71])
+
+    def test_a_reassessment_uses_the_replacement_not_the_obsolete_value(self):
+        """
+        Staleness produces new numbers, and the old ones stop being authority.
+
+        Quoting the superseded score after a reassessment is the failure this
+        distinction exists to catch: it tells the user the world has not moved.
+        """
+        report = validate_scores("Confidence: 0.34", (0.61, 0.88))
+        self.assertEqual([c.value for c in report.unsupported], [0.34])
+
+    def test_the_metadata_is_observational_and_deterministic(self):
+        first = validate_scores(HOSTED_76, self.AUTHORITATIVE)
+        second = validate_scores(HOSTED_76, self.AUTHORITATIVE)
+        self.assertEqual(
+            first.to_metadata(attempted=False, succeeded=False),
+            second.to_metadata(attempted=False, succeeded=False),
+        )
+
+
+class TestScoreCorrectionFlow(unittest.TestCase):
+    """
+    Enforcement, mirroring evidence exactly: instruct, validate, one correction,
+    then fail closed. The model is never asked whether its own number is valid.
+    """
+
+    def _request(self) -> WorkspaceRequest:
+        return WorkspaceRequest(
+            project="mondayos",
+            message="What should I do next?",
+            authoritative_scores=(0.47, 0.94, 0.43),
+        )
+
+    GOOD = "Confidence: 47% (medium). Evidence strength 94%."
+    BAD = "Recommendation confidence: 76% (high) -- my own judgment."
+
+    def test_a_valid_answer_passes_through_untouched(self):
+        provider = _ScriptedProvider(self.GOOD)
+        reply = ProviderWorkspaceResponder(provider).respond(self._request())
+        self.assertEqual(reply.content, self.GOOD)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(reply.metadata["score_validation"]["unsupported"], 0)
+
+    def test_one_correction_is_attempted_and_can_succeed(self):
+        provider = _ScriptedProvider(self.BAD, self.GOOD)
+        reply = ProviderWorkspaceResponder(provider).respond(self._request())
+        self.assertEqual(reply.content, self.GOOD)
+        self.assertEqual(len(provider.calls), 2, "exactly one correction")
+        validation = reply.metadata["score_validation"]
+        self.assertTrue(validation["correction_attempted"])
+        self.assertTrue(validation["correction_succeeded"])
+
+    def test_the_correction_names_the_number_and_the_allowed_set(self):
+        provider = _ScriptedProvider(self.BAD, self.GOOD)
+        ProviderWorkspaceResponder(provider).respond(self._request())
+        correction = provider.calls[1]
+        self.assertIn("0.76", correction)
+        self.assertIn("0.47", correction)
+        self.assertNotIn("is this correct", correction.lower())
+
+    def test_a_second_invalid_answer_fails_closed(self):
+        provider = _ScriptedProvider(self.BAD, self.BAD)
+        reply = ProviderWorkspaceResponder(provider).respond(self._request())
+        self.assertEqual(len(provider.calls), 2, "never a third attempt")
+        self.assertTrue(reply.incomplete)
+        self.assertNotIn("76%", reply.content, "the invented score must not be re-shown")
+
+    def test_a_provider_failure_during_correction_never_promotes_the_original(self):
+        provider = _ScriptedProvider(self.BAD, fail_on=1)
+        reply = ProviderWorkspaceResponder(provider).respond(self._request())
+        self.assertNotIn("76%", reply.content)
+        self.assertTrue(reply.incomplete)
+        self.assertFalse(reply.metadata["score_validation"]["correction_succeeded"])
+
+    def test_an_invented_score_never_reaches_a_streamed_reader(self):
+        provider = _ScriptedProvider(self.BAD, self.BAD)
+        chunks = list(ProviderWorkspaceResponder(provider).respond_stream(self._request()))
+        for chunk in chunks:
+            self.assertNotIn("76%", chunk.text or "")
+
+    def test_the_instruction_tells_the_model_the_scores_are_given_not_made(self):
+        provider = _ScriptedProvider(self.GOOD)
+        ProviderWorkspaceResponder(provider).respond(self._request())
+        self.assertIn("computed by MondayOS", provider.calls[0])
+
+    def test_score_validation_does_not_touch_scoring_or_state(self):
+        provider = _ScriptedProvider(self.BAD, self.GOOD)
+        request = self._request()
+        ProviderWorkspaceResponder(provider).respond(request)
+        self.assertEqual(request.authoritative_scores, (0.47, 0.94, 0.43))
+
+
+class TestMultiHandleCitationGroups(unittest.TestCase):
+    """
+    `[E2, E3]` is two citations, not one unknown handle.
+
+    The grouped form bypassed resolution entirely: the pattern expected a single
+    label, so a group matched nothing, was never checked, and reached the reader
+    with internal E-labels still in it. Every member resolves independently, and
+    one unknown member invalidates the group -- a half-resolved citation is worse
+    than an unresolved one, because it looks checked.
+    """
+
+    def _handles(self) -> dict[str, EvidenceHandle]:
+        return {
+            f"E{i}": EvidenceHandle(label=f"E{i}", kind="commit", reference=f"sha{i}")
+            for i in range(1, 4)
+        }
+
+    def _resolve(self, text: str) -> tuple[str, list[str]]:
+        resolved, _cited, unknown = resolve_handles(text, self._handles())
+        return resolved, sorted(unknown)
+
+    def test_a_single_handle_still_resolves(self):
+        self.assertEqual(self._resolve("See [E2].")[0], "See sha2.")
+
+    def test_two_handles_both_resolve(self):
+        text, unknown = self._resolve("See [E2, E3].")
+        self.assertIn("sha2", text)
+        self.assertIn("sha3", text)
+        self.assertEqual(unknown, [])
+
+    def test_three_handles_all_resolve(self):
+        text, _ = self._resolve("See [E1, E2, E3].")
+        for ref in ("sha1", "sha2", "sha3"):
+            self.assertIn(ref, text)
+
+    def test_whitespace_variants_are_the_same_citation(self):
+        for form in ("[E2,E3]", "[E2, E3]", "[ E2 ,  E3 ]", "[E2 , E3]"):
+            with self.subTest(form=form):
+                text, unknown = self._resolve(f"See {form}.")
+                self.assertEqual(unknown, [])
+                self.assertNotIn("E2", text)
+
+    def test_one_unknown_member_invalidates_the_whole_group(self):
+        text, unknown = self._resolve("See [E2, E9].")
+        self.assertEqual(unknown, ["E9"])
+        self.assertIn("[E2, E9]", text, "a partly-resolved group must not be shown as checked")
+
+    def test_a_duplicated_handle_is_cited_once(self):
+        text, unknown = self._resolve("See [E2, E2].")
+        self.assertEqual(unknown, [])
+        self.assertEqual(text.count("sha2"), 1)
+
+    def test_an_unknown_single_handle_is_still_reported(self):
+        self.assertEqual(self._resolve("See [E99].")[1], ["E99"])
+
+    def test_a_malformed_group_is_left_alone(self):
+        for form in ("[E2, ]", "[, E3]", "[E2; E3]", "[]"):
+            with self.subTest(form=form):
+                text, unknown = self._resolve(f"See {form}.")
+                self.assertEqual(unknown, [])
+                self.assertIn(form, text)
+
+    def test_the_rendered_answer_carries_evidence_not_internal_labels(self):
+        text, _ = self._resolve("Both [E2, E3] point the same way.")
+        self.assertNotRegex(text, r"\bE\d\b")
+
+
+class TestScoreClaimsReachedThroughProse(unittest.TestCase):
+    """
+    The closed connector list was high-precision and too narrow, and a live
+    Anthropic run proved it: asked for its own number, the model wrote
+
+        My recommendation confidence for prioritizing the acceptance fix
+        instead: 75%
+
+    and validation passed it, because "for prioritizing the acceptance fix" is
+    not a connector. A qualifying phrase must not be a way through.
+
+    The widening is bounded in two directions -- a colon, and a score-shaped
+    value -- so the D-4 negatives below still hold.
+    """
+
+    AUTHORITATIVE = (0.47, 0.94, 0.43)
+
+    def _unsupported(self, text: str, authoritative=AUTHORITATIVE) -> list[float]:
+        return sorted({c.value for c in validate_scores(text, authoritative).unsupported})
+
+    def test_the_live_seventy_five(self):
+        text = "My recommendation confidence for prioritizing the acceptance fix instead: 75%"
+        self.assertEqual(self._unsupported(text), [0.75])
+
+    def test_the_number_may_come_first(self):
+        self.assertEqual(
+            self._unsupported("The 75% confidence reflects clearer success criteria."), [0.75]
+        )
+
+    def test_a_count_after_a_colon_is_not_a_score(self):
+        self.assertEqual(self._unsupported("The risk here: we have 3 open PRs."), [])
+
+    def test_a_word_after_a_colon_is_not_a_score(self):
+        self.assertEqual(self._unsupported("Confidence in delivery: high. We closed 12 tasks."), [])
+
+    def test_a_share_after_a_colon_is_still_a_share(self):
+        self.assertEqual(self._unsupported("Execution risk, roughly: 36% of the codebase."), [])
+
+    def test_a_number_far_from_its_label_is_not_a_claim(self):
+        """The D-4 shape. Proximity is not attachment, with or without a colon."""
+        text = "**Projects concentrates risk** -- holding 36% of the codebase in one package."
+        self.assertEqual(self._unsupported(text), [])
+
+    def test_one_claim_found_by_two_patterns_is_counted_once(self):
+        report = validate_scores("Recommendation confidence: 76%", self.AUTHORITATIVE)
+        self.assertEqual(len(report.claims), 1)
+
+    def test_a_label_on_the_next_line_belongs_to_the_next_line(self):
+        """
+        `**Confidence:** 0.61` followed by `**Evidence Strength:** 0.88` is two
+        claims about two concepts. Reading across the newline attributed the
+        confidence to evidence strength -- harmless while both values are
+        authoritative, and a wrong accusation the moment they are not.
+        """
+        text = "**Confidence:** 0.61\n**Evidence Strength:** 0.88"
+        claims = {(c.concept, c.value) for c in validate_scores(text, (0.61, 0.88)).claims}
+        self.assertEqual(claims, {("confidence", 0.61), ("evidence_strength", 0.88)})
+
+    def test_a_valid_colon_score_is_still_valid(self):
+        self.assertEqual(self._unsupported("Confidence for the evidence work: 47%"), [])
+
+
+class TestScoreValidationIsReportedByTheService(unittest.TestCase):
+    """
+    The observational contract: a caller can see what was checked.
+
+    Reported, never persisted. The stored message carries the answer; the
+    reasoning about the answer belongs in the response payload, the same
+    separation `evidence_validation` already keeps.
+    """
+
+    def _service(self, tmp: str, provider: AIProvider):
+        root = Path(tmp)
+        alpha = _project_tree(root, "alpha")
+        return root, WorkspaceService(
+            root=root,
+            engine=_engine(root, {"alpha": alpha}),
+            responder=ProviderWorkspaceResponder(provider),
+        )
+
+    def test_the_payload_carries_a_score_validation_block(self):
+        with TemporaryDirectory() as tmp:
+            _, service = self._service(tmp, FakeProvider("Nothing numeric here."))
+            conversation = service.create_conversation("alpha", "")
+            result = service.send_message("alpha", conversation["id"], "What next?")
+            self.assertIn("score_validation", result)
+
+    def test_the_persisted_message_does_not_carry_it(self):
+        with TemporaryDirectory() as tmp:
+            _, service = self._service(tmp, FakeProvider("Nothing numeric here."))
+            conversation = service.create_conversation("alpha", "")
+            service.send_message("alpha", conversation["id"], "What next?")
+            stored = service.get_conversation("alpha", conversation["id"])["messages"][-1]
+            self.assertNotIn("score_validation", json.dumps(stored))
+
+
+class TestHeadingScopedScoreClaims(unittest.TestCase):
+    """
+    D-9. A heading can establish the concept and the numbers beneath inherit it.
+
+    A live Anthropic answer wrote
+
+        ## Evidence Strength
+
+        - **Workspace and projects recommendations**: 95% (high)
+
+    and no reader saw a claim, because all three shapes need the label and the
+    number within one line or one short span. That 95% happened to be a computed
+    value; an invented number in the same position would have been delivered
+    unchecked, which is what makes this a product defect rather than a near miss.
+
+    Structural parsing, not a fourth widened window. A heading establishes
+    exactly one concept or none, and its block ends at the next heading, a rule,
+    a fence, or the end of the document. Nothing is inferred across sections.
+    """
+
+    def _claims(self, text: str) -> list[tuple[str, float]]:
+        return sorted((concept, value) for concept, value, _ in extract_score_claims(text))
+
+    # ------------------------------------------------------------- inheritance
+
+    def test_a_bullet_inherits_the_heading_concept(self):
+        text = "## Evidence Strength\n\n- Workspace recommendations: 95%\n"
+        self.assertEqual(self._claims(text), [("evidence_strength", 0.95)])
+
+    def test_a_confidence_heading_scopes_its_block(self):
+        text = "## Confidence\n\n- Recommendation confidence: 47%\n"
+        self.assertEqual(self._claims(text), [("confidence", 0.47)])
+
+    def test_an_execution_risk_heading_scopes_its_block(self):
+        text = "## Execution Risk\n\n- Low: 10%\n"
+        self.assertEqual(self._claims(text), [("execution_risk", 0.1)])
+
+    def test_every_bullet_in_the_block_is_a_claim(self):
+        text = "## Evidence Strength\n\n- integrations: 94%\n- workspace: 95%\n"
+        self.assertEqual(
+            self._claims(text), [("evidence_strength", 0.94), ("evidence_strength", 0.95)]
+        )
+
+    def test_a_table_row_inherits_it_too(self):
+        text = "## Evidence Strength\n\n| item | value |\n|---|---|\n| workspace | 95% |\n"
+        self.assertEqual(self._claims(text), [("evidence_strength", 0.95)])
+
+    def test_prose_and_bullets_in_one_block(self):
+        text = "## Execution Risk\n\nThe risk is low.\n\n- baseline: 10%\n"
+        self.assertEqual(self._claims(text), [("execution_risk", 0.1)])
+
+    # ---------------------------------------------------------------- the edges
+
+    def test_the_next_heading_ends_the_scope(self):
+        text = "## Execution Risk\n\n- Low: 10%\n\n## Notes\n\nLater 95% appears.\n"
+        self.assertEqual(self._claims(text), [("execution_risk", 0.1)])
+
+    def test_a_nested_heading_ends_the_scope(self):
+        self.assertEqual(self._claims("## Evidence Strength\n\n### Detail\n\n- 95%\n"), [])
+
+    def test_a_horizontal_rule_ends_the_scope(self):
+        for rule in ("---", "***", "___"):
+            with self.subTest(rule=rule):
+                text = f"## Evidence Strength\n\n{rule}\n\n- 95%\n"
+                self.assertEqual(self._claims(text), [])
+
+    def test_a_fenced_block_is_not_read_at_all(self):
+        text = "## Evidence Strength\n\n```\nscore = 95%\n```\n"
+        self.assertEqual(self._claims(text), [])
+
+    def test_a_heading_naming_two_concepts_scopes_nothing(self):
+        """A heading that could mean two things means neither."""
+        self.assertEqual(self._claims("## Confidence and Execution Risk\n\n- 95%\n"), [])
+
+    def test_a_heading_naming_no_concept_scopes_nothing(self):
+        self.assertEqual(self._claims("## Recent Work\n\n- shipped: 95%\n"), [])
+
+    # ------------------------------------------------------------- the negatives
+
+    def test_the_d4_sentence_is_still_not_a_score(self):
+        text = "**Projects concentrates risk** -- holding 36% of the codebase"
+        self.assertEqual(self._claims(text), [])
+
+    def test_operational_numbers_are_never_scores(self):
+        for text in ("Coverage: 95%", "Memory utilization: 88%", "CPU: 72%", "File count: 61"):
+            with self.subTest(text=text):
+                self.assertEqual(self._claims(text), [])
+
+    def test_a_count_inside_a_scored_block_is_still_a_count(self):
+        """Inheriting a concept must not change what counts as a number."""
+        self.assertEqual(self._claims("## Evidence Strength\n\n- File count: 61\n"), [])
+
+    def test_a_share_inside_a_scored_block_is_still_a_share(self):
+        self.assertEqual(self._claims("## Evidence Strength\n\n- 36% of the codebase\n"), [])
+
+    # ------------------------------------------------------- nothing regressed
+
+    def test_inline_formats_are_unchanged(self):
+        text = "Confidence: 47%. Evidence strength 94%."
+        self.assertEqual(self._claims(text), [("confidence", 0.47), ("evidence_strength", 0.94)])
+
+    def test_a_line_that_names_its_own_concept_keeps_it(self):
+        """
+        D-7's sentence. `## Confidence and Evidence` scopes nothing, and even if
+        it did, a line stating its own label has already said what it means.
+        """
+        text = "## Confidence and Evidence\n\n**Confidence:** 0.61\n**Evidence Strength:** 0.88\n"
+        self.assertEqual(self._claims(text), [("confidence", 0.61), ("evidence_strength", 0.88)])
+
+    def test_the_line_local_gap_does_not_cross_a_line(self):
+        """
+        The over-reach found alongside D-9: the connector gap permitted `\\s`, and
+        a blank line and a `---` rule are made of nothing but permitted
+        characters. The heading therefore reached a number two paragraphs down --
+        a proximity match dressed as a line-local one.
+        """
+        self.assertEqual(self._claims("Evidence Strength\n\n---\n\n95%\n"), [])
+
+
+class TestHeadingScopedScoreEnforcement(unittest.TestCase):
+    """The heading shape has to be enforced, not merely recognised."""
+
+    AUTHORITATIVE = (0.47, 0.94, 0.43)
+    HEADING_GOOD = "## Evidence Strength\n\n- integrations: 94%\n"
+    HEADING_BAD = "## Evidence Strength\n\n- integrations: 95%\n"
+
+    def _request(self) -> WorkspaceRequest:
+        return WorkspaceRequest(
+            project="mondayos",
+            message="How strong is the evidence?",
+            authoritative_scores=self.AUTHORITATIVE,
+        )
+
+    def test_an_invented_score_under_a_heading_fails_validation(self):
+        report = validate_scores(self.HEADING_BAD, self.AUTHORITATIVE)
+        self.assertEqual([c.value for c in report.unsupported], [0.95])
+
+    def test_a_computed_score_under_a_heading_validates(self):
+        self.assertEqual(validate_scores(self.HEADING_GOOD, self.AUTHORITATIVE).unsupported, [])
+
+    def test_the_correction_runs_and_can_succeed(self):
+        provider = _ScriptedProvider(self.HEADING_BAD, self.HEADING_GOOD)
+        reply = ProviderWorkspaceResponder(provider).respond(self._request())
+        self.assertEqual(reply.content, self.HEADING_GOOD.strip())
+        self.assertEqual(len(provider.calls), 2)
+        self.assertTrue(reply.metadata["score_validation"]["correction_succeeded"])
+
+    def test_a_second_failure_fails_closed(self):
+        provider = _ScriptedProvider(self.HEADING_BAD, self.HEADING_BAD)
+        reply = ProviderWorkspaceResponder(provider).respond(self._request())
+        self.assertEqual(len(provider.calls), 2, "never a third attempt")
+        self.assertTrue(reply.incomplete)
+        self.assertNotIn("95%", reply.content)
+
+    def test_the_exact_live_answer_shape(self):
+        """The section from the hosted run, verbatim in shape."""
+        answer = (
+            "## Evidence Strength\n\n"
+            "- **Integrations recommendation**: 94% (high) - directly observed\n"
+            "- **Workspace and projects recommendations**: 95% (high) - directly counted\n"
+        )
+        values = sorted(c.value for c in validate_scores(answer, (0.94, 0.95)).claims)
+        self.assertEqual(values, [0.94, 0.95])

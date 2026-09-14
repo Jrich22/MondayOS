@@ -62,33 +62,31 @@ class AnthropicProvider(AIProvider):
     def cost_tier(self) -> int:
         return 3  # frontier hosted model — highest cost tier
 
-    def _request_timeout(self, max_tokens: int) -> Any:
+    def _request_timeout(self, max_tokens: int) -> float:
         """
-        Connect and read deadlines for one request.
+        The generation deadline for one request, as a plain number.
 
-        This provider previously stored `config.timeout` and never read it, so
-        the knob did nothing and the SDK's own default applied. It is honoured
-        now.
+        **A float, deliberately, and this is a real limitation rather than a
+        simplification.** This provider used to build an `httpx.Timeout` so that
+        connect and read could bind separately. The installed SDK does not use
+        `httpx`: it vendors its own transport as `httpx2`, so the object arrived
+        as a foreign type and every call failed with `APIConnectionError:
+        Connection error.` -- a message that points at the network and not at a
+        type mismatch. The hosted path was unusable and only a hosted run could
+        show it, because Ollama speaks `urlopen` and never touches the SDK.
 
-        The SDK speaks httpx, so connect and read bind separately. **`read` is an
-        inter-chunk deadline, not a total one**: it bounds silence rather than the
-        whole answer, so a stream that keeps producing may exceed it in total.
-        That differs from Ollama, where the single socket timeout does bound the
-        whole generation, and the difference is inherent to streaming rather than
-        a choice made here. The intent is the same on both: fail quickly when the
-        provider cannot be reached, and allow generation time proportionate to the
-        tokens requested.
+        MondayOS does not import the SDK's transport to fix that. Coupling to a
+        library the SDK owns and may rename again trades one version break for
+        the next. A number is the SDK's public contract and every version accepts
+        it.
 
-        Falls back to a single float when httpx is absent.
+        What that costs, stated plainly: **for Anthropic, `connect_timeout` is not
+        independently enforced by MondayOS.** The generation deadline is bound
+        through the SDK's own timeout argument; the connect deadline is a desired
+        capability this SDK gives us no transport-agnostic way to express. Ollama
+        and OpenAI are unaffected and continue to bind both.
         """
-        deadline = self.generation_deadline(max_tokens, self._generation_timeout)
-        try:
-            import httpx
-        except ImportError:
-            return deadline
-        return httpx.Timeout(
-            deadline, connect=self._connect_timeout, write=self._connect_timeout
-        )
+        return self.generation_deadline(max_tokens, self._generation_timeout)
 
     @property
     def tokens_per_second(self) -> float:

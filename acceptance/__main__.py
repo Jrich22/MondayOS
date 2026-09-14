@@ -11,6 +11,7 @@ is invoked on purpose, before a release.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from acceptance.pacing import Pacing
@@ -31,7 +32,17 @@ def main(argv: list[str] | None = None) -> int:
 
     from monday.api import Monday
     from monday.config import MondayConfig
-    from monday.provider_env import provider_config
+    from monday.provider_env import load_env_file, provider_config
+
+    # The same project-local `.env` the dashboard reads, through the same loader.
+    # Without this the documented way to configure a provider worked for one
+    # entry point and silently did not for the other: a key present in `.env`
+    # left this runner falling through to whatever local daemon was answering,
+    # which reads as "Anthropic is unavailable" rather than "nobody loaded the
+    # file". An exported value still wins -- `load_env_file` fills gaps only, and
+    # returns variable names, never values.
+    project_root = Path(os.environ.get("MONDAYOS_ROOT", ".")).resolve()
+    load_env_file(project_root / ".env")
 
     config = provider_config()
     if config is None:

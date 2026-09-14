@@ -63,7 +63,7 @@ from tasks import (
     TaskValidationError,
 )
 
-_VERSION = "1.0.0b1"
+_VERSION = "1.0.0"
 
 
 class Monday:

@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from acceptance.gates import evaluate
+from acceptance.journeys import observe_stream
 from acceptance.pacing import Pacing
 from acceptance.report import AcceptanceReport, stamp
 from acceptance.session import ProjectSession, isolated_root
@@ -98,6 +99,16 @@ def run(
             report.projects[corpus.slug] = outcome
             report.turns.extend(session.turns)
             report.incidents.extend(session.incidents)
+
+            # The streaming half of the delivery contract, once per corpus. The
+            # buffered path is what the thirteen turns exercise; a provider that
+            # streams can also show a reader an identifier before anything has
+            # checked it, and that is a different guarantee with different code
+            # behind it. Ollama could not stream, so this went unexercised for
+            # the whole programme.
+            if report.provider.get("supports_streaming"):
+                pacing.pause(executive=False)
+                report.streams.append(observe_stream(monday, corpus.slug))
             # A pause between projects as well: the next one opens with an
             # executive turn, which is the most expensive call in the journey.
             time.sleep(pacing.between_turns)

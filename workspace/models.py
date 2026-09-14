@@ -115,6 +115,12 @@ class Message:
     # complete answer is a quiet correctness failure, so this is persisted and
     # rendered, never inferred at read time.
     incomplete: bool = False
+    # How generation ended, as the provider reported it: `end_turn`, `max_tokens`,
+    # or empty where the provider does not say. Persisted rather than derived,
+    # because `incomplete` records MondayOS's conclusion and this records the
+    # evidence for it -- and a reader auditing a partial answer months later
+    # needs the second, not just the first.
+    stop_reason: str = ""
     artifact_refs: list[ArtifactRef] = field(default_factory=list)
 
     @property
@@ -134,6 +140,7 @@ class Message:
             "tokens_used": self.tokens_used,
             "error": self.error,
             "incomplete": self.incomplete,
+            "stop_reason": self.stop_reason,
             "artifact_refs": [a.to_dict() for a in self.artifact_refs],
         }
 
@@ -150,6 +157,7 @@ class Message:
             tokens_used=int(data.get("tokens_used", 0) or 0),
             error=str(data.get("error", "")),
             incomplete=bool(data.get("incomplete", False)),
+            stop_reason=str(data.get("stop_reason", "") or ""),
             artifact_refs=[ArtifactRef.from_dict(a) for a in data.get("artifact_refs") or []],
         )
 

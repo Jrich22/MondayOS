@@ -290,6 +290,7 @@ class WorkspaceService:
             tokens_used=reply.tokens_used,
             error=reply.error,
             incomplete=reply.incomplete,
+            stop_reason=str(reply.metadata.get("stop_reason", "") or ""),
         )
         conversation.messages.append(assistant_message)
         conversation.updated_at = assistant_message.created_at
@@ -308,6 +309,16 @@ class WorkspaceService:
             "user_message": user_message.to_dict(),
             "assistant_message": assistant_message.to_dict(),
             "context": snapshot.to_dict() if snapshot else None,
+            # Additive and observational: what evidence validation concluded, so
+            # a caller can tell a refusal apart from an outage and say which
+            # identifiers failed. Reported, never persisted -- the stored message
+            # carries the answer, not the reasoning about it.
+            "evidence_validation": reply.metadata.get("evidence_validation") or {},
+            # The same, for reasoning scores. A caller that can see which numbers
+            # were checked against which authoritative set can tell "the model
+            # reported our confidence" from "the model made one up" without
+            # re-deriving either, which is the whole point of computing them.
+            "score_validation": reply.metadata.get("score_validation") or {},
             # Additive and observational: what the reasoning layer concluded, so
             # the execution path can be inspected rather than reconstructed.
             "assessment": observed_assessment(assessment),
@@ -423,6 +434,10 @@ class WorkspaceService:
         """Write the assistant turn, however the stream ended."""
         streamed = "".join(parts).strip()
 
+        # A stream that never finished has no provider verdict to report: the
+        # reason generation ended is "the caller stopped it", which `incomplete`
+        # already says.
+        stop_reason = ""
         if not finished:
             # Stopped by the caller. Whatever arrived is a real partial answer.
             content, error, incomplete = streamed, "", True
@@ -438,6 +453,7 @@ class WorkspaceService:
             content = reply.content or streamed
             error, incomplete = reply.error, reply.incomplete
             provider, model, tokens = reply.provider, reply.model, reply.tokens_used
+            stop_reason = str(reply.metadata.get("stop_reason", "") or "")
 
         message = Message(
             id=self._store.next_message_id(conversation),
@@ -450,6 +466,7 @@ class WorkspaceService:
             tokens_used=tokens,
             error=error,
             incomplete=incomplete,
+            stop_reason=stop_reason,
         )
         conversation.messages.append(message)
         conversation.updated_at = message.created_at
@@ -479,6 +496,7 @@ class WorkspaceService:
         deterministic digest of what came before.
         """
         plan = compaction.compact(history, summarizer=self._summarizer)
+        assessment = self._assessment(conversation, text, snapshot)
         return WorkspaceRequest(
             project=conversation.project,
             message=text,
@@ -486,8 +504,9 @@ class WorkspaceService:
             history=plan.verbatim,
             conversation_id=conversation.id,
             history_digest=plan.digest,
-            assessment=self._assessment(conversation, text, snapshot),
+            assessment=assessment,
             authority=self._authority(conversation.project),
+            authoritative_scores=_authoritative_scores(conversation, assessment),
         )
 
     def _authority(self, project: str) -> Any:
@@ -933,6 +952,38 @@ def observed_assessment(assessment: Any) -> dict[str, Any] | None:
         # `recommendations[0]` made a faithful quotation look like an invention.
         "computed_values": _computed_values(assessment),
     }
+
+
+def _authoritative_scores(conversation: Any, assessment: Any) -> tuple[float, ...]:
+    """
+    Every reasoning score this turn is entitled to quote.
+
+    Which values are authoritative depends on what kind of turn it is, and the
+    distinctions matter:
+
+    **Fresh executive.** The values computed in this turn's assessment.
+
+    **Continuation.** Those, plus the scores persisted in `StrategicState` -- a
+    continuation explains a decision already made, so the numbers it narrates are
+    the stored ones and a thin fresh assessment would not contain them.
+
+    **Stale reassessment.** The replacement assessment only. When MondayOS has
+    just re-decided because the world moved, the superseded scores are exactly
+    what the answer must *not* repeat, so they are deliberately withheld.
+
+    **Grounded.** The assessment's values if there are any, plus persisted state,
+    because a lookup later in a strategic thread may legitimately recall the
+    stored decision. With neither, the turn has no score authority at all and any
+    number attributed to a reasoning concept is unsupported.
+    """
+    values = set(_computed_values(assessment))
+    if not getattr(assessment, "replaced_stale", False):
+        strategy = getattr(conversation, "strategy", None)
+        for name in ("evidence_strength", "confidence", "execution_risk"):
+            score = getattr(getattr(strategy, name, None), "score", None)
+            if score is not None:
+                values.add(round(float(score), 4))
+    return tuple(sorted(values))
 
 
 def _computed_values(assessment: Any) -> list[float]:

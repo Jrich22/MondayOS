@@ -24,6 +24,7 @@ from typing import Any
 
 from acceptance.journeys import COLD_TURN, DETERMINISM_TURN, JOURNEY, STALE_TURN, Turn
 from acceptance.observe import (
+    audit_scores,
     check_citations,
     cited_commits,
     cited_decisions,
@@ -97,6 +98,39 @@ class TurnRecord:
     # legitimately replaces it, so a follow-up is judged against the decision it
     # was actually continuing (RC1/H-10).
     anchor_at_turn: str = ""
+    # What evidence validation concluded for this turn. Recorded so a fail-closed
+    # refusal is legible -- which identifiers failed, whether the one permitted
+    # correction ran, and whether it worked -- rather than appearing as an
+    # unexplained missing answer.
+    evidence_validation: dict[str, Any] = field(default_factory=dict)
+    # What *the product* concluded about the reasoning scores in this answer.
+    #
+    # Gate 6 reads this and nothing else. It used to re-derive score claims from
+    # the prose with its own window heuristic, which meant two parsers could
+    # disagree about the same answer and the release gate would side with the one
+    # that had never blocked a delivery (D-7). One authority for the decision;
+    # the harness observes the result.
+    score_validation: dict[str, Any] = field(default_factory=dict)
+    # The adversarial cross-check: what an independent parser saw, and where it
+    # and the product disagree. Diagnostic, never a verdict -- but a claim the
+    # product says is not there is an integrity finding, because the product
+    # validator missing a claim is precisely the failure the gate cannot see.
+    score_audit: dict[str, Any] = field(default_factory=dict)
+    # The full assistant text, kept as acceptance evidence only.
+    #
+    # A gate-6 failure could not be adjudicated from the last hosted run: twelve
+    # quoted scores matched nothing MondayOS computed, and the report stored a
+    # 701-character excerpt that did not reach the sentences containing them. Was
+    # the model asserting a score, restating a rounded one, or was the harness
+    # reading a number out of unrelated prose? The artifact could not say, and
+    # the conversations lived in a temporary root that no longer existed.
+    #
+    # This is the answer MondayOS showed a user, nothing more. No prompt, no
+    # snapshot, no model reasoning, no rejected candidate -- gate 12 asserts that
+    # none of those are ever persisted, and this does not persist anything: it
+    # travels in the run artifact, which `reports/` already excludes from the
+    # index.
+    answer: str = ""
     continuation: bool = False
     quoted_scores: dict[str, float] = field(default_factory=dict)
     citations: dict[str, Any] = field(default_factory=dict)
@@ -138,6 +172,10 @@ class TurnRecord:
             "persisted_values": self.persisted_values,
             "persisted_key": self.persisted_key,
             "anchor_at_turn": self.anchor_at_turn,
+            "evidence_validation": self.evidence_validation,
+            "score_validation": self.score_validation,
+            "score_audit": self.score_audit,
+            "answer": self.answer,
             "continuation": self.continuation,
             "quoted_scores": self.quoted_scores,
             "citations": self.citations,
@@ -239,6 +277,8 @@ class ProjectSession:
             outcome = classify(error)
             record.outcome = outcome.value
             record.error = error
+            record.evidence_validation = dict(payload.get("evidence_validation") or {})
+            record.score_validation = dict(payload.get("score_validation") or {})
             if outcome is not Outcome.PROVIDER_TRANSIENT:
                 break
             if attempt + 1 < self._pacing.attempts:
@@ -258,11 +298,17 @@ class ProjectSession:
         answer = str(message.get("content", "") or "")
         record.answer_chars = len(answer)
         record.answer_excerpt = _excerpt(answer)
+        record.answer = answer
         record.tokens_used = int(message.get("tokens_used", 0) or 0)
         record.incomplete = bool(message.get("incomplete", False))
 
         observed = payload.get("assessment") or {}
-        record.stop_reason = str((observed.get("metadata") or {}).get("stop_reason", "") or "")
+        # From the assistant message, which is where the product puts it. This
+        # read was against the reasoning assessment, which has no such key, so
+        # every turn recorded "" on a provider that reports `end_turn` and gate 4
+        # could never be exercised -- a harness defect that looked like a product
+        # one for two hosted runs.
+        record.stop_reason = str(message.get("stop_reason", "") or "")
         # The register as the product decided it, not as this harness would.
         mode = str(observed.get("mode", "") or "")
         record.observed_register = "continuation" if observed.get("continuation") else mode
@@ -278,7 +324,10 @@ class ProjectSession:
         record.continuation = bool(observed.get("continuation"))
         record.citations = check_citations(answer, self._root, self._boundaries).to_dict()
         record.initiatives = named_initiatives(answer, self._discovered)
+        # Diagnostic only. Kept because a validator that silently stops seeing
+        # claims would otherwise look exactly like an answer that makes none.
         record.quoted_scores = quoted_scores(answer)
+        record.score_audit = audit_scores(record.score_validation, record.quoted_scores)
         record.cited_decisions = cited_decisions(answer)
         record.invented_decisions = [
             adr for adr in record.cited_decisions if adr.upper() not in self._own_decisions
@@ -389,8 +438,15 @@ class ProjectSession:
         repeat = self._determinism(anchor)
 
         hidden = sorted(self.strategy_keys_seen - _ALLOWED_STRATEGY_KEYS)
+        # A fail-closed turn is a finished turn. MondayOS answered by declining
+        # to show evidence it could not verify, which is the guarantee working --
+        # counting it as an unfinished flow would penalise the product for
+        # enforcing its own integrity rule.
         completed = all(
-            t.outcome == Outcome.OK.value or t.skipped or t.outcome.startswith("provider")
+            t.outcome == Outcome.OK.value
+            or t.skipped
+            or t.outcome.startswith("provider")
+            or t.outcome == Outcome.PRODUCT_FAIL_CLOSED.value
             for t in self.turns
         )
         return {

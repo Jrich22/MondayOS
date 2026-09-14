@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from acceptance.pacing import Outcome
+
 
 class Verdict(Enum):
     """
@@ -144,7 +146,7 @@ GATES: tuple[tuple[int, str], ...] = (
     (3, "Zero grounded-lookup false positives"),
     (4, "No answer reported complete if output was truncated"),
     (5, "Strategic follow-ups preserve the recommendation"),
-    (6, "Quoted confidence/evidence/risk match the assessment"),
+    (6, "Stated confidence/evidence/risk are MondayOS's own"),
     (7, "Stateless 'say more' stays grounded"),
     (8, "Stateful 'say more' continues strategically"),
     (9, "Project git history stays isolated"),
@@ -187,14 +189,14 @@ def evaluate(
         _lookups_stay_grounded(new(3), scored, unscored),
         _truncation_is_reported(new(4), scored, capabilities),
         _followups_preserve_recommendation(new(5), scored, projects),
-        _quoted_scores_match(new(6), scored),
+        _scores_are_product_validated(new(6), scored),
         _cold_elaboration_grounds(new(7), turns),
         _warm_elaboration_continues(new(8), turns, projects),
         _history_stays_in_project(new(9), scored, unscored),
         _no_invented_decisions(new(10), scored, unscored),
         _cited_lines_resolve(new(11), scored),
         _no_hidden_reasoning(new(12), projects),
-        _every_corpus_completes(new(13), projects),
+        _every_corpus_completes(new(13, required=len(available)), projects, turns),
         _recommendations_are_deterministic(new(14, required=len(available)), projects),
     ]
     return results
@@ -270,42 +272,62 @@ def _truncation_is_reported(
     return e
 
 
-def _quoted_scores_match(e: Evaluation, scored: list[Any]) -> Evaluation:
+def _scores_are_product_validated(e: Evaluation, scored: list[Any]) -> Evaluation:
     """
-    A number the answer states must be one MondayOS computed.
+    Every reasoning score an answer stated was one MondayOS produced.
 
-    Checked against **every** score in the assessment -- facts, inferences,
-    recommendations and rejected alternatives -- rather than against the winning
-    recommendation's three. An answer may legitimately quote the confidence of an
-    inference it is explaining, and comparing that to `recommendations[0]` made a
-    faithful recitation look like an invention: sourcingBOT's assessment computed
-    eight distinct values and the harness knew one of them.
+    **The verdict comes from the product, not from this module.** MondayOS now
+    validates score claims in the response pipeline: it knows the authoritative
+    set for the turn, it decides whether an answer may be delivered, and it
+    records what it concluded. This gate reads that conclusion.
 
-    A turn whose assessment computed nothing is not compared at all. There is no
-    such thing as disagreeing with a number that was never produced, and grounded
-    turns have no recommendation to disagree with (RC1/H-7).
+    It used to re-derive the claims from the prose with a proximity heuristic.
+    Two parsers then held opinions about the same answer and the release gate
+    sided with the one that had never blocked a delivery -- it called an answer's
+    evidence strength 0.61 when the answer said 0.88, because the heading
+    "Confidence and Evidence" put the word within its window (D-7). Recreating a
+    product rule in the measuring instrument means the instrument can disagree
+    with the thing it measures, and when it does, neither is trustworthy.
+
+    Exercised means a turn that actually stated a score. An answer containing no
+    numeric reasoning score has nothing to get right, and counting it as a pass
+    is how a gate reports success for work it never did.
+
+    A fail-closed refusal counts as a pass. The unsupported number did not reach
+    the user, which is the property this gate is about -- not whether the model
+    ever produced one.
     """
-    e.offer(len(scored))
     for turn in scored:
-        # A continuation explains a decision already made. The responder gives
-        # the model that decision's scores "exactly as they were shown to the
-        # user" and forbids inventing others, so the persisted record is what a
-        # quote must match -- a continuation deliberately does not re-rank, and
-        # its own assessment computes almost nothing.
-        authoritative = [float(v) for v in (turn.computed_values or [])]
-        if turn.continuation:
-            authoritative += [float(v) for v in (turn.persisted_values or [])]
-        if not authoritative or not turn.quoted_scores:
-            continue
-        for name, stated in turn.quoted_scores.items():
+        validation = getattr(turn, "score_validation", None) or {}
+        audit = getattr(turn, "score_audit", None) or {}
+
+        # An independent reader found a number the product never reported. That
+        # is not a gate-6 violation by the model -- it is a reason to distrust
+        # the gate itself, so it is recorded as a failure rather than resolved
+        # here in favour of either parser.
+        for claim in audit.get("disagreement") or []:
             e.observe(
-                any(abs(stated - value) <= 0.05 for value in authoritative),
-                f"{turn.project}/{turn.turn_id}: said {name}={stated}, "
-                f"which matches no value MondayOS computed or showed "
-                f"({sorted(set(authoritative))})",
+                False,
+                f"{turn.project}/{turn.turn_id}: AUDIT DISAGREEMENT -- an independent "
+                f"reader found {claim['concept']}={claim['value']} and the product "
+                f"reported no such claim. Investigate before trusting this gate.",
             )
+
+        if not validation:
+            continue
+        e.offer()
+        if not validation.get("claims_found"):
+            continue
+        e.observe(
+            int(validation.get("unsupported", 0)) == 0,
+            f"{turn.project}/{turn.turn_id}: delivered "
+            f"{validation.get('unsupported')} score claim(s) MondayOS did not compute "
+            f"or persist: "
+            f"{[c.get('text') for c in validation.get('unsupported_claims') or []]}",
+        )
+
     if e.exercised == 0:
-        e.note = "no answer quoted a score against an assessment that computed any"
+        e.note = "no answer stated a reasoning score for the product to validate"
     return e
 
 
@@ -461,22 +483,57 @@ def _no_hidden_reasoning(e: Evaluation, projects: dict[str, Any]) -> Evaluation:
     return e
 
 
-def _every_corpus_completes(e: Evaluation, projects: dict[str, Any]) -> Evaluation:
+def _every_corpus_completes(
+    e: Evaluation, projects: dict[str, Any], turns: list[Any]
+) -> Evaluation:
     """
-    No turn was abandoned for want of conversational state.
+    Every corpus reached the end of the journey on real answers.
 
-    Deliberately not "every turn answered": a provider outage is not a product
-    failure. What this asserts is that MondayOS never asked for clarification it
-    should already have had.
+    This gate reported PASS on a hosted run where **all fifty-two turns failed
+    and not one was answered**, because it asked whether the harness had
+    iterated the journey rather than whether MondayOS had completed it. Every
+    other gate correctly went inconclusive; this one turned an outage into a
+    green tick, which is the vacuous pass the hardening exists to prevent.
+
+    Completion now requires answers. The distinctions, in the order they are
+    decided:
+
+      product error      a gate failure, and the only class that is one
+      nothing answered   inconclusive -- the flow was never exercised
+      partial flow       inconclusive, unless a product error explains it
+      completed on answers   pass
     """
+    stalled: list[str] = []
     for project, record in projects.items():
         if not record.get("available"):
             continue
         e.offer()
-        e.observe(
-            bool(record.get("completed")),
-            f"{project}: {record.get('incomplete_reason', 'did not finish')}",
+        mine = [t for t in turns if getattr(t, "project", "") == project]
+        answered = [t for t in mine if t.outcome == Outcome.OK.value]
+        product = [t for t in mine if t.outcome == Outcome.PRODUCT.value]
+
+        if product:
+            e.observe(False, f"{project}: product error on {product[0].turn_id}")
+            continue
+        if not answered:
+            # Offered, never exercised. The provider could not be reached, so the
+            # journey says nothing about MondayOS either way.
+            stalled.append(project)
+            continue
+        if not record.get("completed"):
+            # A partial flow with no product error is missing evidence, not a
+            # defect: something outside MondayOS stopped it short.
+            stalled.append(project)
+            continue
+        e.observe(True, f"{project}: completed on {len(answered)} answered turns")
+
+    if stalled and e.exercised == 0:
+        e.note = (
+            "no corpus produced an answered turn, so completion was never "
+            f"exercised: {', '.join(sorted(stalled))} (provider)"
         )
+    elif stalled:
+        e.note = f"incomplete without a product error: {', '.join(sorted(stalled))} (provider)"
     return e
 
 
