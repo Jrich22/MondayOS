@@ -146,7 +146,7 @@ GATES: tuple[tuple[int, str], ...] = (
     (3, "Zero grounded-lookup false positives"),
     (4, "No answer reported complete if output was truncated"),
     (5, "Strategic follow-ups preserve the recommendation"),
-    (6, "Quoted confidence/evidence/risk match the assessment"),
+    (6, "Stated confidence/evidence/risk are MondayOS's own"),
     (7, "Stateless 'say more' stays grounded"),
     (8, "Stateful 'say more' continues strategically"),
     (9, "Project git history stays isolated"),
@@ -189,7 +189,7 @@ def evaluate(
         _lookups_stay_grounded(new(3), scored, unscored),
         _truncation_is_reported(new(4), scored, capabilities),
         _followups_preserve_recommendation(new(5), scored, projects),
-        _quoted_scores_match(new(6), scored),
+        _scores_are_product_validated(new(6), scored),
         _cold_elaboration_grounds(new(7), turns),
         _warm_elaboration_continues(new(8), turns, projects),
         _history_stays_in_project(new(9), scored, unscored),
@@ -272,42 +272,62 @@ def _truncation_is_reported(
     return e
 
 
-def _quoted_scores_match(e: Evaluation, scored: list[Any]) -> Evaluation:
+def _scores_are_product_validated(e: Evaluation, scored: list[Any]) -> Evaluation:
     """
-    A number the answer states must be one MondayOS computed.
+    Every reasoning score an answer stated was one MondayOS produced.
 
-    Checked against **every** score in the assessment -- facts, inferences,
-    recommendations and rejected alternatives -- rather than against the winning
-    recommendation's three. An answer may legitimately quote the confidence of an
-    inference it is explaining, and comparing that to `recommendations[0]` made a
-    faithful recitation look like an invention: sourcingBOT's assessment computed
-    eight distinct values and the harness knew one of them.
+    **The verdict comes from the product, not from this module.** MondayOS now
+    validates score claims in the response pipeline: it knows the authoritative
+    set for the turn, it decides whether an answer may be delivered, and it
+    records what it concluded. This gate reads that conclusion.
 
-    A turn whose assessment computed nothing is not compared at all. There is no
-    such thing as disagreeing with a number that was never produced, and grounded
-    turns have no recommendation to disagree with (RC1/H-7).
+    It used to re-derive the claims from the prose with a proximity heuristic.
+    Two parsers then held opinions about the same answer and the release gate
+    sided with the one that had never blocked a delivery -- it called an answer's
+    evidence strength 0.61 when the answer said 0.88, because the heading
+    "Confidence and Evidence" put the word within its window (D-7). Recreating a
+    product rule in the measuring instrument means the instrument can disagree
+    with the thing it measures, and when it does, neither is trustworthy.
+
+    Exercised means a turn that actually stated a score. An answer containing no
+    numeric reasoning score has nothing to get right, and counting it as a pass
+    is how a gate reports success for work it never did.
+
+    A fail-closed refusal counts as a pass. The unsupported number did not reach
+    the user, which is the property this gate is about -- not whether the model
+    ever produced one.
     """
-    e.offer(len(scored))
     for turn in scored:
-        # A continuation explains a decision already made. The responder gives
-        # the model that decision's scores "exactly as they were shown to the
-        # user" and forbids inventing others, so the persisted record is what a
-        # quote must match -- a continuation deliberately does not re-rank, and
-        # its own assessment computes almost nothing.
-        authoritative = [float(v) for v in (turn.computed_values or [])]
-        if turn.continuation:
-            authoritative += [float(v) for v in (turn.persisted_values or [])]
-        if not authoritative or not turn.quoted_scores:
-            continue
-        for name, stated in turn.quoted_scores.items():
+        validation = getattr(turn, "score_validation", None) or {}
+        audit = getattr(turn, "score_audit", None) or {}
+
+        # An independent reader found a number the product never reported. That
+        # is not a gate-6 violation by the model -- it is a reason to distrust
+        # the gate itself, so it is recorded as a failure rather than resolved
+        # here in favour of either parser.
+        for claim in audit.get("disagreement") or []:
             e.observe(
-                any(abs(stated - value) <= 0.05 for value in authoritative),
-                f"{turn.project}/{turn.turn_id}: said {name}={stated}, "
-                f"which matches no value MondayOS computed or showed "
-                f"({sorted(set(authoritative))})",
+                False,
+                f"{turn.project}/{turn.turn_id}: AUDIT DISAGREEMENT -- an independent "
+                f"reader found {claim['concept']}={claim['value']} and the product "
+                f"reported no such claim. Investigate before trusting this gate.",
             )
+
+        if not validation:
+            continue
+        e.offer()
+        if not validation.get("claims_found"):
+            continue
+        e.observe(
+            int(validation.get("unsupported", 0)) == 0,
+            f"{turn.project}/{turn.turn_id}: delivered "
+            f"{validation.get('unsupported')} score claim(s) MondayOS did not compute "
+            f"or persist: "
+            f"{[c.get('text') for c in validation.get('unsupported_claims') or []]}",
+        )
+
     if e.exercised == 0:
-        e.note = "no answer quoted a score against an assessment that computed any"
+        e.note = "no answer stated a reasoning score for the product to validate"
     return e
 
 

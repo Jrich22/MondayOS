@@ -65,6 +65,11 @@ class AcceptanceReport:
     gates: list[Evaluation] = field(default_factory=list)
     incidents: list[Any] = field(default_factory=list)
     defects: list[Defect] = field(default_factory=list)
+    # One streamed turn per corpus, through the production streaming entry point.
+    # The 52-turn journey uses the buffered path; streaming is the other half of
+    # the delivery contract and went unexercised for the whole programme because
+    # the local provider could not stream at all.
+    streams: list[Any] = field(default_factory=list)
 
     @property
     def verdict(self) -> str:
@@ -87,6 +92,7 @@ class AcceptanceReport:
             "gates": [g.to_dict() for g in self.gates],
             "provider_incidents": [i.to_dict() for i in self.incidents],
             "defects": [d.to_dict() for d in self.defects],
+            "streaming": [s.to_dict() for s in self.streams],
         }
 
     def to_json(self) -> str:
@@ -166,6 +172,32 @@ class AcceptanceReport:
 
     # --------------------------------------------------------- readiness copy
 
+    def _fail_closed(self) -> int:
+        """
+        Turns MondayOS refused rather than answer.
+
+        Counted separately and never folded into provider incidents. A hosted run
+        recorded fourteen of these as provider outages, which invented downtime
+        that never happened and hid the fact that evidence enforcement had fired
+        fourteen times.
+        """
+        return sum(1 for t in self.turns if t.outcome == "product_fail_closed")
+
+    def _audit_disagreements(self) -> list[tuple[str, str, dict[str, Any]]]:
+        """
+        Turns where an independent reader saw a score the product did not report.
+
+        Surfaced on its own line because it is a different kind of finding from
+        everything else here. Every other row says something about MondayOS's
+        answers; this one says the measurement may not be trustworthy, and a run
+        cannot be called clean until someone has looked.
+        """
+        found: list[tuple[str, str, dict[str, Any]]] = []
+        for turn in self.turns:
+            for claim in (getattr(turn, "score_audit", None) or {}).get("disagreement") or []:
+                found.append((turn.project, turn.turn_id, claim))
+        return found
+
     def _answered(self) -> int:
         """
         Turns that actually produced text.
@@ -198,6 +230,15 @@ class AcceptanceReport:
             f"- **Turns recorded:** {len(self.turns)} ({self._answered()} produced an answer)",
             f"- **Provider incidents:** {len(self.incidents)}"
             " (reported, never counted as product failures)",
+            f"- **Evidence fail-closed refusals:** {self._fail_closed()}"
+            " (MondayOS declined to show unverified evidence — the guarantee"
+            " working, neither an outage nor a defect)",
+            f"- **Streamed turns observed:** {len(self.streams)}"
+            f" ({sum(1 for s in self.streams if s.persisted_matches_shown)} persisted exactly"
+            " what was shown)",
+            f"- **Score audit disagreements:** {len(self._audit_disagreements())}"
+            " (an independent reader found a reasoning score the product did not"
+            " report — an integrity finding about the measurement, not the answer)",
             "",
             "## Gates",
             "",

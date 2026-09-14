@@ -52,24 +52,57 @@ _COMMIT = re.compile(r"\b([0-9a-f]{7,40})\b")
 _CLAIMED_INITIATIVE = re.compile(
     r"(?:initiative|capability)\s*[:\-]?\s*[\"'`]?"
     r"([A-Za-z][\w \-]{2,40}?)[\"'`]?\s*(?:initiative|capability|[.,;)\n])"
-    r"|[\"'`]([A-Za-z][\w \-]{2,40}?)[\"'`]\s+(?:initiative|capability)",
+    r"|[\"'`]([A-Za-z][\w \-]{2,40}?)[\"'`]\s+(?:initiative|capability)"
+    # "Quantum Ledger should be the next initiative." -- the form where the name
+    # leads. Without it a plainly invented capability stated as a recommendation
+    # went undetected, because both other forms expect the noun first.
+    # Case matters here and only here: a name that leads has nothing but its
+    # capitalisation to distinguish it from ordinary prose ("this is the next
+    # initiative"), so the group opts out of the pattern's IGNORECASE.
+    # The connector is required, not optional. Without it any capitalised word
+    # before the noun became an accusation -- "Delivery capability improved after
+    # the refactor" named an invented initiative called "Delivery". A false
+    # negative here costs a missed detection; a false positive fails a release
+    # gate on ordinary prose, and this detector has done that twice.
+    r"|(?-i:\b(?!(?:This|That|It|The|Our|Its|Their|Here|There|We|You)\b)"
+    r"([A-Z][\w\-]*(?:\s+[A-Z][\w\-]*){0,3}))"
+    r"\s+(?:should\s+be|is|as|becomes|remains)\s+"
+    r"(?:the\s+)?(?:next\s+|new\s+)?(?:initiative|capability)\b",
     re.I,
 )
 
+# A Markdown heading is a section label, not a claim about the project. "##
+# Capability Health Assessment" named an initiative called "Health Assessment"
+# and failed a gate on it: the heading word sits immediately before the section
+# title, which is exactly the shape the first pattern looks for.
+_HEADING = re.compile(r"^\s{0,3}(?:#{1,6}\s|\*\*[^*]+\*\*\s*$|[-=]{3,}\s*$)")
+
+# A number is only a quoted score if it is *about* the score. Proximity alone is
+# not enough, and reading it that way produced twelve false gate-6 violations on
+# a hosted run: "**Projects concentrates risk** -- holding 36% of the codebase"
+# put `36%` within twenty-four characters of the word "risk", so the harness
+# recorded an execution risk of 0.36 that the model never claimed.
+#
+# The discriminator is what follows the number, not what precedes it. A share
+# says what it is a share *of*; a score does not. `43%)`, `94%, high` and
+# `66% (medium)` are scores; `36% of the codebase` and `15% of the tests` are
+# not.
+_NOT_A_SCORE = r"(?!\s*%?\s*of\b)"
+
 _QUOTED = {
     "confidence": re.compile(
-        r"confiden(?:ce|t)\D{0,24}?(\d{1,3}(?:\.\d+)?)\s*%|"
-        r"confiden(?:ce|t)\D{0,24}?(0\.\d+)",
+        r"confiden(?:ce|t)\D{0,24}?(\d{1,3}(?:\.\d+)?)" + _NOT_A_SCORE + r"\s*%|"
+        r"confiden(?:ce|t)\D{0,24}?(0\.\d+)" + _NOT_A_SCORE,
         re.I,
     ),
     "evidence_strength": re.compile(
-        r"evidence(?:\s+strength)?\D{0,24}?(\d{1,3}(?:\.\d+)?)\s*%|"
-        r"evidence(?:\s+strength)?\D{0,24}?(0\.\d+)",
+        r"evidence(?:\s+strength)?\D{0,24}?(\d{1,3}(?:\.\d+)?)" + _NOT_A_SCORE + r"\s*%|"
+        r"evidence(?:\s+strength)?\D{0,24}?(0\.\d+)" + _NOT_A_SCORE,
         re.I,
     ),
     "execution_risk": re.compile(
-        r"(?:execution\s+)?risk\D{0,24}?(\d{1,3}(?:\.\d+)?)\s*%|"
-        r"(?:execution\s+)?risk\D{0,24}?(0\.\d+)",
+        r"(?:execution\s+)?risk\D{0,24}?(\d{1,3}(?:\.\d+)?)" + _NOT_A_SCORE + r"\s*%|"
+        r"(?:execution\s+)?risk\D{0,24}?(0\.\d+)" + _NOT_A_SCORE,
         re.I,
     ),
 }
@@ -286,11 +319,62 @@ def named_initiatives(answer: str, discovered: list[str]) -> dict[str, list[str]
     """
     known = {d.lower() for d in discovered}
     claimed: set[str] = set()
-    for match in _CLAIMED_INITIATIVE.finditer(answer or ""):
-        name = (match.group(1) or match.group(2) or "").strip()
+    text = answer or ""
+    for match in _CLAIMED_INITIATIVE.finditer(text):
+        start = text.rfind("\n", 0, match.start()) + 1
+        end = text.find("\n", match.start())
+        if _HEADING.match(text[start : end if end != -1 else len(text)]):
+            continue
+        name = (match.group(1) or match.group(2) or match.group(3) or "").strip()
         if not name:
             continue
         if name.lower() in known or _is_name_shaped(name):
             claimed.add(name)
     invented = sorted(n for n in claimed if n.lower() not in known)
     return {"named": sorted(claimed), "invented": invented}
+
+
+# How close two readings of the same number have to be to be the same number.
+# Matches the product's own `SCORE_TOLERANCE`; stated separately because this
+# module must not import the thing it is cross-checking.
+_AUDIT_TOLERANCE = 0.005
+
+
+def audit_scores(product: dict[str, Any], independent: dict[str, float]) -> dict[str, Any]:
+    """
+    Cross-check the product's score validation against an independent parser.
+
+    The product is the authority: it is the code that decides whether an answer
+    may be delivered, and gate 6 reads its verdict. This exists for the one
+    failure that authority cannot report on itself -- a validator that silently
+    stops seeing claims looks, from the outside, exactly like an answer that
+    makes none.
+
+    **Matched by value, not by concept.** The question is whether the product
+    *saw the number*, not whether both parsers labelled it the same way. This
+    module's own reader is the D-7 window heuristic, which called the confidence
+    in "Confidence and Evidence ... 0.61" an evidence strength; the product saw
+    0.61 and cleared it, and a disagreement about the label is not evidence that
+    a claim was missed.
+
+    A disagreement is never resolved here. Picking a winner is how one parser
+    quietly overrules the other, which is the defect this replaces.
+    """
+    seen = [float(c.get("value", 0.0)) for c in product.get("claims") or []]
+    claims: list[dict[str, Any]] = [
+        {"concept": name, "value": float(value)} for name, value in sorted(independent.items())
+    ]
+    missed = [
+        claim
+        for claim in claims
+        if not any(abs(float(claim["value"]) - value) <= _AUDIT_TOLERANCE for value in seen)
+    ]
+    return {
+        "product_claims": sorted(seen),
+        "independent_claims": claims,
+        # Claims the independent parser found and the product did not report at
+        # all. Anything here stops the release being called clean until a human
+        # has looked at it.
+        "disagreement": missed,
+        "product_checked": bool(product.get("checked")),
+    }
