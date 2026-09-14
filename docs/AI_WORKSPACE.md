@@ -382,6 +382,7 @@ Stated rather than hidden, and each is a deliberate boundary:
 - **Task→commit quality depends on references.** Only a minority of commits name a task, so the graph leans on `Task.commit_refs`.
 - **Retrieval produces grounded evidence; the provider writes the prose.** The finding is assembled deterministically and bounds what a model can say, but answer quality still depends on the configured provider.
 - **The credential filter is conservative.** A legitimate file named `secret.py` is skipped. A missing file costs a gap in retrieval; an indexed credential costs a credential.
+- **Literal discussion of internal evidence-handle syntax may trigger a correction.** An answer that writes `[E1]` while *explaining the citation mechanism* — rather than citing with it — is read as a citation to a handle the turn does not have, and MondayOS regenerates once. The cost is one extra provider call on a turn that talks about MondayOS's own plumbing; no unsupported evidence reaches the user and no integrity guarantee is weakened. Narrowing the handle pattern to recognise prose about handles would loosen the check that closed the multi-handle bypass, which is a worse trade (D-8, accepted for v1.0).
 
 ## 8. Roadmap
 
