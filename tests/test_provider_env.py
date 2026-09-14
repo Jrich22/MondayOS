@@ -294,3 +294,90 @@ class TestOllamaModelValidation(unittest.TestCase):
         """This check belongs to Ollama alone."""
         choice = choose({"ANTHROPIC_API_KEY": SECRET})
         self.assertEqual(choice.provider, "anthropic")
+
+
+class AcceptanceEnvFileTests(unittest.TestCase):
+    """
+    The acceptance runner reads the same `.env` the dashboard does.
+
+    A key present only in `.env` left `python -m acceptance` falling through to
+    whichever local daemon happened to answer, which reads as "Anthropic is
+    unavailable" rather than "nobody loaded the file". The dashboard had called
+    the loader since it shipped; this entry point never did.
+
+    These tests exercise the loader and the selection path together, because the
+    defect was in the seam between them rather than in either one.
+    """
+
+    def _env_file(self, tmp: str, body: str) -> Path:
+        path = Path(tmp) / ".env"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_a_key_present_only_in_the_env_file_is_seen(self):
+        with TemporaryDirectory() as tmp:
+            self._env_file(tmp, "ANTHROPIC_API_KEY=file-value\n")
+            env: dict[str, str] = {}
+            load_env_file(Path(tmp) / ".env", env)
+            choice = choose(env)
+            self.assertEqual(choice.provider, "anthropic")
+            self.assertTrue(choice.streams)
+
+    def test_an_exported_key_is_never_overwritten_by_the_file(self):
+        """An exported value is a deliberate act; a file is a default."""
+        with TemporaryDirectory() as tmp:
+            self._env_file(tmp, "ANTHROPIC_API_KEY=file-value\n")
+            env = {"ANTHROPIC_API_KEY": "exported-value"}
+            load_env_file(Path(tmp) / ".env", env)
+            self.assertEqual(env["ANTHROPIC_API_KEY"], "exported-value")
+
+    def test_the_loader_returns_names_and_never_values(self):
+        with TemporaryDirectory() as tmp:
+            self._env_file(tmp, "ANTHROPIC_API_KEY=super-secret\nOTHER=plain\n")
+            env: dict[str, str] = {}
+            loaded = load_env_file(Path(tmp) / ".env", env)
+            self.assertIn("ANTHROPIC_API_KEY", loaded)
+            self.assertNotIn("super-secret", loaded)
+            self.assertNotIn("super-secret", repr(loaded))
+
+    def test_a_secret_never_reaches_the_provider_config(self):
+        """
+        The config object carries a provider name and model, never a key.
+
+        Each provider reads its own variable directly, so the secret cannot reach
+        a repr, a log line or a crash dump by way of MondayOS's own config.
+        """
+        config = provider_config({"ANTHROPIC_API_KEY": "super-secret"})
+        self.assertNotIn("super-secret", repr(config))
+        for value in vars(config).values():
+            self.assertNotEqual(value, "super-secret")
+
+    def test_a_missing_env_file_is_safe(self):
+        env: dict[str, str] = {}
+        self.assertEqual(load_env_file(Path("/nonexistent/.env"), env), [])
+        self.assertEqual(env, {})
+
+    def test_the_acceptance_runner_loads_the_same_file_as_the_dashboard(self):
+        """
+        Both entry points resolve provider configuration the same way.
+
+        Asserted on the source rather than by running either, because the point
+        is that neither may drift: the defect was one of them calling the loader
+        and the other not.
+        """
+        runner = Path("acceptance/__main__.py").read_text(encoding="utf-8")
+        server = Path("dashboard_api/server.py").read_text(encoding="utf-8")
+        for source, name in (
+            (runner, "acceptance/__main__.py"),
+            (server, "dashboard_api/server.py"),
+        ):
+            with self.subTest(entry_point=name):
+                self.assertIn("load_env_file", source)
+                self.assertIn('".env"', source)
+                self.assertIn("MONDAYOS_ROOT", source)
+
+    def test_the_runner_does_not_parse_env_files_itself(self):
+        """One parser. A second one would be a second precedence rule."""
+        runner = Path("acceptance/__main__.py").read_text(encoding="utf-8")
+        self.assertNotIn("splitlines", runner)
+        self.assertNotIn("ANTHROPIC_API_KEY", runner)
