@@ -436,9 +436,16 @@ class TestGates(unittest.TestCase):
         bad = _turn(citations={**_turn().citations, "with_line": 1, "invalid_lines": ["a.py:900"]})
         self.assertIs(self._gate(11, [bad], self.LIVE).verdict, Verdict.FAIL)
 
-    def test_gate_13_fails_when_a_corpus_did_not_finish(self):
+    def test_gate_13_is_inconclusive_when_a_corpus_did_not_finish(self):
+        """
+        Superseded: this asserted FAIL for a corpus that merely did not finish.
+
+        Under the hardened model an unfinished flow with no product error is
+        missing evidence rather than a defect -- the thing that stopped it was
+        outside MondayOS. A product error still fails, which the test below pins.
+        """
         projects = {"demo": {**self.LIVE["demo"], "completed": False}}
-        self.assertIs(self._gate(13, [_turn()], projects).verdict, Verdict.FAIL)
+        self.assertIs(self._gate(13, [_turn()], projects).verdict, Verdict.INCONCLUSIVE)
 
     # --------------------------------------------- unverifiable vs inconclusive
 
@@ -729,3 +736,106 @@ class TestStrategyIsReadFromTheStore(unittest.TestCase):
             Conversation(id="C", project="p", title="t", created_at=now, updated_at=now).to_dict()
         )
         self.assertNotIn("strategy", keys)
+
+
+class Gate13CompletionTests(unittest.TestCase):
+    """
+    Completing the journey means answering it, not iterating it.
+
+    Gate 13 reported PASS on a hosted run where every one of fifty-two turns
+    failed with `provider_fatal` and not one was answered. Every other gate went
+    inconclusive under the non-vacuous rules; this one turned a provider outage
+    into a green tick. These tests pin each of the four outcomes, starting with
+    the run that exposed it.
+    """
+
+    CORPORA = ("mondayos", "cue-app", "sourcingbot", "weatherbot")
+
+    def _projects(self, completed: bool = True, only: tuple[str, ...] = ()) -> dict:
+        names = only or self.CORPORA
+        return {
+            name: {"available": True, "completed": completed and name in names}
+            for name in self.CORPORA
+        }
+
+    def _gate13(self, projects, turns):
+        results = {e.number: e for e in evaluate(turns, projects, {})}
+        return results[13]
+
+    def test_the_hosted_outage_is_inconclusive_not_pass(self):
+        """
+        The exact run: 52 turns, all provider_fatal, zero answered.
+
+        Thirteen turns per corpus across four corpora, none answered. The gate
+        must not claim the flow completed.
+        """
+        turns = [
+            _turn(project=name, turn_id=f"T{i}", outcome="provider_fatal")
+            for name in self.CORPORA
+            for i in range(13)
+        ]
+        self.assertEqual(len(turns), 52)
+        gate = self._gate13(self._projects(completed=True), turns)
+        self.assertIs(gate.verdict, Verdict.INCONCLUSIVE)
+        self.assertEqual(gate.exercised, 0)
+        self.assertEqual(gate.opportunities, 4)
+        self.assertIn("provider", gate.note)
+
+    def test_all_four_completing_on_real_answers_passes(self):
+        turns = [
+            _turn(project=name, turn_id=f"T{i}", outcome="ok")
+            for name in self.CORPORA
+            for i in range(13)
+        ]
+        gate = self._gate13(self._projects(completed=True), turns)
+        self.assertIs(gate.verdict, Verdict.PASS)
+        self.assertEqual(gate.exercised, 4)
+        self.assertEqual(gate.passed, 4)
+
+    def test_one_corpus_incomplete_is_inconclusive(self):
+        """Partial coverage without a product error is missing evidence."""
+        turns = [
+            _turn(project=name, turn_id=f"T{i}", outcome="ok")
+            for name in self.CORPORA
+            for i in range(13)
+        ]
+        projects = self._projects(only=("mondayos", "cue-app", "sourcingbot"))
+        gate = self._gate13(projects, turns)
+        self.assertIs(gate.verdict, Verdict.INCONCLUSIVE)
+        self.assertEqual(gate.exercised, 3)
+        self.assertIn("weatherbot", gate.note)
+
+    def test_a_product_error_fails(self):
+        """The only class of failure that is MondayOS's."""
+        turns = [
+            _turn(project=name, turn_id=f"T{i}", outcome="ok")
+            for name in self.CORPORA
+            for i in range(13)
+        ]
+        turns.append(_turn(project="weatherbot", turn_id="E.risk", outcome="product_error"))
+        gate = self._gate13(self._projects(), turns)
+        self.assertIs(gate.verdict, Verdict.FAIL)
+        self.assertTrue(any("E.risk" in f for f in gate.failures))
+
+    def test_a_product_error_outranks_a_provider_outage(self):
+        turns = [
+            _turn(project=name, turn_id=f"T{i}", outcome="provider_fatal")
+            for name in self.CORPORA
+            for i in range(13)
+        ]
+        turns.append(_turn(project="mondayos", turn_id="B.next", outcome="product_error"))
+        gate = self._gate13(self._projects(), turns)
+        self.assertIs(gate.verdict, Verdict.FAIL)
+
+    def test_no_other_gate_changed_for_a_fully_answered_run(self):
+        """This fix must not loosen or tighten anything else."""
+        turns = [
+            _turn(project=name, turn_id=f"T{i}", outcome="ok")
+            for name in self.CORPORA
+            for i in range(13)
+        ]
+        verdicts = {e.number: e.verdict for e in evaluate(turns, self._projects(), {})}
+        self.assertIs(verdicts[13], Verdict.PASS)
+        for number in (1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 14):
+            with self.subTest(gate=number):
+                self.assertIsNot(verdicts[number], Verdict.FAIL, "an unrelated gate began failing")

@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from acceptance.pacing import Outcome
+
 
 class Verdict(Enum):
     """
@@ -194,7 +196,7 @@ def evaluate(
         _no_invented_decisions(new(10), scored, unscored),
         _cited_lines_resolve(new(11), scored),
         _no_hidden_reasoning(new(12), projects),
-        _every_corpus_completes(new(13), projects),
+        _every_corpus_completes(new(13, required=len(available)), projects, turns),
         _recommendations_are_deterministic(new(14, required=len(available)), projects),
     ]
     return results
@@ -461,22 +463,57 @@ def _no_hidden_reasoning(e: Evaluation, projects: dict[str, Any]) -> Evaluation:
     return e
 
 
-def _every_corpus_completes(e: Evaluation, projects: dict[str, Any]) -> Evaluation:
+def _every_corpus_completes(
+    e: Evaluation, projects: dict[str, Any], turns: list[Any]
+) -> Evaluation:
     """
-    No turn was abandoned for want of conversational state.
+    Every corpus reached the end of the journey on real answers.
 
-    Deliberately not "every turn answered": a provider outage is not a product
-    failure. What this asserts is that MondayOS never asked for clarification it
-    should already have had.
+    This gate reported PASS on a hosted run where **all fifty-two turns failed
+    and not one was answered**, because it asked whether the harness had
+    iterated the journey rather than whether MondayOS had completed it. Every
+    other gate correctly went inconclusive; this one turned an outage into a
+    green tick, which is the vacuous pass the hardening exists to prevent.
+
+    Completion now requires answers. The distinctions, in the order they are
+    decided:
+
+      product error      a gate failure, and the only class that is one
+      nothing answered   inconclusive -- the flow was never exercised
+      partial flow       inconclusive, unless a product error explains it
+      completed on answers   pass
     """
+    stalled: list[str] = []
     for project, record in projects.items():
         if not record.get("available"):
             continue
         e.offer()
-        e.observe(
-            bool(record.get("completed")),
-            f"{project}: {record.get('incomplete_reason', 'did not finish')}",
+        mine = [t for t in turns if getattr(t, "project", "") == project]
+        answered = [t for t in mine if t.outcome == Outcome.OK.value]
+        product = [t for t in mine if t.outcome == Outcome.PRODUCT.value]
+
+        if product:
+            e.observe(False, f"{project}: product error on {product[0].turn_id}")
+            continue
+        if not answered:
+            # Offered, never exercised. The provider could not be reached, so the
+            # journey says nothing about MondayOS either way.
+            stalled.append(project)
+            continue
+        if not record.get("completed"):
+            # A partial flow with no product error is missing evidence, not a
+            # defect: something outside MondayOS stopped it short.
+            stalled.append(project)
+            continue
+        e.observe(True, f"{project}: completed on {len(answered)} answered turns")
+
+    if stalled and e.exercised == 0:
+        e.note = (
+            "no corpus produced an answered turn, so completion was never "
+            f"exercised: {', '.join(sorted(stalled))} (provider)"
         )
+    elif stalled:
+        e.note = f"incomplete without a product error: {', '.join(sorted(stalled))} (provider)"
     return e
 
 
