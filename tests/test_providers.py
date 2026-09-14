@@ -6,11 +6,9 @@ import sys
 import unittest
 import warnings
 from io import BytesIO
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 from brain.providers import (
-    AIProvider,
     ProviderAuthError,
     ProviderConfig,
     ProviderError,
@@ -22,7 +20,6 @@ from brain.providers import (
 from brain.providers.anthropic import AnthropicProvider
 from brain.providers.ollama import OllamaProvider
 from brain.providers.openai import OpenAIProvider
-
 
 # ---------------------------------------------------------------------------
 # ProviderResponse dataclass
@@ -546,6 +543,7 @@ class TestMondayConfigProviderField(unittest.TestCase):
 class TestAdvisorAIEnrichment(unittest.TestCase):
     def _make_engine(self, provider=None):
         from pathlib import Path
+
         from advisor.engine import AdvisorEngine
 
         monday = MagicMock()
@@ -792,3 +790,130 @@ class TestTimeoutModel(unittest.TestCase):
             source = pathlib.Path(f"brain/providers/{name}.py").read_text()
             with self.subTest(provider=name):
                 self.assertNotIn("self._timeout", source)
+
+
+class TestAnthropicTimeoutContract(unittest.TestCase):
+    """
+    The Anthropic SDK is given a number, not a transport object.
+
+    This provider used to build an `httpx.Timeout`. The installed SDK does not
+    use `httpx` -- it vendors its own transport as `httpx2` -- so the object
+    arrived as a foreign type and **every** Anthropic call failed with
+    `APIConnectionError: Connection error.`, a message that points at the network
+    rather than at a type mismatch. The hosted path was unusable, and only a
+    hosted run could reveal it: Ollama speaks `urlopen` and never touches the SDK,
+    so a green suite on Ollama proved nothing about this.
+
+    A number is the SDK's public contract. These tests pin that, because the
+    tempting fix -- import the SDK's own transport -- trades one version break for
+    the next.
+    """
+
+    def _provider(self, **kw):
+        from brain.providers.anthropic import AnthropicProvider
+        from brain.providers.factory import ProviderConfig
+
+        return AnthropicProvider(ProviderConfig(type="anthropic", **kw))
+
+    def test_the_timeout_is_numeric(self):
+        timeout = self._provider()._request_timeout(2000)
+        self.assertIsInstance(timeout, (int, float))
+        self.assertNotIsInstance(timeout, bool)
+
+    def test_no_transport_object_is_ever_passed(self):
+        """The specific regression: an httpx.Timeout reaching the SDK."""
+        import httpx
+
+        timeout = self._provider()._request_timeout(2000)
+        self.assertNotIsInstance(timeout, httpx.Timeout)
+        self.assertFalse(hasattr(timeout, "connect"), "a transport object leaked through")
+
+    def test_two_thousand_tokens_derives_eighty_seconds(self):
+        self.assertAlmostEqual(self._provider()._request_timeout(2000), 80.0)
+
+    def test_six_thousand_tokens_derives_two_hundred_and_forty_seconds(self):
+        self.assertAlmostEqual(self._provider()._request_timeout(6000), 240.0)
+
+    def test_an_explicit_generation_timeout_still_wins(self):
+        provider = self._provider(generation_timeout=123.0)
+        self.assertAlmostEqual(provider._request_timeout(2000), 123.0)
+        self.assertAlmostEqual(provider._request_timeout(6000), 123.0)
+
+    def test_the_sdk_receives_the_number_we_derived(self):
+        """
+        The argument shape the installed SDK actually accepts.
+
+        The provider imports `anthropic` inside the call, so the stub is
+        installed in `sys.modules`. This fails if the provider ever goes back to
+        constructing a transport object.
+        """
+        import sys
+
+        seen: dict[str, object] = {}
+
+        class Block:
+            text = "ok"
+
+        class Usage:
+            input_tokens = 1
+            output_tokens = 1
+
+        class Response:
+            content = [Block()]
+            stop_reason = "end_turn"
+            model = "claude-sonnet-4-5"
+            usage = Usage()
+
+        class StubMessages:
+            def create(self, **kwargs):
+                return Response()
+
+        class StubClient:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+                self.messages = StubMessages()
+
+        class StubSDK:
+            Anthropic = StubClient
+            APIConnectionError = type("APIConnectionError", (Exception,), {})
+            AuthenticationError = type("AuthenticationError", (Exception,), {})
+            RateLimitError = type("RateLimitError", (Exception,), {})
+            APIError = type("APIError", (Exception,), {})
+
+        original = sys.modules.get("anthropic")
+        sys.modules["anthropic"] = StubSDK
+        try:
+            provider = self._provider()
+            provider._api_key = "unused-by-the-stub"
+            provider.ask("hello", max_tokens=2000)
+        finally:
+            if original is not None:
+                sys.modules["anthropic"] = original
+            else:
+                sys.modules.pop("anthropic", None)
+
+        self.assertIn("timeout", seen)
+        self.assertIsInstance(seen["timeout"], (int, float))
+        self.assertNotIsInstance(seen["timeout"], bool)
+        self.assertAlmostEqual(float(seen["timeout"]), 80.0)
+
+    def test_ollama_timeout_behaviour_is_unchanged(self):
+        from brain.providers.factory import ProviderConfig
+        from brain.providers.ollama import OllamaProvider
+
+        provider = OllamaProvider(ProviderConfig(type="ollama"))
+        self.assertAlmostEqual(provider.generation_deadline(2000), 200.0)
+        self.assertAlmostEqual(provider.generation_deadline(6000), 600.0)
+        self.assertAlmostEqual(provider._connect_timeout, 10.0)
+
+    def test_openai_timeout_behaviour_is_unchanged(self):
+        from brain.providers.factory import ProviderConfig
+        from brain.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider(ProviderConfig(type="openai"))
+        timeout = provider._request_timeout(2000)
+        self.assertTrue(
+            hasattr(timeout, "connect") or isinstance(timeout, (int, float)),
+            "OpenAI's timeout shape changed",
+        )
+        self.assertAlmostEqual(provider.generation_deadline(2000), 80.0)
