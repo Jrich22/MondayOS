@@ -23,6 +23,17 @@ work needs its own adversarial battery: a dotted reference whose class exists an
 whose method does not must still be refused, as must a method on a class from
 another project.
 
+**Status: fixed for parented languages.** `ProjectAuthority.symbol` now resolves
+`Owner.member` when — and only when — the index proves the member belongs to that
+owner, read from `Symbol.parent`. No index schema change.
+
+**Residual.** Ownership can only be proved where the scanner records a parent:
+**56% of MondayOS definitions, and 0% of cue-app's**. TypeScript symbols are
+regex-extracted without a parent (see `docs/AI_WORKSPACE.md` §7), so a qualified
+TypeScript citation such as `EventStore.save` still resolves to UNKNOWN and still
+fails an answer closed. Giving the TypeScript scanner a parent is the remaining
+half of D-12, and it is a scanner change rather than an authority one.
+
 ---
 
 ## 2. D-10 — recognise ranges and bare concept words as score claims
@@ -65,6 +76,34 @@ to never fix it: the cost is one correction, and the alternative is a citation
 check that tolerates citation-shaped text it cannot resolve.
 
 ---
+
+## 4b. Platform quality — managed products inflate MondayOS's self-measurements
+
+**Impact: MondayOS's own strategic answers report statistics that are 30% not
+about MondayOS.**
+
+`projects/cue-app` and `projects/sourcingbot` live inside the MondayOS tree, so
+the MondayOS index contains **222 of 751 files (30%) that belong to managed
+products**. `project_boundaries` correctly makes them unreachable as evidence —
+measured citation leakage is zero — but nothing excludes them from the *counts*.
+
+The visible symptom is the recurring inference in MondayOS's own executive
+answers that *"projects concentrates 36% of the codebase in one area, making it
+the place where a regression would cost most."* That area is not MondayOS code.
+The file counts, area counts and concentration ratios a self-question returns are
+all computed over the union.
+
+Not a correctness defect — no wrong evidence is cited, and isolation holds. It is
+a measurement-honesty defect in the platform's view of itself, which matters
+precisely because self-reasoning is what MondayOS is for.
+
+**Care required.** The boundary set already identifies exactly which roots to
+exclude, so the fix is likely to be scoping the statistics rather than the index —
+files under a nested project root should stay indexed (they are the products'
+own evidence when those projects are queried) but not counted as the parent's.
+Changing what the index *contains* would drift the benchmark; changing what the
+statistics *count* should not, and that expectation needs checking before the
+work starts.
 
 ## 5. Measurement — retire the harness's independent score reader as a verdict source
 

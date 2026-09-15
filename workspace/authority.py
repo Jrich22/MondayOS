@@ -165,6 +165,9 @@ class ProjectAuthority:
         self._records: dict[str, str | None] = {}
         self._symbols: frozenset[str] | None = None
         self._symbols_loaded = False
+        # member name -> the classes that define it, from `Symbol.parent`.
+        self._owners: dict[str, frozenset[str]] = {}
+        self._owners_loaded = False
         self._tasks: dict[str, TaskRecord | None] = {}
 
     # ------------------------------------------------------------------ git
@@ -363,23 +366,72 @@ class ProjectAuthority:
         names = self._symbol_names()
         if names is None:
             return Resolution.UNAVAILABLE
-        return Resolution.RESOLVED if name.lower() in names else Resolution.UNKNOWN
+        wanted = name.lower()
+        if wanted in names:
+            return Resolution.RESOLVED
+        if "." not in wanted:
+            return Resolution.UNKNOWN
+        owner, _, member = wanted.rpartition(".")
+        # The owner is the segment immediately before the member, so
+        # `module.Class.method` is judged on `Class`.
+        owner = owner.rpartition(".")[2]
+        if not owner or not member:
+            return Resolution.UNKNOWN
+        return (
+            Resolution.RESOLVED
+            if owner in self._symbol_owners().get(member, frozenset())
+            else Resolution.UNKNOWN
+        )
 
     def _symbol_names(self) -> frozenset[str] | None:
         if self._symbols_loaded:
             return self._symbols
+        self._load_symbols()
+        return self._symbols
+
+    def _symbol_owners(self) -> dict[str, frozenset[str]]:
+        """
+        Which classes each member name actually belongs to.
+
+        Read from `Symbol.parent`, which the index already records, so nothing
+        about the index schema changes.
+
+        This is the whole of D-12's safety. Retrieval cites symbols as
+        `Owner.member` while the index keys bare names, so a faithful citation of
+        real code was looked up as one string, missed, and reported UNKNOWN --
+        *the project says this does not exist* -- and the answer was refused.
+        Resolving the qualified form fixes that, but only if ownership is proved:
+        a fallback asking merely "do both names exist?" would let `ClassA` and an
+        unrelated `method_b` combine into a symbol nobody wrote, turning a
+        refusal of real evidence into acceptance of fabricated evidence. That is
+        the worse trade, so the parent must match.
+        """
+        if not self._owners_loaded:
+            self._load_symbols()
+        return self._owners
+
+    def _load_symbols(self) -> None:
+        """One read of the index, feeding both the name set and the owner map."""
         self._symbols_loaded = True
+        self._owners_loaded = True
         if self._symbol_index is None:
-            return None
+            return
         try:
             index = self._symbol_index()
             table = getattr(index, "symbols", None)
             if table is None:
-                return None
+                return
             self._symbols = frozenset(str(k).lower() for k in table)
+            owners: dict[str, set[str]] = {}
+            for key, definitions in table.items():
+                for definition in definitions if isinstance(definitions, list) else [definitions]:
+                    parent = str(getattr(definition, "parent", "") or "").lower()
+                    if parent:
+                        owners.setdefault(str(key).lower(), set()).add(parent)
+            self._owners = {member: frozenset(p) for member, p in owners.items()}
         except Exception:  # noqa: BLE001 — an unreadable index is unavailable, not empty
             self._symbols = None
-        return self._symbols
+            self._owners = {}
 
     # --------------------------------------------------------- availability
 
