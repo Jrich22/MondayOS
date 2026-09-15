@@ -16,6 +16,7 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from typing import Any
 
 from brain.providers.base import AIProvider, ProviderAvailability, ProviderError, ProviderResponse
@@ -3610,3 +3611,134 @@ class TestHeadingScopedScoreEnforcement(unittest.TestCase):
         )
         values = sorted(c.value for c in validate_scores(answer, (0.94, 0.95)).claims)
         self.assertEqual(values, [0.94, 0.95])
+
+
+class _FakeSymbolIndex:
+    """
+    A symbol table shaped exactly like `intelligence.index`'s.
+
+    Keys are lower-cased names; each value is a list of definitions, because a
+    name can be defined more than once in a project. `parent` is the owning
+    class, empty for a module-level definition — which is what makes ownership
+    checkable without changing the index schema.
+    """
+
+    def __init__(self, definitions: list[tuple[str, str, str]]) -> None:
+        self.symbols: dict[str, list[Any]] = {}
+        for name, kind, parent in definitions:
+            entry = SimpleNamespace(name=name, kind=kind, parent=parent, path="x.py", line=1)
+            self.symbols.setdefault(name.lower(), []).append(entry)
+
+
+class TestQualifiedSymbolResolution(unittest.TestCase):
+    """
+    D-12. Retrieval cites `Owner.member`; the index keys bare names.
+
+    MondayOS's own question engine returns symbol citations in qualified form --
+    `ExecutionOrchestrator.execute`, `Monday.workspace` -- and the authority
+    looked the whole string up as one key, found nothing, and returned UNKNOWN.
+    UNKNOWN means *the project says this does not exist*, so a faithful citation
+    of real code was reported as fabricated and the answer was refused. Three
+    turns of the v1.0 acceptance run lost a correct answer this way, and the
+    effect is worst when MondayOS reasons about itself, because platform answers
+    are method-dense.
+
+    The compatibility layer resolves a qualified name **only when the index can
+    prove the member belongs to that owner**. `Symbol.parent` already records
+    it, so nothing about the index changes.
+
+    The rule this suite exists to hold: two bare names existing independently is
+    never enough. That would let the fallback manufacture a qualified symbol out
+    of unrelated parts, which is a worse failure than the one being fixed --
+    fabricated evidence that validates.
+    """
+
+    def _authority(self) -> ProjectAuthority:
+        index = _FakeSymbolIndex(
+            [
+                ("ExecutionOrchestrator", "class", ""),
+                ("execute", "method", "ExecutionOrchestrator"),
+                ("Monday", "class", ""),
+                ("execute", "method", "Monday"),
+                ("workspace", "method", "Monday"),
+                ("ClassA", "class", ""),
+                ("only_on_a", "method", "ClassA"),
+                ("ClassB", "class", ""),
+                ("method_b", "method", "ClassB"),
+                ("free_function", "function", ""),
+            ]
+        )
+        return ProjectAuthority(Path("."), slug="demo", symbol_index=lambda: index)
+
+    # ------------------------------------------------------- the required cases
+
+    def test_1_real_owner_and_member_of_that_owner_resolves(self):
+        self.assertIs(
+            self._authority().symbol("ExecutionOrchestrator.execute"), Resolution.RESOLVED
+        )
+
+    def test_2_a_bare_symbol_resolves_exactly_as_before(self):
+        authority = self._authority()
+        self.assertIs(authority.symbol("ExecutionOrchestrator"), Resolution.RESOLVED)
+        self.assertIs(authority.symbol("free_function"), Resolution.RESOLVED)
+        self.assertIs(authority.symbol("does_not_exist"), Resolution.UNKNOWN)
+
+    def test_3_a_real_owner_with_a_nonexistent_member_is_unknown(self):
+        self.assertIs(
+            self._authority().symbol("ExecutionOrchestrator.fake_method"), Resolution.UNKNOWN
+        )
+
+    def test_4_a_nonexistent_owner_with_a_real_member_is_unknown(self):
+        self.assertIs(self._authority().symbol("FakeOrchestrator.execute"), Resolution.UNKNOWN)
+
+    def test_5_two_bare_names_existing_independently_is_not_ownership(self):
+        """
+        The adversarial case, and the reason this is not a two-lookup fallback.
+
+        `ClassA` exists. `method_b` exists. `method_b` belongs to `ClassB`. A
+        fallback that asked only "do both names exist?" would manufacture
+        `ClassA.method_b` out of unrelated parts and report fabricated evidence
+        as verified — strictly worse than the refusal it replaces.
+        """
+        self.assertIs(self._authority().symbol("ClassA.method_b"), Resolution.UNKNOWN)
+        self.assertIs(self._authority().symbol("ClassB.only_on_a"), Resolution.UNKNOWN)
+
+    # --------------------------------------------------------------- the edges
+
+    def test_an_overloaded_member_resolves_only_for_its_real_owners(self):
+        """`execute` is defined on two classes. Each owns its own, and no others."""
+        authority = self._authority()
+        self.assertIs(authority.symbol("Monday.execute"), Resolution.RESOLVED)
+        self.assertIs(authority.symbol("ExecutionOrchestrator.execute"), Resolution.RESOLVED)
+        self.assertIs(authority.symbol("ClassA.execute"), Resolution.UNKNOWN)
+
+    def test_a_module_level_function_is_not_owned_by_a_class(self):
+        self.assertIs(self._authority().symbol("ClassA.free_function"), Resolution.UNKNOWN)
+
+    def test_ownership_is_matched_case_insensitively(self):
+        self.assertIs(
+            self._authority().symbol("executionorchestrator.EXECUTE"), Resolution.RESOLVED
+        )
+
+    def test_a_deeper_dotted_path_uses_the_immediate_owner(self):
+        """`module.Class.method` — the owner is the segment before the member."""
+        self.assertIs(
+            self._authority().symbol("orchestrator.ExecutionOrchestrator.execute"),
+            Resolution.RESOLVED,
+        )
+
+    def test_malformed_qualified_names_never_resolve(self):
+        authority = self._authority()
+        for name in ("ExecutionOrchestrator.", ".execute", ".", "..", "ClassA..method_b"):
+            with self.subTest(name=name):
+                self.assertIs(authority.symbol(name), Resolution.UNKNOWN)
+
+    def test_without_an_index_a_qualified_name_is_unavailable_not_unknown(self):
+        """
+        Cannot check is not the same as does not exist. A qualified name with no
+        index behind it must stay unverifiable, or a project whose index has not
+        been built would report every real symbol as fabricated.
+        """
+        with TemporaryDirectory() as tmp:
+            authority = ProjectAuthority(Path(tmp))
+            self.assertIs(authority.symbol("ClassA.method_b"), Resolution.UNAVAILABLE)
