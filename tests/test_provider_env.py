@@ -25,6 +25,7 @@ from monday.provider_env import (
     ollama_available,
     ollama_has_model,
     provider_config,
+    provider_configs,
 )
 
 SECRET = "sk-ant-test-0123456789abcdefghijklmnop"
@@ -87,6 +88,29 @@ class TestChoose(unittest.TestCase):
     def test_openai_is_used_when_anthropic_is_absent(self):
         choice = choose({"OPENAI_API_KEY": SECRET})
         self.assertEqual(choice.provider, "openai")
+
+    def test_deepseek_is_used_when_other_hosted_providers_are_absent(self):
+        choice = choose({"DEEPSEEK_API_KEY": SECRET})
+        self.assertEqual(choice.provider, "deepseek")
+
+    @patch("monday.provider_env.ollama_models", return_value=None)
+    @patch("monday.provider_env._sdk_available", return_value=True)
+    def test_provider_pool_contains_all_configured_hosted_models(self, _sdk, _ollama):
+        configs = provider_configs({
+            "ANTHROPIC_API_KEY": "a",
+            "OPENAI_API_KEY": "o",
+            "DEEPSEEK_API_KEY": "d",
+        })
+        self.assertEqual([config.type for config in configs], [
+            "anthropic", "openai", "deepseek",
+        ])
+
+    def test_explicit_provider_pins_pool_to_one_model(self):
+        configs = provider_configs({
+            "MONDAYOS_PROVIDER": "deepseek",
+            "ANTHROPIC_API_KEY": "a",
+        })
+        self.assertEqual([config.type for config in configs], ["deepseek"])
 
     def test_an_explicit_request_is_honoured_over_detection(self):
         """

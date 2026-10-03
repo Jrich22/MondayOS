@@ -109,6 +109,15 @@ class Monday:
         self.__tasks = TaskManager(self._config.project_root)
         self.__reasoner = ReasoningEngine(self.__knowledge, self.__tasks)
         self.__provider = create_provider(self._config.provider_config)
+        self.__providers = [
+            provider
+            for config_item in self._config.provider_configs
+            if (provider := create_provider(config_item)) is not None
+        ]
+        if self.__provider is not None and all(
+            candidate.name != self.__provider.name for candidate in self.__providers
+        ):
+            self.__providers.insert(0, self.__provider)
         # Per-project question engines, built on first use.
         self.__question_engines: dict[str, Any] = {}
         # Reasoning engines, cached per project alongside the question engines
@@ -1377,7 +1386,9 @@ class Monday:
             )
 
         if providers is None:
-            available = [self.__provider] if self.__provider is not None else []
+            available = list(self.__providers)
+            if not available and self.__provider is not None:
+                available = [self.__provider]
         else:
             available = list(providers)
 
@@ -1411,6 +1422,7 @@ class Monday:
             execution_id=report.execution_id,
             mode=report.mode,
             provider_used=report.provider_used,
+            provider_attempts=list(report.provider_attempts),
             status=report.status,
             prompt_summary=report.prompt_summary,
             duration_ms=report.duration_ms,

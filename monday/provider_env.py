@@ -15,8 +15,9 @@ Selection order, when `MONDAYOS_PROVIDER` is not set:
 
     1. anthropic   ANTHROPIC_API_KEY present and the SDK importable
     2. openai      OPENAI_API_KEY present and the SDK importable
-    3. ollama      a local daemon answering on OLLAMA_HOST
-    4. none        no provider; the workspace says so rather than pretending
+    3. deepseek    DEEPSEEK_API_KEY present and the OpenAI SDK importable
+    4. ollama      a local daemon answering on OLLAMA_HOST
+    5. none        no provider; the workspace says so rather than pretending
 
 Hosted providers come first because they are the capable ones, and local last
 because it is the fallback that always works. The order is fixed and stated so
@@ -41,11 +42,13 @@ from typing import Any
 PROVIDER_ENV: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
     "ollama": "",
 }
 MODEL_ENV: dict[str, str] = {
     "anthropic": "MONDAYOS_ANTHROPIC_MODEL",
     "openai": "MONDAYOS_OPENAI_MODEL",
+    "deepseek": "MONDAYOS_DEEPSEEK_MODEL",
     "ollama": "MONDAYOS_OLLAMA_MODEL",
 }
 
@@ -191,6 +194,8 @@ def choose(environ: Mapping[str, str] | None = None) -> ProviderChoice:
         return _describe("anthropic", env, reason="ANTHROPIC_API_KEY is set")
     if env.get("OPENAI_API_KEY") and _sdk_available("openai"):
         return _describe("openai", env, reason="OPENAI_API_KEY is set")
+    if env.get("DEEPSEEK_API_KEY") and _sdk_available("openai"):
+        return _describe("deepseek", env, reason="DEEPSEEK_API_KEY is set")
     installed = ollama_models()
     if installed is not None:
         return _describe_ollama(env, installed)
@@ -199,7 +204,8 @@ def choose(environ: Mapping[str, str] | None = None) -> ProviderChoice:
         provider="",
         model="",
         reason=(
-            "set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run a local Ollama daemon. "
+            "set ANTHROPIC_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY, "
+            "or run a local Ollama daemon. "
             "See docs/PROVIDERS.md."
         ),
     )
@@ -272,3 +278,29 @@ def provider_config(environ: Mapping[str, str] | None = None) -> Any:
     if not choice.configured:
         return None
     return ProviderConfig(type=choice.provider, model=choice.model)
+
+
+def provider_configs(environ: Mapping[str, str] | None = None) -> list[Any]:
+    """Return every configured provider in deterministic failover order."""
+    from brain.providers.factory import ProviderConfig
+
+    env = environ if environ is not None else os.environ
+    requested = (env.get("MONDAYOS_PROVIDER") or "").strip().lower()
+    if requested:
+        choice = _describe(requested, env, reason=f"MONDAYOS_PROVIDER={requested}")
+        return [ProviderConfig(type=choice.provider, model=choice.model)]
+
+    configs: list[Any] = []
+    for provider, sdk in (("anthropic", "anthropic"), ("openai", "openai"),
+                          ("deepseek", "openai")):
+        env_var = PROVIDER_ENV[provider]
+        if env.get(env_var) and _sdk_available(sdk):
+            model = (env.get(MODEL_ENV[provider], "") or "").strip()
+            configs.append(ProviderConfig(type=provider, model=model))
+
+    installed = ollama_models()
+    if installed is not None:
+        ollama = _describe_ollama(env, installed)
+        if ollama.configured:
+            configs.append(ProviderConfig(type="ollama", model=ollama.model))
+    return configs

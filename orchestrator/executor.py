@@ -113,6 +113,31 @@ def select_provider(
     return available[0]
 
 
+def rank_providers(
+    providers: "list[AIProvider]",
+    policy: ProviderSelectionPolicy,
+    manual_name: str = "",
+) -> "list[AIProvider]":
+    """Return providers in execution order so the orchestrator can fail over."""
+    available = [p for p in providers if p is not None]
+    if manual_name:
+        return [p for p in available if p.name == manual_name]
+    if policy is ProviderSelectionPolicy.MANUAL:
+        return available[:1]
+    if policy is ProviderSelectionPolicy.PREFER_LOCAL:
+        def key(p: AIProvider) -> tuple[int, int]:
+            return (-p.capability_tier, p.cost_tier)
+
+        local = sorted((p for p in available if p.is_local), key=key)
+        remote = sorted((p for p in available if not p.is_local), key=key)
+        return local + remote
+    if policy is ProviderSelectionPolicy.LOWEST_COST:
+        return sorted(available, key=lambda p: (p.cost_tier, -p.capability_tier))
+    if policy is ProviderSelectionPolicy.HIGHEST_CAPABILITY:
+        return sorted(available, key=lambda p: (-p.capability_tier, p.cost_tier))
+    return available
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -241,7 +266,8 @@ class ExecutionOrchestrator:
         assert unit is not None  # we just enqueued one
 
         # ── 5. Provider selection ────────────────────────────────────────
-        provider = select_provider(self._providers, self._policy, self._manual_provider)
+        candidates = rank_providers(self._providers, self._policy, self._manual_provider)
+        provider = candidates[0] if candidates else None
         report.provider_used = provider.name if provider else ""
 
         # ── Safety gate: autonomous requires explicit enablement ─────────
@@ -269,20 +295,53 @@ class ExecutionOrchestrator:
             )
 
         # ── 6. Provider executes (through the abstraction only) ──────────
-        self._publish(EventType.MODEL_CALL_STARTED, task_id, execution_id,
-                      {"provider": provider.name, "policy": self._policy.value})
-        try:
-            response = provider.ask(
-                unit.plan.prompt,
-                context=unit.plan.context,
-                max_tokens=self._max_tokens,
-            )
-        except Exception as exc:  # provider errors must not crash the pipeline
-            self._publish(EventType.MODEL_CALL_FAILED, task_id, execution_id,
-                          {"provider": provider.name, "error": str(exc)})
+        response = None
+        failures: list[str] = []
+        for candidate in candidates:
+            readiness = candidate.availability()
+            if not readiness.available:
+                reason = readiness.reason or "unavailable"
+                report.provider_attempts.append({
+                    "provider": candidate.name,
+                    "status": "unavailable",
+                    "reason": reason,
+                })
+                failures.append(f"{candidate.name}: {reason}")
+                continue
+
+            self._publish(EventType.MODEL_CALL_STARTED, task_id, execution_id,
+                          {"provider": candidate.name, "policy": self._policy.value})
+            try:
+                response = candidate.ask(
+                    unit.plan.prompt,
+                    context=unit.plan.context,
+                    max_tokens=self._max_tokens,
+                )
+            except Exception as exc:  # a provider failure triggers the next candidate
+                reason = str(exc)
+                report.provider_attempts.append({
+                    "provider": candidate.name,
+                    "status": "failed",
+                    "reason": reason,
+                })
+                failures.append(f"{candidate.name}: {reason}")
+                self._publish(EventType.MODEL_CALL_FAILED, task_id, execution_id,
+                              {"provider": candidate.name, "error": reason})
+                continue
+
+            provider = candidate
+            report.provider_used = candidate.name
+            report.provider_attempts.append({
+                "provider": candidate.name,
+                "status": "completed",
+                "reason": "",
+            })
+            break
+
+        if response is None:
             return self._finish(
                 report, t0, status="failed",
-                error=f"Provider execution failed: {exc}",
+                error="All eligible AI providers failed: " + "; ".join(failures),
             )
         report.model_used = response.model or ""
         self._publish(EventType.MODEL_CALL_COMPLETED, task_id, execution_id,

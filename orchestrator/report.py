@@ -69,6 +69,7 @@ class ExecutionReport:
     provider_used: str = ""
     model_used: str = ""
     prompt_summary: str = ""
+    provider_attempts: list[dict[str, Any]] = field(default_factory=list)
 
     # Timing
     started_at: str = ""

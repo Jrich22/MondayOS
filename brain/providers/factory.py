@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from brain.providers.base import AIProvider
 
-_VALID_TYPES = frozenset({"anthropic", "openai", "ollama"})
+_VALID_TYPES = frozenset({"anthropic", "deepseek", "openai", "ollama"})
 
 
 @dataclass
@@ -29,7 +29,7 @@ class ProviderConfig:
     Configuration for an AI provider.
 
     Attributes:
-        type:       Provider name: "anthropic" | "openai" | "ollama" | "".
+        type:       Provider name: "anthropic" | "deepseek" | "openai" | "ollama" | "".
                     Empty string disables the provider.
         model:      Model identifier. Provider default used when empty.
         api_key:    API key. Read from the standard env var when empty.
@@ -113,6 +113,10 @@ def create_provider(config: ProviderConfig | None) -> "AIProvider | None":
     if provider_type in ("openai", "open_ai", "open-ai"):
         from brain.providers.openai import OpenAIProvider
         return OpenAIProvider(config)
+
+    if provider_type in ("deepseek", "deep_seek", "deep-seek"):
+        from brain.providers.deepseek import DeepSeekProvider
+        return DeepSeekProvider(config)
 
     if provider_type == "ollama":
         from brain.providers.ollama import OllamaProvider

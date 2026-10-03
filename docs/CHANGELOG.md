@@ -9,6 +9,16 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- DeepSeek as a first-class provider through its OpenAI-compatible API, configured
+  with `DEEPSEEK_API_KEY` and an optional `MONDAYOS_DEEPSEEK_MODEL` override.
+- Policy-ranked provider failover. A rate-limited, unreachable, or failed model
+  now hands execution to the next eligible provider, with every attempt recorded
+  in the execution report.
+- Automatic dashboard discovery of all configured hosted and local providers,
+  allowing Claude, OpenAI, DeepSeek, and Ollama to operate as one model pool.
+
 ## [1.0.0] — 2026-09-14 — Verifiable Answers
 
 The release that makes MondayOS's answers checkable. No new surface area: one

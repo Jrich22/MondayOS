@@ -27,6 +27,7 @@ from __future__ import annotations
 from orchestrator.executor import (
     ExecutionOrchestrator,
     ProviderSelectionPolicy,
+    rank_providers,
     select_provider,
 )
 from orchestrator.planner import ExecutionPlan, ExecutionPlanner
@@ -38,6 +39,7 @@ __all__ = [
     "ExecutionOrchestrator",
     "ExecutionMode",
     "ProviderSelectionPolicy",
+    "rank_providers",
     "select_provider",
     "ExecutionPlan",
     "ExecutionPlanner",

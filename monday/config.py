@@ -32,6 +32,9 @@ class MondayConfig:
                                 provider to enrich advisory recommendations.
                                 None (default) preserves fully deterministic
                                 behaviour with no external calls.
+        provider_configs:       Optional ordered provider pool used for automatic
+                                failover. ``provider_config`` remains the primary
+                                provider for single-provider features.
 
     TODO: Add from_toml(path) classmethod to load from config/monday.toml.
     TODO: Add from_env() classmethod to override fields from environment vars.
@@ -44,3 +47,4 @@ class MondayConfig:
     log_level: str = "INFO"
     session_id: str | None = None
     provider_config: "ProviderConfig | None" = None
+    provider_configs: "list[ProviderConfig]" = field(default_factory=list)
