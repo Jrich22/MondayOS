@@ -346,6 +346,26 @@ TASK-0001 marked COMPLETED
 
 ---
 
+## `monday telegram`
+
+Run the private Telegram control plane using the project-local `.env`:
+
+```bash
+monday telegram [--once] [--identify] [--provider NAME]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--once` | off | Process one long-poll response and exit. Useful during setup. |
+| `--identify` | off | Print pending Telegram user/chat IDs and exit. |
+| `--provider NAME` | role defaults | Pin one provider for productive team stages. The final Reviewer still requires OpenAI/ChatGPT (`fake` is available for offline tests). Without a pin, productive roles use their preferred provider with ordered fallback. |
+
+`TELEGRAM_BOT_TOKEN` and `MONDAYOS_TELEGRAM_ALLOWED_USER_IDS` are required.
+See [TELEGRAM.md](TELEGRAM.md) for setup, commands, restart behavior, and the
+always-on Mac mini service.
+
+---
+
 ## Error handling
 
 All errors print to `stderr` and exit with code `1`:

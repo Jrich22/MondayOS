@@ -5,6 +5,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -20,7 +21,7 @@ from tasks import (
     TaskType,
     TaskValidationError,
 )
-from tasks.task import StatusTransition, _VALID_TRANSITIONS
+from tasks.task import _VALID_TRANSITIONS, StatusTransition
 
 
 def _make_task(status: TaskStatus = TaskStatus.BACKLOG) -> Task:
@@ -286,6 +287,15 @@ class TestTaskManager:
         with pytest.raises(TaskNotFoundError):
             self.mgr.get("TASK-9999")
 
+    @pytest.mark.parametrize(
+        "task_id",
+        ["../active/TASK-0001", "/tmp/TASK-0001", "TASK-" + "1" * 1000],
+    )
+    def test_get_rejects_unsafe_or_unbounded_ids(self, task_id: str) -> None:
+        self._create()
+        with pytest.raises(TaskNotFoundError):
+            self.mgr.get(task_id)
+
     def test_update_status_changes_status(self) -> None:
         task = self._create()
         updated = self.mgr.update_status(
@@ -374,6 +384,27 @@ class TestTaskManager:
         self.mgr.update_status(task.id, TaskStatus.COMPLETED, changed_by="human:test")
         retrieved = self.mgr.get(task.id)
         assert retrieved.status == TaskStatus.COMPLETED
+
+    def test_completed_copy_wins_if_active_cleanup_is_interrupted(self) -> None:
+        task = self._create()
+        self.mgr.update_status(task.id, TaskStatus.ASSIGNED, changed_by="human:test")
+        self.mgr.update_status(task.id, TaskStatus.IN_PROGRESS, changed_by="human:test")
+        active = self.tmp_path / "tasks" / "active" / f"{task.id}.md"
+        completed = self.tmp_path / "tasks" / "completed" / f"{task.id}.md"
+
+        with mock.patch.object(Path, "unlink", side_effect=OSError("simulated crash")):
+            with pytest.raises(OSError, match="simulated crash"):
+                self.mgr.update_status(
+                    task.id,
+                    TaskStatus.COMPLETED,
+                    changed_by="human:test",
+                )
+
+        assert active.exists()
+        assert completed.exists()
+        assert self.mgr.get(task.id).status == TaskStatus.COMPLETED
+        assert not active.exists()
+        assert self.mgr.list_active() == []
 
 
 # ===========================================================================

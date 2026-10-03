@@ -45,12 +45,14 @@ class ProviderSelectionPolicy(Enum):
                          falling back to the most capable remote one.
     LOWEST_COST        — pick the cheapest provider (ties broken by capability).
     HIGHEST_CAPABILITY — pick the most capable provider (ties broken by cost).
+    ORDERED_FAILOVER   — try providers in the caller-supplied order.
     MANUAL             — use the explicitly named provider only.
     """
 
     PREFER_LOCAL = "prefer-local"
     LOWEST_COST = "lowest-cost"
     HIGHEST_CAPABILITY = "highest-capability"
+    ORDERED_FAILOVER = "ordered-failover"
     MANUAL = "manual"
 
     @classmethod
@@ -65,6 +67,8 @@ class ProviderSelectionPolicy(Enum):
             "cheapest": cls.LOWEST_COST,
             "capability": cls.HIGHEST_CAPABILITY,
             "best": cls.HIGHEST_CAPABILITY,
+            "fallback": cls.ORDERED_FAILOVER,
+            "failover": cls.ORDERED_FAILOVER,
         }
         if normalized in aliases:
             return aliases[normalized]
@@ -96,7 +100,10 @@ def select_provider(
                 return p
         return None
 
-    if policy is ProviderSelectionPolicy.MANUAL:
+    if policy in (
+        ProviderSelectionPolicy.MANUAL,
+        ProviderSelectionPolicy.ORDERED_FAILOVER,
+    ):
         return available[0]
 
     if policy is ProviderSelectionPolicy.PREFER_LOCAL:
@@ -124,6 +131,8 @@ def rank_providers(
         return [p for p in available if p.name == manual_name]
     if policy is ProviderSelectionPolicy.MANUAL:
         return available[:1]
+    if policy is ProviderSelectionPolicy.ORDERED_FAILOVER:
+        return available
     if policy is ProviderSelectionPolicy.PREFER_LOCAL:
         def key(p: AIProvider) -> tuple[int, int]:
             return (-p.capability_tier, p.cost_tier)
@@ -268,7 +277,6 @@ class ExecutionOrchestrator:
         # ── 5. Provider selection ────────────────────────────────────────
         candidates = rank_providers(self._providers, self._policy, self._manual_provider)
         provider = candidates[0] if candidates else None
-        report.provider_used = provider.name if provider else ""
 
         # ── Safety gate: autonomous requires explicit enablement ─────────
         if self._mode is ExecutionMode.AUTONOMOUS and not self._autonomous_enabled:

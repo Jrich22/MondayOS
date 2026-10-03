@@ -36,11 +36,19 @@ and one parent record tying the child runs together.
   **block** verdict, the pipeline stops immediately — later stages do not run and
   the task is left in progress for rework. A stage that fails to execute (e.g. no
   provider available) also stops the pipeline.
-- **Verdict.** A blocking stage vetoes by emitting a marker
-  (`BLOCK`, `REJECT`, `VETO`, `NOT APPROVED`, `DO NOT MERGE`) in its result, or by
-  failing outright. Everything else is a pass. (A production provider integration
-  would emit an explicit structured verdict; the marker convention is what the
-  fake-agent harness and current providers use.)
+- **Verdict.** Every provider is instructed to return a JSON verdict object with
+  `verdict` set to `pass`, `needs_changes`, or `block`. MondayOS parses that
+  structured object and never infers approval from reassuring prose. For QA,
+  Security, and Reviewer, only an explicit valid `pass` advances the pipeline;
+  `needs_changes`, `block`, an execution failure, or a missing, malformed, or
+  truncated verdict stops it. CPO and Lead Engineer verdicts are retained for
+  audit but do not veto the workflow.
+
+- **Provider boundary.** Productive roles use their role defaults and ordered
+  failover across the configured provider pool. A whole-team provider pin applies
+  only to those productive roles. The final independent Reviewer requires
+  OpenAI/ChatGPT and fails closed if it is unavailable. The deterministic `fake`
+  provider is permitted only for offline workflow tests.
 
 ## Task lifecycle
 
@@ -95,11 +103,22 @@ from monday import Monday, MondayConfig
 m = Monday(MondayConfig(project_root="."))
 
 r = m.team("run", task_id="TASK-0001")     # TeamResponse
-r.status            # awaiting-approval | blocked | failed | dry-run | rejected
+r.status            # running | awaiting-approval | completed | interrupted |
+                    # blocked | changes-requested | invalid-verdict | failed |
+                    # dry-run | rejected
 r.stages            # per-stage: role, run_id, status, verdict, summary
 r.approval_run_id   # approve this to complete the task
+m.team("get", team_run_id=r.team_run_id)
+m.team("interrupt", team_run_id=r.team_run_id,
+       reason="worker stopped")             # abandoned running records only
 m.team("history", task_id="TASK-0001")
 ```
+
+Remote callers may reserve an idempotent `team_run_id`, observe best-effort
+progress with `progress_callback`, and durably record the initial identity with
+`checkpoint_callback`. If that required checkpoint callback raises, no task or
+provider work begins and the public `monday.TeamCheckpointError` propagates so
+the caller can retry from its own durable state.
 
 ## Records
 

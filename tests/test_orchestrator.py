@@ -113,6 +113,18 @@ class TestEnumsFromStr(unittest.TestCase):
         self.assertIs(ProviderSelectionPolicy.from_str("cheapest"), ProviderSelectionPolicy.LOWEST_COST)
         self.assertIs(ProviderSelectionPolicy.from_str("best"), ProviderSelectionPolicy.HIGHEST_CAPABILITY)
         self.assertIs(ProviderSelectionPolicy.from_str("manual"), ProviderSelectionPolicy.MANUAL)
+        self.assertIs(
+            ProviderSelectionPolicy.from_str("ordered-failover"),
+            ProviderSelectionPolicy.ORDERED_FAILOVER,
+        )
+        self.assertIs(
+            ProviderSelectionPolicy.from_str("fallback"),
+            ProviderSelectionPolicy.ORDERED_FAILOVER,
+        )
+        self.assertIs(
+            ProviderSelectionPolicy.from_str("failover"),
+            ProviderSelectionPolicy.ORDERED_FAILOVER,
+        )
 
     def test_policy_invalid_raises(self):
         with self.assertRaises(ValueError):
@@ -160,6 +172,10 @@ class TestSelectProvider(unittest.TestCase):
         chosen = select_provider(self.all, ProviderSelectionPolicy.MANUAL)
         self.assertIs(chosen, self.anthropic)
 
+    def test_ordered_failover_selects_first_candidate(self):
+        chosen = select_provider(self.all, ProviderSelectionPolicy.ORDERED_FAILOVER)
+        self.assertIs(chosen, self.anthropic)
+
     def test_manual_name_override(self):
         chosen = select_provider(self.all, ProviderSelectionPolicy.PREFER_LOCAL, manual_name="openai")
         self.assertIs(chosen, self.openai)
@@ -171,6 +187,13 @@ class TestSelectProvider(unittest.TestCase):
     def test_rank_providers_preserves_fallback_order(self):
         ranked = rank_providers(self.all, ProviderSelectionPolicy.HIGHEST_CAPABILITY)
         self.assertEqual([p.name for p in ranked], ["anthropic", "openai", "ollama"])
+
+    def test_rank_ordered_failover_preserves_caller_order(self):
+        ranked = rank_providers(
+            [self.openai, self.ollama, self.anthropic],
+            ProviderSelectionPolicy.ORDERED_FAILOVER,
+        )
+        self.assertEqual([p.name for p in ranked], ["openai", "ollama", "anthropic"])
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +460,7 @@ class TestMondayExecute(unittest.TestCase):
         r = self.monday.execute(self.task_id, mode="review", providers=[prov])
         self.assertFalse(r.success)
         self.assertEqual(r.status, "failed")
+        self.assertEqual(r.provider_used, "")
         self.assertIn("failed", r.message.lower())
 
     def test_provider_failure_falls_back_to_next_candidate(self):

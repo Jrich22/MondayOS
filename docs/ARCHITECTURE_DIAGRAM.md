@@ -43,10 +43,10 @@ class: `Monday`. Internal subsystems are private implementation detail.
 │ engine │ │session │ │ engine  │ │reasoner│ │  (AIProvider ABC)     │
 └────────┘ └────────┘ └─────────┘ │ router │ └──────────┬───────────┘
                                   └────────┘            │
-                                              ┌─────────┼──────────┐
-                                              ▼         ▼          ▼
-                                          Anthropic   OpenAI    Ollama
-                                           (Claude)   (GPT-*)   (local)
+                                      ┌─────────┬───────┼───────┬─────────┐
+                                      ▼         ▼       ▼       ▼
+                                  Anthropic   OpenAI DeepSeek  Ollama
+                                   (Claude)   (GPT-*) (hosted) (local)
 
    ┌──────────────────────── events (EventBus, audit) ─────────────────────────┐
    │  TASK_* · KNOWLEDGE_* · MODEL_CALL_* · APPROVAL_*  published by subsystems  │
@@ -110,7 +110,7 @@ The orchestrator coordinates; it never implements a model. The full pipeline:
              ▼
    ┌─────────────────────┐
    │ 5. Provider select  │  policy: prefer-local | lowest-cost |
-   │                     │  highest-capability | manual
+   │                     │  highest-capability | ordered-failover | manual
    └─────────┬───────────┘
              ▼
         ┌────────────── mode gate ──────────────┐
@@ -148,10 +148,12 @@ Each numbered stage is a separate, independently tested component
 
 ---
 
-## 4. Provider abstraction (model independence)
+## 4. Provider abstraction (model flexibility)
 
-Model independence is a hard architectural boundary. No SDK or provider name
-appears outside `brain/providers/`.
+Provider execution is a hard architectural boundary: SDK calls live in
+`brain/providers/` and every caller uses `AIProvider`. Role policy may name a
+provider outside that package—for example, the final Reviewer deliberately
+requires OpenAI—but it cannot bypass the common execution interface.
 
 ```
         callers (advisor, orchestrator, …)
@@ -162,12 +164,12 @@ appears outside `brain/providers/`.
             │  + selection metadata │   is_local · cost_tier · capability_tier
             └───────────┬───────────┘
                         │  create_provider(ProviderConfig)
-        ┌───────────────┼────────────────┐
-        ▼               ▼                ▼
-┌──────────────┐ ┌─────────────┐ ┌──────────────┐
-│AnthropicProv.│ │OpenAIProvider│ │OllamaProvider│
-│ anthropic SDK│ │  openai SDK  │ │ HTTP (local) │
-└──────────────┘ └─────────────┘ └──────────────┘
+      ┌─────────────┬───────────┼───────────┬─────────────┐
+      ▼             ▼           ▼           ▼
+┌──────────────┐ ┌─────────────┐ ┌───────────┐ ┌──────────────┐
+│AnthropicProv.│ │OpenAIProvider│ │ DeepSeek  │ │OllamaProvider│
+│ anthropic SDK│ │  openai SDK  │ │OpenAI API │ │ HTTP (local) │
+└──────────────┘ └─────────────┘ └───────────┘ └──────────────┘
 ```
 
 Swapping providers is a configuration change (`ProviderConfig.type`); no calling
@@ -181,8 +183,9 @@ code changes.
    subsystems depend on `core`/`events`. Nothing depends back on `monday`.
 2. **One public surface.** External code imports `from monday import Monday` and
    the `*Response` types — nothing else.
-3. **Provider isolation.** Provider SDKs are reachable only through
-   `brain.providers`.
+3. **Provider isolation.** Provider SDK calls are contained in
+   `brain.providers`; orchestration may name providers for role policy and
+   failover but executes them only through the shared `AIProvider` interface.
 4. **Storage is files.** Every subsystem persists to Markdown/JSON under the
    project root. There is no shared database and no global mutable state.
 5. **Events are the audit trail.** Cross-subsystem signalling happens by

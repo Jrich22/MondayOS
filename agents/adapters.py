@@ -13,14 +13,30 @@ so `monday agent run` works with no API keys configured.
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Iterable
 from typing import Any
 
 from brain.providers.base import AIProvider, ProviderAvailability, ProviderResponse
 from brain.providers.factory import ProviderConfig, create_provider
 
-__all__ = ["FakeAgentProvider", "build_provider_for", "availability_for", "FAKE_PROVIDER"]
+__all__ = [
+    "FakeAgentProvider",
+    "build_provider_for",
+    "build_provider_pool",
+    "availability_for",
+    "FAKE_PROVIDER",
+]
 
 FAKE_PROVIDER = "fake"
+_FALLBACK_PROVIDER_ORDER = ("openai", "anthropic", "deepseek", "ollama")
+_SUPPORTED_PROVIDER_NAMES = frozenset((*_FALLBACK_PROVIDER_ORDER, FAKE_PROVIDER))
+_MODEL_ENV = {
+    "openai": "MONDAYOS_OPENAI_MODEL",
+    "anthropic": "MONDAYOS_ANTHROPIC_MODEL",
+    "deepseek": "MONDAYOS_DEEPSEEK_MODEL",
+    "ollama": "MONDAYOS_OLLAMA_MODEL",
+}
 
 
 class FakeAgentProvider(AIProvider):
@@ -133,7 +149,13 @@ class FakeAgentProvider(AIProvider):
             }
         return f"{prose}\n\n```json\n{json.dumps(payload, indent=2)}\n```"
 
-    def ask(self, prompt: str, context: str = "", max_tokens: int = 1024, **kwargs: Any) -> ProviderResponse:
+    def ask(
+        self,
+        prompt: str,
+        context: str = "",
+        max_tokens: int = 1024,
+        **kwargs: Any,
+    ) -> ProviderResponse:
         self.calls.append(("ask", prompt))
         return ProviderResponse(
             content=self._body("completed", prompt),
@@ -142,7 +164,13 @@ class FakeAgentProvider(AIProvider):
             tokens_used=42,
         )
 
-    def plan(self, objective: str, context: str = "", max_tokens: int = 2048, **kwargs: Any) -> ProviderResponse:
+    def plan(
+        self,
+        objective: str,
+        context: str = "",
+        max_tokens: int = 2048,
+        **kwargs: Any,
+    ) -> ProviderResponse:
         self.calls.append(("plan", objective))
         return ProviderResponse(content=self._body("planned", objective), provider=self._name)
 
@@ -150,12 +178,22 @@ class FakeAgentProvider(AIProvider):
         self.calls.append(("summarize", content))
         return ProviderResponse(content=self._body("summarized", content), provider=self._name)
 
-    def review(self, content: str, criteria: list[str] | None = None, **kwargs: Any) -> ProviderResponse:
+    def review(
+        self,
+        content: str,
+        criteria: list[str] | None = None,
+        **kwargs: Any,
+    ) -> ProviderResponse:
         self.calls.append(("review", content))
         return ProviderResponse(content=self._body("reviewed", content), provider=self._name)
 
 
-def build_provider_for(agent: Any, *, role: str = "") -> AIProvider | None:
+def build_provider_for(
+    agent: Any,
+    *,
+    role: str = "",
+    configured_providers: Iterable[AIProvider] | None = None,
+) -> AIProvider | None:
     """
     Construct the AIProvider for an agent (or a bare provider name).
 
@@ -174,14 +212,105 @@ def build_provider_for(agent: Any, *, role: str = "") -> AIProvider | None:
     if name == FAKE_PROVIDER:
         return FakeAgentProvider(role=role_slug)
 
+    configured = _provider_named(configured_providers, name)
+    if configured is not None:
+        return configured
+    if configured_providers is not None:
+        # An explicit configured pool is an allowlist. Do not reconstruct a
+        # provider from ambient environment credentials when the operator
+        # intentionally excluded it (for example, a DeepSeek-only deployment).
+        return None
+
     try:
-        return create_provider(ProviderConfig(type=name))
+        model = (os.environ.get(_MODEL_ENV.get(name, ""), "") or "").strip()
+        base_url = ""
+        if name == "ollama":
+            base_url = (os.environ.get("OLLAMA_HOST") or "").strip()
+            if base_url and not base_url.startswith(("http://", "https://")):
+                base_url = f"http://{base_url}"
+        return create_provider(
+            ProviderConfig(type=name, model=model, base_url=base_url)
+        )
     except Exception:
         # Unknown type or provider that can't be constructed without credentials.
         return None
 
 
-def availability_for(agent: Any, *, role: str = "") -> ProviderAvailability:
+def build_provider_pool(
+    agent: Any,
+    *,
+    role: str = "",
+    configured_providers: Iterable[AIProvider] | None = None,
+) -> list[AIProvider]:
+    """
+    Build a deterministic role-first provider pool for automatic failover.
+
+    The agent's configured provider remains the primary. The other supported
+    providers follow in a stable order so a rate limit, missing key, or service
+    failure can move the same role to another model without changing routing.
+    An invalid primary is not silently hidden by fallback providers, and the
+    offline ``fake`` provider always remains a single-provider pool so tests are
+    deterministic.
+    """
+    role_slug = str(getattr(agent, "role", role) or role)
+    primary_name = str(getattr(agent, "provider", agent) or "").strip().lower()
+    if role_slug == "reviewer":
+        # Product invariant: the terminal independent review is ChatGPT/OpenAI.
+        # Registry customization and automatic failover may not weaken it.
+        primary_name = "openai"
+    elif primary_name not in _SUPPORTED_PROVIDER_NAMES:
+        # Fail closed on configuration mistakes. A supported provider that is
+        # temporarily unavailable may use the ordered fallback pool below, but
+        # an unknown name is not an outage: it is almost certainly a typo. If
+        # we silently selected another model, the recorded operator intent and
+        # the provider that actually handled the work would disagree.
+        return []
+    configured = (
+        None if configured_providers is None else list(configured_providers)
+    )
+    if configured is None:
+        primary = build_provider_for(primary_name, role=role_slug)
+        if primary is None:
+            return []
+    else:
+        # A supplied pool is an allowlist as well as configuration. Never
+        # rebuild a role's preferred hosted provider outside it: that could
+        # bypass MONDAYOS_PROVIDER or a local-only operator policy.
+        primary = _provider_named(configured, primary_name)
+        if primary is None and role_slug == "reviewer":
+            return []  # mandatory OpenAI reviewer is unavailable: fail closed
+
+    # The terminal reviewer is the mandatory ChatGPT/OpenAI quality gate. A
+    # different model may not silently stand in for it during an outage.
+    if primary is not None and (
+        primary.name == FAKE_PROVIDER or role_slug == "reviewer"
+    ):
+        return [primary]
+
+    providers = [primary] if primary is not None else []
+    seen = {primary.name} if primary is not None else set()
+    for name in _FALLBACK_PROVIDER_ORDER:
+        if name in seen:
+            continue
+        # A Monday instance passes the providers it already validated and
+        # configured at startup. When that explicit pool is present, do not add
+        # bare providers outside it (especially an unverified local Ollama).
+        if configured is not None:
+            candidate = _provider_named(configured, name)
+        else:
+            candidate = build_provider_for(name, role=role_slug)
+        if candidate is not None:
+            providers.append(candidate)
+            seen.add(candidate.name)
+    return providers
+
+
+def availability_for(
+    agent: Any,
+    *,
+    role: str = "",
+    configured_providers: Iterable[AIProvider] | None = None,
+) -> ProviderAvailability:
     """
     Report provider availability for an agent (or a bare provider name).
 
@@ -189,11 +318,58 @@ def availability_for(agent: Any, *, role: str = "") -> ProviderAvailability:
     with a clear reason. Used by `monday agent list` and by the runtime's
     pre-run gate so missing keys fail gracefully.
     """
+    role_slug = str(getattr(agent, "role", role) or role)
     name = str(getattr(agent, "provider", agent) or "").strip().lower()
-    prov = build_provider_for(agent, role=role)
-    if prov is None:
+    if role_slug == "reviewer":
+        name = "openai"
+    pool = build_provider_pool(
+        agent,
+        role=role_slug,
+        configured_providers=configured_providers,
+    )
+    if not pool:
         return ProviderAvailability(
             available=False, provider=name or "(none)",
             reason=f"unknown or unconstructable provider {name!r}",
         )
-    return prov.availability()
+
+    # Match execution semantics: the runtime tries the ordered pool until one
+    # provider is usable.  Reporting only the primary here made ``agent list``
+    # claim a role was unavailable even though the same role would immediately
+    # run on a healthy fallback.
+    first_failure: ProviderAvailability | None = None
+    for provider in pool:
+        try:
+            availability = provider.availability()
+        except Exception as exc:
+            availability = ProviderAvailability(
+                available=False,
+                provider=provider.name,
+                reason=(
+                    "availability check failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+        if availability.available:
+            return availability
+        if first_failure is None:
+            first_failure = availability
+
+    # Preserve the primary provider's diagnostic when every candidate is down;
+    # it is the provider the registry asked for and therefore the most useful
+    # setup error to show.
+    assert first_failure is not None
+    return first_failure
+
+
+def _provider_named(
+    providers: Iterable[AIProvider] | None,
+    name: str,
+) -> AIProvider | None:
+    if providers is None:
+        return None
+    wanted = name.strip().lower()
+    for provider in providers:
+        if provider.name.strip().lower() == wanted:
+            return provider
+    return None

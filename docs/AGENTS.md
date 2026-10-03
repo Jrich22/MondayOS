@@ -30,10 +30,13 @@ Task ──assign──► Role ──registry──► Agent (name + provider)
         AgentRun  →  logs/agents/run-*.json   (logged + reviewable)
 ```
 
-The runtime adds **no** provider-specific code. It builds providers through
-`brain.providers.factory` and talks only to the `AIProvider` abstraction, so it
-reuses the same orchestrator, provider adapters, and safety modes that back
-`monday execute`.
+The runtime adds **no** provider-specific execution code. It builds a role-first
+provider pool through `brain.providers.factory` and talks only to the `AIProvider`
+abstraction, so it reuses the same orchestrator, failover, provider adapters, and
+safety modes that back `monday execute`. For productive roles an explicit
+`--provider` remains pinned; without one, the role's provider is primary and the
+remaining configured models are fallback. The terminal Reviewer is pinned to
+OpenAI/ChatGPT and fails closed instead of substituting another model.
 
 ## Components (`agents/`)
 
@@ -70,7 +73,9 @@ monday agent history [--role ROLE] [--task TASK-ID] [--limit N]
 ```
 
 `--provider fake` runs the deterministic offline harness — useful for demos and
-CI with no API keys configured.
+CI with no API keys configured. Productive roles accept other explicit provider
+pins. The Reviewer accepts only OpenAI/ChatGPT (`fake` remains available for
+offline tests), so a direct non-OpenAI reviewer override is rejected.
 
 ### Typical loop
 

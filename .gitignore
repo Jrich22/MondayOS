@@ -67,6 +67,9 @@ logs/agents/
 agents/active/
 agents/.sequences.json
 
+# Telegram offset, pending jobs, and single-process lock (runtime state)
+logs/telegram/
+
 # Confluence publish mapping/history — local runtime state (never secrets)
 logs/publish/
 

@@ -64,7 +64,9 @@ still logged (status `blocked`) with the gate's reason.
 
 ## The review loop
 
-Every run is written to `logs/agents/run-*.json` and is reviewable:
+Every run is written to `logs/agents/run-*.json`. A successful standalone run
+that is pending review is reviewable; in a team workflow, only the exact final
+approval child of an `awaiting-approval` parent is reviewable:
 
 ```bash
 monday agent run    TASK-0001 --role lead-engineer   # → task REVIEW, run logged
@@ -73,14 +75,17 @@ monday agent review run-abc123 --approve             # human approves → task c
 monday agent review run-abc123 --reject --note "…"   # human rejects → left for rework
 ```
 
-- **Approve** records the decision on the run and completes the task.
-- **Reject** records the decision and leaves the task at `REVIEW`.
+- **Approve** records the decision and completes the task for an eligible gate.
+- **Reject** records the decision and leaves that task at `REVIEW` for rework.
+- Failed, unavailable, blocked, stale, and non-gate team-stage runs cannot be
+  approved after the fact.
 
 ## Guarantees
 
 - No agent commits, pushes, touches secrets, or live-trades without a human
   approval — structurally and by the gate.
 - No task is auto-completed under the default posture without an explicit approval.
-- Every run — allowed or blocked — is logged and reviewable.
+- Every run — allowed or blocked — is logged; only a current, successful
+  pending gate is reviewable.
 - The policy lives in one module (`agents/gates.py`) and is covered by tests
   (`tests/test_agents.py`), so it can be audited and changed in one place.

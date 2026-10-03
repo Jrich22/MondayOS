@@ -351,13 +351,16 @@ class TeamResponse:
     Response from Monday.team().
 
     Attributes:
-        action:          The team action performed (currently "run").
-        success:         True if the pipeline completed (or dry-ran) without a
-                         blocking stage or failure.
+        action:          The team action performed: run | get | interrupt | history.
+        success:         True when the requested API action succeeded. For get,
+                         interrupt, and history, inspect status/run data for the
+                         referenced workflow's outcome.
         message:         Human-readable status (includes the approval command).
         team_run_id:     Parent team-run identifier.
         task_id:         The task the team worked.
-        status:          awaiting-approval | blocked | failed | dry-run | rejected.
+        status:          running | awaiting-approval | completed | interrupted |
+                         blocked | changes-requested | invalid-verdict | failed |
+                         dry-run | rejected.
         stopped_at:      Role slug where the pipeline stopped early ("" if none).
         approval_run_id: Run to approve to complete the task ("" unless awaiting).
         stages:          Per-stage records (role, run_id, status, verdict, summary).

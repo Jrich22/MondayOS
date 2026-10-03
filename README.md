@@ -7,11 +7,13 @@ Version: `1.0.0b1` (Beta) · Python ≥ 3.11 · No database required
 MondayOS turns AI models into reliable, long-term engineering collaborators —
 participants that carry institutional knowledge, reason about trade-offs,
 document their work, and coordinate execution under human oversight. It is
-provider-independent: Claude, OpenAI, and local Ollama models plug into the same
-abstraction, and the platform never depends on any single one.
+provider-flexible: Claude, OpenAI, DeepSeek, and local Ollama models plug into the
+same abstraction with role-aware failover. Productive stages can move between
+configured models; the final independent team review deliberately requires
+OpenAI/ChatGPT and fails closed when it is unavailable.
 
 > **Beta status.** The platform is feature-complete for single-developer,
-> local use and fully tested (773 tests). It is not yet hardened for
+> local use and covered by an automated test suite. It is not yet hardened for
 > multi-user or production deployment. See [RELEASE.md](RELEASE.md) for the
 > full list of features, limitations, and known issues.
 
@@ -27,7 +29,8 @@ engineering knowledge** as a first-class output, and treats AI agents as
 Three commitments shape every design choice:
 
 - **Explainability is non-negotiable.** Every action carries a reasoning trace.
-- **Model independence is a hard boundary.** No lock-in to one AI provider.
+- **Model flexibility is a hard boundary.** Productive roles can fail over among
+  configured providers; the final quality gate is intentionally OpenAI/ChatGPT.
 - **Human oversight is a feature.** Consequential actions stop and ask.
 
 The full vision is in [docs/VISION.md](docs/VISION.md).
@@ -46,11 +49,15 @@ The full vision is in [docs/VISION.md](docs/VISION.md).
 | **Repository doctor** | `monday doctor` | Health inspection across git, tests, code quality, docs, tasks, config |
 | **Engineering advisor** | `monday advise` | Synthesise risks, next actions, and a recommended sprint goal |
 | **Project management** | `monday project` / `onboard` | Register and onboard external repositories |
-| **AI provider layer** | _(config)_ | Interchangeable Claude / OpenAI / Ollama providers behind one interface |
+| **AI provider layer** | _(config)_ | Interchangeable Claude / OpenAI / DeepSeek / Ollama providers with fallback |
 | **Execution orchestrator** | `monday execute` | Delegate a task to an AI provider through a safe, policy-driven pipeline |
+| **Telegram control plane** | `monday telegram` | Create tasks, run the agent team, and receive progress remotely |
 
-Everything is stored as human-readable Markdown/JSON on disk and in Git — no
-database, fully auditable, diffable, and offline-capable.
+Source, configuration templates, and product documentation are stored as
+human-readable files in Git. Operational state (agent runs, execution logs, and
+Telegram checkpoints) is human-readable Markdown/JSON on local disk but is
+gitignored today. Automated GitHub synchronization of that runtime record is a
+later delivery increment; there is no database dependency.
 
 ---
 
@@ -79,10 +86,10 @@ interfaces and an event bus.
                                                │brain.provider│◀──────┘  execute through
                                                │  (AIProvider)│          the abstraction only
                                                └──────┬──────┘
-                                       ┌──────────────┼──────────────┐
-                                       ▼              ▼              ▼
-                                   Anthropic        OpenAI         Ollama
-                                    (Claude)        (GPT-*)       (local)
+                               ┌───────────┬──────────┼──────────┬───────────┐
+                               ▼           ▼         ▼          ▼
+                           Anthropic     OpenAI   DeepSeek     Ollama
+                            (Claude)     (GPT-*)  (hosted)     (local)
 
    ┌────────────────────────────── events (audit bus) ──────────────────────────────┐
    └─── core (shared types) ·  Storage: Git + Markdown/JSON files (no database) ─────┘
@@ -92,9 +99,10 @@ A detailed component diagram and data-flow walkthrough is in
 [docs/ARCHITECTURE_DIAGRAM.md](docs/ARCHITECTURE_DIAGRAM.md). The original
 layered design rationale is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-**Subsystems** (`*/` packages): `monday` (public API), `brain` (reasoning,
-routing, providers), `knowledge`, `memory`, `tasks`, `workflows`, `migrate`,
-`doctor`, `advisor`, `orchestrator`, `events`, `search`, `core`.
+**Subsystems** (`*/` packages): `monday` (public API), `agents` (role and team
+runtime), `telegram_bot` (private control plane), `brain` (reasoning, routing,
+providers), `knowledge`, `memory`, `tasks`, `workflows`, `migrate`, `doctor`,
+`advisor`, `orchestrator`, `events`, `search`, `core`.
 
 ---
 
@@ -116,7 +124,7 @@ pip install -e ".[dev]"
 
 # 4. Verify
 monday status
-pytest                            # 773 passed, 12 skipped
+pytest                            # run the complete automated test suite
 ```
 
 `monday status` should print `MondayOS v1.0.0b1` and a healthy module list.
@@ -164,6 +172,9 @@ monday execute TASK-0001 --mode autonomous --enable-autonomous
 ```
 
 Full command reference: [docs/CLI.md](docs/CLI.md).
+
+Telegram setup and the always-on Mac mini service are documented in
+[docs/TELEGRAM.md](docs/TELEGRAM.md).
 
 ---
 

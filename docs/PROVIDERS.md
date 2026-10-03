@@ -57,9 +57,12 @@ rather than animating one chunk to look like tokens arriving.
 | Lead Engineer | `anthropic` (Claude) | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` + `anthropic` SDK |
 | QA | `anthropic` | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` + `anthropic` SDK |
 | Security | `anthropic` | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` + `anthropic` SDK |
-| Reviewer | `anthropic` | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` + `anthropic` SDK |
+| Reviewer | `openai` (ChatGPT) | `gpt-4o-mini` | `OPENAI_API_KEY` + `openai` SDK |
 
-Every mapping is overridable per agent: `monday agent register --role qa --provider ollama`.
+Productive-role mappings are overridable per agent:
+`monday agent register --role qa --provider ollama`. The Reviewer mapping is a
+runtime integrity rule: custom registry metadata is preserved, but review still
+executes through OpenAI/ChatGPT.
 
 ## Required environment variables
 
@@ -74,9 +77,19 @@ Every mapping is overridable per agent: `monday agent register --role qa --provi
 Keys are read from the environment (or an explicit `api_key` in `ProviderConfig`);
 they are never written to disk by MondayOS.
 
+Optional model and local-host overrides:
+
+| Variable | Purpose |
+|---|---|
+| `MONDAYOS_OPENAI_MODEL` | OpenAI model used by agent roles. |
+| `MONDAYOS_ANTHROPIC_MODEL` | Anthropic model used by agent roles. |
+| `MONDAYOS_DEEPSEEK_MODEL` | DeepSeek model used by agent roles. |
+| `MONDAYOS_OLLAMA_MODEL` | Installed Ollama model used by agent roles. |
+| `OLLAMA_HOST` | Ollama base URL; a bare `host:port` is normalized to HTTP. |
+
 ```bash
-export OPENAI_API_KEY="sk-…"        # CPO, Research
-export ANTHROPIC_API_KEY="sk-ant-…" # Lead Engineer, QA, Security, Reviewer
+export OPENAI_API_KEY="sk-…"        # CPO, Research, Reviewer
+export ANTHROPIC_API_KEY="sk-ant-…" # Lead Engineer, QA, Security
 export DEEPSEEK_API_KEY="sk-…"      # Coding and automatic fallback
 pip install openai anthropic        # provider SDKs (optional — install what you use)
 ```
@@ -94,6 +107,15 @@ For example, setting `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and
 `DEEPSEEK_API_KEY` makes all three eligible without copying credentials into a
 MondayOS configuration file.
 
+Agent and team runs use the same idea with role-aware ordering. The role's
+registered provider is primary; configured candidates then follow in deterministic
+OpenAI, Anthropic, DeepSeek, Ollama order with duplicates removed. A normal team
+therefore preserves its division of labor but can continue when Claude or another
+hosted provider reaches a limit. The final Reviewer is the exception: OpenAI/
+ChatGPT is mandatory and an outage stops the approval path. `--provider NAME`
+remains a strict pin for productive stages and never falls through to a different
+model, but a whole-team pin cannot replace the final OpenAI reviewer.
+
 ## Availability checks
 
 Before a run that would call a provider, MondayOS checks availability (SDK present
@@ -101,30 +123,31 @@ Before a run that would call a provider, MondayOS checks availability (SDK prese
 
 ```bash
 monday agent list
-#   ★ AGENT-0001  cpo            openai      ✓ ready            ChatGPT
-#   ★ AGENT-0002  lead-engineer  anthropic   needs ANTHROPIC…  Claude Code
+#   ★ AGENT-0001  cpo            openai→deepseek       ✓ ready   ChatGPT
+#   ★ AGENT-0002  lead-engineer  anthropic→deepseek    ✓ ready   Claude Code
+#   ★ AGENT-0006  reviewer       openai                needs setup Reviewer Agent
 ```
 
-`✓ ready` means the SDK is importable and the key is set; otherwise the column
-shows the missing requirement.
+The provider column shows `registered→effective` when the first currently usable
+fallback differs from the registry preference. `✓ ready` describes that effective
+provider. The Reviewer never falls back: it remains `openai` and reports setup as
+needed when OpenAI/ChatGPT is unavailable.
 
 ## Graceful failure when a provider is not ready
 
-A run (or a team stage) that resolves to an unavailable provider **does not call
-the API and does not touch the task**. It stops with a clear, actionable message:
+An explicitly pinned standalone agent run that resolves to an unavailable
+provider **does not call the API and does not touch the task**. It stops with a
+clear, actionable message:
 
 ```
-$ monday agent run TASK-0001 --role cpo
+$ monday agent run TASK-0001 --role cpo --provider openai
   Status    : unavailable
   Provider unavailable — OPENAI_API_KEY is not set; set OPENAI_API_KEY.
 ```
 
-```
-$ monday team run TASK-0001
-  Status  : failed
-  Stopped at: cpo
-  Pipeline stopped at CPO: Provider unavailable — OPENAI_API_KEY is not set; set OPENAI_API_KEY.
-```
+A team run claims its task by moving it to `IN_PROGRESS` before the first stage.
+If no provider can execute a stage, the team stops as `failed` and leaves the
+task in progress for recovery; it never reports that the stage ran successfully.
 
 To run with no keys configured (demos, CI), use the offline provider:
 
@@ -148,4 +171,5 @@ The selected provider and model are recorded on every run and shown in output:
 Review-required is unchanged: real providers only ever produce output that is
 captured and moved to REVIEW. No agent commits, pushes, changes secrets, or
 executes live — see [APPROVAL_GATES.md](APPROVAL_GATES.md). Missing credentials
-fail safe (stop with instructions), never mid-action.
+are skipped before a call; if no eligible provider succeeds, the run stops and
+records every attempt.

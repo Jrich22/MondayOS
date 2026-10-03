@@ -16,12 +16,21 @@ Adding a role is a single entry in `ROLES`; nothing in the runtime changes.
 | **QA** (`qa`) | Tests, regression, validation, coverage, bug reproduction | `anthropic` | testing, regression, validation, coverage, bug-repro |
 | **Security** (`security`) | Secrets/credential review, risky diffs, live-trading safety, dependency risk | `anthropic` | secrets-review, credential-audit, risk-assessment, dependency-audit, live-trading-safety |
 | **Research** (`research`) | Data analysis, experiment design, research reports, edge discovery | `openai` | data-analysis, experiment-design, research-reports, edge-discovery |
-| **Reviewer** (`reviewer`) | Code review, PR review, risk assessment | `anthropic` | code-review, pr-review, risk-assessment |
+| **Reviewer** (`reviewer`) | Code review, PR review, risk assessment | `openai` (ChatGPT) | code-review, pr-review, risk-assessment |
 
-Provider defaults are exactly that — defaults. Every agent's provider is
-overridable at registration: `monday agent register --name … --role … --provider ollama`.
-`CPO → openai` and `Lead Engineer → anthropic` are the pinned mappings that make
-"ChatGPT is the CPO agent" and "Claude is the Lead Engineer agent" true out of the box.
+Provider defaults are exactly that — defaults for productive roles. Those
+agents are overridable at registration:
+`monday agent register --name … --role … --provider ollama`.
+`CPO → openai`, `Lead Engineer → anthropic`, and `Reviewer → openai` are the
+preferred mappings that make ChatGPT the product strategist and independent final
+reviewer while Claude leads implementation. If a preferred provider is unavailable
+or rate-limited, an unpinned run tries the remaining configured provider pool in
+order. The terminal Reviewer is the exception: it requires its OpenAI/ChatGPT
+primary and fails closed if that provider is unavailable.
+Although a custom Reviewer record may retain its requested provider for audit,
+the runtime always executes the Reviewer gate with OpenAI/ChatGPT.
+The exact legacy seeded `Reviewer Agent` is migrated from Anthropic to OpenAI on
+first use; custom reviewer registrations are never rewritten.
 
 ## Roles vs. agents
 
@@ -36,7 +45,7 @@ overridable at registration: `monday agent register --name … --role … --prov
   | QA Agent | qa | anthropic |
   | Security Agent | security | anthropic |
   | Research Agent | research | openai |
-  | Reviewer Agent | reviewer | anthropic |
+  | Reviewer Agent | reviewer | openai |
 
 You can register additional agents for any role; `monday agent run --role R`
 picks the role's default agent (or the first active one).
@@ -59,7 +68,11 @@ approval regardless of role — see [APPROVAL_GATES.md](APPROVAL_GATES.md).
 - `monday agent assign TASK-ID --role qa` sets the task's `assigned_to` to
   `role:qa` — the task is owned by a role, not a person or model.
 - `monday agent run TASK-ID --role qa` resolves the role to its agent/provider and
-  executes under the approval gate.
+  executes under the approval gate. Without `--provider`, its registered provider
+  is tried first, followed by the configured OpenAI, Anthropic, DeepSeek, and
+  Ollama pool without duplicates. The Reviewer stays on OpenAI. Supplying
+  `--provider` is an explicit pin and disables fallback for productive stages;
+  a whole-team pin cannot replace the final OpenAI reviewer.
 
 QA, Security, Research, and Reviewer agents can each be run independently against
 any task — e.g. run the Lead Engineer to produce work, then the Reviewer and
