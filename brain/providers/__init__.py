@@ -17,6 +17,7 @@ Public surface:
 Provider implementations (not imported by default — lazy-loaded by factory):
     AnthropicProvider — Claude via anthropic SDK
     OpenAIProvider    — GPT-* via openai SDK
+    DeepSeekProvider  — DeepSeek via its OpenAI-compatible API
     OllamaProvider    — local models via Ollama REST API
 """
 from __future__ import annotations

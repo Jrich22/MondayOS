@@ -14,8 +14,9 @@ Selection order, when `MONDAYOS_PROVIDER` is unset:
 
 1. `anthropic` — `ANTHROPIC_API_KEY` set and the SDK importable
 2. `openai` — `OPENAI_API_KEY` set and the SDK importable
-3. `ollama` — a local daemon answering on `OLLAMA_HOST`
-4. none — the workspace says so rather than pretending to be configured
+3. `deepseek` — `DEEPSEEK_API_KEY` set and the OpenAI SDK importable
+4. `ollama` — a local daemon answering on `OLLAMA_HOST`
+5. none — the workspace says so rather than pretending to be configured
 
 Set `MONDAYOS_PROVIDER` to pin one explicitly. An explicit choice is honoured
 even if it cannot run: being told "you asked for anthropic and the key is not
@@ -42,6 +43,7 @@ rather than animating one chunk to look like tokens arriving.
 |---|---|
 | `anthropic` | yes |
 | `openai` | not yet — single chunk |
+| `deepseek` | not yet — single chunk |
 | `ollama` | not yet — single chunk |
 
 ---
@@ -65,6 +67,7 @@ Every mapping is overridable per agent: `monday agent register --role qa --provi
 |---|---|---|---|
 | `openai` | `OPENAI_API_KEY` | `pip install openai` | OpenAI-compatible endpoints via `base_url`. |
 | `anthropic` | `ANTHROPIC_API_KEY` | `pip install anthropic` | Claude models. |
+| `deepseek` | `DEEPSEEK_API_KEY` | `pip install openai` | DeepSeek's OpenAI-compatible API. |
 | `ollama` | *(none)* | *(none — HTTP)* | Local service at `http://localhost:11434` (override with `base_url`). |
 | `fake` | *(none)* | *(built in)* | Offline deterministic provider for demos/CI. |
 
@@ -74,8 +77,22 @@ they are never written to disk by MondayOS.
 ```bash
 export OPENAI_API_KEY="sk-…"        # CPO, Research
 export ANTHROPIC_API_KEY="sk-ant-…" # Lead Engineer, QA, Security, Reviewer
+export DEEPSEEK_API_KEY="sk-…"      # Coding and automatic fallback
 pip install openai anthropic        # provider SDKs (optional — install what you use)
 ```
+
+## Automatic failover
+
+When more than one provider is supplied to the Execution Orchestrator, MondayOS
+ranks them using the selected policy. If the preferred provider is unavailable,
+rate-limited, or fails during generation, the next eligible provider continues
+the task. Every attempt and failure reason is recorded in the execution report.
+An explicit manual provider remains pinned and does not silently switch models.
+
+The dashboard automatically builds this pool from every configured provider key.
+For example, setting `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and
+`DEEPSEEK_API_KEY` makes all three eligible without copying credentials into a
+MondayOS configuration file.
 
 ## Availability checks
 

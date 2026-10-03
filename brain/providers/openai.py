@@ -39,17 +39,23 @@ class OpenAIProvider(AIProvider):
     via the base_url config field.
     """
 
+    provider_name = _PROVIDER_NAME
+    default_model = _DEFAULT_MODEL
+    api_key_env = "OPENAI_API_KEY"
+    default_base_url: str | None = None
+    display_name = "OpenAI"
+
     def __init__(self, config: "ProviderConfig") -> None:
-        self._model = config.model or _DEFAULT_MODEL
-        self._api_key = config.api_key or os.environ.get("OPENAI_API_KEY", "")
-        self._base_url = config.base_url or None
+        self._model = config.model or self.default_model
+        self._api_key = config.api_key or os.environ.get(self.api_key_env, "")
+        self._base_url = config.base_url or self.default_base_url
         self._max_tokens = config.max_tokens
         self._connect_timeout = config.connect_timeout
         self._generation_timeout = config.generation_timeout
 
     @property
     def name(self) -> str:
-        return _PROVIDER_NAME
+        return self.provider_name
 
     @property
     def is_local(self) -> bool:
@@ -106,18 +112,18 @@ class OpenAIProvider(AIProvider):
             importlib.import_module("openai")
         except ImportError:
             return ProviderAvailability(
-                available=False, provider=_PROVIDER_NAME, model=self._model,
+                available=False, provider=self.name, model=self._model,
                 reason="openai SDK not installed",
-                env_var="OPENAI_API_KEY", install_hint="pip install openai",
+                env_var=self.api_key_env, install_hint="pip install openai",
             )
         if not self._api_key:
             return ProviderAvailability(
-                available=False, provider=_PROVIDER_NAME, model=self._model,
-                reason="OPENAI_API_KEY is not set", env_var="OPENAI_API_KEY",
+                available=False, provider=self.name, model=self._model,
+                reason=f"{self.api_key_env} is not set", env_var=self.api_key_env,
             )
         return ProviderAvailability(
-            available=True, provider=_PROVIDER_NAME, model=self._model,
-            reason="ready", env_var="OPENAI_API_KEY",
+            available=True, provider=self.name, model=self._model,
+            reason="ready", env_var=self.api_key_env,
         )
 
     def ask(
@@ -226,7 +232,7 @@ class OpenAIProvider(AIProvider):
             return ProviderResponse(
                 content=content,
                 model=response.model,
-                provider=_PROVIDER_NAME,
+                provider=self.name,
                 tokens_used=tokens,
                 metadata={
                     "stop_reason": finish_reason,
@@ -235,13 +241,13 @@ class OpenAIProvider(AIProvider):
             )
 
         except _openai.AuthenticationError as exc:
-            raise ProviderAuthError(f"OpenAI auth failed: {exc}") from exc
+            raise ProviderAuthError(f"{self.display_name} auth failed: {exc}") from exc
         except _openai.RateLimitError as exc:
-            raise ProviderRateLimitError(f"OpenAI rate limit: {exc}") from exc
+            raise ProviderRateLimitError(f"{self.display_name} rate limit: {exc}") from exc
         except _openai.APIConnectionError as exc:
-            raise ProviderUnavailableError(f"OpenAI unreachable: {exc}") from exc
+            raise ProviderUnavailableError(f"{self.display_name} unreachable: {exc}") from exc
         except (_openai.APIStatusError, Exception) as exc:
-            raise ProviderError(f"OpenAI error: {exc}") from exc
+            raise ProviderError(f"{self.display_name} error: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------

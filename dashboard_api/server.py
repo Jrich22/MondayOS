@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from monday import Monday, MondayConfig
-from monday.provider_env import choose, load_env_file
+from monday.provider_env import choose, load_env_file, provider_configs
 from monday.provider_env import provider_config as resolve_provider_config
 
 from . import errors, security
@@ -51,6 +51,7 @@ def build_service(root: Path | None = None, provider: str | None = None) -> Dash
             project_root=project_root,
             require_human_approval=True,
             provider_config=resolve_provider_config(),
+            provider_configs=provider_configs(),
         )
     )
     return DashboardService(

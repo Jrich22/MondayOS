@@ -278,6 +278,7 @@ class ExecuteResponse:
         execution_id:       Unique ID of this execution (also the report filename).
         mode:               Execution mode used (dry-run / review / autonomous).
         provider_used:      Name of the AI provider that executed the task ("" if none).
+        provider_attempts:  Ordered provider failover audit trail.
         status:             Pipeline outcome: dry-run / skipped / blocked / failed /
                             validation-failed / review / completed.
         prompt_summary:     One-line summary of the prompt sent to the provider.
@@ -297,6 +298,7 @@ class ExecuteResponse:
     execution_id: str = ""
     mode: str = ""
     provider_used: str = ""
+    provider_attempts: list[dict[str, Any]] = field(default_factory=list)
     status: str = ""
     prompt_summary: str = ""
     duration_ms: float = 0.0

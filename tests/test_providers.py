@@ -18,6 +18,7 @@ from brain.providers import (
     create_provider,
 )
 from brain.providers.anthropic import AnthropicProvider
+from brain.providers.deepseek import DeepSeekProvider
 from brain.providers.ollama import OllamaProvider
 from brain.providers.openai import OpenAIProvider
 
@@ -159,6 +160,17 @@ class TestCreateProviderFactory(unittest.TestCase):
         cfg = ProviderConfig(type="open-ai")
         provider = create_provider(cfg)
         self.assertIsInstance(provider, OpenAIProvider)
+
+    def test_deepseek_creates_deepseek_provider(self):
+        provider = create_provider(ProviderConfig(type="deepseek"))
+        self.assertIsInstance(provider, DeepSeekProvider)
+        self.assertEqual(provider.name, "deepseek")
+
+    def test_deepseek_uses_its_key_and_endpoint(self):
+        provider = DeepSeekProvider(ProviderConfig(type="deepseek", api_key="sk-test"))
+        self.assertEqual(provider._model, "deepseek-chat")
+        self.assertEqual(provider._base_url, "https://api.deepseek.com")
+        self.assertTrue(provider.availability().available)
 
     def test_ollama_creates_ollama_provider(self):
         cfg = ProviderConfig(type="ollama")

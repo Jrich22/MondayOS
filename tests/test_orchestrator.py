@@ -18,6 +18,7 @@ from orchestrator import (
     ExecutionUnit,
     ProviderSelectionPolicy,
     ResultValidator,
+    rank_providers,
     select_provider,
 )
 from orchestrator.executor import ExecutionOrchestrator
@@ -166,6 +167,10 @@ class TestSelectProvider(unittest.TestCase):
     def test_manual_name_not_available_returns_none(self):
         chosen = select_provider(self.all, ProviderSelectionPolicy.PREFER_LOCAL, manual_name="cohere")
         self.assertIsNone(chosen)
+
+    def test_rank_providers_preserves_fallback_order(self):
+        ranked = rank_providers(self.all, ProviderSelectionPolicy.HIGHEST_CAPABILITY)
+        self.assertEqual([p.name for p in ranked], ["anthropic", "openai", "ollama"])
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +438,24 @@ class TestMondayExecute(unittest.TestCase):
         self.assertFalse(r.success)
         self.assertEqual(r.status, "failed")
         self.assertIn("failed", r.message.lower())
+
+    def test_provider_failure_falls_back_to_next_candidate(self):
+        primary = FakeProvider(
+            "anthropic", capability_tier=3, cost_tier=3, raise_on_call=True,
+        )
+        fallback = FakeProvider("deepseek", capability_tier=2, cost_tier=1)
+        r = self.monday.execute(
+            self.task_id,
+            mode="review",
+            policy="highest-capability",
+            providers=[fallback, primary],
+        )
+        self.assertTrue(r.success)
+        self.assertEqual(r.provider_used, "deepseek")
+        self.assertEqual(
+            [(a["provider"], a["status"]) for a in r.provider_attempts],
+            [("anthropic", "failed"), ("deepseek", "completed")],
+        )
 
     def test_validation_failure_blocks_capture(self):
         prov = self._provider(content="")  # empty → fails validation
