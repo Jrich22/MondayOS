@@ -35,6 +35,15 @@ _REVIEW_PREFIX = (
 )
 
 
+def _model_installed(model: str, installed: list[str]) -> bool:
+    """Match Ollama's implicit ``latest`` tag without mixing explicit tags."""
+    if model in installed:
+        return True
+    if ":" in model:
+        return False
+    return any(name.split(":", 1)[0] == model for name in installed)
+
+
 class OllamaProvider(AIProvider):
     """
     AI provider backed by a locally-running Ollama service.
@@ -47,7 +56,7 @@ class OllamaProvider(AIProvider):
     base_url="http://localhost:11434").
     """
 
-    def __init__(self, config: "ProviderConfig") -> None:
+    def __init__(self, config: ProviderConfig) -> None:
         self._model = config.model or _DEFAULT_MODEL
         self._base_url = (config.base_url or _DEFAULT_BASE_URL).rstrip("/")
         self._connect_timeout = config.connect_timeout
@@ -80,13 +89,47 @@ class OllamaProvider(AIProvider):
 
     def availability(self) -> ProviderAvailability:
         """
-        Local provider: no API key or SDK required. Reported available; actual
-        reachability of the Ollama service surfaces at call time (not pinged here
-        to keep availability checks fast and network-free).
+        Verify that the local daemon answers and the configured model is pulled.
+
+        Treating every Ollama instance as available made an automatic fallback
+        select a stopped daemon (or a missing model) and fail only after work had
+        begun. The lightweight tags request keeps that failure at the provider
+        gate instead.
         """
+        try:
+            request = Request(f"{self._base_url}/api/tags")
+            timeout = min(max(float(self._connect_timeout), 0.1), 1.0)
+            with urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        except (HTTPError, URLError, OSError, ValueError) as exc:
+            return ProviderAvailability(
+                available=False,
+                provider=_PROVIDER_NAME,
+                model=self._model,
+                reason=f"Ollama service is unavailable at {self._base_url}: {type(exc).__name__}",
+            )
+
+        rows = payload.get("models") if isinstance(payload, dict) else None
+        installed = [
+            str(item.get("name") or "")
+            for item in (rows if isinstance(rows, list) else [])
+            if isinstance(item, dict) and item.get("name")
+        ]
+        if not _model_installed(self._model, installed):
+            return ProviderAvailability(
+                available=False,
+                provider=_PROVIDER_NAME,
+                model=self._model,
+                reason=(
+                    f"Ollama model {self._model!r} is not installed at "
+                    f"{self._base_url}; run `ollama pull {self._model}`"
+                ),
+            )
         return ProviderAvailability(
-            available=True, provider=_PROVIDER_NAME, model=self._model,
-            reason=f"local Ollama service at {self._base_url} (not verified)",
+            available=True,
+            provider=_PROVIDER_NAME,
+            model=self._model,
+            reason=f"ready at {self._base_url}",
         )
 
     def ask(

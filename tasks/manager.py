@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import warnings
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ from tasks.task import ApprovalLevel, StatusTransition, Task, TaskPriority, Task
 
 _TASK_PREFIX = "TASK"
 _SEQUENCES_FILENAME = ".sequences.json"
+_TASK_ID_PATTERN = re.compile(r"^TASK-\d{1,64}(?:-[A-Z0-9]{1,12})?$")
 
 # Files to skip when scanning for task entries
 _SKIP_NAMES = frozenset({"index.md", "README.md"})
@@ -107,10 +109,34 @@ class TaskManager:
         Searches active/ first, then completed/.
         Raises TaskNotFoundError if the task does not exist in either location.
         """
-        for directory in (self._active_dir, self._completed_dir):
-            path = directory / f"{task_id}.md"
-            if path.exists():
-                return self._parser.parse(path.read_text(encoding="utf-8"), source_path=str(path))
+        # Task IDs become filenames.  Reject anything outside the bounded ID
+        # grammar before joining paths so traversal, absolute paths, and
+        # filesystem-length abuse cannot escape the task stores.
+        if not _TASK_ID_PATTERN.fullmatch(str(task_id)):
+            raise TaskNotFoundError(str(task_id))
+        active_path = self._active_dir / f"{task_id}.md"
+        completed_path = self._completed_dir / f"{task_id}.md"
+
+        # The completed copy is the commit record for an archive. A process can
+        # stop after that durable write but before removing the active copy; in
+        # that split state terminal truth must win. Best-effort cleanup keeps
+        # later scans tidy, while a permissions error cannot hide completion.
+        if completed_path.exists():
+            task = self._parser.parse(
+                completed_path.read_text(encoding="utf-8"),
+                source_path=str(completed_path),
+            )
+            if active_path.exists():
+                try:
+                    active_path.unlink()
+                except OSError:
+                    pass
+            return task
+        if active_path.exists():
+            return self._parser.parse(
+                active_path.read_text(encoding="utf-8"),
+                source_path=str(active_path),
+            )
         raise TaskNotFoundError(task_id)
 
     def update_status(
@@ -219,6 +245,10 @@ class TaskManager:
         for path in sorted(self._active_dir.glob("*.md")):
             if path.name in _SKIP_NAMES:
                 continue
+            # A completed copy means archive commit succeeded even if cleanup
+            # of this stale active path was interrupted.
+            if (self._completed_dir / path.name).exists():
+                continue
             try:
                 task = self._parser.parse(path.read_text(encoding="utf-8"), source_path=str(path))
                 tasks.append(task)
@@ -276,6 +306,8 @@ class TaskManager:
 
         Raises TaskNotFoundError if not found in active/.
         """
+        if not _TASK_ID_PATTERN.fullmatch(str(task_id)):
+            raise TaskNotFoundError(str(task_id))
         active_path = self._active_dir / f"{task_id}.md"
         if not active_path.exists():
             raise TaskNotFoundError(task_id)

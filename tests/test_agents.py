@@ -8,6 +8,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from agents.adapters import FAKE_PROVIDER, FakeAgentProvider, build_provider_for
 from agents.gates import GATED_ACTIONS, ApprovalGate
@@ -20,10 +21,10 @@ from agents.roles import (
     list_roles,
     normalize_role,
 )
+from agents.runtime import AgentRuntime
 from monday import Monday, MondayConfig
 from monday.cli import main
 from orchestrator.report import ExecutionMode
-
 
 # ---------------------------------------------------------------------------
 # Roles
@@ -44,7 +45,7 @@ class TestRoles(unittest.TestCase):
                 "qa": "anthropic",
                 "security": "anthropic",
                 "research": "openai",
-                "reviewer": "anthropic",
+                "reviewer": "openai",
             },
         )
 
@@ -164,6 +165,32 @@ class TestAgentRegistry(unittest.TestCase):
         self.reg.seed_defaults()
         self.assertEqual(self.reg.resolve_by_role("cpo").provider, "openai")
         self.assertEqual(self.reg.resolve_by_role("lead-engineer").provider, "anthropic")
+        self.assertEqual(self.reg.resolve_by_role("reviewer").provider, "openai")
+
+    def test_legacy_seeded_reviewer_migrates_to_openai(self):
+        self.reg.seed_defaults()
+        reviewer = self.reg.resolve_by_role("reviewer")
+        reviewer.provider = "anthropic"
+        self.reg._write(reviewer)
+
+        self.reg.ensure_seeded()
+
+        migrated = self.reg.resolve_by_role("reviewer")
+        self.assertEqual(migrated.provider, "openai")
+        self.assertEqual(migrated.metadata["provider_migration"], "reviewer-openai-v1")
+
+    def test_custom_anthropic_reviewer_is_not_migrated(self):
+        custom = self.reg.register(
+            "My Reviewer",
+            "reviewer",
+            provider="anthropic",
+            is_default=True,
+            description="Keep Claude here",
+        )
+
+        self.reg.ensure_seeded()
+
+        self.assertEqual(self.reg.get(custom.id).provider, "anthropic")
 
     def test_id_allocation_sequential(self):
         a = self.reg.register("First", "qa")
@@ -232,6 +259,31 @@ class TestAgentRuntimeEndToEnd(unittest.TestCase):
         params = dict(task_id=self.task_id, role="lead-engineer", provider="fake")
         params.update(kw)
         return self.monday.agent("run", **params)
+
+    def _write_team_record(
+        self,
+        team_run_id: str,
+        *,
+        status: str,
+        child_run_ids: list[str] | None = None,
+        approval_run_id: str = "",
+    ) -> Path:
+        runs_dir = self.root / "logs" / "agents"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        path = runs_dir / f"{team_run_id}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "team_run_id": team_run_id,
+                    "task_id": self.task_id,
+                    "status": status,
+                    "child_run_ids": child_run_ids or [],
+                    "approval_run_id": approval_run_id,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
 
     def test_list_seeds_defaults(self):
         r = self.monday.agent("list")
@@ -323,6 +375,273 @@ class TestAgentRuntimeEndToEnd(unittest.TestCase):
         self.assertEqual(r.data["approval"]["decision"], "rejected")
         got = self.monday.task("get", task_id=self.task_id)
         self.assertEqual(got.data["status"], "review")  # left for rework
+
+    def test_unreadable_or_malformed_team_parent_fails_closed(self):
+        run = self._run()
+        parent_path = self._write_team_record(
+            "team-corrupt-parent",
+            status="awaiting-approval",
+            child_run_ids=[run.run_id],
+            approval_run_id=run.run_id,
+        )
+        malformed_payloads = (
+            "{not-json",
+            json.dumps(
+                {
+                    "team_run_id": "team-corrupt-parent",
+                    "task_id": self.task_id,
+                    "status": "awaiting-approval",
+                    "child_run_ids": run.run_id,
+                    "approval_run_id": run.run_id,
+                }
+            ),
+        )
+
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload):
+                parent_path.write_text(payload, encoding="utf-8")
+                response = self.monday.agent(
+                    "review",
+                    run_id=run.run_id,
+                    approve=True,
+                    by="human:attacker",
+                )
+
+                self.assertFalse(response.success)
+                self.assertIn("unreadable or malformed", response.message)
+                child = json.loads(
+                    (self.root / "logs" / "agents" / f"{run.run_id}.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(child["approval"]["decision"], "pending")
+                self.assertEqual(
+                    self.monday.task("get", task_id=self.task_id).data["status"],
+                    "review",
+                )
+
+    def test_running_team_blocks_standalone_approval_bypass(self):
+        standalone = self._run()
+        self._write_team_record("team-running-window", status="running")
+
+        response = self.monday.agent(
+            "review",
+            run_id=standalone.run_id,
+            approve=True,
+            by="human:attacker",
+        )
+
+        self.assertFalse(response.success)
+        self.assertIn("active team run", response.message)
+        self.assertIn("standalone run cannot bypass", response.message)
+        child = json.loads(
+            (self.root / "logs" / "agents" / f"{standalone.run_id}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(child["approval"]["decision"], "pending")
+        self.assertEqual(
+            self.monday.task("get", task_id=self.task_id).data["status"],
+            "review",
+        )
+
+    def test_restarted_task_invalidates_stale_team_approval_gate(self):
+        gate = self._run(role="reviewer")
+        parent_path = self._write_team_record(
+            "team-stale-gate",
+            status="awaiting-approval",
+            child_run_ids=[gate.run_id],
+            approval_run_id=gate.run_id,
+        )
+        restarted = self.monday.task(
+            "start",
+            task_id=self.task_id,
+            changed_by="human:rework",
+        )
+        self.assertTrue(restarted.success)
+        self.assertEqual(restarted.data["status"], "in-progress")
+
+        response = self.monday.agent(
+            "review",
+            run_id=gate.run_id,
+            approve=True,
+            by="human:attacker",
+        )
+
+        self.assertFalse(response.success)
+        self.assertIn("expected 'review'", response.message)
+        child = json.loads(
+            (self.root / "logs" / "agents" / f"{gate.run_id}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(child["approval"]["decision"], "pending")
+        parent = json.loads(parent_path.read_text(encoding="utf-8"))
+        self.assertEqual(parent["status"], "awaiting-approval")
+        self.assertEqual(
+            self.monday.task("get", task_id=self.task_id).data["status"],
+            "in-progress",
+        )
+
+    def test_retry_recovers_exact_approval_after_child_checkpoint_failure(self):
+        gate = self._run(role="reviewer")
+        parent_path = self._write_team_record(
+            "team-crash-recovery",
+            status="awaiting-approval",
+            child_run_ids=[gate.run_id],
+            approval_run_id=gate.run_id,
+        )
+        runtime = AgentRuntime(self.monday, self.root)
+
+        with mock.patch.object(
+            runtime,
+            "_persist_required",
+            side_effect=OSError("simulated child checkpoint failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated child checkpoint failure"):
+                runtime.review(
+                    gate.run_id,
+                    approve=True,
+                    by="human:original",
+                    note="Original reviewed evidence.",
+                )
+
+        self.assertEqual(
+            self.monday.task("get", task_id=self.task_id).data["status"],
+            "completed",
+        )
+        child_path = self.root / "logs" / "agents" / f"{gate.run_id}.json"
+        self.assertEqual(
+            json.loads(child_path.read_text(encoding="utf-8"))["approval"]["decision"],
+            "pending",
+        )
+        self.assertEqual(
+            json.loads(parent_path.read_text(encoding="utf-8"))["status"],
+            "awaiting-approval",
+        )
+
+        retry = self.monday.agent(
+            "review",
+            run_id=gate.run_id,
+            approve=True,
+            by="human:retry",
+            note="Retry metadata must not replace the original audit.",
+        )
+
+        self.assertTrue(retry.success, retry.message)
+        self.assertEqual(retry.data["approval"]["decision"], "approved")
+        self.assertEqual(retry.data["approval"]["by"], "human:original")
+        self.assertEqual(
+            retry.data["approval"]["note"],
+            "Original reviewed evidence.",
+        )
+        parent = json.loads(parent_path.read_text(encoding="utf-8"))
+        self.assertEqual(parent["status"], "completed")
+        self.assertEqual(
+            parent["approval"],
+            {
+                key: retry.data["approval"][key]
+                for key in ("decision", "by", "at", "note")
+            },
+        )
+
+    def test_opposite_retry_recovers_approved_completion_after_checkpoint_failure(self):
+        gate = self._run(role="reviewer")
+        parent_path = self._write_team_record(
+            "team-opposite-crash-recovery",
+            status="awaiting-approval",
+            child_run_ids=[gate.run_id],
+            approval_run_id=gate.run_id,
+        )
+        runtime = AgentRuntime(self.monday, self.root)
+
+        with mock.patch.object(
+            runtime,
+            "_persist_required",
+            side_effect=OSError("simulated child checkpoint failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated child checkpoint failure"):
+                runtime.review(
+                    gate.run_id,
+                    approve=True,
+                    by="human:original",
+                    note="Original approval.",
+                )
+
+        retry = self.monday.agent(
+            "review",
+            run_id=gate.run_id,
+            approve=False,
+            by="human:opposite",
+            note="Must not replace the durable approval.",
+        )
+
+        self.assertTrue(retry.success, retry.message)
+        self.assertEqual(retry.data["approval"]["decision"], "approved")
+        self.assertEqual(retry.data["approval"]["by"], "human:original")
+        self.assertEqual(retry.data["approval"]["note"], "Original approval.")
+        self.assertEqual(
+            self.monday.task("get", task_id=self.task_id).data["status"],
+            "completed",
+        )
+        self.assertEqual(
+            json.loads(parent_path.read_text(encoding="utf-8"))["status"],
+            "completed",
+        )
+
+    def test_reject_fails_closed_after_unrelated_direct_task_completion(self):
+        gate = self._run(role="reviewer")
+        parent_path = self._write_team_record(
+            "team-unrelated-completion",
+            status="awaiting-approval",
+            child_run_ids=[gate.run_id],
+            approval_run_id=gate.run_id,
+        )
+        completed = self.monday.task(
+            "complete",
+            task_id=self.task_id,
+            changed_by="human:outside",
+            reason="manual completion unrelated to the agent gate",
+        )
+        self.assertTrue(completed.success)
+
+        response = self.monday.agent(
+            "review",
+            run_id=gate.run_id,
+            approve=False,
+            by="human:attacker",
+        )
+
+        self.assertFalse(response.success)
+        self.assertIn("does not attribute", response.message)
+        child = self.monday.agent("history", task_id=self.task_id).data["runs"]
+        child = next(item for item in child if item["run_id"] == gate.run_id)
+        self.assertEqual(child["approval"]["decision"], "pending")
+        self.assertEqual(
+            json.loads(parent_path.read_text(encoding="utf-8"))["status"],
+            "awaiting-approval",
+        )
+
+    def test_public_run_lookup_rejects_path_traversal_ids(self):
+        runtime = AgentRuntime(self.monday, self.root)
+        malicious_ids = (
+            "../outside",
+            "run-../../outside",
+            "run-safe/../../../outside",
+            "run-valid.json",
+        )
+
+        for run_id in malicious_ids:
+            with self.subTest(run_id=run_id):
+                with self.assertRaisesRegex(ValueError, "run_id must begin"):
+                    runtime.get_run(run_id)
+                response = self.monday.agent(
+                    "review",
+                    run_id=run_id,
+                    approve=True,
+                )
+                self.assertFalse(response.success)
+                self.assertIn("run_id must begin", response.message)
 
     def test_review_unknown_run_fails(self):
         r = self.monday.agent("review", run_id="run-doesnotexist", approve=True)

@@ -16,12 +16,13 @@ import pytest
 from monday import (
     AskResponse,
     LearnResponse,
+    ModuleStatus,
     Monday,
     MondayConfig,
-    ModuleStatus,
     SearchResponse,
     StatusResponse,
     TaskResponse,
+    TeamCheckpointError,
 )
 
 
@@ -55,6 +56,9 @@ class TestImportContract:
 
     def test_module_status_importable(self) -> None:
         assert ModuleStatus is not None
+
+    def test_team_checkpoint_error_importable(self) -> None:
+        assert issubclass(TeamCheckpointError, RuntimeError)
 
 
 # ---------------------------------------------------------------------------

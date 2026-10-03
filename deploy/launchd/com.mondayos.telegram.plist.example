@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mondayos.telegram</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_WITH_MONDAYOS_ROOT/.venv/bin/monday</string>
+    <string>--project-root</string>
+    <string>REPLACE_WITH_MONDAYOS_ROOT</string>
+    <string>telegram</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>REPLACE_WITH_MONDAYOS_ROOT</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>REPLACE_WITH_MONDAYOS_ROOT/logs/telegram-stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>REPLACE_WITH_MONDAYOS_ROOT/logs/telegram-stderr.log</string>
+</dict>
+</plist>

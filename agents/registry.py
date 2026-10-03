@@ -167,13 +167,35 @@ class AgentRegistry:
         return created
 
     def ensure_seeded(self) -> None:
-        """Seed defaults only if the registry is currently empty."""
-        if not self._read_all():
+        """Seed a fresh registry and apply narrow migrations to known defaults."""
+        agents = self._read_all()
+        if not agents:
             self.seed_defaults()
+            return
+        self._migrate_seeded_defaults(agents)
 
     # ------------------------------------------------------------------
     # Internal helpers (mirror tasks/manager.py + tasks/parser.py)
     # ------------------------------------------------------------------
+
+    def _migrate_seeded_defaults(self, agents: list[Agent]) -> None:
+        """Move only the legacy seeded Reviewer from Anthropic to OpenAI."""
+        role = ROLES["reviewer"]
+        for agent in agents:
+            is_legacy_seed = (
+                agent.name == _DEFAULT_AGENT_NAMES["reviewer"]
+                and agent.role == "reviewer"
+                and agent.provider == "anthropic"
+                and agent.is_default
+                and agent.description == role.description
+                and agent.capabilities == list(role.capabilities)
+            )
+            if not is_legacy_seed:
+                continue
+            agent.provider = role.default_provider
+            agent.updated = datetime.now(tz=UTC)
+            agent.metadata["provider_migration"] = "reviewer-openai-v1"
+            self._write(agent)
 
     def _read_all(self) -> list[Agent]:
         if not self._active_dir.exists():

@@ -274,10 +274,15 @@ def provider_config(environ: Mapping[str, str] | None = None) -> Any:
     """
     from brain.providers.factory import ProviderConfig
 
-    choice = choose(environ)
+    env = environ if environ is not None else os.environ
+    choice = choose(env)
     if not choice.configured:
         return None
-    return ProviderConfig(type=choice.provider, model=choice.model)
+    return ProviderConfig(
+        type=choice.provider,
+        model=choice.model,
+        base_url=_provider_base_url(choice.provider, env),
+    )
 
 
 def provider_configs(environ: Mapping[str, str] | None = None) -> list[Any]:
@@ -288,7 +293,11 @@ def provider_configs(environ: Mapping[str, str] | None = None) -> list[Any]:
     requested = (env.get("MONDAYOS_PROVIDER") or "").strip().lower()
     if requested:
         choice = _describe(requested, env, reason=f"MONDAYOS_PROVIDER={requested}")
-        return [ProviderConfig(type=choice.provider, model=choice.model)]
+        return [ProviderConfig(
+            type=choice.provider,
+            model=choice.model,
+            base_url=_provider_base_url(choice.provider, env),
+        )]
 
     configs: list[Any] = []
     for provider, sdk in (("anthropic", "anthropic"), ("openai", "openai"),
@@ -302,5 +311,19 @@ def provider_configs(environ: Mapping[str, str] | None = None) -> list[Any]:
     if installed is not None:
         ollama = _describe_ollama(env, installed)
         if ollama.configured:
-            configs.append(ProviderConfig(type="ollama", model=ollama.model))
+            configs.append(ProviderConfig(
+                type="ollama",
+                model=ollama.model,
+                base_url=_provider_base_url("ollama", env),
+            ))
     return configs
+
+
+def _provider_base_url(provider: str, env: Mapping[str, str]) -> str:
+    """Return a normalized non-secret endpoint override for a provider."""
+    if provider != "ollama":
+        return ""
+    base = (env.get("OLLAMA_HOST") or "").strip()
+    if base and not base.startswith(("http://", "https://")):
+        base = f"http://{base}"
+    return base

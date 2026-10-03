@@ -93,6 +93,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _register_execute(subparsers)
     _register_agent(subparsers)
     _register_team(subparsers)
+    _register_telegram(subparsers)
     _register_publish(subparsers)
     _register_growth(subparsers)
 
@@ -1390,7 +1391,8 @@ def _register_execute(subparsers: Any) -> None:
         default="prefer-local",
         help=(
             "Provider selection policy: prefer-local | lowest-cost | "
-            "highest-capability | manual (default: prefer-local)."
+            "highest-capability | ordered-failover | manual "
+            "(default: prefer-local)."
         ),
     )
     p.add_argument(
@@ -1511,8 +1513,24 @@ def _register_agent(subparsers: Any) -> None:
     p_run = agent_sub.add_parser("run", help="Run a task via a role.")
     p_run.add_argument("task_id", metavar="TASK-ID", help="Task to run.")
     p_run.add_argument("--role", required=True, metavar="ROLE", help="Role slug to route to.")
-    p_run.add_argument("--provider", metavar="NAME", default="", help="Provider override (e.g. fake, anthropic).")
-    p_run.add_argument("--policy", metavar="POLICY", default="manual", help="Provider selection policy (default: manual).")
+    p_run.add_argument(
+        "--provider",
+        metavar="NAME",
+        default="",
+        help=(
+            "Provider override (e.g. fake, anthropic). Reviewer requires "
+            "OpenAI; fake is allowed for offline tests."
+        ),
+    )
+    p_run.add_argument(
+        "--policy",
+        metavar="POLICY",
+        default="ordered-failover",
+        help=(
+            "Provider selection policy: ordered-failover, prefer-local, manual, "
+            "lowest-cost, or highest-capability (default: ordered-failover)."
+        ),
+    )
     p_run.add_argument("--mode", metavar="MODE", default="review", help="dry-run | review | autonomous (default: review).")
     p_run.add_argument("--dry-run", "-n", action="store_true", help="Shortcut for --mode dry-run.")
     p_run.add_argument("--autonomous", action="store_true", help="Shortcut for --mode autonomous.")
@@ -1561,7 +1579,15 @@ def _cmd_agent_list(args: argparse.Namespace) -> int:
             status = "✓ ready" if a.get("available") else f"needs {a.get('requires') or 'setup'}"
         else:
             status = ""
-        print(f"  {mark} {a['id']}  {a['role']:<14} {a['provider']:<10} {status:<18} {a['name']}")
+        registered = str(a.get("provider") or "")
+        effective = str(a.get("effective_provider") or registered)
+        provider_label = (
+            registered if registered == effective else f"{registered}→{effective}"
+        )
+        print(
+            f"  {mark} {a['id']}  {a['role']:<14} "
+            f"{provider_label:<21} {status:<18} {a['name']}"
+        )
     return 0
 
 
@@ -1702,7 +1728,15 @@ def _register_team(subparsers: Any) -> None:
 
     p_run = team_sub.add_parser("run", help="Run the full team pipeline on a task.")
     p_run.add_argument("task_id", metavar="TASK-ID", help="Task to run the team on.")
-    p_run.add_argument("--provider", metavar="NAME", default="", help="Provider override for every stage (e.g. fake).")
+    p_run.add_argument(
+        "--provider",
+        metavar="NAME",
+        default="",
+        help=(
+            "Provider override for productive stages; the final reviewer remains "
+            "OpenAI (use fake only for offline testing)."
+        ),
+    )
     p_run.add_argument("--mode", metavar="MODE", default="review", help="review (default) | dry-run.")
     p_run.add_argument("--json", "-j", action="store_true", help="Output the team run record as JSON.")
     p_run.set_defaults(func=_cmd_team_run)
@@ -1734,13 +1768,18 @@ def _cmd_team_run(args: argparse.Namespace) -> int:
     _VERDICT_MARK = {"pass": "✓", "needs_changes": "⚠", "block": "✗"}
     for st in r.stages:
         verdict = st.get("verdict", "")
-        mark = _VERDICT_MARK.get(verdict, "✗")
+        is_dry_stage = r.status == "dry-run" or st.get("status") == "dry-run"
+        mark = "•" if is_dry_stage else _VERDICT_MARK.get(verdict, "✗")
         role = st.get("role", "")
         prov = st.get("provider_used", "") or "—"
         model = st.get("provider_model", "")
         prov_label = f"{prov} ({model})" if model else prov
         conf = (st.get("confidence") or "").strip()
-        verdict_label = f"{verdict} ({conf})" if conf else verdict
+        verdict_label = (
+            "planned"
+            if is_dry_stage
+            else (f"{verdict} ({conf})" if conf else verdict)
+        )
         print(f"  {mark} {role:<14} [{st.get('status', ''):<9}] {verdict_label:<20} {prov_label}")
         summary = (st.get("summary") or "").strip()
         if summary:
@@ -1758,6 +1797,9 @@ def _cmd_team_run(args: argparse.Namespace) -> int:
 def _cmd_team_history(args: argparse.Namespace) -> int:
     monday = _monday(args)
     r = monday.team("history", task_id=getattr(args, "task_id", None), limit=args.limit)
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
     runs = r.data.get("runs", [])
     if not runs:
         print("No team runs yet.")
@@ -1766,6 +1808,130 @@ def _cmd_team_history(args: argparse.Namespace) -> int:
     _hr()
     for run in runs:
         print(f"  {run['team_run_id']}  {run.get('status', ''):<17} {run.get('task_id', '')}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Telegram control plane
+# ---------------------------------------------------------------------------
+
+def _register_telegram(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "telegram",
+        help="Run the private Telegram control plane.",
+        description=(
+            "Long-poll Telegram for authorized requests, create MondayOS tasks, "
+            "delegate them to the agent team, and report progress."
+        ),
+    )
+    p.add_argument("--once", action="store_true", help="Process one poll and exit.")
+    p.add_argument(
+        "--identify",
+        action="store_true",
+        help="Show Telegram user/chat IDs from pending messages, then exit.",
+    )
+    p.add_argument(
+        "--provider",
+        default="",
+        help=(
+            "Pin one provider for productive team stages; the final reviewer "
+            "remains OpenAI (use fake only for offline testing). Omit for "
+            "role defaults with automatic fallback."
+        ),
+    )
+    p.set_defaults(func=_cmd_telegram)
+
+
+def _cmd_telegram(args: argparse.Namespace) -> int:
+    import os
+    import signal
+    from dataclasses import replace
+
+    from monday import Monday, MondayConfig
+    from monday.provider_env import (
+        load_env_file,
+        provider_config,
+        provider_configs,
+    )
+    from telegram_bot.client import HttpTelegramClient
+    from telegram_bot.config import TelegramConfig
+    from telegram_bot.runner import TelegramRunner
+    from telegram_bot.service import TelegramBotService
+    from telegram_bot.state import InstanceLock, TelegramState
+
+    root = Path(args.project_root).resolve()
+    load_env_file(root / ".env")
+    if args.identify:
+        lock_path = root / "logs" / "telegram" / "bot.lock"
+        with InstanceLock(lock_path):
+            token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+            if not token:
+                raise ValueError("TELEGRAM_BOT_TOKEN is required")
+            discovery = HttpTelegramClient(token)
+            identity = discovery.get_me()
+            discovery.delete_webhook(drop_pending_updates=False)
+            # Reading with no offset displays pending /start messages but does
+            # not confirm them. The normal worker will still receive them.
+            updates = discovery.get_updates(offset=None, timeout=1)
+            print(f"Bot: @{identity.get('username') or identity.get('id')}")
+            found = False
+            for update in updates:
+                message = update.get("message") or {}
+                sender = message.get("from") or {}
+                chat = message.get("chat") or {}
+                if sender.get("id") is None:
+                    continue
+                found = True
+                print(
+                    f"User ID: {sender.get('id')}  "
+                    f"Username: @{sender.get('username') or '—'}  "
+                    f"Chat ID: {chat.get('id')}  Type: {chat.get('type') or '—'}"
+                )
+            if not found:
+                print("No pending messages. Send /start to the bot, then run this again.")
+        return 0
+
+    config = TelegramConfig.from_env(root)
+    # Blank is intentional: each team role uses its preferred model and the
+    # runtime can fail over across the configured provider pool. An explicit
+    # CLI/env value remains a hard pin for operators who want one provider.
+    chosen = (args.provider or config.provider).strip().lower()
+    if chosen != config.provider:
+        config = replace(config, provider=chosen)
+
+    monday = Monday(MondayConfig(
+        project_root=root,
+        require_human_approval=True,
+        provider_config=provider_config(),
+        provider_configs=provider_configs(),
+    ))
+    client = HttpTelegramClient(config.token)
+    state = TelegramState(config.state_path)
+    service = TelegramBotService(monday, client, state, config)
+    runner = TelegramRunner(
+        client,
+        service,
+        state,
+        poll_timeout=config.poll_timeout,
+    )
+
+    with InstanceLock(config.lock_path):
+        identity = runner.start()
+        print(
+            f"MondayOS Telegram connected as @{identity.get('username') or identity.get('id')} "
+            f"using {chosen or 'role defaults with automatic fallback'}."
+        )
+        if args.once:
+            count = runner.run_once()
+            print(f"Processed {count} update(s).")
+            return 0
+
+        def stop(_signum: int, _frame: Any) -> None:
+            runner.stop()
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        runner.run_forever()
     return 0
 
 

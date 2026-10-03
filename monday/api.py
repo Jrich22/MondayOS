@@ -503,7 +503,7 @@ class Monday:
         )
 
     def _task_start(self, task_id: str) -> TaskResponse:
-        """Transition a task from BACKLOG → ASSIGNED → IN_PROGRESS in two hops."""
+        """Start a backlog task or restart a blocked/review task in progress."""
         if not task_id:
             return TaskResponse(
                 action="start",
@@ -528,6 +528,13 @@ class Monday:
                     new_status=TaskStatus.IN_PROGRESS,
                     changed_by=changed_by,
                     reason="workflow start",
+                )
+            if task.status in (TaskStatus.BLOCKED, TaskStatus.REVIEW):
+                task = self.__tasks.update_status(
+                    task_id=task_id,
+                    new_status=TaskStatus.IN_PROGRESS,
+                    changed_by=changed_by,
+                    reason="workflow restart",
                 )
             return TaskResponse(
                 action="start",
@@ -1356,7 +1363,8 @@ class Monday:
                                 modification unless mode is "autonomous" AND
                                 autonomous_enabled is True.
             policy:             Provider selection policy: "prefer-local" |
-                                "lowest-cost" | "highest-capability" | "manual".
+                                "lowest-cost" | "highest-capability" |
+                                "ordered-failover" | "manual".
             provider:           Explicit provider name override (manual selection).
             providers:          Optional explicit list of AIProvider instances.
                                 Defaults to this instance's configured provider.
@@ -1448,7 +1456,8 @@ class Monday:
             run       — route a task to a role and run it through the Execution
                         Orchestrator under the approval gate. Requires: task_id,
                         role. Optional: provider, policy, mode, autonomous_enabled,
-                        approved, requested_actions.
+                        approved, requested_actions. Reviewer only accepts OpenAI
+                        (or fake for offline tests).
             review    — record a human decision on a run. Requires: run_id,
                         approve (bool). Optional: by, note.
             history   — list past runs. Optional: role, task_id, limit.
@@ -1461,6 +1470,7 @@ class Monday:
             monday=self,
             project_root=self._config.project_root,
             require_human_approval=self._config.require_human_approval,
+            configured_providers=(list(self.__providers) or None),
         )
 
         try:
@@ -1471,8 +1481,12 @@ class Monday:
                 rows = []
                 for a in agents:
                     d = a.to_dict()
-                    av = availability_for(a)
+                    av = availability_for(
+                        a,
+                        configured_providers=(list(self.__providers) or None),
+                    )
                     d["available"] = av.available
+                    d["effective_provider"] = av.provider
                     d["model"] = av.model
                     d["requires"] = av.env_var
                     d["provider_status"] = av.reason
@@ -1522,7 +1536,7 @@ class Monday:
                     task_id=kwargs.get("task_id", ""),
                     role=kwargs.get("role", ""),
                     provider=kwargs.get("provider", ""),
-                    policy=kwargs.get("policy", "manual"),
+                    policy=kwargs.get("policy", "ordered-failover"),
                     mode=kwargs.get("mode", "review"),
                     autonomous_enabled=bool(kwargs.get("autonomous_enabled", False)),
                     approved=bool(kwargs.get("approved", False)),
@@ -1599,10 +1613,19 @@ class Monday:
 
         Actions:
             run     — run the pipeline. Requires: task_id. Optional: provider,
-                      mode ("review" | "dry-run"), stage_providers.
+                      mode ("review" | "dry-run"), stage_providers, team_run_id,
+                      progress_callback, checkpoint_callback. Provider pins and
+                      stage injection cannot replace the OpenAI Reviewer (fake
+                      remains available for offline tests).
+            get     — retrieve one exact team run. Requires: team_run_id.
+            interrupt — mark an abandoned running team as interrupted. Requires:
+                      team_run_id. Optional: reason.
             history — list past team runs. Optional: task_id, limit.
 
-        Returns a TeamResponse. Does not raise for expected failures.
+        Returns a TeamResponse for ordinary workflow outcomes. A failure in the
+        caller-supplied required ``checkpoint_callback`` raises
+        ``TeamCheckpointError`` before task or provider work so a durable remote
+        controller can retry safely.
         """
         from agents.team import TeamWorkflow
 
@@ -1610,6 +1633,7 @@ class Monday:
             monday=self,
             project_root=self._config.project_root,
             require_human_approval=self._config.require_human_approval,
+            configured_providers=(list(self.__providers) or None),
         )
 
         try:
@@ -1619,11 +1643,47 @@ class Monday:
                     provider=kwargs.get("provider", ""),
                     mode=kwargs.get("mode", "review"),
                     stage_providers=kwargs.get("stage_providers"),
+                    team_run_id=kwargs.get("team_run_id", ""),
+                    progress_callback=kwargs.get("progress_callback"),
+                    checkpoint_callback=kwargs.get("checkpoint_callback"),
                 )
                 return TeamResponse(
                     action="run",
                     success=tr.success,
                     message=tr.message,
+                    team_run_id=tr.team_run_id,
+                    task_id=tr.task_id,
+                    status=tr.status,
+                    stopped_at=tr.stopped_at,
+                    approval_run_id=tr.approval_run_id,
+                    stages=list(tr.stages),
+                    data=tr.to_dict(),
+                )
+
+            if action == "get":
+                tr = team.get_team_run(kwargs.get("team_run_id", ""))
+                return TeamResponse(
+                    action="get",
+                    success=True,
+                    message=tr.message or f"Found {tr.team_run_id}",
+                    team_run_id=tr.team_run_id,
+                    task_id=tr.task_id,
+                    status=tr.status,
+                    stopped_at=tr.stopped_at,
+                    approval_run_id=tr.approval_run_id,
+                    stages=list(tr.stages),
+                    data=tr.to_dict(),
+                )
+
+            if action == "interrupt":
+                tr = team.interrupt(
+                    kwargs.get("team_run_id", ""),
+                    reason=kwargs.get("reason", ""),
+                )
+                return TeamResponse(
+                    action="interrupt",
+                    success=True,
+                    message=tr.message or f"{tr.team_run_id} is {tr.status}",
                     team_run_id=tr.team_run_id,
                     task_id=tr.task_id,
                     status=tr.status,
@@ -1647,9 +1707,12 @@ class Monday:
             return TeamResponse(
                 action=action,
                 success=False,
-                message=f"Unknown action {action!r}. Valid actions: run, history",
+                message=(
+                    f"Unknown action {action!r}. "
+                    "Valid actions: run, get, interrupt, history"
+                ),
             )
-        except (ValueError, LookupError) as exc:
+        except (OSError, ValueError, LookupError) as exc:
             return TeamResponse(action=action, success=False, message=str(exc))
 
     def publish(self, action: str = "confluence", **kwargs: Any) -> PublishResponse:

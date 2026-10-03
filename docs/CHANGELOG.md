@@ -11,6 +11,20 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Role-aware agent fallback: each unpinned role tries its preferred configured
+  provider and then the configured OpenAI, Anthropic, DeepSeek, and Ollama pool
+  in deterministic order. Explicit provider overrides stay pinned for productive
+  stages. The final Reviewer is a mandatory OpenAI/ChatGPT gate and does not
+  silently fall back to another model or inherit a whole-team pin, except for
+  the explicit offline `fake` test mode.
+- A private Telegram control plane with strict user allowlisting, durable update
+  deduplication, restart-safe task creation, agent-stage progress, task commands,
+  and approval/rejection commands.
+- An optional transport-neutral team progress callback. Team runs are persisted
+  as `running` and after every stage, while notification failures remain
+  non-fatal to agent work.
+- An example launchd service for keeping the Telegram worker running on a Mac
+  mini without storing credentials in the service definition.
 - DeepSeek as a first-class provider through its OpenAI-compatible API, configured
   with `DEEPSEEK_API_KEY` and an optional `MONDAYOS_DEEPSEEK_MODEL` override.
 - Policy-ranked provider failover. A rate-limited, unreachable, or failed model

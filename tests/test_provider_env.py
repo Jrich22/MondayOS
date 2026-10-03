@@ -179,6 +179,19 @@ class TestProviderConfig(unittest.TestCase):
         self.assertEqual(config.type, "anthropic")
         self.assertEqual(config.model, "claude-x")
 
+    def test_ollama_config_carries_normalized_host_and_model(self):
+        env = {
+            "MONDAYOS_PROVIDER": "ollama",
+            "MONDAYOS_OLLAMA_MODEL": "qwen3:8b",
+            "OLLAMA_HOST": "mac-mini.local:11434",
+        }
+        config = provider_config(env)
+        pool = provider_configs(env)
+
+        self.assertEqual(config.model, "qwen3:8b")
+        self.assertEqual(config.base_url, "http://mac-mini.local:11434")
+        self.assertEqual(pool[0].base_url, "http://mac-mini.local:11434")
+
     def test_none_when_nothing_is_available(self):
         choice = choose({"MONDAYOS_PROVIDER": ""})
         if not choice.configured:

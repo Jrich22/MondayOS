@@ -33,14 +33,18 @@ Public surface:
     ProjectResponse  — return type of Monday.project()
     OnboardResponse  — return type of Monday.onboard()
     ExecuteResponse  — return type of Monday.execute()
+    AgentResponse    — return type of Monday.agent()
+    TeamResponse     — return type of Monday.team()
     StatusResponse   — return type of Monday.status()
     WorkspaceResponse — return type of Monday.workspace()
     ModuleStatus     — per-module health in StatusResponse
+    TeamCheckpointError — required team checkpoint callback failure
 """
 from __future__ import annotations
 
 from monday.api import Monday
 from monday.config import MondayConfig
+from monday.errors import TeamCheckpointError
 from monday.types import (
     AdviseResponse,
     AgentResponse,
@@ -76,6 +80,7 @@ __all__ = [
     "StatusResponse",
     "TaskResponse",
     "TeamResponse",
+    "TeamCheckpointError",
     "WorkflowResponse",
     "WorkspaceResponse",
     "ModuleStatus",

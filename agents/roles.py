@@ -57,8 +57,8 @@ class Role:
 # ---------------------------------------------------------------------------
 # The six roles. Adding one here is the ONLY change needed to support it.
 #
-# Provider defaults: cpo → openai (ChatGPT) and lead-engineer → anthropic
-# (Claude Code) are pinned by the initiative. qa / security / reviewer default
+# Provider defaults: cpo / reviewer → openai (ChatGPT) and lead-engineer →
+# anthropic (Claude Code) are pinned by the initiative. qa / security default
 # to anthropic; research → openai. Every default is overridable via
 # `monday agent register --provider …`.
 # ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ ROLES: dict[str, Role] = {
             "Code review, PR review, and risk assessment. The independent second "
             "opinion before work is approved."
         ),
-        default_provider="anthropic",
+        default_provider="openai",
         capabilities=("code-review", "pr-review", "risk-assessment"),
         gated_actions=(),
     ),
