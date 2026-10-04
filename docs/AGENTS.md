@@ -8,9 +8,12 @@ to the existing Execution Orchestrator, and every run is logged as a reviewable
 record.
 
 > **MondayOS remains the system of record.** Agents do work, but MondayOS owns the
-> tasks, knowledge, logs, approvals, and truth. Agents cannot commit, push, touch
-> secrets, or live-trade without explicit human approval. Autonomous live
-> execution is intentionally not implemented — see [APPROVAL_GATES.md](APPROVAL_GATES.md).
+> tasks, knowledge, logs, approvals, and truth. The advisory agent runtime cannot
+> commit, push, touch secrets, or live-trade without explicit human approval — see
+> [APPROVAL_GATES.md](APPROVAL_GATES.md). Real repository delivery is a separate,
+> narrowly bounded controller: [BUILD_WORKFLOW.md](BUILD_WORKFLOW.md) may create an
+> isolated commit and pull request only after deterministic checks and an
+> exact-artifact ChatGPT review. It cannot merge or deploy.
 
 ## How it fits together
 

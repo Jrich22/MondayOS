@@ -346,6 +346,29 @@ TASK-0001 marked COMPLETED
 
 ---
 
+## `monday build`
+
+Build an existing task in an isolated worktree, run fixed validation, obtain a
+fresh high-confidence ChatGPT/Codex review, and open a GitHub pull request. This
+workflow never merges or deploys.
+
+```bash
+monday build run TASK-0001 [--id DELIVERY-ID] [--json]
+monday build get DELIVERY-ID [--json]
+monday build history [--task TASK-ID] [--limit N] [--json]
+monday build capabilities [--json]
+```
+
+`capabilities` is read-only and reports Claude Code, Codex/ChatGPT Reviewer, and
+GitHub readiness. It exits with status `1` when the report says `ready: false`,
+including with `--json`, so startup scripts can use it as a real preflight check.
+The JSON response still has `success: true` when the inspection itself completed;
+the runnable verdict is `data.ready`. See
+[BUILD_WORKFLOW.md](BUILD_WORKFLOW.md) for the trust model, prerequisites, repair
+loop, and current MondayOS-repository-only scope.
+
+---
+
 ## `monday telegram`
 
 Run the private Telegram control plane using the project-local `.env`:
@@ -361,6 +384,8 @@ monday telegram [--once] [--identify] [--provider NAME]
 | `--provider NAME` | role defaults | Pin one provider for productive team stages. The final Reviewer still requires OpenAI/ChatGPT (`fake` is available for offline tests). Without a pin, productive roles use their preferred provider with ordered fallback. |
 
 `TELEGRAM_BOT_TOKEN` and `MONDAYOS_TELEGRAM_ALLOWED_USER_IDS` are required.
+Set `MONDAYOS_TELEGRAM_LIVE_BUILD=true` to make private plain text, `/build`, and
+`/deliver` use the autonomous PR workflow. It is off by default.
 See [TELEGRAM.md](TELEGRAM.md) for setup, commands, restart behavior, and the
 always-on Mac mini service.
 
@@ -379,7 +404,9 @@ Error: no content provided.
 
 Argument errors (missing required flags, invalid choices) print argparse usage to `stderr` and exit with code `2`.
 
-Success always exits with code `0`.
+Successful commands exit with code `0`. The deliberate exception is
+`monday build capabilities`: a completed inspection exits with code `1` when
+`data.ready` is false, as described above.
 
 ---
 

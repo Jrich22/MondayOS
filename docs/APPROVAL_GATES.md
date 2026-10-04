@@ -1,5 +1,12 @@
 # Approval Gates
 
+> **Scope note:** this policy governs the advisory execution and agent-team
+> runtimes. The separately implemented [Autonomous Build
+> Workflow](BUILD_WORKFLOW.md) treats an isolated branch and open pull request as
+> a review artifact, not a production release. It can create that artifact only
+> through fixed validation and an independent, exact-artifact ChatGPT gate; it
+> cannot merge or deploy. ADR-022 records this deliberately narrow boundary.
+
 The Multi-Agent Runtime is **review-required by default**. An agent may plan and
 produce output, but MondayOS will not let it finalize work — or take a sensitive
 action — without an explicit human approval. This document describes that policy

@@ -93,6 +93,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _register_execute(subparsers)
     _register_agent(subparsers)
     _register_team(subparsers)
+    _register_build(subparsers)
     _register_telegram(subparsers)
     _register_publish(subparsers)
     _register_growth(subparsers)
@@ -1812,6 +1813,175 @@ def _cmd_team_history(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# build — artifact-bound autonomous delivery
+# ---------------------------------------------------------------------------
+
+def _register_build(subparsers: Any) -> None:
+    p = subparsers.add_parser(
+        "build",
+        help="Build a task, verify it, review it, and open a pull request.",
+        description=(
+            "Run the artifact-bound delivery workflow in an isolated worktree.\n"
+            "A successful build is committed, pushed, and opened as a pull request;\n"
+            "it is never merged or deployed by this command.\n\n"
+            "examples:\n"
+            "  monday build run TASK-0001\n"
+            "  monday build get delivery-abc123\n"
+            "  monday build history --task TASK-0001\n"
+            "  monday build capabilities\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    build_sub = p.add_subparsers(title="build actions", metavar="<action>")
+    build_sub.required = True
+
+    p_run = build_sub.add_parser("run", help="Build one MondayOS task through pull request.")
+    p_run.add_argument("task_id", metavar="TASK-ID", help="Task to implement.")
+    p_run.add_argument(
+        "--id",
+        dest="delivery_id",
+        metavar="DELIVERY-ID",
+        default="",
+        help="Use a caller-reserved delivery ID for safe reconciliation.",
+    )
+    p_run.add_argument(
+        "--json", "-j", action="store_true", help="Output the delivery record as JSON."
+    )
+    p_run.set_defaults(func=_cmd_build_run)
+
+    p_get = build_sub.add_parser("get", help="Retrieve one exact delivery record.")
+    p_get.add_argument("delivery_id", metavar="DELIVERY-ID", help="Delivery ID to retrieve.")
+    p_get.add_argument(
+        "--json", "-j", action="store_true", help="Output the delivery record as JSON."
+    )
+    p_get.set_defaults(func=_cmd_build_get)
+
+    p_history = build_sub.add_parser("history", help="List past delivery jobs.")
+    p_history.add_argument("--task", dest="task_id", metavar="TASK-ID", help="Filter by task.")
+    p_history.add_argument(
+        "--limit", type=int, default=20, metavar="N", help="Max jobs to show (default: 20)."
+    )
+    p_history.add_argument("--json", "-j", action="store_true", help="Output the listing as JSON.")
+    p_history.set_defaults(func=_cmd_build_history)
+
+    p_capabilities = build_sub.add_parser(
+        "capabilities", help="Check builder, reviewer, and GitHub readiness."
+    )
+    p_capabilities.add_argument(
+        "--json", "-j", action="store_true", help="Output capabilities as JSON."
+    )
+    p_capabilities.set_defaults(func=_cmd_build_capabilities)
+
+
+def _build_json(response: Any) -> dict[str, Any]:
+    """Return the complete public response without conflating it with job state."""
+    from dataclasses import asdict
+
+    return asdict(response)
+
+
+def _print_build(response: Any) -> int:
+    if not response.success and not response.delivery_id:
+        print(f"Error: {response.message}", file=sys.stderr)
+        return 1
+
+    print()
+    print("═" * 64)
+    print(f"  BUILD — {response.delivery_id or '(unassigned)'}")
+    print("═" * 64)
+    print(f"  Task    : {response.task_id or '—'}")
+    print(f"  Status  : {response.status or '—'}")
+    print(f"  Phase   : {response.phase or '—'}")
+    if response.branch:
+        print(f"  Branch  : {response.branch}")
+    if response.commit_sha:
+        print(f"  Commit  : {response.commit_sha}")
+    if response.pr_url:
+        print(f"  PR      : {response.pr_url}")
+    if response.changed_files:
+        print(f"  Files   : {len(response.changed_files)}")
+        for path in response.changed_files:
+            print(f"    - {path}")
+    if response.attempts:
+        print(f"  Attempts: {len(response.attempts)}")
+    _hr()
+    if response.message:
+        print(f"  {response.message}")
+    return 0 if response.success else 1
+
+
+def _cmd_build_run(args: argparse.Namespace) -> int:
+    import json as _json
+
+    monday = _monday(args)
+    r = monday.build(
+        "run",
+        task_id=args.task_id,
+        delivery_id=(args.delivery_id or None),
+    )
+    if args.json:
+        print(_json.dumps(_build_json(r), indent=2, sort_keys=True))
+        return 0 if r.success else 1
+    return _print_build(r)
+
+
+def _cmd_build_get(args: argparse.Namespace) -> int:
+    import json as _json
+
+    r = _monday(args).build("get", delivery_id=args.delivery_id)
+    if args.json:
+        print(_json.dumps(_build_json(r), indent=2, sort_keys=True))
+        return 0 if r.success else 1
+    return _print_build(r)
+
+
+def _cmd_build_history(args: argparse.Namespace) -> int:
+    import json as _json
+
+    r = _monday(args).build("history", task_id=args.task_id, limit=args.limit)
+    if args.json:
+        print(_json.dumps(_build_json(r), indent=2, sort_keys=True))
+        return 0 if r.success else 1
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    jobs = r.data.get("jobs", [])
+    if not jobs:
+        print("No builds yet.")
+        return 0
+    print(f"Builds ({r.data.get('count', len(jobs))})")
+    _hr()
+    for job in jobs:
+        print(
+            f"  {job.get('delivery_id', '')}  "
+            f"{job.get('status', ''):<12} {job.get('task_id', '')}"
+        )
+    return 0
+
+
+def _cmd_build_capabilities(args: argparse.Namespace) -> int:
+    import json as _json
+
+    r = _monday(args).build("capabilities")
+    if args.json:
+        print(_json.dumps(_build_json(r), indent=2, sort_keys=True))
+        return 0 if r.success and bool(r.data.get("ready")) else 1
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
+    print("Build capabilities")
+    _hr()
+    for name, value in sorted(r.data.items()):
+        rendered = (
+            _json.dumps(value, sort_keys=True)
+            if isinstance(value, (dict, list))
+            else str(value)
+        )
+        print(f"  {name:<12}: {rendered}")
+    return 0 if bool(r.data.get("ready")) else 1
+
+
+# ---------------------------------------------------------------------------
 # Telegram control plane
 # ---------------------------------------------------------------------------
 
@@ -1821,7 +1991,8 @@ def _register_telegram(subparsers: Any) -> None:
         help="Run the private Telegram control plane.",
         description=(
             "Long-poll Telegram for authorized requests, create MondayOS tasks, "
-            "delegate them to the agent team, and report progress."
+            "delegate advisory work to the agent team or opt-in private builds "
+            "to autonomous PR delivery, and report progress."
         ),
     )
     p.add_argument("--once", action="store_true", help="Process one poll and exit.")

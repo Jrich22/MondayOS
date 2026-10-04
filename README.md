@@ -31,7 +31,8 @@ Three commitments shape every design choice:
 - **Explainability is non-negotiable.** Every action carries a reasoning trace.
 - **Model flexibility is a hard boundary.** Productive roles can fail over among
   configured providers; the final quality gate is intentionally OpenAI/ChatGPT.
-- **Human oversight is a feature.** Consequential actions stop and ask.
+- **Autonomy is bounded by evidence.** Live builds require deterministic checks
+  and an exact-artifact ChatGPT review, then stop at a pull request.
 
 The full vision is in [docs/VISION.md](docs/VISION.md).
 
@@ -51,7 +52,8 @@ The full vision is in [docs/VISION.md](docs/VISION.md).
 | **Project management** | `monday project` / `onboard` | Register and onboard external repositories |
 | **AI provider layer** | _(config)_ | Interchangeable Claude / OpenAI / DeepSeek / Ollama providers with fallback |
 | **Execution orchestrator** | `monday execute` | Delegate a task to an AI provider through a safe, policy-driven pipeline |
-| **Telegram control plane** | `monday telegram` | Create tasks, run the agent team, and receive progress remotely |
+| **Autonomous builds** | `monday build` | Build in an isolated worktree, validate, repair, require ChatGPT review, and open a PR |
+| **Telegram control plane** | `monday telegram` | Create tasks, run the agent team, or opt into private live builds with progress |
 
 Source, configuration templates, and product documentation are stored as
 human-readable files in Git. Operational state (agent runs, execution logs, and
@@ -99,8 +101,8 @@ A detailed component diagram and data-flow walkthrough is in
 [docs/ARCHITECTURE_DIAGRAM.md](docs/ARCHITECTURE_DIAGRAM.md). The original
 layered design rationale is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-**Subsystems** (`*/` packages): `monday` (public API), `agents` (role and team
-runtime), `telegram_bot` (private control plane), `brain` (reasoning, routing,
+**Subsystems** (`*/` packages): `monday` (public API), `delivery` (isolated,
+artifact-bound builds), `agents` (role and team runtime), `telegram_bot` (private control plane), `brain` (reasoning, routing,
 providers), `knowledge`, `memory`, `tasks`, `workflows`, `migrate`, `doctor`,
 `advisor`, `orchestrator`, `events`, `search`, `core`.
 
@@ -169,6 +171,10 @@ monday execute TASK-0001 --dry-run                 # plan only, no calls, no cha
 monday execute TASK-0001                            # review-required (default)
 monday execute TASK-0001 --policy highest-capability
 monday execute TASK-0001 --mode autonomous --enable-autonomous
+
+# Artifact-bound delivery (real edits, tests, ChatGPT review, PR only)
+monday build capabilities
+monday build run TASK-0001
 ```
 
 Full command reference: [docs/CLI.md](docs/CLI.md).
