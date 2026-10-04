@@ -42,7 +42,12 @@ _GIT_ENV = {
     "GIT_AUTHOR_EMAIL": "synthetic@example.invalid",
     "GIT_COMMITTER_NAME": "synthetic",
     "GIT_COMMITTER_EMAIL": "synthetic@example.invalid",
-    "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PATH": "/Library/Developer/CommandLineTools/usr/bin:/usr/bin:/bin",
 }
 
 # The capabilities this corpus plants. A test asserting the outcome should say

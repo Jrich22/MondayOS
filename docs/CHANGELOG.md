@@ -11,6 +11,35 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- An artifact-bound `Monday.build()` workflow and `monday build` CLI. It creates
+  a job-owned worktree from the exact remote base, accepts structured text
+  patches from Claude Code with Codex fallback, runs fixed validation and secret
+  checks, requires a fresh high-confidence ChatGPT/Codex review bound to the
+  exact staged artifact, repairs up to three attempts, then commits, non-force
+  pushes, and opens or reconciles a GitHub pull request. It cannot merge or
+  deploy. Codex builder and reviewer sessions run from private non-repository
+  runtimes with model tools disabled; the reviewer receives the controller's
+  bounded exact staged diff and verifies its SHA-256 before launch.
+- Opt-in private Telegram live builds via
+  `MONDAYOS_TELEGRAM_LIVE_BUILD=true`. Private plain text and `/build` create and
+  deliver a task; `/deliver TASK-ID` delivers an existing task. Durable update
+  identity, progress, restart recovery, and group-chat execution blocking are
+  preserved.
+- A strict Git delivery layer with bounded argv-only processes, repository
+  leases, owned worktrees, path and file policy, exact staging/fingerprinting,
+  HEAD integrity checks, hook-free controller commits, non-force pushes, and
+  ownership-checked cleanup.
+- Fail-closed macOS validation containment entered before candidate imports,
+  with a read-only staged worktree, hidden repository history, no network or
+  process inspection, kernel-level detachment prevention, trusted Git and Python
+  executables, ignored candidate pytest configuration, finite process/file/CPU
+  and incremental address-space ceilings, plus aggregate memory and
+  runtime-storage watchdogs that account for fast exits and open-but-unlinked
+  files.
+- Candidate-controlled test output is withheld on both success and failure;
+  repair models receive only controller-derived check identity and exit status,
+  closing encoded-source and prompt-injection channels through failed tests.
+
 - Role-aware agent fallback: each unpinned role tries its preferred configured
   provider and then the configured OpenAI, Anthropic, DeepSeek, and Ollama pool
   in deterministic order. Explicit provider overrides stay pinned for productive

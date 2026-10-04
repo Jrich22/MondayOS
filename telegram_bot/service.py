@@ -1,6 +1,7 @@
 """Telegram commands mapped exclusively onto the public MondayOS API."""
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from typing import Any
@@ -14,6 +15,7 @@ _TASK_ID = re.compile(
     re.IGNORECASE,
 )
 _RUN_ID = re.compile(r"^run-[A-Za-z0-9-]{1,80}$")
+_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _ROLE_NAMES = {
     "cpo": "Product strategy",
     "lead-engineer": "Technical design",
@@ -21,6 +23,10 @@ _ROLE_NAMES = {
     "security": "Security review",
     "reviewer": "Final product review",
 }
+
+
+class TelegramUpdatePendingError(RuntimeError):
+    """A durable live delivery is still running and must be reconciled later."""
 
 
 class TelegramBotService:
@@ -75,7 +81,10 @@ class TelegramBotService:
             return
 
         if command in {"start", "help"}:
-            self._client.send_message(chat_id, _help())
+            self._client.send_message(
+                chat_id,
+                _help(live_build=self._config.live_build and chat_type == "private"),
+            )
             return
         if command == "tasks":
             self._send_tasks(chat_id)
@@ -93,6 +102,19 @@ class TelegramBotService:
                 return
             self._run_task(update_id, chat_id, task_id)
             return
+        if command == "deliver":
+            if not self._config.live_build:
+                self._client.send_message(
+                    chat_id,
+                    "Live builds are disabled for this Telegram controller.",
+                )
+                return
+            task_id = argument.split(maxsplit=1)[0].upper() if argument else ""
+            if not _TASK_ID.fullmatch(task_id):
+                self._client.send_message(chat_id, "Use /deliver TASK-0001")
+                return
+            self._deliver_existing(update_id, chat_id, task_id)
+            return
         if command == "build":
             objective = argument.strip()
         elif command:
@@ -104,7 +126,10 @@ class TelegramBotService:
         if not objective:
             self._client.send_message(chat_id, "Tell me what you want MondayOS to build.")
             return
-        self._create_and_run(update_id, chat_id, user_id, objective)
+        if chat_type == "private" and self._config.live_build and command in {"", "build"}:
+            self._create_and_deliver(update_id, chat_id, user_id, objective)
+        else:
+            self._create_and_run(update_id, chat_id, user_id, objective)
 
     def report_error(self, update: dict[str, Any], *, will_retry: bool) -> None:
         """Send a generic failure only to an authorized originating chat."""
@@ -144,17 +169,26 @@ class TelegramBotService:
             return None
         return chat_id, user_id, chat_type
 
-    def _create_and_run(
+    def _task_for_request(
         self,
         update_id: int,
         chat_id: int,
         user_id: int,
         objective: str,
-    ) -> None:
+        *,
+        workflow: str,
+    ) -> tuple[str, bool]:
+        """Create or reconcile the one task owned by this Telegram update."""
         job = self._state.job(update_id)
+        recorded_workflow = str(job.get("workflow") or "")
+        if recorded_workflow and recorded_workflow != workflow:
+            raise RuntimeError(
+                "The saved Telegram request belongs to a different workflow"
+            )
         task_id = str(job.get("task_id") or "")
         if not task_id:
             task_id = self._find_task_for_update(update_id)
+        created = False
         if not task_id:
             marker = self._idempotency_marker(update_id)
             response = self._monday.task(
@@ -171,15 +205,177 @@ class TelegramBotService:
                     chat_id,
                     f"I could not create the task: {response.message}",
                 )
-                return
+                return "", False
             task_id = str(response.task_id)
-            self._state.set_job(update_id, task_id=task_id, chat_id=chat_id)
+            created = True
+        self._state.set_job(
+            update_id,
+            task_id=task_id,
+            chat_id=chat_id,
+            workflow=workflow,
+        )
+        return task_id, created
+
+    def _create_and_run(
+        self,
+        update_id: int,
+        chat_id: int,
+        user_id: int,
+        objective: str,
+    ) -> None:
+        task_id, _created = self._task_for_request(
+            update_id,
+            chat_id,
+            user_id,
+            objective,
+            workflow="team-review",
+        )
+        if not task_id:
+            return
 
         self._client.send_message(
             chat_id,
             f"Created {task_id}. Monday is assigning the agent team now.",
         )
         self._run_task(update_id, chat_id, task_id)
+
+    def _create_and_deliver(
+        self,
+        update_id: int,
+        chat_id: int,
+        user_id: int,
+        objective: str,
+    ) -> None:
+        task_id, _created = self._task_for_request(
+            update_id,
+            chat_id,
+            user_id,
+            objective,
+            workflow="live-build",
+        )
+        if not task_id:
+            return
+        job = self._state.job(update_id)
+        if not bool(job.get("live_started_announced")):
+            self._client.send_message(
+                chat_id,
+                f"Created {task_id}. Monday is starting its live build now.",
+            )
+            self._state.set_job(update_id, live_started_announced=True)
+        self._run_live_build(update_id, chat_id, task_id)
+
+    def _deliver_existing(self, update_id: int, chat_id: int, task_id: str) -> None:
+        task = self._monday.task("get", task_id=task_id)
+        if not task.success:
+            self._client.send_message(chat_id, task.message)
+            return
+        job = self._state.job(update_id)
+        recorded_task = str(job.get("task_id") or "")
+        if recorded_task and recorded_task != task_id:
+            raise RuntimeError("The saved Telegram delivery belongs to another task")
+        recorded_workflow = str(job.get("workflow") or "")
+        if recorded_workflow and recorded_workflow != "live-build":
+            raise RuntimeError("The saved Telegram request is not a live build")
+        self._state.set_job(
+            update_id,
+            task_id=task_id,
+            chat_id=chat_id,
+            workflow="live-build",
+        )
+        if not bool(job.get("live_started_announced")):
+            self._client.send_message(
+                chat_id,
+                f"Monday is starting a live build for {task_id}.",
+            )
+            self._state.set_job(update_id, live_started_announced=True)
+        self._run_live_build(update_id, chat_id, task_id)
+
+    def _run_live_build(self, update_id: int, chat_id: int, task_id: str) -> None:
+        """Run or reconcile one caller-reserved autonomous delivery."""
+        job = self._state.job(update_id)
+        if bool(job.get("delivery_final_sent")):
+            return
+        saved_result = job.get("delivery_result")
+        if bool(job.get("delivery_terminal")) and isinstance(saved_result, dict):
+            self._client.send_message(chat_id, _delivery_result(task_id, saved_result))
+            self._state.set_job(update_id, delivery_final_sent=True)
+            return
+
+        stable_id = self._delivery_id(update_id)
+        recorded_id = str(job.get("delivery_id") or "")
+        if recorded_id and recorded_id != stable_id:
+            raise RuntimeError("The saved Telegram delivery identity does not match")
+        self._state.set_job(
+            update_id,
+            task_id=task_id,
+            chat_id=chat_id,
+            workflow="live-build",
+            delivery_id=stable_id,
+            delivery_reserved=True,
+        )
+        response = self._monday.build(
+            "run",
+            task_id=task_id,
+            delivery_id=stable_id,
+            progress_callback=lambda event: self._live_progress(
+                update_id, chat_id, event,
+            ),
+        )
+        result = _delivery_snapshot(response, fallback_id=stable_id)
+        if result["delivery_id"] != stable_id:
+            raise RuntimeError("MondayOS did not honor the reserved delivery identity")
+        terminal = _delivery_terminal(str(result.get("status") or ""))
+        self._state.set_job(
+            update_id,
+            delivery_reserved=False,
+            delivery_terminal=terminal,
+            delivery_final_sent=False,
+            delivery_status=result["status"],
+            delivery_phase=result["phase"],
+            delivery_result=result,
+        )
+        if terminal:
+            self._client.send_message(chat_id, _delivery_result(task_id, result))
+            self._state.set_job(update_id, delivery_final_sent=True)
+            return
+
+        # A lease-owning worker may still be building this exact delivery.
+        # Report its durable state, but leave the result retryable instead of
+        # presenting an in-progress snapshot as a final outcome.
+        progress = _delivery_progress_text(_delivery_progress_snapshot(result))
+        text = progress or _delivery_pending_result(task_id, result)
+        prior = str(
+            self._state.job(update_id).get("last_delivery_progress_text") or ""
+        )
+        if text and text != prior:
+            self._client.send_message(chat_id, text)
+            self._state.set_job(update_id, last_delivery_progress_text=text)
+        raise TelegramUpdatePendingError(
+            f"Telegram update {update_id} live delivery is still in progress"
+        )
+
+    def _delivery_id(self, update_id: int) -> str:
+        identity = f"telegram:{self._bot_id}:{update_id}".encode()
+        digest = hashlib.sha256(identity).hexdigest()[:20]
+        return f"delivery-telegram-{digest}"
+
+    def _live_progress(self, update_id: int, chat_id: int, event: Any) -> None:
+        snapshot = _delivery_progress_snapshot(event)
+        if not snapshot:
+            return
+        text = _delivery_progress_text(snapshot)
+        prior = self._state.job(update_id)
+        self._state.set_job(
+            update_id,
+            delivery_phase=snapshot.get("phase", ""),
+            delivery_status=snapshot.get("status", ""),
+            delivery_attempt=snapshot.get("attempt", 0),
+            delivery_progress=snapshot,
+        )
+        if not text or text == str(prior.get("last_delivery_progress_text") or ""):
+            return
+        self._client.send_message(chat_id, text)
+        self._state.set_job(update_id, last_delivery_progress_text=text)
 
     def _find_task_for_update(self, update_id: int) -> str:
         marker = self._idempotency_marker(update_id)
@@ -470,10 +666,188 @@ def _team_result(task_id: str, run: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _help() -> str:
+def _delivery_snapshot(response: Any, *, fallback_id: str) -> dict[str, Any]:
+    data = getattr(response, "data", {})
+    payload = dict(data) if isinstance(data, dict) else {}
+
+    def value(name: str, default: Any = "") -> Any:
+        direct = getattr(response, name, None)
+        return direct if direct not in (None, "") else payload.get(name, default)
+
+    success = bool(value("success", False))
+    status = str(value("status", "") or ("succeeded" if success else "failed"))
+    phase = str(value("phase", "") or status)
+    raw_files = value("changed_files", [])
+    changed_files = (
+        [_bounded_text(item, 200) for item in raw_files[:50]]
+        if isinstance(raw_files, list)
+        else []
+    )
+    raw_attempts = value("attempts", [])
+    if isinstance(raw_attempts, list):
+        attempts = len(raw_attempts)
+    else:
+        attempts = max(0, _integer(raw_attempts, 0))
+    return {
+        "delivery_id": str(value("delivery_id", fallback_id) or fallback_id),
+        "success": success,
+        "status": _bounded_text(status, 80),
+        "phase": _bounded_text(phase, 80),
+        "branch": _bounded_text(value("branch", ""), 160),
+        "commit_sha": _bounded_text(value("commit_sha", ""), 64),
+        "pr_url": _github_pr_url(value("pr_url", "")),
+        "changed_files": changed_files,
+        "attempts": attempts,
+        "message": _bounded_text(value("message", ""), 300),
+    }
+
+
+def _delivery_progress_snapshot(event: Any) -> dict[str, Any]:
+    if isinstance(event, dict):
+        payload = event
+    else:
+        serializer = getattr(event, "to_dict", None)
+        if callable(serializer):
+            serialized = serializer()
+            payload = serialized if isinstance(serialized, dict) else {}
+        else:
+            attributes = getattr(event, "__dict__", {})
+            payload = attributes if isinstance(attributes, dict) else {}
+    if not payload:
+        return {}
+    event_name = _bounded_text(payload.get("event", ""), 80)
+    phase = _bounded_text(payload.get("phase", "") or event_name, 80)
+    status = _bounded_text(payload.get("status", ""), 80)
+    verdict = _bounded_text(payload.get("verdict", ""), 40)
+    return {
+        "event": event_name,
+        "phase": phase,
+        "status": status,
+        "attempt": max(0, _integer(payload.get("attempt"), 0)),
+        "max_attempts": max(0, _integer(payload.get("max_attempts"), 0)),
+        "verdict": verdict,
+    }
+
+
+def _delivery_progress_text(progress: dict[str, Any]) -> str:
+    marker = " ".join(
+        str(progress.get(name) or "")
+        for name in ("event", "phase", "status")
+    ).lower().replace("_", "-")
+    attempt = _integer(progress.get("attempt"), 0)
+    maximum = _integer(progress.get("max_attempts"), 0)
+    count = f" {attempt}/{maximum}" if attempt and maximum else (f" {attempt}" if attempt else "")
+    if "checkout" in marker or "workspace" in marker or "prepar" in marker:
+        return "Monday prepared an isolated build workspace."
+    if "repair" in marker:
+        if count:
+            return f"ChatGPT requested changes. Monday is repairing attempt{count}."
+        return "ChatGPT requested changes. Monday is repairing the build."
+    if any(word in marker for word in ("edit", "build", "implement", "patch")):
+        return f"Monday is building attempt{count}." if count else "Monday is building."
+    if any(word in marker for word in ("valid", "verify", "test")):
+        if "finish" in marker and progress.get("status") in {"passed", "success", "succeeded"}:
+            return f"Validation passed for attempt{count}." if count else "Validation passed."
+        return (
+            f"Monday is validating attempt{count}."
+            if count
+            else "Monday is validating the build."
+        )
+    if "review" in marker:
+        verdict = str(progress.get("verdict") or "").lower()
+        if verdict == "pass":
+            return f"ChatGPT approved attempt{count}." if count else "ChatGPT approved the build."
+        if verdict in {"needs_changes", "needs-changes"}:
+            return (
+                f"ChatGPT requested changes on attempt{count}."
+                if count
+                else "ChatGPT requested changes."
+            )
+        return (
+            f"ChatGPT is reviewing attempt{count}."
+            if count
+            else "ChatGPT is reviewing the build."
+        )
+    if any(word in marker for word in ("commit", "push", "github", "pull-request", "deliver")):
+        return "The approved change is being published to GitHub."
+    return ""
+
+
+def _delivery_terminal(status: str) -> bool:
+    return status.strip().lower() in {
+        "blocked",
+        "cancelled",
+        "completed",
+        "failed",
+        "interrupted",
+        "pr-open",
+        "rejected",
+        "succeeded",
+    }
+
+
+def _delivery_result(task_id: str, result: dict[str, Any]) -> str:
+    status = str(result.get("status") or "failed")
+    pr_url = _github_pr_url(result.get("pr_url", ""))
+    commit = str(result.get("commit_sha") or "")
+    success = bool(result.get("success"))
+    if success and pr_url:
+        lines = [f"{task_id} passed ChatGPT review.", f"Pull request: {pr_url}"]
+    else:
+        lines = [f"{task_id} live build: {status}."]
+        if pr_url:
+            lines.append(f"Pull request: {pr_url}")
+    if _COMMIT_SHA.fullmatch(commit):
+        lines.append(f"Commit: {commit[:12]}")
+    attempts = max(0, _integer(result.get("attempts"), 0))
+    if attempts:
+        lines.append(f"Attempts: {attempts}")
+    changed = result.get("changed_files")
+    if isinstance(changed, list) and changed:
+        lines.append(f"Changed files: {len(changed)}")
+    message = _bounded_text(result.get("message", ""), 300)
+    if message and not success:
+        lines.append(message)
+    return "\n".join(lines)
+
+
+def _delivery_pending_result(task_id: str, result: dict[str, Any]) -> str:
+    phase = _bounded_text(result.get("phase", ""), 80) or "in progress"
     return (
-        "Send a normal text message and MondayOS will create a task and assign its agent team.\n\n"
-        "/build REQUEST — create and run a task\n"
+        f"{task_id} is still {phase}. Monday will reconcile this exact build "
+        "the next time the request is checked."
+    )
+
+
+def _github_pr_url(value: Any) -> str:
+    url = str(value or "").strip()
+    if len(url) > 500 or not url.startswith("https://github.com/") or any(
+        char.isspace() for char in url
+    ):
+        return ""
+    return url
+
+
+def _bounded_text(value: Any, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _help(*, live_build: bool = False) -> str:
+    build = (
+        "/build REQUEST — create, build, review, and open a pull request\n"
+        "/deliver TASK-ID — build and deliver an existing task\n"
+        if live_build
+        else "/build REQUEST — create and run a task\n"
+    )
+    intro = (
+        "Send a normal text message and Monday will build it, validate it, have ChatGPT "
+        "review it, and open a pull request."
+        if live_build
+        else "Send a normal text message and MondayOS will create a task and assign its agent team."
+    )
+    return (
+        f"{intro}\n\n"
+        f"{build}"
         "/run TASK-ID — run an existing task\n"
         "/status [TASK-ID] — system or task status\n"
         "/tasks — active tasks\n"

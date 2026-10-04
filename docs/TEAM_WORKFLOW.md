@@ -18,6 +18,12 @@ and one parent record tying the child runs together.
 > executed live. On a full pass the task is moved to `REVIEW` and waits for a
 > human to approve. Autonomous mode is not offered for team runs.
 
+For real repository changes, use the separate [Autonomous Build
+Workflow](BUILD_WORKFLOW.md). `Monday.build()` applies controlled patches in an
+isolated worktree, runs deterministic validation, requires a fresh ChatGPT review
+of the exact artifact, and stops after opening a pull request. It does not change
+the guarantees of `Monday.team()` described here.
+
 ## The pipeline
 
 | Stage | Role | Purpose | Blocking? |

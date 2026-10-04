@@ -70,6 +70,10 @@ agents/.sequences.json
 # Telegram offset, pending jobs, and single-process lock (runtime state)
 logs/telegram/
 
+# Autonomous delivery checkpoints and isolated worktrees. Approved source and
+# its review evidence are pushed to GitHub; restart-safe local audit state is not.
+logs/delivery/
+
 # Confluence publish mapping/history — local runtime state (never secrets)
 logs/publish/
 

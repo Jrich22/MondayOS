@@ -1,6 +1,6 @@
 # MondayOS — Architectural Decision Records
 
-**Last Updated:** 2026-09-02
+**Last Updated:** 2026-10-04
 
 This file is the canonical log of all architectural decisions made for MondayOS. Decisions are recorded in the format described in [DOCUMENTATION_STANDARDS.md](DOCUMENTATION_STANDARDS.md).
 
@@ -933,3 +933,74 @@ the two leaves a **gap**. Gaps are free; reuse is not.
   Both sides are lower bounds; the larger one is the safer floor.
 - Runtime ids are longer. That is the price of the uniqueness, and the sequence
   prefix keeps them readable and sortable.
+
+---
+
+## ADR-022: An Open Pull Request Is an Autonomous Review Artifact, Not a Release
+
+**Status:** Accepted
+
+**Date:** 2026-10-03
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+ADR-006 correctly prevents the general agent runtime from taking
+production-impacting actions without a human approval. It classified `commit`
+and `push` conservatively because that runtime had no structural way to prove
+what an agent had changed, what verification ran, or whether the reviewed bytes
+were the bytes being published.
+
+MondayOS now needs a fast, unattended implementation loop while retaining a hard
+boundary before release. A commit on a unique isolated branch and an open pull
+request are inspectable proposals; merging or deploying them is the action that
+changes a shared or production environment.
+
+### Decision
+
+The `Monday.build()` controller may create a commit, non-force-push its unique
+branch, and open a pull request without a human approval only when all of these
+conditions hold:
+
+- the work begins from an exact commit in the configured GitHub repository;
+- a coding model can propose text patches but cannot perform controller
+  mutations;
+- Codex builder and reviewer subprocesses run from a private non-repository
+  runtime with model tools disabled, so tracked project configuration and
+  repository instructions cannot reconfigure them;
+- fixed validation passes in containment with no model-selected commands;
+- containment is entered through macOS's system sandbox library before pytest or
+  candidate code loads; the candidate worktree is read-only, repository Git
+  history and host data are withheld, and network and process inspection are
+  denied;
+- descendants stay in the controller-owned process group, receive finite
+  process/file/CPU limits, and are additionally bounded by aggregate memory and
+  private-runtime storage watchdogs;
+- candidate pytest configuration is ignored and protected from proposed
+  changes; every deliberately excluded containment self-test is named with its
+  reason in the validation evidence;
+- credential and protected-path checks pass;
+- a fresh ChatGPT/Codex reviewer returns a high-confidence pass with no findings;
+- the controller passes that reviewer the bounded exact staged diff and the
+  reviewer independently verifies its SHA-256 digest before launch;
+- the review, validation evidence, staged diff, tree, commit, remote branch, and
+  pull request are cryptographically or exactly bound to the same artifact; and
+- the controller stops at the open pull request. It cannot merge or deploy.
+
+This is a narrow reclassification of one controller-owned delivery path. It does
+not weaken the approval gate for `Monday.execute()`, `Monday.agent()`,
+`Monday.team()`, publishing, secrets, destructive operations, live trading,
+merge, or deployment.
+
+### Consequences
+
+- Monday can repair and deliver reviewable code while the operator is away.
+- ChatGPT is the required independent quality gate; a missing, ambiguous, or
+  contradictory review fails closed.
+- Every published result is visible in GitHub as source, commit history, checks,
+  and a pull request before it can reach a release branch.
+- Runtime failures can leave a diagnostic worktree or an interrupted local job,
+  but they cannot silently authorize a different artifact.
+- Merge and deployment automation require a separate decision and are outside
+  this ADR.

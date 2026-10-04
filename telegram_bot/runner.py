@@ -6,7 +6,7 @@ import threading
 from collections.abc import Callable
 
 from telegram_bot.client import TelegramAPIError, TelegramClient, TelegramRateLimitError
-from telegram_bot.service import TelegramBotService
+from telegram_bot.service import TelegramBotService, TelegramUpdatePendingError
 from telegram_bot.state import TelegramState
 
 _MAX_HANDLER_ATTEMPTS = 3
@@ -63,6 +63,11 @@ class TelegramRunner:
                 continue
             try:
                 self._service.handle_update(update)
+            except TelegramUpdatePendingError:
+                # This update owns a durable delivery that is still running.
+                # Keep its offset and checkpoint live without consuming the
+                # bounded poison-update failure budget.
+                raise
             except TelegramAPIError as exc:
                 if exc.retryable:
                     raise
@@ -119,6 +124,9 @@ class TelegramRunner:
                 backoff = min(60, backoff * 2)
             except TelegramUpdateRetryError as exc:
                 print(str(exc), file=sys.stderr)
+                self._wait(backoff)
+                backoff = min(60, backoff * 2)
+            except TelegramUpdatePendingError:
                 self._wait(backoff)
                 backoff = min(60, backoff * 2)
 
