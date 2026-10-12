@@ -27,6 +27,7 @@ from monday.types import (
     AdviseResponse,
     AgentResponse,
     AskResponse,
+    BuildResponse,
     DoctorResponse,
     ExecuteResponse,
     GrowthResponse,
@@ -1715,6 +1716,85 @@ class Monday:
         except (OSError, ValueError, LookupError) as exc:
             return TeamResponse(action=action, success=False, message=str(exc))
 
+    def build(self, action: str = "run", **kwargs: Any) -> BuildResponse:
+        """
+        Build a task in an isolated worktree and stop after opening its pull request.
+
+        This is deliberately separate from :meth:`team`: the team workflow reasons
+        about a task, while this artifact-bound workflow may create reviewed source
+        changes.  The delivery implementation is imported only when this method is
+        called so importing ``monday`` never initializes model, Git, or GitHub tools.
+
+        Actions:
+            run          — execute one delivery. Requires ``task_id``. Optional:
+                           ``delivery_id``, ``progress_callback``, and
+                           ``checkpoint_callback``.
+            get          — retrieve one durable delivery. Requires ``delivery_id``.
+            history      — list deliveries. Optional: ``task_id`` and ``limit``.
+            capabilities — report local builder, reviewer, and GitHub readiness.
+
+        Delivery policy is not injectable through this public method. The
+        mandatory reviewer and controller-owned validation are fixed by the
+        delivery subsystem.
+        """
+        try:
+            from delivery.workflow import DeliveryWorkflow
+
+            workflow = DeliveryWorkflow(
+                project_root=self._config.project_root,
+                monday=self,
+            )
+
+            if action == "run":
+                job = workflow.run(
+                    task_id=str(kwargs.get("task_id", "")),
+                    delivery_id=(kwargs.get("delivery_id") or None),
+                    progress_callback=kwargs.get("progress_callback"),
+                    checkpoint_callback=kwargs.get("checkpoint_callback"),
+                )
+                return _build_response_from_job("run", job, run_outcome=True)
+
+            if action == "get":
+                job = workflow.get(str(kwargs.get("delivery_id", "")))
+                return _build_response_from_job("get", job, run_outcome=False)
+
+            if action == "history":
+                raw_history = workflow.history(
+                    task_id=kwargs.get("task_id"),
+                    limit=int(kwargs.get("limit", 20)),
+                )
+                if isinstance(raw_history, dict):
+                    raw_jobs = raw_history.get("jobs", raw_history.get("runs", []))
+                else:
+                    raw_jobs = raw_history
+                jobs = [_delivery_payload(item) for item in (raw_jobs or [])]
+                return BuildResponse(
+                    action="history",
+                    success=True,
+                    message=f"{len(jobs)} build(s)",
+                    data={"jobs": jobs, "count": len(jobs)},
+                )
+
+            if action == "capabilities":
+                capabilities = _delivery_payload(workflow.capabilities())
+                return BuildResponse(
+                    action="capabilities",
+                    success=True,
+                    message="Build runtime capabilities reported.",
+                    data=capabilities,
+                )
+
+            return BuildResponse(
+                action=action,
+                success=False,
+                message=(
+                    f"Unknown action {action!r}. "
+                    "Valid actions: run, get, history, capabilities"
+                ),
+            )
+        except (OSError, RuntimeError, TypeError, ValueError, LookupError) as exc:
+            return BuildResponse(action=action, success=False, message=str(exc))
+
     def publish(self, action: str = "confluence", **kwargs: Any) -> PublishResponse:
         """
         Publish a MondayOS document to an external destination (Confluence).
@@ -3382,6 +3462,55 @@ class Monday:
 
     def __repr__(self) -> str:
         return f"Monday(version={self.VERSION!r}, session_id={self._session_id!r})"
+
+
+def _delivery_payload(value: Any) -> dict[str, Any]:
+    """Return a detached public payload for a delivery record or capability set."""
+    if isinstance(value, dict):
+        return dict(value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        payload = to_dict()
+        if isinstance(payload, dict):
+            return dict(payload)
+    raise TypeError("Delivery workflow returned an unsupported result")
+
+
+def _build_response_from_job(
+    action: str,
+    job: Any,
+    *,
+    run_outcome: bool,
+) -> BuildResponse:
+    """Map an internal delivery job to the stable Monday public response."""
+    data = _delivery_payload(job)
+    raw_changed = data.get("changed_files", [])
+    changed_files = [str(item) for item in raw_changed] if isinstance(raw_changed, list) else []
+    raw_attempts = data.get("attempts", [])
+    attempts = [
+        _delivery_payload(item) for item in raw_attempts
+    ] if isinstance(raw_attempts, list) else []
+    succeeded = bool(data.get("success", False)) if run_outcome else True
+    delivery_id = str(data.get("delivery_id", ""))
+    status = str(data.get("status", ""))
+    message = str(data.get("message", ""))
+    if not message:
+        message = f"{delivery_id} is {status}".strip()
+    return BuildResponse(
+        action=action,
+        success=succeeded,
+        message=message,
+        delivery_id=delivery_id,
+        task_id=str(data.get("task_id", "")),
+        status=status,
+        phase=str(data.get("phase", "")),
+        branch=str(data.get("branch", "")),
+        commit_sha=str(data.get("commit_sha", "")),
+        pr_url=str(data.get("pr_url", "")),
+        changed_files=changed_files,
+        attempts=attempts,
+        data=data,
+    )
 
 
 def _growth_content_response(

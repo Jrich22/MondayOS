@@ -27,6 +27,7 @@ PACKAGES = (
     "brain",
     "core",
     "dashboard_api",
+    "delivery",
     "doctor",
     "events",
     "growth",
@@ -115,6 +116,10 @@ class TestNoImportCycles(unittest.TestCase):
         """
         deps = _dependencies()
         self.assertNotIn("monday", deps.get("growth", set()))
+
+    def test_delivery_stays_below_the_public_facade(self):
+        """Monday may invoke delivery lazily; delivery must never import Monday."""
+        self.assertNotIn("monday", _dependencies().get("delivery", set()))
 
 
 class TestLayering(unittest.TestCase):

@@ -20,6 +20,18 @@ def _ids(value: str) -> frozenset[int]:
     return frozenset(items)
 
 
+def _boolean(value: str, *, name: str, default: bool = False) -> bool:
+    """Parse one explicit environment boolean and reject unsafe typos."""
+    token = str(value or "").strip().lower()
+    if not token:
+        return default
+    if token in {"1", "true", "yes", "on"}:
+        return True
+    if token in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true or false")
+
+
 @dataclass(frozen=True)
 class TelegramConfig:
     """Validated bot settings. The token is excluded from repr and logs."""
@@ -30,6 +42,7 @@ class TelegramConfig:
     allowed_chat_ids: frozenset[int] = field(default_factory=frozenset)
     provider: str = ""
     poll_timeout: int = 30
+    live_build: bool = False
 
     @property
     def state_path(self) -> Path:
@@ -54,6 +67,10 @@ class TelegramConfig:
         )
         chats = _ids(env.get("MONDAYOS_TELEGRAM_ALLOWED_CHAT_IDS") or "")
         provider = (env.get("MONDAYOS_TELEGRAM_PROVIDER") or "").strip().lower()
+        live_build = _boolean(
+            env.get("MONDAYOS_TELEGRAM_LIVE_BUILD") or "",
+            name="MONDAYOS_TELEGRAM_LIVE_BUILD",
+        )
         raw_timeout = (env.get("MONDAYOS_TELEGRAM_POLL_TIMEOUT") or "30").strip()
         try:
             timeout = int(raw_timeout)
@@ -78,6 +95,7 @@ class TelegramConfig:
             project_root=Path(project_root).resolve(),
             provider=provider,
             poll_timeout=timeout,
+            live_build=live_build,
         )
 
     def safe_summary(self) -> dict[str, object]:
@@ -88,4 +106,5 @@ class TelegramConfig:
             "project_root": str(self.project_root),
             "provider": self.provider or "role-defaults-with-fallback",
             "poll_timeout": self.poll_timeout,
+            "live_build": self.live_build,
         }

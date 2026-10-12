@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import threading
 import unittest
 from io import BytesIO
@@ -21,9 +22,22 @@ from telegram_bot.client import (
     split_message,
 )
 from telegram_bot.config import TelegramConfig
-from telegram_bot.runner import TelegramRunner, TelegramUpdateRetryError
-from telegram_bot.service import TelegramBotService, _parse, _title
+from telegram_bot.runner import (
+    TelegramJobWorker,
+    TelegramRunner,
+    TelegramUpdateRetryError,
+)
+from telegram_bot.service import (
+    TelegramBotService,
+    TelegramUpdatePendingError,
+    _parse,
+    _title,
+)
 from telegram_bot.state import InstanceLock, TelegramState, TelegramStateError
+
+
+def _fake_token() -> str:
+    return "secret-" + "token"
 
 
 def _update(update_id=10, user_id=7, chat_id=7, text="Build a health endpoint"):
@@ -36,6 +50,33 @@ def _update(update_id=10, user_id=7, chat_id=7, text="Build a health endpoint"):
             "text": text,
         },
     }
+
+
+def test_launchd_example_has_explicit_tool_path_without_credentials() -> None:
+    plist_path = (
+        Path(__file__).resolve().parent.parent
+        / "deploy"
+        / "launchd"
+        / "com.mondayos.telegram.plist.example"
+    )
+    raw = plist_path.read_bytes()
+    payload = plistlib.loads(raw)
+    environment = payload["EnvironmentVariables"]
+
+    assert set(environment) == {"PATH"}
+    paths = environment["PATH"].split(":")
+    assert paths == [
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/"
+        "CodexCLI.app/Contents/MacOS",
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    assert raw.count(b"REPLACE_WITH_MONDAYOS_ROOT") == 5
+    assert all(marker not in raw.upper() for marker in (b"TOKEN", b"PASSWORD", b"API_KEY"))
 
 
 class FakeTelegramClient:
@@ -72,6 +113,9 @@ class FakeMonday:
         self.team_runs = []
         self.agent_runs = []
         self.agent_calls = []
+        self.build_calls = []
+        self.build_executions = 0
+        self.delivery_runs = {}
 
     def task(self, action, **kwargs):
         self.task_calls.append((action, kwargs))
@@ -204,6 +248,76 @@ class FakeMonday:
             )
         raise AssertionError(action)
 
+    def build(self, action, **kwargs):
+        self.build_calls.append((action, dict(kwargs)))
+        if action != "run":
+            raise AssertionError(action)
+        delivery_id = kwargs["delivery_id"]
+        existing = self.delivery_runs.get(delivery_id)
+        if existing is None:
+            self.build_executions += 1
+            callback = kwargs.get("progress_callback")
+            if callback:
+                callback({
+                    "delivery_id": delivery_id,
+                    "status": "running",
+                    "phase": "preparing",
+                    "attempts": [],
+                })
+                callback({
+                    "delivery_id": delivery_id,
+                    "status": "running",
+                    "phase": "implementing",
+                    "attempts": [],
+                })
+                callback({
+                    "delivery_id": delivery_id,
+                    "status": "running",
+                    "phase": "validating",
+                    "attempts": [],
+                })
+                callback({
+                    "delivery_id": delivery_id,
+                    "status": "running",
+                    "phase": "reviewing",
+                    "attempts": [],
+                })
+                callback({
+                    "delivery_id": delivery_id,
+                    "status": "running",
+                    "phase": "pushing",
+                    "attempts": [{"number": 1, "status": "passed"}],
+                })
+            existing = {
+                "delivery_id": delivery_id,
+                "task_id": kwargs["task_id"],
+                "status": "pr-open",
+                "phase": "completed",
+                "success": True,
+                "branch": "codex/task-0001-12345678",
+                "commit_sha": "a" * 40,
+                "pr_url": "https://github.com/example/mondayos/pull/55",
+                "changed_files": ["telegram_bot/service.py", "tests/test_telegram.py"],
+                "attempts": [{"number": 1, "status": "passed"}],
+                "message": "Pull request opened.",
+            }
+            self.delivery_runs[delivery_id] = existing
+        return SimpleNamespace(
+            action="run",
+            success=existing["success"],
+            message=existing["message"],
+            delivery_id=delivery_id,
+            task_id=existing["task_id"],
+            status=existing["status"],
+            phase=existing["phase"],
+            branch=existing["branch"],
+            commit_sha=existing["commit_sha"],
+            pr_url=existing["pr_url"],
+            changed_files=list(existing["changed_files"]),
+            attempts=list(existing["attempts"]),
+            data=dict(existing),
+        )
+
     def status(self):
         return SimpleNamespace(healthy=True, version="1.0.0")
 
@@ -213,7 +327,7 @@ class TelegramFixture(unittest.TestCase):
         self.tmp = TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.config = TelegramConfig(
-            token="secret-token",
+            token=_fake_token(),
             allowed_user_ids=frozenset({7}),
             project_root=self.root,
             provider="fake",
@@ -251,6 +365,24 @@ class TestTelegramConfig(unittest.TestCase):
         self.assertEqual(cfg.allowed_chat_ids, frozenset({-100123}))
         self.assertNotIn("super-secret", repr(cfg))
         self.assertNotIn("super-secret", str(cfg.safe_summary()))
+        self.assertFalse(cfg.live_build)
+
+    def test_live_build_is_explicit_and_strict(self):
+        with TemporaryDirectory() as tmp:
+            cfg = TelegramConfig.from_env(Path(tmp), {
+                "TELEGRAM_BOT_TOKEN": "token",
+                "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+                "MONDAYOS_TELEGRAM_LIVE_BUILD": "true",
+            })
+            self.assertTrue(cfg.live_build)
+            self.assertTrue(cfg.safe_summary()["live_build"])
+
+            with self.assertRaisesRegex(ValueError, "must be true or false"):
+                TelegramConfig.from_env(Path(tmp), {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+                    "MONDAYOS_TELEGRAM_LIVE_BUILD": "tru",
+                })
 
     def test_rejects_non_numeric_allowlist_and_invalid_timeout(self):
         with TemporaryDirectory() as tmp:
@@ -313,7 +445,7 @@ class TestTelegramService(TelegramFixture):
 
     def test_command_for_other_bot_is_ignored_in_allowlisted_group(self):
         group_config = TelegramConfig(
-            token="secret-token",
+            token=_fake_token(),
             allowed_user_ids=frozenset({7}),
             allowed_chat_ids=frozenset({-100}),
             project_root=self.root,
@@ -373,6 +505,211 @@ class TestTelegramService(TelegramFixture):
         self.assertIn("Created TASK-0001", combined)
         self.assertIn("Product strategy: pass via fake", combined)
         self.assertIn("/approve run-reviewer-1", combined)
+
+    def test_disabled_live_flag_keeps_build_on_team_workflow(self):
+        self.service.handle_update(_update(text="/build Keep the safe workflow"))
+
+        self.assertEqual(self.monday.team_calls, 1)
+        self.assertEqual(self.monday.build_executions, 0)
+        self.assertEqual(self.state.job(10)["workflow"], "team-review")
+
+    def test_private_build_runs_live_delivery_and_persists_progress(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            provider="fake",
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        TelegramRunner(self.client, service, self.state).start()
+
+        service.handle_update(_update(text="/build Ship a health endpoint"))
+
+        self.assertEqual(len(self.monday.tasks), 1)
+        self.assertEqual(self.monday.team_calls, 0)
+        self.assertEqual(self.monday.build_executions, 1)
+        action, request = self.monday.build_calls[-1]
+        self.assertEqual(action, "run")
+        self.assertEqual(request["task_id"], "TASK-0001")
+        self.assertRegex(request["delivery_id"], r"^delivery-telegram-[0-9a-f]{20}$")
+        job = self.state.job(10)
+        self.assertEqual(job["workflow"], "live-build")
+        self.assertEqual(job["delivery_id"], request["delivery_id"])
+        self.assertEqual(job["delivery_status"], "pr-open")
+        self.assertEqual(job["delivery_progress"]["phase"], "pushing")
+        self.assertTrue(job["delivery_terminal"])
+        self.assertTrue(job["delivery_final_sent"])
+        combined = "\n".join(text for _, text in self.client.sent)
+        self.assertIn("isolated build workspace", combined)
+        self.assertIn("Monday is validating the build", combined)
+        self.assertIn("ChatGPT is reviewing the build", combined)
+        self.assertIn("passed ChatGPT review", combined)
+        self.assertIn("https://github.com/example/mondayos/pull/55", combined)
+
+    def test_nonterminal_live_delivery_stays_retryable_until_reconciled(self):
+        created = self.monday.task(
+            "create",
+            title="Existing",
+            objective="Ship it",
+            priority="P2",
+        )
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        service.bind_bot_identity(self.client.get_me())
+        delivery_id = service._delivery_id(20)
+        self.monday.delivery_runs[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": created.task_id,
+            "status": "running",
+            "phase": "validating",
+            "success": False,
+            "branch": "codex/task-0001-12345678",
+            "commit_sha": "",
+            "pr_url": "",
+            "changed_files": ["app.py"],
+            "attempts": [{"number": 1, "status": "validating"}],
+            "message": "Validation is still running.",
+        }
+        update = _update(update_id=20, text=f"/deliver {created.task_id}")
+
+        with self.assertRaises(TelegramUpdatePendingError):
+            service.handle_update(update)
+
+        pending = self.state.job(20)
+        self.assertFalse(pending["delivery_terminal"])
+        self.assertFalse(pending["delivery_final_sent"])
+        self.assertIn("validating", self.client.sent[-1][1].lower())
+
+        durable = self.monday.delivery_runs[delivery_id]
+        durable.update({
+            "status": "interrupted",
+            "phase": "interrupted",
+            "message": "Start a new build request with a new delivery identity.",
+        })
+        service.handle_update(update)
+
+        settled = self.state.job(20)
+        self.assertTrue(settled["delivery_terminal"])
+        self.assertTrue(settled["delivery_final_sent"])
+        self.assertEqual(len(self.monday.build_calls), 2)
+        self.assertIn("live build: interrupted", self.client.sent[-1][1])
+
+    def test_private_deliver_runs_existing_task_without_creating_another(self):
+        created = self.monday.task(
+            "create", title="Existing", objective="Ship it", priority="P2",
+        )
+        initial_task_calls = len(self.monday.task_calls)
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+
+        service.handle_update(
+            _update(update_id=18, text=f"/deliver {created.task_id}")
+        )
+
+        self.assertEqual(len(self.monday.tasks), 1)
+        self.assertEqual(self.monday.build_executions, 1)
+        self.assertEqual(self.monday.build_calls[-1][1]["task_id"], created.task_id)
+        self.assertFalse(any(
+            action == "create"
+            for action, _kwargs in self.monday.task_calls[initial_task_calls:]
+        ))
+
+    def test_live_build_duplicate_update_reuses_task_and_delivery(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        update = _update(update_id=19, text="/build Ship this exactly once")
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        identity = self.client.get_me()
+        service.bind_bot_identity(identity)
+
+        service.handle_update(update)
+        first_id = self.state.job(19)["delivery_id"]
+        restarted = TelegramBotService(
+            self.monday,
+            self.client,
+            TelegramState(config.state_path),
+            config,
+        )
+        restarted.bind_bot_identity(identity)
+        restarted.handle_update(update)
+
+        self.assertEqual(len(self.monday.tasks), 1)
+        self.assertEqual(self.monday.build_executions, 1)
+        self.assertEqual(len(self.monday.build_calls), 1)
+        self.assertEqual(TelegramState(config.state_path).job(19)["delivery_id"], first_id)
+
+    def test_live_mode_never_runs_live_builds_from_groups(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            allowed_chat_ids=frozenset({-100}),
+            project_root=self.root,
+            provider="fake",
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        update = _update(chat_id=-100, text="/build Keep groups review-only")
+        update["message"]["chat"]["type"] = "group"
+
+        service.handle_update(update)
+
+        self.assertEqual(self.monday.team_calls, 1)
+        self.assertEqual(self.monday.build_executions, 0)
+
+    def test_group_deliver_is_silently_ignored_even_when_live_is_enabled(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            allowed_chat_ids=frozenset({-100}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        update = _update(chat_id=-100, text="/deliver TASK-0001")
+        update["message"]["chat"]["type"] = "group"
+
+        service.handle_update(update)
+
+        self.assertEqual(self.monday.build_executions, 0)
+        self.assertFalse(self.client.sent)
+
+    def test_deliver_reports_disabled_without_touching_task_or_build(self):
+        self.service.handle_update(_update(text="/deliver TASK-0001"))
+
+        self.assertIn("Live builds are disabled", self.client.sent[-1][1])
+        self.assertFalse(self.monday.task_calls)
+        self.assertEqual(self.monday.build_executions, 0)
+
+    def test_live_flag_makes_private_plain_text_a_live_build_request(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            provider="fake",
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+
+        service.handle_update(_update(text="Build this from an ordinary message"))
+
+        self.assertEqual(self.monday.team_calls, 0)
+        self.assertEqual(self.monday.build_executions, 1)
+        self.assertEqual(self.state.job(10)["workflow"], "live-build")
 
     def test_retry_same_update_does_not_duplicate_task_or_team_run(self):
         update = _update()
@@ -599,6 +936,118 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(final.job(10), {})
         self.assertEqual(final.completed_job(10)["task_id"], "TASK-0001")
 
+    def test_legacy_state_load_is_read_only_until_the_first_mutation(self):
+        legacy = {
+            "version": 2,
+            "bot_id": 99,
+            "bot_username": "monday_test_bot",
+            "last_update_id": -1,
+            "jobs": {},
+            "completed_jobs": {},
+            "failed_jobs": {},
+        }
+        self.config.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.state_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+        loaded = TelegramState(self.config.state_path)
+
+        self.assertEqual(
+            json.loads(self.config.state_path.read_text(encoding="utf-8"))["version"],
+            2,
+        )
+        loaded.bind_bot_identity(99, "monday_test_bot")
+        self.assertEqual(
+            json.loads(self.config.state_path.read_text(encoding="utf-8"))["version"],
+            3,
+        )
+
+    def test_enqueue_is_idempotent_and_rejects_changed_duplicate_content(self):
+        request = _update(update_id=10, text="Build exactly once")
+
+        self.assertEqual(self.state.enqueue(10, request), (True, 1))
+        self.assertEqual(self.state.enqueue(10, request), (False, 1))
+        self.assertEqual(self.state.pending_count, 1)
+        self.assertEqual(self.state.next_offset, 11)
+
+        changed = _update(update_id=10, text="Build something different")
+        with self.assertRaisesRegex(TelegramStateError, "does not match"):
+            self.state.enqueue(10, changed)
+        with self.assertRaisesRegex(TelegramStateError, "queue key"):
+            self.state.enqueue(11, request)
+
+        self.state.acknowledge(10)
+        self.assertEqual(self.state.enqueue(10, request), (False, 0))
+        self.assertEqual(self.state.pending_count, 0)
+
+    def test_worker_claims_fifo_and_processes_only_one_request_per_call(self):
+        handled = []
+
+        class RecordingService:
+            def handle_update(self, update):
+                handled.append(update["update_id"])
+
+        # Deliberately enqueue out of order: Telegram update ids define FIFO.
+        self.state.enqueue(12, _update(update_id=12, text="second"))
+        self.state.enqueue(11, _update(update_id=11, text="first"))
+        worker = TelegramJobWorker(
+            RecordingService(),
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        self.assertTrue(worker.run_once())
+        self.assertEqual(handled, [11])
+        self.assertEqual(self.state.pending_count, 1)
+        self.assertTrue(worker.run_once())
+        self.assertEqual(handled, [11, 12])
+        self.assertEqual(self.state.pending_count, 0)
+        self.assertFalse(worker.run_once())
+
+    def test_intake_persists_work_without_running_monday_until_worker_drain(self):
+        self.client.updates = [
+            _update(update_id=50, text="Build the first request"),
+            _update(update_id=51, text="Build the second request"),
+        ]
+        runner = TelegramRunner(
+            self.client, self.service, self.state, poll_timeout=1,
+        )
+
+        self.assertEqual(runner.ingest_once(), 2)
+
+        self.assertEqual(self.state.next_offset, 52)
+        self.assertEqual(self.state.pending_count, 2)
+        self.assertFalse(self.monday.tasks)
+        self.assertEqual(self.monday.team_calls, 0)
+        self.assertEqual(self.monday.build_executions, 0)
+
+        # The compatibility run drains the already durable inbox even though
+        # this poll contains no new Telegram updates.
+        self.assertEqual(runner.run_once(), 0)
+        self.assertEqual(len(self.monday.tasks), 2)
+        self.assertEqual(self.monday.team_calls, 2)
+        self.assertEqual(self.state.pending_count, 0)
+
+    def test_unauthorized_update_body_is_never_persisted(self):
+        secret = "never-persist-this-private-message"
+        self.client.updates = [
+            _update(update_id=52, user_id=999, chat_id=999, text=secret),
+        ]
+        runner = TelegramRunner(
+            self.client, self.service, self.state, poll_timeout=1,
+        )
+
+        self.assertEqual(runner.ingest_once(), 1)
+
+        self.assertEqual(self.state.next_offset, 53)
+        self.assertEqual(self.state.pending_count, 0)
+        self.assertEqual(self.state.job(52), {})
+        persisted = self.config.state_path.read_text(encoding="utf-8")
+        self.assertNotIn(secret, persisted)
+        self.assertNotIn('"999"', persisted)
+        self.assertFalse(self.monday.tasks)
+        self.assertFalse(self.client.sent)
+
     def test_corrupt_state_fails_closed_instead_of_replaying_updates(self):
         self.config.state_path.parent.mkdir(parents=True)
         self.config.state_path.write_text("not-json", encoding="utf-8")
@@ -620,6 +1069,256 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(self.state.next_offset, 13)
         self.assertEqual(self.client.offsets, [None])
 
+    def test_background_intake_keeps_polling_while_worker_is_blocked(self):
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_queued = threading.Event()
+        stop = threading.Event()
+        errors = []
+
+        class BlockingMonday(FakeMonday):
+            def team(self, action, **kwargs):
+                if action == "run":
+                    first_started.set()
+                    if not release_first.wait(5):
+                        raise AssertionError("test did not release the active job")
+                return super().team(action, **kwargs)
+
+        class SequencedClient(FakeTelegramClient):
+            def __init__(self):
+                super().__init__()
+                self.poll_count = 0
+
+            def get_updates(self, *, offset, timeout):
+                self.offsets.append(offset)
+                self.poll_count += 1
+                if self.poll_count == 1:
+                    return [_update(update_id=100, text="Build the slow request")]
+                if self.poll_count == 2:
+                    first_started.wait(5)
+                    return [_update(update_id=101, text="Build the queued request")]
+                stop.wait(5)
+                return []
+
+            def send_message(self, chat_id, text):
+                result = super().send_message(chat_id, text)
+                if "Queue position: 2" in text:
+                    second_queued.set()
+                return result
+
+        monday = BlockingMonday()
+        client = SequencedClient()
+        service = TelegramBotService(monday, client, self.state, self.config)
+        runner = TelegramRunner(
+            client,
+            service,
+            self.state,
+            poll_timeout=1,
+            stop_event=stop,
+        )
+
+        def run() -> None:
+            try:
+                runner.run_forever()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(second_queued.wait(5))
+
+        self.assertEqual(self.state.next_offset, 102)
+        self.assertEqual(self.state.pending_count, 2)
+        self.assertEqual(self.state.job(100)["phase"], "running")
+        self.assertEqual(self.state.job(101)["phase"], "queued")
+        self.assertEqual(len(monday.tasks), 1)
+        self.assertEqual(monday.team_calls, 0)
+
+        # A clean stop finishes the active checkpoint but deliberately leaves
+        # the second durable request for the next process to recover.
+        runner.stop()
+        release_first.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.state.pending_count, 1)
+        self.assertEqual(self.state.job(101)["phase"], "queued")
+
+    def test_restart_drains_running_and_queued_jobs_with_same_delivery_id(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        self.state.bind_bot_identity(99, "monday_test_bot")
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        service.bind_bot_identity(self.client.get_me())
+        build_update = _update(update_id=70, text="/build Recover this build")
+        help_update = _update(update_id=71, text="/help")
+        delivery_id = service._delivery_id(70)
+        self.monday.delivery_runs[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "status": "running",
+            "phase": "validating",
+            "success": False,
+            "branch": "codex/task-0001-12345678",
+            "commit_sha": "",
+            "pr_url": "",
+            "changed_files": ["app.py"],
+            "attempts": [{"number": 1, "status": "validating"}],
+            "message": "Validation is still running.",
+        }
+        normalized = service.normalize_update(build_update)
+        self.assertIsNotNone(normalized)
+        self.state.enqueue(70, normalized)
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        with self.assertRaises(TelegramUpdatePendingError):
+            worker.run_once()
+
+        saved = self.state.job(70)
+        self.assertEqual(saved["phase"], "waiting")
+        self.assertEqual(saved["delivery_id"], delivery_id)
+        normalized_help = service.normalize_update(help_update)
+        self.assertIsNotNone(normalized_help)
+        self.state.enqueue(71, normalized_help)
+        self.assertEqual(self.state.pending_count, 2)
+
+        self.monday.delivery_runs[delivery_id].update({
+            "status": "pr-open",
+            "phase": "completed",
+            "success": True,
+            "commit_sha": "a" * 40,
+            "pr_url": "https://github.com/example/mondayos/pull/55",
+            "message": "Pull request opened.",
+        })
+        restarted_state = TelegramState(config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday, self.client, restarted_state, config,
+        )
+        restarted_service.bind_bot_identity(self.client.get_me())
+        restarted_runner = TelegramRunner(
+            self.client,
+            restarted_service,
+            restarted_state,
+            poll_timeout=1,
+        )
+
+        self.assertEqual(restarted_runner.run_once(), 0)
+
+        self.assertEqual(restarted_state.pending_count, 0)
+        self.assertEqual(len(self.monday.tasks), 1)
+        self.assertEqual(
+            [request["delivery_id"] for _action, request in self.monday.build_calls],
+            [delivery_id, delivery_id],
+        )
+        self.assertEqual(
+            restarted_state.completed_job(70)["delivery_id"], delivery_id,
+        )
+
+    def test_nonterminal_live_build_remains_pending_until_runner_reconciles_it(self):
+        created = self.monday.task(
+            "create", title="Existing", objective="Ship it", priority="P2",
+        )
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        service.bind_bot_identity(self.client.get_me())
+        update = _update(update_id=27, text=f"/deliver {created.task_id}")
+        delivery_id = service._delivery_id(27)
+        self.monday.delivery_runs[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": created.task_id,
+            "status": "running",
+            "phase": "validating",
+            "success": False,
+            "branch": "codex/task-0001-12345678",
+            "commit_sha": "",
+            "pr_url": "",
+            "changed_files": ["app.py"],
+            "attempts": [{"number": 1, "status": "validating"}],
+            "message": "Validation is still running.",
+        }
+        runner = TelegramRunner(self.client, service, self.state, poll_timeout=1)
+
+        self.client.updates = [update]
+        with self.assertRaises(TelegramUpdatePendingError):
+            runner.run_once()
+
+        pending = self.state.job(27)
+        self.assertFalse(pending["delivery_terminal"])
+        self.assertNotIn("attempt_count", pending)
+        self.assertEqual(pending["phase"], "waiting")
+        self.assertEqual(self.state.next_offset, 28)
+        self.assertFalse(self.state.is_terminal(27))
+
+        self.monday.delivery_runs[delivery_id].update({
+            "status": "pr-open",
+            "phase": "completed",
+            "success": True,
+            "commit_sha": "a" * 40,
+            "pr_url": "https://github.com/example/mondayos/pull/55",
+            "message": "Pull request opened.",
+        })
+        self.client.updates = [update]
+
+        self.assertEqual(runner.run_once(), 1)
+        self.assertEqual(self.state.next_offset, 28)
+        self.assertEqual(self.state.completed_job(27)["delivery_status"], "pr-open")
+        self.assertEqual(len(self.monday.build_calls), 2)
+
+    def test_pending_update_uses_backoff_without_failure_counting(self):
+        stop = threading.Event()
+        waits = []
+        update = _update(update_id=28, text="/help")
+
+        class PendingService:
+            def handle_update(self, _update):
+                raise TelegramUpdatePendingError("still running")
+
+        def wait(seconds):
+            waits.append(seconds)
+            if len(waits) == 3:
+                stop.set()
+            return True
+
+        self.client.updates = [update]
+        runner = TelegramRunner(
+            self.client,
+            PendingService(),
+            self.state,
+            poll_timeout=1,
+        )
+        self.assertEqual(runner.ingest_once(), 1)
+        worker = TelegramJobWorker(
+            PendingService(),
+            self.state,
+            stop_event=stop,
+            wake_event=threading.Event(),
+            wait=wait,
+        )
+
+        worker.run_forever()
+
+        self.assertEqual(waits, [1, 2, 4])
+        self.assertEqual(self.client.offsets, [None])
+        self.assertEqual(self.state.job(28)["phase"], "waiting")
+        self.assertEqual(self.state.next_offset, 29)
+        self.assertEqual(self.state.pending_count, 1)
+        self.assertNotIn("attempt_count", self.state.job(28))
+        self.assertFalse(self.state.is_terminal(28))
+
     def test_same_bot_identity_retains_persisted_offset(self):
         self.state.bind_bot_identity(99, "monday_test_bot")
         self.state.acknowledge(61)
@@ -631,6 +1330,39 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
         self.assertEqual(self.state.next_offset, 62)
         self.assertEqual(self.client.offsets, [62])
+
+    def test_bot_rename_cannot_invalidate_an_addressed_queued_command(self):
+        self.client.identity = {"id": 99, "username": "old_monday_bot"}
+        runner = TelegramRunner(
+            self.client, self.service, self.state, poll_timeout=1,
+        )
+        runner.start()
+        self.client.updates = [
+            _update(
+                update_id=62,
+                text="/build@old_monday_bot Keep this queued request",
+            ),
+        ]
+
+        self.assertEqual(runner.ingest_once(), 1)
+        saved = self.state.job(62)["request"]["message"]["text"]
+        self.assertEqual(saved, "/build Keep this queued request")
+        self.assertFalse(self.monday.tasks)
+
+        self.client.identity = {"id": 99, "username": "new_monday_bot"}
+        restarted_state = TelegramState(self.config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday, self.client, restarted_state, self.config,
+        )
+        restarted = TelegramRunner(
+            self.client, restarted_service, restarted_state, poll_timeout=1,
+        )
+        restarted.start()
+
+        self.assertEqual(restarted.run_once(), 0)
+        self.assertEqual(len(self.monday.tasks), 1)
+        self.assertEqual(self.monday.team_calls, 1)
+        self.assertEqual(restarted_state.pending_count, 0)
 
     def test_changed_bot_identity_resets_offset_before_polling(self):
         self.state.bind_bot_identity(88, "old_bot")
@@ -683,7 +1415,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
             def send_message(self, chat_id, text):
                 self.send_count += 1
-                if self.fail_enabled and self.send_count == 4:
+                if self.fail_enabled and self.send_count == 5:
                     raise TelegramAPIError("temporary outage", retryable=True)
                 return super().send_message(chat_id, text)
 
@@ -695,7 +1427,8 @@ class TestTelegramStateAndRunner(TelegramFixture):
             runner.run_once()
         self.assertEqual(len(self.monday.tasks), 1)
         self.assertEqual(self.monday.team_calls, 1)
-        self.assertIsNone(self.state.next_offset)
+        self.assertEqual(self.state.next_offset, 16)
+        self.assertEqual(self.state.job(15)["phase"], "waiting")
 
         client.fail_enabled = False
         client.updates = [update]
@@ -753,7 +1486,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
             self.client.updates = [update]
             with self.assertRaises(TelegramUpdateRetryError):
                 runner.run_once()
-            self.assertIsNone(self.state.next_offset)
+            self.assertEqual(self.state.next_offset, 32)
             self.assertEqual(self.state.job(31)["attempt_count"], expected_attempt)
 
         self.client.updates = [update]
@@ -782,6 +1515,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
             runner.run_once()
 
         self.assertEqual(self.state.job(35)["attempt_count"], 1)
+        self.assertEqual(self.state.next_offset, 36)
         self.assertFalse(self.state.is_terminal(35))
 
     def test_permanent_send_failure_dead_letters_only_that_update(self):
@@ -961,7 +1695,7 @@ class TestTelegramMondayIntegration(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = TelegramConfig(
-                token="secret-token",
+                token=_fake_token(),
                 allowed_user_ids=frozenset({7}),
                 project_root=root,
                 provider="fake",
@@ -986,7 +1720,7 @@ class TestTelegramMondayIntegration(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = TelegramConfig(
-                token="secret-token",
+                token=_fake_token(),
                 allowed_user_ids=frozenset({7}),
                 project_root=root,
                 provider="fake",
@@ -1018,7 +1752,7 @@ class TestTelegramMondayIntegration(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = TelegramConfig(
-                token="secret-token",
+                token=_fake_token(),
                 allowed_user_ids=frozenset({7}),
                 project_root=root,
                 provider="fake",

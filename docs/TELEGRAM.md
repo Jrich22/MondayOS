@@ -5,24 +5,33 @@ outbound long polling, so it does not open a public port or require a tunnel.
 
 ## What this increment does
 
-- Accepts normal private text as a build request.
+- Accepts private text as either an advisory-team request (default) or an
+  autonomous live build (explicit opt-in).
 - Creates a durable MondayOS task with Telegram provenance.
-- Assigns the task to the MondayOS agent team in review mode.
-- Reports team and stage progress back to the originating chat.
+- Runs the MondayOS agent team in review mode by default.
+- With live builds enabled, edits an isolated worktree, validates, automatically
+  repairs, requires ChatGPT approval of the exact artifact, and opens a PR.
+- Reports team/build progress back to the originating chat.
 - Supports task/system status, active-task listing, and explicit run commands.
 - Supports idempotent approval and rejection of reviewed runs.
-- Recovers safely after restart without creating a second task for the same
-  Telegram update. An interrupted team run is marked and one replacement run is
-  linked to the same durable Telegram job.
-- Retries unexpected handler failures three times, then preserves a dead-letter
-  checkpoint so one poison update cannot block every later request.
+- Atomically saves each accepted, minimal request and the advanced Telegram
+  offset in `logs/telegram/state.json`, then immediately confirms that it was
+  saved and reports its FIFO queue position. Unauthorized or otherwise ignored
+  content is never queued.
+- Keeps polling and acknowledging new requests while one non-daemon worker
+  exclusively runs Monday/model work. Commands execute in FIFO order, and
+  provider/build concurrency stays at one because a MondayOS instance and its
+  providers are intentionally not thread-safe.
+- Recovers queued, running, waiting, and retrying work after restart with the
+  same Telegram job, task, run, and delivery identities. It retries an
+  unexpected poison failure at most three times, then terminalizes that job so
+  later work can proceed.
+- Removes active request text when a job becomes a terminal replay tombstone.
+  A graceful stop finishes the current job and leaves the rest durably queued.
 
-The Telegram worker is sequential because a MondayOS instance and its providers
-are intentionally not thread-safe. Telegram retains queued updates while the
-worker is busy, but Telegram's Bot API only retains them for up to 24 hours. This
-first increment therefore should not be left offline for more than a day; a later
-queue-worker split will persist incoming requests immediately while long builds
-run separately.
+Telegram is the transport only until an accepted request is saved. After that
+atomic checkpoint, the local queue—not Telegram's temporary update retention—is
+the source of truth for pending work.
 
 ## Create the bot
 
@@ -51,6 +60,10 @@ MONDAYOS_TELEGRAM_ALLOWED_CHAT_IDS=-1001234567890
 # Optional: pin the productive team stages to one provider.
 # The final reviewer still requires OpenAI/ChatGPT. Leave unset for role-aware fallback.
 MONDAYOS_TELEGRAM_PROVIDER=deepseek
+
+# Optional: private-chat autonomous builds. Default is false.
+# Requires Codex/ChatGPT and GitHub CLI authentication; Claude Code is optional.
+MONDAYOS_TELEGRAM_LIVE_BUILD=true
 ```
 
 Provider credentials remain in this same local environment file, as documented
@@ -66,7 +79,8 @@ From the MondayOS project root:
 monday telegram
 ```
 
-For one polling cycle during setup:
+To ingest one long-poll response, drain the durable inbox synchronously, and
+then exit:
 
 ```bash
 monday telegram --once
@@ -86,12 +100,15 @@ At startup MondayOS verifies the bot identity and removes any prior webhook
 without dropping queued updates. Polling and webhooks cannot be used at the same
 time, so this ensures one predictable delivery path.
 
-The saved offset, retry jobs, and replay tombstones are bound to the bot's
-numeric Telegram identity. Renaming the same bot keeps its offset. Replacing the
-token with a different bot clears the old bot's update state before polling, so
-one bot's offset cannot silently discard another bot's pending messages.
+The saved offset, durable FIFO jobs, retries, and replay tombstones in
+`logs/telegram/state.json` are bound to the bot's numeric Telegram identity.
+Renaming the same bot keeps its state. Replacing the token with a different bot
+clears the old bot's update state before polling, so one bot's offset cannot
+silently discard another bot's pending messages.
 
 ## Commands
+
+With live builds disabled (the default):
 
 ```text
 normal text             create and run a task
@@ -104,6 +121,15 @@ normal text             create and run a task
 /help                   show help
 ```
 
+With `MONDAYOS_TELEGRAM_LIVE_BUILD=true` in a private chat:
+
+```text
+normal text             create, build, validate, review, and open a PR
+/build REQUEST          create, build, validate, review, and open a PR
+/deliver TASK-ID        deliver an existing task through a PR
+/run TASK-ID            run the advisory agent team (unchanged)
+```
+
 Only allowlisted Telegram users are processed. Unauthorized messages are ignored
 without revealing whether the bot controls MondayOS. Group messages are ignored
 unless the chat is separately allowlisted, and group chatter never becomes a
@@ -112,8 +138,10 @@ task implicitly. In an allowlisted group, a command addressed with
 addressed to another bot are ignored.
 
 Allowlisted groups intentionally expose only `/build`, `/run`, `/status`, and
-`/help`. Task listings and approval decisions (`/tasks`, `/approve`, `/reject`)
-remain private-chat-only even when the group itself is allowlisted.
+`/help`. A group `/build` always uses the advisory team even when private live
+builds are enabled; `/deliver` is ignored. Task listings and approval decisions
+(`/tasks`, `/approve`, `/reject`) remain private-chat-only even when the group
+itself is allowlisted.
 
 ## Always-on Mac mini service
 
@@ -123,6 +151,13 @@ of its root-path placeholder, copy it to
 `~/Library/LaunchAgents/com.mondayos.telegram.plist`,
 and load it with launchd. It contains no credentials; `monday telegram` reads the
 Git-ignored project `.env` at startup.
+
+The example defines an explicit, minimal `PATH` because launchd does not inherit
+your interactive shell setup. It includes the Codex CLI bundled with the ChatGPT
+app, Apple Silicon Homebrew, Intel Homebrew, and macOS system tool locations. If
+you installed Codex, Claude Code, or GitHub CLI somewhere else, add that exact
+executable directory to the copied plist before loading it. Never put tokens or
+API keys in the plist.
 
 ```bash
 chmod 600 .env
@@ -147,14 +182,26 @@ launchctl bootout "gui/$(id -u)" \
 
 Diagnostics are written to `logs/telegram-stdout.log` and
 `logs/telegram-stderr.log`. A startup failure is usually an invalid bot token,
-an empty user allowlist, an unreplaced plist path, or another worker already
-holding `logs/telegram/bot.lock`.
+an empty user allowlist, an unreplaced plist path, a required CLI installed
+outside the plist's explicit `PATH`, or another worker already holding
+`logs/telegram/bot.lock`.
 
 ## Current boundary
 
-This slice provides the remote control plane and runs the existing MondayOS team
-workflow. That workflow produces planned/reviewed agent output and a final review
-gate that still requires human approval in this increment. It does **not** yet
-edit code in the terminal, run the ChatGPT repair loop, commit, push, merge,
-deploy, or transcribe voice. Those are subsequent increments that will reuse this
-same durable Telegram request path.
+The default Telegram behavior still runs the advisory team and requires its
+existing human approval. The opt-in private live-build path performs real code
+delivery through `Monday.build()`: isolated patch application, fixed tests,
+bounded repair, exact-artifact ChatGPT review, commit, push, and pull request.
+It does **not** merge, deploy, operate on registered external repositories, or
+transcribe voice.
+
+Accepted work runs through the durable FIFO queue. The polling intake stays
+responsive while its single worker performs a team run or live build, so model
+and build concurrency remains one. Restart preserves stable work identities;
+graceful shutdown finishes the active item and leaves later items queued. The
+`--once` setup mode intentionally ingests and drains synchronously instead.
+
+Queue state is local operational data under `logs/telegram/` and remains
+Git-ignored. Terminal replay tombstones retain the identity needed for
+deduplication but not the active request text. Full build details are in
+[BUILD_WORKFLOW.md](BUILD_WORKFLOW.md).

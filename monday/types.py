@@ -380,6 +380,48 @@ class TeamResponse:
 
 
 @dataclass
+class BuildResponse:
+    """
+    Response from Monday.build().
+
+    A single shape covers starting, retrieving, and listing artifact-bound
+    delivery jobs as well as reporting runtime capabilities.  The flattened
+    fields are the values callers most often need; ``data`` retains the full
+    durable job record (or the action-specific listing/capability payload).
+
+    Attributes:
+        action:        The build action performed: run | get | history | capabilities.
+        success:       True when the requested action succeeded.  For a run this
+                       is the delivery job's outcome, not merely successful dispatch.
+        message:       Human-readable status or error message.
+        delivery_id:   Durable delivery-job identifier.
+        task_id:       MondayOS task implemented by this build.
+        status:        Delivery outcome, such as reserved, running, failed, or pr-open.
+        phase:         Current workflow phase within the delivery outcome.
+        branch:        Isolated Git branch used for the build.
+        commit_sha:    Commit created after verification and review.
+        pr_url:        Pull-request URL when delivery reached pr-open.
+        changed_files: Repository-relative files included in the reviewed artifact.
+        attempts:      Bounded implementation/verification/review attempt records.
+        data:          Full action-specific payload.
+    """
+
+    action: str
+    success: bool
+    message: str = ""
+    delivery_id: str = ""
+    task_id: str = ""
+    status: str = ""
+    phase: str = ""
+    branch: str = ""
+    commit_sha: str = ""
+    pr_url: str = ""
+    changed_files: list[str] = field(default_factory=list)
+    attempts: list[dict[str, Any]] = field(default_factory=list)
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class PublishResponse:
     """
     Response from Monday.publish().
