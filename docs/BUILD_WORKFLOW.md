@@ -42,9 +42,9 @@ stale and stops delivery.
 
 ## Current scope
 
-This first implementation intentionally builds only the trusted MondayOS
-repository configured as `project_root`. Registered external project delivery,
-background workers, automatic merge, and deployment are later increments.
+This implementation intentionally builds only the trusted MondayOS repository
+configured as `project_root`. Registered external project delivery, automatic
+merge, and deployment are later increments.
 
 The workflow:
 
@@ -166,20 +166,30 @@ sends phase updates and the final PR link. Allowlisted group `/build` commands
 continue to use the advisory team workflow; groups can never start terminal code
 execution.
 
-The Telegram implementation is synchronous in this increment. The bot cannot
-poll for another update while a build is running; a durable background queue is
-the next scaling step.
+Telegram atomically persists each accepted minimal request together with its
+advanced offset in `logs/telegram/state.json`, immediately returns a saved
+receipt with the FIFO position, and continues polling. One non-daemon worker
+exclusively performs Monday/model jobs, including `Monday.build()`, so build
+concurrency remains one even while intake stays responsive. Unauthorized and
+otherwise ignored content is not queued.
+
+Queued, running, waiting, and retrying work is recovered after restart with
+stable Telegram job, task, run, and delivery identities. Unexpected poison work
+is bounded to three attempts. A graceful stop finishes the active build and
+leaves later work queued; `monday telegram --once` instead ingests one poll
+response and drains its accepted work synchronously before exiting.
 
 ## Records and GitHub truth
 
 Approved source, the commit, branch, pull request, validation summary, reviewer
 identity/verdict, and reviewed artifact digest are stored on GitHub. Detailed
-restart-safe controller records stay locally under `logs/delivery/` and are
-gitignored because they contain machine paths and in-progress state. A crashed
-identity is terminalized as interrupted rather than replaying an uncertain
-mutation; a new request receives a new identity. These records are not
-credentials, but they are not yet synchronized to GitHub. Do not describe this
-increment as storing every runtime byte in GitHub.
+restart-safe controller records stay locally under `logs/delivery/`; Telegram
+queue state stays locally in `logs/telegram/state.json`. Both are Git-ignored
+because they contain machine paths or in-progress state. Terminal Telegram
+replay tombstones keep stable identity and outcome data but remove the active
+request text. These records are not credentials, but they are not yet
+synchronized to GitHub. Do not describe this increment as storing every runtime
+byte in GitHub.
 
 Failed worktrees are retained for diagnosis. Earlier rejected candidates are
 removed only when another attempt is about to begin; if the attempt budget is

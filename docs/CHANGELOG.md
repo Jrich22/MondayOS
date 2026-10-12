@@ -25,6 +25,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
   deliver a task; `/deliver TASK-ID` delivers an existing task. Durable update
   identity, progress, restart recovery, and group-chat execution blocking are
   preserved.
+- Durable Telegram intake and a single background execution worker. Authorized
+  minimal requests are atomically queued with the advanced offset in
+  `logs/telegram/state.json` and receive an immediate saved/position receipt;
+  unauthorized or ignored content is not queued. Intake remains responsive
+  during Monday/model work while concurrency stays one. Restart recovers
+  queued, running, waiting, and retrying jobs with stable identities, poison
+  work is bounded to three attempts, graceful stop drains only the active job,
+  and terminal tombstones remove request text. `--once` ingests and drains
+  synchronously.
 - A strict Git delivery layer with bounded argv-only processes, repository
   leases, owned worktrees, path and file policy, exact staging/fingerprinting,
   HEAD integrity checks, hook-free controller commits, non-force pushes, and

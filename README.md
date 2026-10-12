@@ -53,7 +53,7 @@ The full vision is in [docs/VISION.md](docs/VISION.md).
 | **AI provider layer** | _(config)_ | Interchangeable Claude / OpenAI / DeepSeek / Ollama providers with fallback |
 | **Execution orchestrator** | `monday execute` | Delegate a task to an AI provider through a safe, policy-driven pipeline |
 | **Autonomous builds** | `monday build` | Build in an isolated worktree, validate, repair, require ChatGPT review, and open a PR |
-| **Telegram control plane** | `monday telegram` | Create tasks, run the agent team, or opt into private live builds with progress |
+| **Telegram control plane** | `monday telegram` | Durably queue requests, keep intake responsive, and run one agent-team or private live-build job at a time |
 
 Source, configuration templates, and product documentation are stored as
 human-readable files in Git. Operational state (agent runs, execution logs, and
@@ -180,7 +180,9 @@ monday build run TASK-0001
 Full command reference: [docs/CLI.md](docs/CLI.md).
 
 Telegram setup and the always-on Mac mini service are documented in
-[docs/TELEGRAM.md](docs/TELEGRAM.md).
+[docs/TELEGRAM.md](docs/TELEGRAM.md). Accepted requests are atomically persisted
+to a local, Git-ignored FIFO queue before Telegram is acknowledged; one
+background worker runs Monday/model jobs while intake continues polling.
 
 ---
 

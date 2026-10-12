@@ -14,18 +14,24 @@ outbound long polling, so it does not open a public port or require a tunnel.
 - Reports team/build progress back to the originating chat.
 - Supports task/system status, active-task listing, and explicit run commands.
 - Supports idempotent approval and rejection of reviewed runs.
-- Recovers safely after restart without creating a second task for the same
-  Telegram update. An interrupted team run is marked and one replacement run is
-  linked to the same durable Telegram job.
-- Retries unexpected handler failures three times, then preserves a dead-letter
-  checkpoint so one poison update cannot block every later request.
+- Atomically saves each accepted, minimal request and the advanced Telegram
+  offset in `logs/telegram/state.json`, then immediately confirms that it was
+  saved and reports its FIFO queue position. Unauthorized or otherwise ignored
+  content is never queued.
+- Keeps polling and acknowledging new requests while one non-daemon worker
+  exclusively runs Monday/model work. Commands execute in FIFO order, and
+  provider/build concurrency stays at one because a MondayOS instance and its
+  providers are intentionally not thread-safe.
+- Recovers queued, running, waiting, and retrying work after restart with the
+  same Telegram job, task, run, and delivery identities. It retries an
+  unexpected poison failure at most three times, then terminalizes that job so
+  later work can proceed.
+- Removes active request text when a job becomes a terminal replay tombstone.
+  A graceful stop finishes the current job and leaves the rest durably queued.
 
-The Telegram worker is sequential because a MondayOS instance and its providers
-are intentionally not thread-safe. Telegram retains queued updates while the
-worker is busy, but Telegram's Bot API only retains them for up to 24 hours. This
-first increment therefore should not be left offline for more than a day; a later
-queue-worker split will persist incoming requests immediately while long builds
-run separately.
+Telegram is the transport only until an accepted request is saved. After that
+atomic checkpoint, the local queue—not Telegram's temporary update retention—is
+the source of truth for pending work.
 
 ## Create the bot
 
@@ -73,7 +79,8 @@ From the MondayOS project root:
 monday telegram
 ```
 
-For one polling cycle during setup:
+To ingest one long-poll response, drain the durable inbox synchronously, and
+then exit:
 
 ```bash
 monday telegram --once
@@ -93,10 +100,11 @@ At startup MondayOS verifies the bot identity and removes any prior webhook
 without dropping queued updates. Polling and webhooks cannot be used at the same
 time, so this ensures one predictable delivery path.
 
-The saved offset, retry jobs, and replay tombstones are bound to the bot's
-numeric Telegram identity. Renaming the same bot keeps its offset. Replacing the
-token with a different bot clears the old bot's update state before polling, so
-one bot's offset cannot silently discard another bot's pending messages.
+The saved offset, durable FIFO jobs, retries, and replay tombstones in
+`logs/telegram/state.json` are bound to the bot's numeric Telegram identity.
+Renaming the same bot keeps its state. Replacing the token with a different bot
+clears the old bot's update state before polling, so one bot's offset cannot
+silently discard another bot's pending messages.
 
 ## Commands
 
@@ -187,7 +195,13 @@ bounded repair, exact-artifact ChatGPT review, commit, push, and pull request.
 It does **not** merge, deploy, operate on registered external repositories, or
 transcribe voice.
 
-Builds run synchronously in the polling worker today, so the bot processes no
-new Telegram updates until the current build finishes. Telegram retains queued
-updates temporarily; a durable ingestion/build-worker split is the next control
-plane increment. Full build details are in [BUILD_WORKFLOW.md](BUILD_WORKFLOW.md).
+Accepted work runs through the durable FIFO queue. The polling intake stays
+responsive while its single worker performs a team run or live build, so model
+and build concurrency remains one. Restart preserves stable work identities;
+graceful shutdown finishes the active item and leaves later items queued. The
+`--once` setup mode intentionally ingests and drains synchronously instead.
+
+Queue state is local operational data under `logs/telegram/` and remains
+Git-ignored. Terminal replay tombstones retain the identity needed for
+deduplication but not the active request text. Full build details are in
+[BUILD_WORKFLOW.md](BUILD_WORKFLOW.md).

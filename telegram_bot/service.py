@@ -30,7 +30,7 @@ class TelegramUpdatePendingError(RuntimeError):
 
 
 class TelegramBotService:
-    """Sequential Telegram-to-MondayOS application service."""
+    """Authorized Telegram requests mapped onto the public MondayOS API."""
 
     def __init__(
         self,
@@ -50,6 +50,70 @@ class TelegramBotService:
         """Record the verified getMe username used for addressed commands."""
         self._bot_id = _integer(identity.get("id"), 0)
         self._bot_username = str(identity.get("username") or "").strip().lstrip("@").lower()
+
+    def normalize_update(self, update: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the minimum authorized request safe to persist in the inbox.
+
+        Telegram payloads contain considerably more identity and message data
+        than MondayOS needs.  Intake therefore applies the same allowlist and
+        command-addressing rules as execution, then stores only the update,
+        sender, chat, chat type, and request text (or a voice marker).  Ignored
+        and unauthorized updates never enter the durable queue.
+        """
+        update_id = _integer(update.get("update_id"), -1)
+        message = update.get("message")
+        if update_id < 0 or not isinstance(message, dict):
+            return None
+        context = self._authorized_context(message)
+        if context is None:
+            return None
+        chat_id, user_id, chat_type = context
+        text = str(message.get("text") or "").strip()
+        has_voice = bool(message.get("voice"))
+        if not text and not has_voice:
+            return None
+
+        if text:
+            parsed = _parse(text, self._bot_username)
+            if parsed is None:
+                return None
+            command, argument = parsed
+            if chat_type != "private" and command not in {
+                "build", "run", "status", "help",
+            }:
+                return None
+            # Addressing is an intake concern. Persist a canonical command
+            # without @username so a later rename of this same bot cannot make
+            # already-authorized queued work fail its second parse at execution.
+            head, separator, _tail = text.partition(" ")
+            if head.startswith("/") and "@" in head:
+                text = head.partition("@")[0]
+                if separator and argument:
+                    text = f"{text} {argument}"
+
+        normalized_message: dict[str, Any] = {
+            "from": {"id": user_id, "is_bot": False},
+            "chat": {"id": chat_id, "type": chat_type},
+        }
+        if text:
+            normalized_message["text"] = text
+        else:
+            normalized_message["voice"] = {"queued": True}
+        return {"update_id": update_id, "message": normalized_message}
+
+    def announce_queued(self, update: dict[str, Any], position: int) -> None:
+        """Confirm durable intake without invoking Monday or a model."""
+        message = update.get("message")
+        if not isinstance(message, dict):
+            return
+        context = self._authorized_context(message)
+        if context is None:
+            return
+        if position <= 1:
+            text = "Request saved. Monday is starting it automatically."
+        else:
+            text = f"Request saved. Queue position: {position}."
+        self._client.send_message(context[0], text)
 
     def handle_update(self, update: dict[str, Any]) -> None:
         update_id = _integer(update.get("update_id"), -1)

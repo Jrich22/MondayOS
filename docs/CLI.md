@@ -379,13 +379,19 @@ monday telegram [--once] [--identify] [--provider NAME]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--once` | off | Process one long-poll response and exit. Useful during setup. |
+| `--once` | off | Ingest one long-poll response, drain the durable inbox synchronously, and exit. Useful during setup. |
 | `--identify` | off | Print pending Telegram user/chat IDs and exit. |
 | `--provider NAME` | role defaults | Pin one provider for productive team stages. The final Reviewer still requires OpenAI/ChatGPT (`fake` is available for offline tests). Without a pin, productive roles use their preferred provider with ordered fallback. |
 
 `TELEGRAM_BOT_TOKEN` and `MONDAYOS_TELEGRAM_ALLOWED_USER_IDS` are required.
 Set `MONDAYOS_TELEGRAM_LIVE_BUILD=true` to make private plain text, `/build`, and
 `/deliver` use the autonomous PR workflow. It is off by default.
+In normal daemon mode, accepted minimal requests are atomically saved in
+`logs/telegram/state.json` before the Telegram offset advances. The bot returns
+a saved receipt with the FIFO queue position and keeps polling while one
+non-daemon worker exclusively runs Monday/model work. Restart recovers pending
+jobs with stable identities, and graceful shutdown finishes the active job while
+leaving the remainder queued.
 See [TELEGRAM.md](TELEGRAM.md) for setup, commands, restart behavior, and the
 always-on Mac mini service.
 
