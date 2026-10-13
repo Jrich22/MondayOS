@@ -70,6 +70,9 @@ agents/.sequences.json
 # Telegram offset, pending jobs, and single-process lock (runtime state)
 logs/telegram/
 
+# Task transition locks coordinate terminal state with autonomous delivery.
+tasks/.locks/
+
 # Autonomous delivery checkpoints and isolated worktrees. Approved source and
 # its review evidence are pushed to GitHub; restart-safe local audit state is not.
 logs/delivery/
@@ -82,6 +85,7 @@ logs/growth/
 
 # Project registry — runtime state with machine-specific absolute paths
 config/projects.json
+config/projects.json.lock
 
 # AI Workspace conversations — runtime state, and user content rather than
 # source. MondayOS owns the record (ADR-015); it is not version-controlled.

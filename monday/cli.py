@@ -393,6 +393,12 @@ def _register_task(subparsers: Any) -> None:
         "--created-by", metavar="WHO", default="human:cli",
         help="Creator identifier (default: human:cli).",
     )
+    p_create.add_argument(
+        "--project",
+        default="",
+        metavar="NAME",
+        help="Registered project this task belongs to.",
+    )
     p_create.set_defaults(func=_cmd_task_create)
 
     # get
@@ -454,6 +460,7 @@ def _cmd_task_create(args: argparse.Namespace) -> int:
         task_type=args.task_type,
         priority=args.priority,
         created_by=args.created_by,
+        project=args.project,
     )
 
     if r.success:
@@ -1198,6 +1205,15 @@ def _register_project(subparsers: Any) -> None:
     reg.add_argument("name", help="Unique project name (slug).")
     reg.add_argument("path", help="Absolute path to the project source directory.")
     reg.add_argument("--description", default="", help="Human-readable description.")
+    reg.add_argument(
+        "--delivery-repository",
+        default="",
+        metavar="OWNER/REPO",
+        help=(
+            "Enable autonomous branch/PR delivery to this exact GitHub repository. "
+            "Its existing CI may run when Monday pushes."
+        ),
+    )
     reg.add_argument("--overwrite", action="store_true", help="Replace existing entry.")
     reg.set_defaults(func=_cmd_project_register)
 
@@ -1225,6 +1241,7 @@ def _cmd_project_register(args: argparse.Namespace) -> int:
         name=args.name,
         path=args.path,
         description=args.description,
+        delivery_repository=args.delivery_repository,
         overwrite=args.overwrite,
     )
     if r.success:
@@ -1232,6 +1249,8 @@ def _cmd_project_register(args: argparse.Namespace) -> int:
         print(f"  Path: {r.data.get('source_path', '')}")
         if r.data.get("description"):
             print(f"  Desc: {r.data['description']}")
+        if r.data.get("delivery_repository"):
+            print(f"  Delivery: {r.data['delivery_repository']}")
         print(f"  At:   {r.data.get('registered_at', '')}")
     else:
         print(f"Error: {r.message}", file=sys.stderr)
@@ -1242,6 +1261,9 @@ def _cmd_project_register(args: argparse.Namespace) -> int:
 def _cmd_project_list(args: argparse.Namespace) -> int:
     monday = _monday(args)
     r = monday.project("list")
+    if not r.success:
+        print(f"Error: {r.message}", file=sys.stderr)
+        return 1
     projects = r.data.get("projects", [])
     if not projects:
         print("No projects registered.")
@@ -1270,6 +1292,7 @@ def _cmd_project_get(args: argparse.Namespace) -> int:
         print(f"  Path       : {d.get('source_path', '')}")
         print(f"  Description: {d.get('description', '') or '(none)'}")
         print(f"  Registered : {d.get('registered_at', '')}")
+        print(f"  Delivery   : {d.get('delivery_repository', '') or '(analysis only)'}")
         print()
     else:
         print(f"Error: {r.message}", file=sys.stderr)
@@ -1826,6 +1849,7 @@ def _register_build(subparsers: Any) -> None:
             "it is never merged or deployed by this command.\n\n"
             "examples:\n"
             "  monday build run TASK-0001\n"
+            "  monday build run TASK-0002 --project customer-portal\n"
             "  monday build get delivery-abc123\n"
             "  monday build history --task TASK-0001\n"
             "  monday build capabilities\n"
@@ -1837,6 +1861,12 @@ def _register_build(subparsers: Any) -> None:
 
     p_run = build_sub.add_parser("run", help="Build one MondayOS task through pull request.")
     p_run.add_argument("task_id", metavar="TASK-ID", help="Task to implement.")
+    p_run.add_argument(
+        "--project",
+        default="",
+        metavar="NAME",
+        help="Deliver into an explicitly enrolled registered project.",
+    )
     p_run.add_argument(
         "--id",
         dest="delivery_id",
@@ -1852,12 +1882,21 @@ def _register_build(subparsers: Any) -> None:
     p_get = build_sub.add_parser("get", help="Retrieve one exact delivery record.")
     p_get.add_argument("delivery_id", metavar="DELIVERY-ID", help="Delivery ID to retrieve.")
     p_get.add_argument(
+        "--project",
+        default="",
+        metavar="NAME",
+        help="Assert that the delivery belongs to this canonical project.",
+    )
+    p_get.add_argument(
         "--json", "-j", action="store_true", help="Output the delivery record as JSON."
     )
     p_get.set_defaults(func=_cmd_build_get)
 
     p_history = build_sub.add_parser("history", help="List past delivery jobs.")
     p_history.add_argument("--task", dest="task_id", metavar="TASK-ID", help="Filter by task.")
+    p_history.add_argument(
+        "--project", default="", metavar="NAME", help="Filter by canonical project."
+    )
     p_history.add_argument(
         "--limit", type=int, default=20, metavar="N", help="Max jobs to show (default: 20)."
     )
@@ -1869,6 +1908,12 @@ def _register_build(subparsers: Any) -> None:
     )
     p_capabilities.add_argument(
         "--json", "-j", action="store_true", help="Output capabilities as JSON."
+    )
+    p_capabilities.add_argument(
+        "--project",
+        default="",
+        metavar="NAME",
+        help="Check readiness for an explicitly enrolled registered project.",
     )
     p_capabilities.set_defaults(func=_cmd_build_capabilities)
 
@@ -1890,6 +1935,9 @@ def _print_build(response: Any) -> int:
     print(f"  BUILD — {response.delivery_id or '(unassigned)'}")
     print("═" * 64)
     print(f"  Task    : {response.task_id or '—'}")
+    if response.project_name or response.repository:
+        print(f"  Project : {response.project_name or 'mondayos'}")
+        print(f"  Repo    : {response.repository or '—'}")
     print(f"  Status  : {response.status or '—'}")
     print(f"  Phase   : {response.phase or '—'}")
     if response.branch:
@@ -1914,11 +1962,13 @@ def _cmd_build_run(args: argparse.Namespace) -> int:
     import json as _json
 
     monday = _monday(args)
-    r = monday.build(
-        "run",
-        task_id=args.task_id,
-        delivery_id=(args.delivery_id or None),
-    )
+    kwargs: dict[str, Any] = {
+        "task_id": args.task_id,
+        "delivery_id": (args.delivery_id or None),
+    }
+    if args.project:
+        kwargs["project"] = args.project
+    r = monday.build("run", **kwargs)
     if args.json:
         print(_json.dumps(_build_json(r), indent=2, sort_keys=True))
         return 0 if r.success else 1
@@ -1928,7 +1978,10 @@ def _cmd_build_run(args: argparse.Namespace) -> int:
 def _cmd_build_get(args: argparse.Namespace) -> int:
     import json as _json
 
-    r = _monday(args).build("get", delivery_id=args.delivery_id)
+    kwargs: dict[str, Any] = {"delivery_id": args.delivery_id}
+    if args.project:
+        kwargs["project"] = args.project
+    r = _monday(args).build("get", **kwargs)
     if args.json:
         print(_json.dumps(_build_json(r), indent=2, sort_keys=True))
         return 0 if r.success else 1
@@ -1938,7 +1991,10 @@ def _cmd_build_get(args: argparse.Namespace) -> int:
 def _cmd_build_history(args: argparse.Namespace) -> int:
     import json as _json
 
-    r = _monday(args).build("history", task_id=args.task_id, limit=args.limit)
+    kwargs: dict[str, Any] = {"task_id": args.task_id, "limit": args.limit}
+    if args.project:
+        kwargs["project"] = args.project
+    r = _monday(args).build("history", **kwargs)
     if args.json:
         print(_json.dumps(_build_json(r), indent=2, sort_keys=True))
         return 0 if r.success else 1
@@ -1962,7 +2018,10 @@ def _cmd_build_history(args: argparse.Namespace) -> int:
 def _cmd_build_capabilities(args: argparse.Namespace) -> int:
     import json as _json
 
-    r = _monday(args).build("capabilities")
+    kwargs: dict[str, Any] = {}
+    if args.project:
+        kwargs["project"] = args.project
+    r = _monday(args).build("capabilities", **kwargs)
     if args.json:
         print(_json.dumps(_build_json(r), indent=2, sort_keys=True))
         return 0 if r.success and bool(r.data.get("ready")) else 1

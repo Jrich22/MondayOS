@@ -74,13 +74,23 @@ class DeliveryJob:
     message: str = ""
     created_at: str = ""
     updated_at: str = ""
+    # Appended to preserve the positional constructor contract of schema-v1
+    # delivery records while extending their durable target identity.
+    project_name: str = ""
+    expected_repository: str = ""
+    root_device: int = 0
+    root_inode: int = 0
+    worktree_owner_token: str = ""
 
     @property
     def terminal(self) -> bool:
         return self.status in {"pr-open", "failed", "interrupted", "rejected"}
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    def to_dict(self, *, include_private: bool = False) -> dict[str, Any]:
+        payload = asdict(self)
+        if not include_private:
+            payload.pop("worktree_owner_token", None)
+        return payload
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DeliveryJob:
@@ -89,6 +99,10 @@ class DeliveryJob:
             task_id=str(data.get("task_id", "")),
             objective=str(data.get("objective", "")),
             repo_root=str(data.get("repo_root", "")),
+            project_name=str(data.get("project_name", "")),
+            expected_repository=str(data.get("expected_repository", "")),
+            root_device=int(data.get("root_device", 0) or 0),
+            root_inode=int(data.get("root_inode", 0) or 0),
             status=str(data.get("status", "reserved")),
             phase=str(data.get("phase", "reserved")),
             success=bool(data.get("success", False)),
@@ -98,6 +112,7 @@ class DeliveryJob:
             repository=str(data.get("repository", "")),
             branch=str(data.get("branch", "")),
             worktree=str(data.get("worktree", "")),
+            worktree_owner_token=str(data.get("worktree_owner_token", "")),
             builder=str(data.get("builder", "")),
             reviewer=str(data.get("reviewer", "codex-chatgpt")),
             max_attempts=int(data.get("max_attempts", 3)),

@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from core.identity import require_slug, slug
 from delivery.backends import (
     ArtifactReviewer,
     ClaudeCodePatchBuilder,
@@ -28,7 +29,7 @@ from delivery.backends import (
     _redact,
     _run_process,
 )
-from delivery.git import ChangedPath, GitRepository, GitValidationError, Worktree
+from delivery.git import BaseRevision, ChangedPath, GitRepository, GitValidationError, Worktree
 from delivery.github import GhCliClient
 from delivery.security import (
     ArtifactSecurityError,
@@ -40,6 +41,7 @@ from delivery.security import (
 from delivery.store import DeliveryStore
 from delivery.types import DeliveryAttempt, DeliveryJob
 from delivery.validation import MondayValidationRunner, ValidationResult
+from tasks.manager import TaskManager
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 CheckpointCallback = Callable[[dict[str, Any]], None]
@@ -56,10 +58,11 @@ class _BuilderProviderError(RuntimeError):
 class DeliveryWorkflow:
     """Turn one MondayOS task into one independently reviewed GitHub PR.
 
-    This initial slice deliberately targets only the configured MondayOS
-    checkout.  It cannot merge, deploy, install dependencies, or execute a
-    model-selected command.  Builders return text patches; the controller owns
-    every filesystem, validation, Git, and GitHub mutation.
+    MondayOS remains the controller and system of record even when the target is
+    a separately registered repository. It cannot merge, deploy, install
+    dependencies, or execute a model-selected command. Builders return text
+    patches; the controller owns every filesystem, validation, Git, and GitHub
+    mutation.
     """
 
     def __init__(
@@ -67,6 +70,10 @@ class DeliveryWorkflow:
         *,
         monday: Any,
         project_root: Path,
+        repository_root: Path | None = None,
+        project_name: str = "",
+        expected_repository: str = "",
+        expected_root_identity: tuple[int, int] | None = None,
         builders: Sequence[PatchBuilder] | None = None,
         reviewer: ArtifactReviewer | None = None,
         validator: Any | None = None,
@@ -80,16 +87,59 @@ class DeliveryWorkflow:
         if not 1 <= max_attempts <= 10:
             raise ValueError("max_attempts must be between 1 and 10")
         self.monday = monday
-        self.project_root = Path(project_root).resolve()
-        self.store = DeliveryStore(self.project_root)
-        self.builders = list(builders or (ClaudeCodePatchBuilder(), CodexPatchBuilder()))
+        self.controller_root = Path(project_root).resolve(strict=True)
+        self.project_root = self.controller_root  # compatibility for embedders/tests
+        self.repository_root = (
+            Path(repository_root).expanduser().absolute()
+            if repository_root is not None
+            else self.controller_root
+        )
+        self.project_name = (
+            require_slug(project_name, ascii_only=True) if project_name else ""
+        )
+        self.expected_repository = str(expected_repository or "").strip()
+        self.external_target = repository_root is not None
+        if self.external_target:
+            if not self.project_name:
+                raise ValueError("external delivery requires a registered project identity")
+            if not self.expected_repository:
+                raise ValueError("external delivery requires a pinned GitHub repository")
+            target_canonical = self.repository_root.resolve(strict=True)
+            if _paths_overlap(self.controller_root, target_canonical):
+                raise ValueError(
+                    "external delivery repository must be separate from the MondayOS "
+                    "controller directory"
+                )
+        if expected_root_identity is None:
+            metadata = self.repository_root.stat()
+            expected_root_identity = (metadata.st_dev, metadata.st_ino)
+        if (
+            not isinstance(expected_root_identity, tuple)
+            or len(expected_root_identity) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in expected_root_identity
+            )
+        ):
+            raise ValueError("expected_root_identity must be a device/inode integer tuple")
+        self.root_device, self.root_inode = expected_root_identity
+        self.store = DeliveryStore(self.controller_root)
+        default_builders: Sequence[PatchBuilder] = (
+            (CodexPatchBuilder(),)
+            if self.external_target
+            else (ClaudeCodePatchBuilder(), CodexPatchBuilder())
+        )
+        self.builders = list(builders if builders is not None else default_builders)
         self.reviewer = reviewer or CodexArtifactReviewer()
-        self.validator = validator or MondayValidationRunner(source_root=self.project_root)
+        self.validator = validator or MondayValidationRunner(source_root=self.controller_root)
         self.github = github or GhCliClient()
         self.repository = repository or GitRepository(
-            self.project_root,
-            trusted_root=self.project_root,
+            self.repository_root,
+            trusted_root=self.repository_root,
             runtime_root=self.store.root,
+            expected_github_repository=self.expected_repository or None,
+            expected_root_identity=(self.root_device, self.root_inode),
+            require_embedded_git_dir=self.external_target,
         )
         self.max_attempts = max_attempts
         self.builder_timeout = builder_timeout
@@ -114,6 +164,9 @@ class DeliveryWorkflow:
             "github": github,
             "validation": validation,
             "repository": repository,
+            "project_name": self.project_name,
+            "repo_root": str(self.repository_root),
+            "expected_repository": self.expected_repository,
             "max_attempts": self.max_attempts,
             "delivery": "pull-request-only",
             "merge_enabled": False,
@@ -123,8 +176,19 @@ class DeliveryWorkflow:
     def get(self, delivery_id: str) -> DeliveryJob:
         return self.store.get(delivery_id)
 
-    def history(self, *, task_id: str | None = None, limit: int = 20) -> list[DeliveryJob]:
-        return self.store.history(task_id=task_id, limit=limit)
+    def history(
+        self,
+        *,
+        task_id: str | None = None,
+        project_name: str | None = None,
+        limit: int = 20,
+    ) -> list[DeliveryJob]:
+        canonical_project = slug(project_name) if project_name is not None else None
+        return self.store.history(
+            task_id=task_id,
+            project_name=canonical_project,
+            limit=limit,
+        )
 
     def run(
         self,
@@ -138,20 +202,29 @@ class DeliveryWorkflow:
         delivery_id = delivery_id or f"delivery-{uuid.uuid4().hex[:16]}"
         task_response = self.monday.task("get", task_id=task_id)
         task_data = dict(getattr(task_response, "data", {}) or {})
-        objective = _objective(task_id, task_data)
+        raw_objective = _objective(task_id, task_data)
+        if _redact(raw_objective) != raw_objective:
+            raise ArtifactSecurityError(
+                "task title, objective, or acceptance criteria contains credential-like material"
+            )
+        objective = raw_objective[:50_000]
         now = _now()
         job = DeliveryJob(
             delivery_id=delivery_id,
             task_id=task_id,
             objective=objective,
-            repo_root=str(self.project_root),
+            repo_root=str(self.repository_root),
+            project_name=self.project_name,
+            expected_repository=self.expected_repository,
+            root_device=self.root_device,
+            root_inode=self.root_inode,
             max_attempts=self.max_attempts,
             created_at=now,
             updated_at=now,
         )
         existing = self._existing_job(delivery_id)
         if existing is not None:
-            self._require_task_binding(existing, task_id)
+            self._require_binding(existing, job)
             if existing.terminal:
                 return existing
             return self._reconcile_interrupted(
@@ -161,97 +234,133 @@ class DeliveryWorkflow:
 
         reservation_owned = False
         try:
-            with self._workflow_lease():
-                # Reserve only after owning the repository-wide lease.  This
-                # closes the gap where a duplicate caller could otherwise see
-                # a fresh record before its live worker acquired the lease and
-                # incorrectly classify that live worker as crashed.
-                existing = self.store.reserve(job)
-                if existing is not None:
-                    self._require_task_binding(existing, task_id)
-                    if existing.terminal:
-                        return existing
-                    return self._mark_interrupted(existing, progress_callback)
-                reservation_owned = True
+            with self._workflow_lease() as workflow_guard_fd:
+                try:
+                    # A different identity must not bypass an unresolved run for
+                    # this exact task and repository.  The original identity is
+                    # the only safe key for publication reconciliation.
+                    blocking = self._blocking_delivery(job)
+                    if blocking is not None:
+                        existing = self.store.reserve(job)
+                        if existing is not None:
+                            self._require_binding(existing, job)
+                            return existing
+                        reservation_owned = True
+                        return self._fail(
+                            job,
+                            "unresolved-delivery",
+                            (
+                                f"Delivery {blocking.delivery_id} must be retried or "
+                                "settled before starting another build for this task"
+                            ),
+                        )
 
-                if checkpoint_callback is not None:
-                    # The reservation is durable before an external controller is
-                    # asked to checkpoint it.  Failure stops before model or Git work.
-                    checkpoint_callback(job.to_dict())
-                if not getattr(task_response, "success", False):
-                    return self._fail(
-                        job,
-                        "task-not-found",
-                        getattr(task_response, "message", ""),
-                    )
-                if task_data.get("status") in {"completed", "cancelled"}:
-                    return self._fail(
-                        job,
-                        "terminal-task",
-                        "Completed or cancelled tasks cannot run",
-                    )
+                    # Reserve only after owning the repository-wide lease.  This
+                    # closes the gap where a duplicate caller could otherwise see
+                    # a fresh record before its live worker acquired the lease and
+                    # incorrectly classify that live worker as crashed.
+                    existing = self.store.reserve(job)
+                    if existing is not None:
+                        self._require_binding(existing, job)
+                        if existing.terminal:
+                            return existing
+                        return self._mark_interrupted(existing, progress_callback)
+                    reservation_owned = True
 
-                self._update(
-                    job,
-                    status="running",
-                    phase="preflight",
-                    message="Checking build tools",
-                )
-                self._notify(job, progress_callback)
-                repository_ready = self._repository_readiness()
-                if not repository_ready["available"]:
-                    return self._fail(
+                    if checkpoint_callback is not None:
+                        # The reservation is durable before an external controller is
+                        # asked to checkpoint it.  Failure stops before model or Git work.
+                        checkpoint_callback(job.to_dict())
+                    if not getattr(task_response, "success", False):
+                        return self._fail(
+                            job,
+                            "task-not-found",
+                            getattr(task_response, "message", ""),
+                        )
+                    if task_data.get("status") in {"completed", "cancelled"}:
+                        return self._fail(
+                            job,
+                            "terminal-task",
+                            "Completed or cancelled tasks cannot run",
+                        )
+                    target_error = self._task_target_error(task_data)
+                    if target_error:
+                        return self._fail(job, "project-mismatch", target_error)
+
+                    self._update(
                         job,
-                        "repository-unavailable",
-                        repository_ready["reason"],
+                        status="running",
+                        phase="preflight",
+                        message="Checking build tools",
                     )
-                validation_ready = self._validation_readiness()
-                if not validation_ready["available"]:
-                    return self._fail(
+                    self._notify(job, progress_callback)
+                    repository_ready = self._repository_readiness()
+                    if not repository_ready["available"]:
+                        return self._fail(
+                            job,
+                            "repository-unavailable",
+                            repository_ready["reason"],
+                        )
+                    validation_ready = self._validation_readiness()
+                    if not validation_ready["available"]:
+                        return self._fail(
+                            job,
+                            "validation-unavailable",
+                            validation_ready["reason"],
+                        )
+                    builders, builder_reasons = self._select_builders()
+                    if not builders:
+                        detail = "; ".join(builder_reasons) or "No builders are configured"
+                        return self._fail(
+                            job,
+                            "builder-unavailable",
+                            f"No authenticated coding builder is available. {detail}",
+                        )
+                    reviewer_ready = self._availability(self.reviewer)
+                    if not reviewer_ready["available"]:
+                        return self._fail(
+                            job,
+                            "reviewer-unavailable",
+                            reviewer_ready["reason"],
+                        )
+                    github_ready = self._availability(self.github)
+                    if not github_ready["available"]:
+                        return self._fail(job, "github-unavailable", github_ready["reason"])
+                    job.builder = _safe_text(builders[0].name, 200)
+                    self.store.persist(job)
+                    return self._run_locked(
                         job,
-                        "validation-unavailable",
-                        validation_ready["reason"],
+                        task_data,
+                        builders,
+                        progress_callback,
+                        workflow_guard_fd,
                     )
-                builders, builder_reasons = self._select_builders()
-                if not builders:
-                    detail = "; ".join(builder_reasons) or "No builders are configured"
-                    return self._fail(
-                        job,
-                        "builder-unavailable",
-                        f"No authenticated coding builder is available. {detail}",
-                    )
-                reviewer_ready = self._availability(self.reviewer)
-                if not reviewer_ready["available"]:
-                    return self._fail(
-                        job,
-                        "reviewer-unavailable",
-                        reviewer_ready["reason"],
-                    )
-                github_ready = self._availability(self.github)
-                if not github_ready["available"]:
-                    return self._fail(job, "github-unavailable", github_ready["reason"])
-                job.builder = _safe_text(builders[0].name, 200)
-                self.store.persist(job)
-                return self._run_locked(job, task_data, builders, progress_callback)
+                except Exception as exc:
+                    # Persist the outcome while this worker still owns the
+                    # repository lease.  Otherwise a retry can acquire the
+                    # lease, update the record, and then be overwritten here.
+                    if reservation_owned:
+                        if self._publication_started(job):
+                            return self._publication_pending(job, exc)
+                        return self._fail(job, _failure_code(exc), _safe_message(exc))
+                    raise
         except _WorkflowLeaseTimeoutError as exc:
             # A duplicate caller must never terminalize a record whose original
             # worker still owns the lease.  Return the newest durable snapshot
             # so its controller can report progress and reconcile on retry.
             current = self._existing_job(delivery_id)
             if current is not None:
-                self._require_task_binding(current, task_id)
+                self._require_binding(current, job)
                 return current
             existing = self.store.reserve(job)
             if existing is not None:
-                self._require_task_binding(existing, task_id)
+                self._require_binding(existing, job)
                 return existing
             return self._fail(job, "workflow-busy", _safe_message(exc))
         except Exception as exc:  # fail closed at the durable workflow boundary
-            if reservation_owned:
-                return self._fail(job, _failure_code(exc), _safe_message(exc))
             existing = self.store.reserve(job)
             if existing is not None:
-                self._require_task_binding(existing, task_id)
+                self._require_binding(existing, job)
                 return existing
             return self._fail(job, _failure_code(exc), _safe_message(exc))
 
@@ -262,11 +371,75 @@ class DeliveryWorkflow:
             return None
 
     @staticmethod
-    def _require_task_binding(job: DeliveryJob, task_id: str) -> None:
-        if job.task_id != task_id:
+    def _require_binding(existing: DeliveryJob, requested: DeliveryJob) -> None:
+        if existing.task_id != requested.task_id:
             raise ValueError(
-                f"{job.delivery_id} is already bound to {job.task_id}, not {task_id}"
+                f"{existing.delivery_id} is already bound to {existing.task_id}, "
+                f"not {requested.task_id}"
             )
+        fields = (
+            ("project", existing.project_name, requested.project_name),
+            ("repository root", existing.repo_root, requested.repo_root),
+            ("GitHub repository", existing.expected_repository, requested.expected_repository),
+        )
+        for label, prior, current in fields:
+            if prior != current:
+                raise ValueError(
+                    f"{existing.delivery_id} is already bound to another {label}"
+                )
+        # Schema-v1 controller records predate filesystem fingerprints. They
+        # remain valid only for the same self target established by the fields
+        # above; a non-zero stored identity is always enforced exactly.
+        if existing.root_device and existing.root_device != requested.root_device:
+            raise ValueError(
+                f"{existing.delivery_id} is already bound to another root device"
+            )
+        if existing.root_inode and existing.root_inode != requested.root_inode:
+            raise ValueError(
+                f"{existing.delivery_id} is already bound to another root inode"
+            )
+
+    def _task_target_error(self, task: dict[str, Any]) -> str:
+        task_project = slug(str(task.get("project", "") or ""))
+        if self.external_target:
+            if not task_project:
+                return (
+                    "External delivery requires a task explicitly assigned to the "
+                    f"{self.project_name!r} project"
+                )
+            if task_project != self.project_name:
+                return (
+                    f"Task belongs to project {task_project!r}, not "
+                    f"{self.project_name!r}"
+                )
+            task_repository = str(
+                task.get("project_delivery_repository", "") or ""
+            )
+            task_device = task.get("project_source_device")
+            task_inode = task.get("project_source_inode")
+            if not task_repository or task_device is None or task_inode is None:
+                return (
+                    "External delivery requires a task created with a pinned "
+                    "project target; create a new task for the registered project"
+                )
+            if task_repository != self.expected_repository:
+                return "Task is pinned to a different GitHub repository"
+            if (
+                isinstance(task_device, bool)
+                or not isinstance(task_device, int)
+                or isinstance(task_inode, bool)
+                or not isinstance(task_inode, int)
+                or task_device != self.root_device
+                or task_inode != self.root_inode
+            ):
+                return "Task is pinned to a different project directory identity"
+            return ""
+        if task_project and task_project != "mondayos":
+            return (
+                f"Task belongs to external project {task_project!r}; select its "
+                "registered target explicitly"
+            )
+        return ""
 
     def _reconcile_interrupted(
         self,
@@ -274,17 +447,119 @@ class DeliveryWorkflow:
         *,
         progress_callback: ProgressCallback | None,
     ) -> DeliveryJob:
+        result: DeliveryJob
+        recovered_worktree: Worktree | None = None
         try:
-            with self._workflow_lease():
+            with self._workflow_lease() as workflow_guard_fd:
                 current = self.store.get(job.delivery_id)
-                self._require_task_binding(current, job.task_id)
+                self._require_binding(current, job)
                 if current.terminal:
                     return current
-                return self._mark_interrupted(current, progress_callback)
+                if not self._publication_started(current):
+                    result = self._mark_interrupted(current, None)
+                else:
+                    try:
+                        recovered_worktree = self._recover_publication_worktree(current)
+                        result = self._reconcile_publication(
+                            current,
+                            recovered_worktree,
+                            workflow_guard_fd,
+                        )
+                    except Exception as exc:
+                        result = self._publication_pending(current, exc)
         except _WorkflowLeaseTimeoutError:
             current = self.store.get(job.delivery_id)
-            self._require_task_binding(current, job.task_id)
+            self._require_binding(current, job)
             return current
+
+        self._notify(result, progress_callback)
+        if result.success and recovered_worktree is not None:
+            return self._finish_published(result, recovered_worktree, progress_callback)
+        return result
+
+    def _blocking_delivery(self, requested: DeliveryJob) -> DeliveryJob | None:
+        for existing in self.store.history(task_id=requested.task_id, limit=0):
+            if (
+                existing.delivery_id != requested.delivery_id
+                and existing.repo_root == requested.repo_root
+                and existing.project_name == requested.project_name
+                and not existing.terminal
+            ):
+                return existing
+        return None
+
+    @staticmethod
+    def _publication_started(job: DeliveryJob) -> bool:
+        return bool(job.commit_sha) and (
+            job.pushed or job.phase in {"pushing", "pull-request", "completed"}
+        )
+
+    def _recover_publication_worktree(self, job: DeliveryJob) -> Worktree:
+        if (
+            not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", job.commit_sha)
+            or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", job.base_sha)
+            or not job.worktree
+            or not job.branch
+            or job.artifact_sha256 != job.reviewed_artifact_sha256
+            or not re.fullmatch(r"[0-9a-f]{64}", job.artifact_sha256)
+        ):
+            raise ArtifactSecurityError(
+                "publication record is missing its exact reviewed artifact identity"
+            )
+        return self.repository.recover_worktree(
+            path=Path(job.worktree),
+            branch=job.branch,
+            base_sha=job.base_sha,
+            owner_token=job.worktree_owner_token,
+        )
+
+    def _reconcile_publication(
+        self,
+        job: DeliveryJob,
+        worktree: Worktree,
+        workflow_guard_fd: int,
+    ) -> DeliveryJob:
+        published = self.repository.remote_branch_is_exact(worktree, job.commit_sha)
+        if not published:
+            if job.pushed or job.phase == "pull-request":
+                raise ArtifactSecurityError(
+                    "the previously verified remote branch is no longer present"
+                )
+            return self._mark_interrupted(job, None)
+
+        task_manager = TaskManager(self.controller_root)
+        with task_manager.lock(job.task_id) as publication_guard_fd:
+            # An exact remote branch proves that the original worker crossed
+            # the irreversible publication boundary while it owned the task
+            # guard.  Finish that already-authorized transition even if the
+            # task was subsequently terminalized after the controller died.
+            job.pushed = True
+            job.status = "running"
+            job.failure_code = ""
+            self._update(
+                job,
+                phase="pull-request",
+                message="Reconciling the exact published branch with GitHub",
+            )
+            current_task = self.monday.task("get", task_id=job.task_id)
+            current_task_data = dict(getattr(current_task, "data", {}) or {})
+            title = str(current_task_data.get("title", "Autonomous build"))
+            result = self.github.ensure_pull_request(
+                repo_root=self.repository_root,
+                repository=job.repository,
+                base=job.base_branch,
+                branch=job.branch,
+                title=_pr_title(job.task_id, title),
+                body=_pr_body(job),
+                expected_sha=job.commit_sha,
+                inherited_guard_fds=(publication_guard_fd, workflow_guard_fd),
+            )
+            if not result.success:
+                return self._publication_pending(
+                    job,
+                    RuntimeError(result.message or "GitHub pull request state is unverified"),
+                )
+            return self._record_pr_success(job, result.url, result.number)
 
     def _mark_interrupted(
         self,
@@ -311,11 +586,19 @@ class DeliveryWorkflow:
         task_data: dict[str, Any],
         builders: Sequence[PatchBuilder],
         progress_callback: ProgressCallback | None,
+        workflow_guard_fd: int,
     ) -> DeliveryJob:
         self._update(job, phase="preparing", message="Preparing an isolated worktree")
         self._notify(job, progress_callback)
         self.repository.validate_trusted_root()
         repository_slug = self.repository.github_slug()
+        if (
+            self.expected_repository
+            and repository_slug.casefold() != self.expected_repository.casefold()
+        ):
+            raise GitValidationError(
+                "registered GitHub repository does not match the target origin"
+            )
         base = self.repository.resolve_base()
         worktree = self.repository.create_worktree(job.task_id, base)
         job.base_ref = base.ref
@@ -324,6 +607,7 @@ class DeliveryWorkflow:
         job.repository = repository_slug
         job.branch = worktree.branch
         job.worktree = str(worktree.path)
+        job.worktree_owner_token = worktree.owner_token
         self.store.persist(job)
 
         started = self.monday.task("start", task_id=job.task_id)
@@ -460,7 +744,9 @@ class DeliveryWorkflow:
             self._notify(job, progress_callback)
             validation = self.validator.run(
                 worktree=worktree.path,
-                source_root=self.project_root,
+                source_root=self.controller_root,
+                repository_root=self.repository_root,
+                mondayos_tests=not self.external_target,
                 changed_files=staged_files,
             )
             validation_dicts = [
@@ -484,6 +770,8 @@ class DeliveryWorkflow:
                 objective=job.objective,
                 diff=staged_diff,
                 verification_sha256=attempt.verification_sha256,
+                project_name=job.project_name,
+                repository=job.repository,
             )
 
             self._update(job, phase="reviewing", message=f"ChatGPT reviewing attempt {number}")
@@ -522,6 +810,8 @@ class DeliveryWorkflow:
                 objective=job.objective,
                 diff=final_diff,
                 verification_sha256=attempt.verification_sha256,
+                project_name=job.project_name,
+                repository=job.repository,
             )
             if (
                 final_diff_sha != attempt.diff_sha256
@@ -539,10 +829,12 @@ class DeliveryWorkflow:
             return self._deliver(
                 job,
                 task_data,
+                base,
                 worktree,
                 staged_files,
                 final_diff_sha,
                 progress_callback,
+                workflow_guard_fd,
             )
 
         return self._fail(
@@ -555,10 +847,12 @@ class DeliveryWorkflow:
         self,
         job: DeliveryJob,
         task_data: dict[str, Any],
+        base: BaseRevision,
         worktree: Worktree,
         changed_files: list[str],
         expected_diff_sha256: str,
         progress_callback: ProgressCallback | None,
+        workflow_guard_fd: int,
     ) -> DeliveryJob:
         self._update(job, phase="committing", message="Committing the approved artifact")
         self._notify(job, progress_callback)
@@ -571,36 +865,113 @@ class DeliveryWorkflow:
         job.commit_sha = commit
         self.store.persist(job)
 
-        self._update(job, phase="pushing", message="Pushing the approved branch")
-        self._notify(job, progress_callback)
-        pushed_sha = self.repository.push(worktree, commit)
-        if pushed_sha != commit:
-            raise ArtifactSecurityError("pushed SHA does not match the approved commit")
-        job.pushed = True
-        self.store.persist(job)
-
-        self._update(job, phase="pull-request", message="Opening the GitHub pull request")
-        self._notify(job, progress_callback)
-        result = self.github.ensure_pull_request(
-            repo_root=self.project_root,
-            repository=job.repository,
-            base=job.base_branch,
-            branch=job.branch,
-            title=_pr_title(job.task_id, str(task_data.get("title", "Autonomous build"))),
-            body=_pr_body(job),
-            expected_sha=commit,
+        # A task can be completed or cancelled while models and validation run.
+        # Serialize the last persisted-state check with the irreversible push/PR
+        # transition using the same task lock as every TaskManager mutation. If
+        # terminalization wins the lock, delivery stops before publishing; if
+        # delivery wins, the complete push/PR transition is one linearized unit.
+        self._update(
+            job,
+            phase="publication-ready",
+            message="Approved artifact is ready for the final task check and publication",
         )
-        if not result.success:
-            raise RuntimeError(result.message or "GitHub pull request creation failed")
-        job.pr_url = result.url
-        job.pr_number = result.number
+        self._notify(job, progress_callback)
+        task_manager = TaskManager(self.controller_root)
+        with task_manager.lock(job.task_id) as publication_guard_fd:
+            current_task = self.monday.task("get", task_id=job.task_id)
+            current_task_data = dict(getattr(current_task, "data", {}) or {})
+            if not getattr(current_task, "success", False):
+                return self._fail(
+                    job,
+                    "task-not-found",
+                    getattr(current_task, "message", "Task is unavailable"),
+                )
+            if current_task_data.get("status") in {"completed", "cancelled"}:
+                return self._fail(
+                    job,
+                    "terminal-task",
+                    "Task became completed or cancelled before publication; nothing was pushed",
+                )
+            target_error = self._task_target_error(current_task_data)
+            if target_error:
+                return self._fail(job, "project-mismatch", target_error)
+
+            self._update(job, phase="pushing", message="Pushing the approved branch")
+            inherited_guard_fds = (publication_guard_fd, workflow_guard_fd)
+            pushed_sha = self.repository.push(
+                worktree,
+                commit,
+                expected_base=base,
+                inherited_guard_fds=inherited_guard_fds,
+            )
+            if pushed_sha != commit:
+                raise ArtifactSecurityError("pushed SHA does not match the approved commit")
+            job.pushed = True
+            self.store.persist(job)
+
+            self._update(job, phase="pull-request", message="Opening the GitHub pull request")
+            result = self.github.ensure_pull_request(
+                repo_root=self.repository_root,
+                repository=job.repository,
+                base=job.base_branch,
+                branch=job.branch,
+                title=_pr_title(
+                    job.task_id,
+                    str(current_task_data.get("title", task_data.get("title", "Autonomous build"))),
+                ),
+                body=_pr_body(job),
+                expected_sha=commit,
+                inherited_guard_fds=inherited_guard_fds,
+            )
+            if not result.success:
+                pending = self._publication_pending(
+                    job,
+                    RuntimeError(result.message or "GitHub pull request state is unverified"),
+                )
+            else:
+                pending = None
+                self._record_pr_success(job, result.url, result.number)
+
+        self._notify(job, progress_callback)
+        if pending is not None:
+            return pending
+        return self._finish_published(job, worktree, progress_callback)
+
+    def _record_pr_success(self, job: DeliveryJob, url: str, number: int) -> DeliveryJob:
+        job.pr_url = url
+        job.pr_number = number
         job.status = "pr-open"
         job.phase = "completed"
         job.success = True
-        job.message = f"ChatGPT approved the exact artifact and PR #{result.number} is open"
+        job.failure_code = ""
+        job.message = f"ChatGPT approved the exact artifact and PR #{number} is open"
         job.updated_at = _now()
         self.store.persist(job)
+        return job
 
+    def _publication_pending(self, job: DeliveryJob, exc: BaseException) -> DeliveryJob:
+        job.status = "publication-pending"
+        if job.phase == "completed":
+            job.phase = "pull-request"
+        job.success = False
+        job.failure_code = ""
+        job.message = _safe_text(
+            (
+                "Publication may have crossed an irreversible boundary and could not "
+                f"be verified. Retry this exact delivery identity. {_safe_message(exc)}"
+            ),
+            2_000,
+        )
+        job.updated_at = _now()
+        self.store.persist(job)
+        return job
+
+    def _finish_published(
+        self,
+        job: DeliveryJob,
+        worktree: Worktree,
+        progress_callback: ProgressCallback | None,
+    ) -> DeliveryJob:
         try:
             reviewed = self.monday.task(
                 "review",
@@ -615,7 +986,12 @@ class DeliveryWorkflow:
             reviewed = None
         if not getattr(reviewed, "success", False):
             job.message += "; task status could not be moved to REVIEW"
-            self.store.persist(job)
+            try:
+                self.store.persist(job)
+            except Exception:
+                # The exact PR success record is already durable.  A secondary
+                # annotation must never downgrade or overwrite that outcome.
+                pass
         self._notify(job, progress_callback)
         try:
             self.repository.cleanup(worktree, delete_branch=False)
@@ -623,7 +999,10 @@ class DeliveryWorkflow:
             # The published commit/PR is authoritative.  A retained owned
             # worktree is recoverable local diagnostic state, not a failed PR.
             job.message += "; the local worktree was retained for cleanup"
-            self.store.persist(job)
+            try:
+                self.store.persist(job)
+            except Exception:
+                pass
         return job
 
     def _select_builders(self) -> tuple[list[PatchBuilder], list[str]]:
@@ -680,11 +1059,19 @@ class DeliveryWorkflow:
     def _repository_readiness(self) -> dict[str, Any]:
         try:
             self.repository.validate_trusted_root()
-            slug = self.repository.github_slug()
+            repository = self.repository.github_slug()
+            if (
+                self.expected_repository
+                and repository.casefold() != self.expected_repository.casefold()
+            ):
+                raise GitValidationError(
+                    "registered GitHub repository does not match the target origin"
+                )
             return {
                 "available": True,
                 "tool": "repository",
-                "reason": f"trusted GitHub repository {slug}",
+                "reason": f"trusted GitHub repository {repository}",
+                "repository": repository,
             }
         except Exception as exc:
             return {
@@ -709,7 +1096,7 @@ class DeliveryWorkflow:
                 "tool": "validation",
                 "reason": "autonomous validation currently requires macOS",
             }
-        python = self.project_root / ".venv" / "bin" / "python"
+        python = self.controller_root / ".venv" / "bin" / "python"
         if not python.is_file() or not os.access(python, os.X_OK):
             return {
                 "available": False,
@@ -782,10 +1169,10 @@ class DeliveryWorkflow:
         return job
 
     @contextmanager
-    def _workflow_lease(self) -> Iterator[None]:
+    def _workflow_lease(self) -> Iterator[int]:
         lock_dir = self.store.root / "workflow-locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256(os.fsencode(self.project_root)).hexdigest()
+        digest = hashlib.sha256(os.fsencode(self.repository_root)).hexdigest()
         path = lock_dir / f"{digest}.lock"
         flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):
@@ -803,12 +1190,13 @@ class DeliveryWorkflow:
                             "another build already owns this repository"
                         ) from None
                     time.sleep(0.05)
-            yield
+            yield descriptor
         finally:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
-                os.close(descriptor)
+            # Do not issue LOCK_UN: an irreversible publication child may have
+            # inherited this same open file description. Closing our copy keeps
+            # the repository lease held until the final inherited descriptor
+            # closes, including during graceful controller unwinding.
+            os.close(descriptor)
 
 
 def _objective(task_id: str, task: dict[str, Any]) -> str:
@@ -825,7 +1213,12 @@ def _objective(task_id: str, task: dict[str, Any]) -> str:
     ]
     if criteria:
         lines.extend(["Acceptance criteria:", *[f"- {item}" for item in criteria]])
-    return _safe_text("\n".join(lines), 50_000)
+    return "\n".join(lines)
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    """Return whether either canonical directory contains the other."""
+    return first == second or first in second.parents or second in first.parents
 
 
 def _require_index_only(entries: Sequence[ChangedPath]) -> None:
@@ -984,6 +1377,8 @@ def _pr_body(job: DeliveryJob) -> str:
         "## MondayOS autonomous build\n\n"
         f"- Task: `{job.task_id}`\n"
         f"- Build: `{job.delivery_id}`\n"
+        f"- Project: `{job.project_name or 'mondayos'}`\n"
+        f"- Repository: `{job.repository}`\n"
         f"- Attempts: {len(job.attempts)}/{job.max_attempts}\n"
         "- Independent reviewer: ChatGPT/Codex\n"
         "- Reviewer verdict: pass (high confidence)\n"
@@ -1009,7 +1404,7 @@ def _safe_text(value: Any, limit: int) -> str:
         text = str(value)
     except Exception:
         text = type(value).__name__
-    return _redact(text)[:limit]
+    return str(_redact(text))[:limit]
 
 
 def _failure_code(exc: BaseException) -> str:

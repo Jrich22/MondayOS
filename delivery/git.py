@@ -25,8 +25,10 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import IO
+from typing import IO, TypeAlias
 from urllib.parse import urlparse
+
+from delivery.security import protected_path_reason
 
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_MAX_OUTPUT = 256_000
@@ -36,12 +38,16 @@ _BRANCH_RE = re.compile(r"^codex/[a-z0-9][a-z0-9-]{0,79}-[0-9a-f]{8}$")
 _OWNER_FILE_SUFFIX = ".owner.json"
 _OWNER_SCHEMA = 2
 _CONTAINED_VALIDATION_ENV = "MONDAYOS_INTERNAL_CONTAINED_VALIDATION"
+_BASE_TREE_MAX_OUTPUT = 8_000_000
+_ATTRIBUTE_BATCH_MAX_PATHS = 128
+_ATTRIBUTE_BATCH_MAX_BYTES = 32_000
+_GIT_ADMIN_MAX_ENTRIES = 1_000_000
+_RemoteSnapshot: TypeAlias = tuple[tuple[str, ...], tuple[str, ...], tuple[str, str]]
 _CHILD_ENV_ALLOWLIST = {
     "HOME",
     "LANG",
     "LC_ALL",
     "LOGNAME",
-    "PATH",
     "SHELL",
     "SSH_AUTH_SOCK",
     "TMPDIR",
@@ -159,6 +165,36 @@ class _BoundedCollector:
         return False
 
 
+def _validated_inherited_guard_fds(fds: tuple[int, ...]) -> tuple[int, ...]:
+    """Validate the small set of controller lock descriptors passed to a child."""
+    if not isinstance(fds, tuple):
+        raise ValueError("inherited guard descriptors must be a tuple")
+    if any(
+        isinstance(descriptor, bool)
+        or not isinstance(descriptor, int)
+        or descriptor <= 2
+        for descriptor in fds
+    ):
+        raise ValueError("inherited guard descriptors must be open integers above stderr")
+    if len(set(fds)) != len(fds):
+        raise ValueError("inherited guard descriptors must be unique")
+    for descriptor in fds:
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError as exc:
+            raise ValueError("inherited guard descriptor is not open") from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise ValueError(
+                "inherited guard descriptor must identify one controller-owned regular file"
+            )
+    return fds
+
+
 def run_command(
     argv: Sequence[str],
     *,
@@ -167,6 +203,7 @@ def run_command(
     max_output_bytes: int = DEFAULT_MAX_OUTPUT,
     env: Mapping[str, str] | None = None,
     check: bool = False,
+    inherited_guard_fds: tuple[int, ...] = (),
 ) -> CommandResult:
     """Run an argv vector with bounded capture and process-group timeout kill.
 
@@ -177,10 +214,14 @@ def run_command(
     exact_argv = tuple(str(part) for part in argv)
     if not exact_argv or any(not part or "\x00" in part for part in exact_argv):
         raise ValueError("argv must contain non-empty, NUL-free arguments")
+    executable = Path(exact_argv[0])
+    if not executable.is_absolute():
+        raise ValueError("the child executable must be an absolute path")
     if timeout <= 0:
         raise ValueError("timeout must be positive")
     if max_output_bytes < 0:
         raise ValueError("max_output_bytes cannot be negative")
+    guard_fds = _validated_inherited_guard_fds(inherited_guard_fds)
 
     # Delivery runs inside processes that may hold provider, Telegram, and
     # GitHub credentials.  Start from a small operational allowlist instead of
@@ -194,6 +235,7 @@ def run_command(
         for key in _CHILD_ENV_ALLOWLIST:
             if key in env:
                 child_env[key] = str(env[key])
+    child_env["PATH"] = _trusted_child_path(executable, cwd)
     child_env["GIT_TERMINAL_PROMPT"] = "0"
     child_env["GIT_ALLOW_PROTOCOL"] = "https:ssh:file"
     # Formula-level system configuration lives under Homebrew's writable
@@ -215,6 +257,7 @@ def run_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=isolate_process_group,
+        pass_fds=guard_fds,
     )
     assert process.stdout is not None
     assert process.stderr is not None
@@ -319,6 +362,9 @@ class GitRepository:
         max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
         max_patch_bytes: int = 5_000_000,
         lock_timeout: float = 30.0,
+        expected_github_repository: str | None = None,
+        expected_root_identity: tuple[int, int] | None = None,
+        require_embedded_git_dir: bool = False,
     ) -> None:
         self.repo_root = Path(repo_root)
         self.trusted_root = Path(trusted_root)
@@ -332,12 +378,40 @@ class GitRepository:
             raise GitValidationError("configured Git executable is unavailable") from exc
         if not resolved_git.is_file() or not os.access(resolved_git, os.X_OK):
             raise GitValidationError("configured Git executable is not executable")
+        try:
+            configured_root = self.repo_root.resolve(strict=True)
+        except OSError:
+            configured_root = self.repo_root.absolute()
+        if _path_is_within(resolved_git, configured_root):
+            raise GitValidationError(
+                "configured Git executable cannot come from the delivery repository"
+            )
         self.git_binary = os.fspath(resolved_git)
         self.command_timeout = command_timeout
         self.max_output_bytes = max_output_bytes
         self.max_file_bytes = max_file_bytes
         self.max_patch_bytes = max_patch_bytes
         self.lock_timeout = lock_timeout
+        self.expected_github_repository = (
+            _normalize_github_repository(expected_github_repository)
+            if expected_github_repository is not None
+            else None
+        )
+        if expected_root_identity is not None and (
+            not isinstance(expected_root_identity, tuple)
+            or len(expected_root_identity) != 2
+            or any(not isinstance(value, int) or value < 0 for value in expected_root_identity)
+        ):
+            raise GitValidationError(
+                "expected root identity must be a (device, inode) integer tuple"
+            )
+        self.expected_root_identity = expected_root_identity
+        self.require_embedded_git_dir = bool(require_embedded_git_dir)
+        self._git_dir_identity = (
+            _initial_embedded_git_identity(self.repo_root)
+            if self.require_embedded_git_dir
+            else None
+        )
         self._lock_guard = threading.RLock()
         self._lock_depth = 0
 
@@ -356,6 +430,45 @@ class GitRepository:
             raise GitValidationError(f"trusted repository is unavailable: {exc}") from exc
         if canonical != trusted_canonical or not canonical.is_dir():
             raise GitValidationError("repository does not resolve to the trusted root")
+        try:
+            metadata = canonical.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise GitValidationError("trusted repository identity is unavailable") from exc
+        actual_identity = (metadata.st_dev, metadata.st_ino)
+        if (
+            self.expected_root_identity is not None
+            and actual_identity != self.expected_root_identity
+        ):
+            raise GitValidationError("trusted repository root identity changed")
+        if self.require_embedded_git_dir:
+            git_dir = canonical / ".git"
+            try:
+                git_metadata = git_dir.lstat()
+            except OSError as exc:
+                raise GitValidationError(
+                    "trusted repository must contain an embedded .git directory"
+                ) from exc
+            if stat.S_ISLNK(git_metadata.st_mode) or not stat.S_ISDIR(git_metadata.st_mode):
+                raise GitValidationError(
+                    "trusted repository must use a real embedded .git directory; "
+                    "linked worktrees are not delivery targets"
+                )
+            git_identity = (int(git_metadata.st_dev), int(git_metadata.st_ino))
+            if self._git_dir_identity is None:
+                self._git_dir_identity = git_identity
+            elif git_identity != self._git_dir_identity:
+                raise GitValidationError("trusted repository Git directory identity changed")
+            _assert_owned_git_admin_tree(git_dir, expected_identity=git_identity)
+            embedded_git_dir = git_dir.resolve(strict=True)
+            if embedded_git_dir.parent != canonical:
+                raise GitValidationError("trusted repository Git directory escaped its root")
+            absolute_git_dir = self._resolved_git_path(canonical, "--absolute-git-dir")
+            common_git_dir = self._resolved_git_path(canonical, "--git-common-dir")
+            if absolute_git_dir != embedded_git_dir or common_git_dir != embedded_git_dir:
+                raise GitValidationError(
+                    "trusted repository must own its Git directory and common object database"
+                )
+        self._assert_safe_local_config(canonical)
         result = self._git(canonical, "rev-parse", "--show-toplevel", check=True)
         try:
             actual = Path(result.stdout.strip()).resolve(strict=True)
@@ -421,36 +534,37 @@ class GitRepository:
         root = self.validate_trusted_root()
         self._validate_remote(remote)
         with self.lock():
-            self._validated_remote_identity(root, remote)
-            self._git(root, "fetch", "--no-tags", "--prune", remote, check=True)
-            symbolic = self._git(
+            snapshot = self._validated_remote_identity(root, remote)
+            fetch_url = snapshot[0][0]
+            advertised = self._git(
                 root,
-                "symbolic-ref",
-                "--quiet",
-                "--short",
-                f"refs/remotes/{remote}/HEAD",
+                "ls-remote",
+                "--symref",
+                fetch_url,
+                "HEAD",
+                check=True,
             )
-            if not symbolic.ok:
-                self._git(root, "remote", "set-head", remote, "--auto", check=True)
-                symbolic = self._git(
-                    root,
-                    "symbolic-ref",
-                    "--quiet",
-                    "--short",
-                    f"refs/remotes/{remote}/HEAD",
-                    check=True,
-                )
-            remote_branch = symbolic.stdout.strip()
-            prefix = f"{remote}/"
-            if not remote_branch.startswith(prefix):
-                raise GitValidationError("origin default branch could not be resolved")
-            branch = remote_branch[len(prefix) :]
+            branch, advertised_sha = self._parse_advertised_head(advertised)
             self._validate_ref_component(branch)
-            ref = f"refs/remotes/{remote}/{branch}"
+            ref = _base_tracking_ref(remote, branch)
+            remote_ref = f"refs/heads/{branch}"
+            self._git(
+                root,
+                "fetch",
+                "--no-tags",
+                "--no-prune",
+                "--no-recurse-submodules",
+                "--no-auto-maintenance",
+                "--no-write-fetch-head",
+                fetch_url,
+                f"+{remote_ref}:{ref}",
+                check=True,
+            )
             sha = self._git(root, "rev-parse", "--verify", f"{ref}^{{commit}}", check=True)
             exact_sha = sha.stdout.strip().lower()
-            if not _SHA_RE.fullmatch(exact_sha):
+            if not _SHA_RE.fullmatch(exact_sha) or exact_sha != advertised_sha:
                 raise GitValidationError("remote default branch did not resolve to an exact SHA")
+            self._assert_remote_identity_unchanged(root, remote, snapshot)
             return BaseRevision(remote=remote, branch=branch, ref=ref, sha=exact_sha)
 
     def create_worktree(self, task_id: str, base: BaseRevision) -> Worktree:
@@ -476,6 +590,7 @@ class GitRepository:
                     root,
                     "worktree",
                     "add",
+                    "--no-checkout",
                     "--no-track",
                     "-b",
                     branch,
@@ -491,6 +606,37 @@ class GitRepository:
                         raise GitValidationError(
                             "new worktree is not linked to the trusted repository"
                         )
+                    self._assert_safe_local_config(path)
+                    base_paths = self._base_tree_paths(root, base.sha)
+                    self._git(
+                        path,
+                        "read-tree",
+                        "--reset",
+                        "--no-recurse-submodules",
+                        base.sha,
+                        check=True,
+                    )
+                    self._assert_no_filter_drivers(
+                        path,
+                        base_paths,
+                        source=base.sha,
+                    )
+                    # checkout-index has no checkout hook.  The command-wide
+                    # hooksPath override remains defense in depth for every
+                    # Git child spawned by this adapter.
+                    self._git(path, "checkout-index", "--all", "--force", check=True)
+                    clean = self._git(
+                        path,
+                        "status",
+                        "--porcelain=v1",
+                        "-z",
+                        "--untracked-files=all",
+                        check=True,
+                    )
+                    if clean.stdout_truncated or clean.stdout_invalid_utf8 or clean.stdout:
+                        raise GitValidationError(
+                            "new worktree did not materialize the exact clean base"
+                        )
                     _write_owner_marker(
                         marker,
                         root,
@@ -502,11 +648,37 @@ class GitRepository:
                         worktree_common,
                     )
                 except Exception:
-                    self._git(root, "worktree", "remove", os.fspath(path))
-                    self._git(root, "branch", "-d", branch)
+                    self._git(
+                        root,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        os.fspath(path),
+                        check=True,
+                    )
+                    self._git(root, "branch", "-D", branch, check=True)
                     raise
                 return Worktree(path, branch, base.sha, marker, token)
         raise GitValidationError("could not allocate a unique worktree")
+
+    def recover_worktree(
+        self,
+        *,
+        path: Path,
+        branch: str,
+        base_sha: str,
+        owner_token: str,
+    ) -> Worktree:
+        """Rehydrate and prove an owned worktree from one durable job record."""
+        if not owner_token or not re.fullmatch(r"[0-9a-f]{64}", owner_token):
+            raise GitValidationError("durable worktree ownership token is invalid")
+        candidate_path = Path(path)
+        marker = self._runtime_directory("owners") / (
+            f"{candidate_path.name}{_OWNER_FILE_SUFFIX}"
+        )
+        worktree = Worktree(candidate_path, branch, base_sha, marker, owner_token)
+        self._validate_owned_worktree(worktree)
+        return worktree
 
     def status(self, worktree: Worktree) -> list[ChangedPath]:
         path = self._validate_owned_worktree(worktree)
@@ -554,6 +726,12 @@ class GitRepository:
         with self.lock():
             root = self._validate_owned_worktree(worktree)
             self._assert_owned_ref(worktree, root, worktree.base_sha)
+            base_paths = self._base_tree_paths(root, worktree.base_sha)
+            self._assert_no_filter_drivers(
+                root,
+                base_paths,
+                source=worktree.base_sha,
+            )
             self._git(
                 root,
                 "reset",
@@ -884,7 +1062,15 @@ class GitRepository:
             self._assert_owned_ref(worktree, root, commit_sha)
             return commit_sha
 
-    def push(self, worktree: Worktree, expected_sha: str, remote: str = "origin") -> str:
+    def push(
+        self,
+        worktree: Worktree,
+        expected_sha: str,
+        remote: str = "origin",
+        *,
+        expected_base: BaseRevision | None = None,
+        inherited_guard_fds: tuple[int, ...] = (),
+    ) -> str:
         """Push this unique branch without force and return the exact HEAD SHA."""
         root = self._validate_owned_worktree(worktree)
         self._validate_remote(remote)
@@ -893,22 +1079,103 @@ class GitRepository:
         if not _BRANCH_RE.fullmatch(worktree.branch):
             raise GitValidationError("worktree branch is invalid")
         with self.lock():
-            self._validated_remote_identity(self.validate_trusted_root(), remote)
+            trusted_root = self.validate_trusted_root()
+            snapshot = self._validated_remote_identity(trusted_root, remote)
+            push_url = snapshot[1][0]
+            if expected_base is not None:
+                self._assert_remote_base(root, remote, push_url, expected_base)
             self._assert_owned_ref(worktree, root, expected_sha)
             self._git(
                 root,
                 "push",
-                remote,
+                "--no-follow-tags",
+                "--no-signed",
+                "--recurse-submodules=no",
+                push_url,
                 f"{expected_sha}:refs/heads/{worktree.branch}",
                 check=True,
+                inherited_guard_fds=inherited_guard_fds,
             )
             remote_ref = f"refs/heads/{worktree.branch}"
-            result = self._git(root, "ls-remote", "--refs", remote, remote_ref, check=True)
+            result = self._git(root, "ls-remote", "--refs", push_url, remote_ref, check=True)
+            if result.stdout_truncated or result.stdout_invalid_utf8:
+                raise GitValidationError("remote branch response is oversized or not valid UTF-8")
             records = [line.split("\t", 1) for line in result.stdout.splitlines() if line]
             if records != [[expected_sha, remote_ref]]:
                 raise GitValidationError("remote branch does not equal the approved commit")
+            self._assert_remote_identity_unchanged(trusted_root, remote, snapshot)
             self._assert_owned_ref(worktree, root, expected_sha)
             return expected_sha
+
+    def remote_branch_is_exact(
+        self,
+        worktree: Worktree,
+        expected_sha: str,
+        remote: str = "origin",
+    ) -> bool:
+        """Prove whether the unique remote branch equals the approved commit.
+
+        An absent branch is a safe negative result.  A branch at any other SHA
+        is a hard integrity failure rather than an invitation to overwrite it.
+        """
+        root = self._validate_owned_worktree(worktree)
+        self._validate_remote(remote)
+        if not _SHA_RE.fullmatch(expected_sha):
+            raise GitValidationError("expected published commit must be an exact SHA")
+        if not _BRANCH_RE.fullmatch(worktree.branch):
+            raise GitValidationError("worktree branch is invalid")
+        with self.lock():
+            trusted_root = self.validate_trusted_root()
+            snapshot = self._validated_remote_identity(trusted_root, remote)
+            push_url = snapshot[1][0]
+            self._assert_owned_ref(worktree, root, expected_sha)
+            remote_ref = f"refs/heads/{worktree.branch}"
+            result = self._git(
+                root,
+                "ls-remote",
+                "--refs",
+                push_url,
+                remote_ref,
+                check=True,
+            )
+            if result.stdout_truncated or result.stdout_invalid_utf8:
+                raise GitValidationError(
+                    "remote branch response is oversized or not valid UTF-8"
+                )
+            records = [line.split("\t", 1) for line in result.stdout.splitlines() if line]
+            if not records:
+                self._assert_remote_identity_unchanged(trusted_root, remote, snapshot)
+                self._assert_owned_ref(worktree, root, expected_sha)
+                return False
+            if records != [[expected_sha, remote_ref]]:
+                raise GitValidationError(
+                    "remote branch exists but does not equal the approved commit"
+                )
+            self._assert_remote_identity_unchanged(trusted_root, remote, snapshot)
+            self._assert_owned_ref(worktree, root, expected_sha)
+            return True
+
+    def _assert_remote_base(
+        self,
+        root: Path,
+        remote: str,
+        remote_url: str,
+        expected: BaseRevision,
+    ) -> None:
+        """Prove the remote base still equals the revision reviewed by the job."""
+        if expected.remote != remote:
+            raise GitValidationError("expected base belongs to a different remote")
+        self._validate_ref_component(expected.branch)
+        if expected.ref != _base_tracking_ref(remote, expected.branch):
+            raise GitValidationError("expected base ref does not match its remote branch")
+        if not _SHA_RE.fullmatch(expected.sha):
+            raise GitValidationError("expected base must contain an exact commit SHA")
+        result = self._git(root, "ls-remote", "--symref", remote_url, "HEAD", check=True)
+        branch, sha = self._parse_advertised_head(result)
+        if branch != expected.branch:
+            raise GitValidationError("remote default branch changed from the reviewed branch")
+        if sha != expected.sha:
+            raise GitValidationError("remote base branch moved from the reviewed commit")
 
     def cleanup(self, worktree: Worktree, *, delete_branch: bool = False) -> None:
         """Remove only a worktree whose exact ownership marker still matches."""
@@ -1035,38 +1302,91 @@ class GitRepository:
             raise GitValidationError("staged path list is oversized or not valid UTF-8")
         return tuple(sorted(path for path in result.stdout.split("\x00") if path))
 
-    def _assert_no_filter_drivers(self, root: Path, paths: Iterable[str]) -> None:
-        """Reject candidate paths whose attributes could execute Git filters."""
-        exact_paths = tuple(paths)
+    def _base_tree_paths(self, root: Path, base_sha: str) -> tuple[str, ...]:
+        """Return a base tree inventory only when every entry is a regular blob."""
+        if not _SHA_RE.fullmatch(base_sha):
+            raise GitValidationError("base tree must be identified by an exact commit SHA")
         result = self._git(
             root,
-            "check-attr",
+            "ls-tree",
+            "-r",
             "-z",
-            "filter",
-            "--",
-            *exact_paths,
+            "--full-tree",
+            base_sha,
             check=True,
+            max_output_bytes=max(self.max_output_bytes, _BASE_TREE_MAX_OUTPUT),
         )
         if result.stdout_truncated or result.stdout_invalid_utf8:
-            raise GitValidationError("Git attribute output is oversized or not valid UTF-8")
-        records = result.stdout.split("\x00")
-        if records and records[-1] == "":
-            records.pop()
-        if len(records) != len(exact_paths) * 3:
-            raise GitValidationError("Git returned malformed filter attributes")
+            raise GitValidationError("base tree inventory is oversized or not valid UTF-8")
+        paths: list[str] = []
         seen: set[str] = set()
-        allowed = set(exact_paths)
-        for index in range(0, len(records), 3):
-            path, attribute, value = records[index : index + 3]
-            if path not in allowed or path in seen or attribute != "filter":
-                raise GitValidationError("Git returned malformed filter attributes")
-            seen.add(path)
-            if value not in {"unspecified", "unset"}:
+        for record in result.stdout.split("\x00"):
+            if not record:
+                continue
+            metadata, separator, raw_path = record.partition("\t")
+            fields = metadata.split()
+            if not separator or len(fields) != 3:
+                raise GitValidationError("base tree contains a malformed entry")
+            mode, object_type, object_id = fields
+            relative = _validate_relative_path(raw_path)
+            if (
+                mode not in {"100644", "100755"}
+                or object_type != "blob"
+                or not _SHA_RE.fullmatch(object_id)
+            ):
                 raise GitValidationError(
-                    f"Git clean/smudge filters are not permitted for candidate path: {path}"
+                    f"base tree may not contain symlinks or gitlinks: {relative}"
                 )
-        if seen != allowed:
-            raise GitValidationError("Git returned incomplete filter attributes")
+            if relative in seen:
+                raise GitValidationError("base tree contains a duplicate path")
+            seen.add(relative)
+            paths.append(relative)
+        return tuple(paths)
+
+    def _assert_no_filter_drivers(
+        self,
+        root: Path,
+        paths: Iterable[str],
+        *,
+        source: str | None = None,
+    ) -> None:
+        """Reject candidate paths whose attributes could execute Git filters."""
+        exact_paths = tuple(paths)
+        if not exact_paths:
+            return
+        if source is not None and not _SHA_RE.fullmatch(source):
+            raise GitValidationError("filter attribute source must be an exact commit SHA")
+        for batch in _attribute_path_batches(exact_paths):
+            args = ["check-attr", "-z"]
+            if source is not None:
+                args.append(f"--source={source}")
+            # --all omits attributes that are genuinely unspecified.  Asking
+            # only for `filter` would render both the unspecified state and a
+            # literal driver named "unspecified" with the same text.
+            args.extend(["--all", "--", *batch])
+            result = self._git(root, *args, check=True)
+            if result.stdout_truncated or result.stdout_invalid_utf8:
+                raise GitValidationError(
+                    "Git attribute output is oversized or not valid UTF-8"
+                )
+            records = result.stdout.split("\x00")
+            if records and records[-1] == "":
+                records.pop()
+            if len(records) % 3:
+                raise GitValidationError("Git returned malformed filter attributes")
+            seen: set[tuple[str, str]] = set()
+            allowed = set(batch)
+            for index in range(0, len(records), 3):
+                path, attribute, _value = records[index : index + 3]
+                key = (path, attribute)
+                if path not in allowed or not attribute or key in seen:
+                    raise GitValidationError("Git returned malformed filter attributes")
+                seen.add(key)
+                if attribute == "filter":
+                    raise GitValidationError(
+                        "Git clean/smudge filters are not permitted for "
+                        f"candidate path: {path}"
+                    )
 
     def _validate_deleted_tracked_file(self, root: Path, relative: str) -> None:
         result = self._git(root, "ls-tree", "-z", "HEAD", "--", relative, check=True)
@@ -1136,6 +1456,7 @@ class GitRepository:
         if actual_marker.name != expected_marker_name:
             raise GitValidationError("worktree ownership marker has an invalid location")
         marker = _read_owner_marker(worktree.owner_marker)
+        self._assert_safe_local_config(actual)
         trusted_common = self._resolved_git_path(root, "--git-common-dir")
         worktree_common = self._resolved_git_path(actual, "--git-common-dir")
         worktree_git_dir = self._resolved_git_path(actual, "--absolute-git-dir")
@@ -1195,12 +1516,53 @@ class GitRepository:
         except OSError as exc:
             raise GitValidationError(f"Git returned an invalid {query} path") from exc
 
+    def _assert_safe_local_config(self, root: Path) -> None:
+        """Reject repository-local settings that can execute or redirect Git."""
+        local = self._git(
+            root,
+            "config",
+            "--local",
+            "--no-includes",
+            "--name-only",
+            "-z",
+            "--list",
+            check=True,
+        )
+        keys = self._validated_config_keys(local, "local")
+        if "extensions.worktreeconfig" in {key.casefold() for key in keys}:
+            worktree = self._git(
+                root,
+                "config",
+                "--worktree",
+                "--no-includes",
+                "--name-only",
+                "-z",
+                "--list",
+                check=True,
+            )
+            keys += self._validated_config_keys(worktree, "worktree")
+        for raw_key in keys:
+            if _dangerous_local_config_key(raw_key.casefold()):
+                raise GitValidationError(
+                    f"unsafe repository-local Git configuration is not permitted: {raw_key}"
+                )
+
+    @staticmethod
+    def _validated_config_keys(result: CommandResult, scope: str) -> list[str]:
+        if result.stdout_truncated or result.stdout_invalid_utf8:
+            raise GitValidationError("local Git configuration is oversized or not valid UTF-8")
+        keys = [key for key in result.stdout.split("\x00") if key]
+        if any("\n" in key or "\r" in key for key in keys):
+            raise GitValidationError(f"{scope} Git configuration contains a malformed key")
+        return keys
+
     def _git(
         self,
         cwd: Path,
         *args: str,
         check: bool = False,
         max_output_bytes: int | None = None,
+        inherited_guard_fds: tuple[int, ...] = (),
     ) -> CommandResult:
         return run_command(
             [
@@ -1219,6 +1581,7 @@ class GitRepository:
                 self.max_output_bytes if max_output_bytes is None else max_output_bytes
             ),
             check=check,
+            inherited_guard_fds=inherited_guard_fds,
         )
 
     @staticmethod
@@ -1230,19 +1593,71 @@ class GitRepository:
         self,
         root: Path,
         remote: str,
-    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, str]]:
+    ) -> _RemoteSnapshot:
+        self._assert_safe_local_config(root)
         fetch = self._git(root, "remote", "get-url", "--all", remote, check=True)
         push = self._git(root, "remote", "get-url", "--push", "--all", remote, check=True)
+        if (
+            fetch.stdout_truncated
+            or fetch.stdout_invalid_utf8
+            or push.stdout_truncated
+            or push.stdout_invalid_utf8
+        ):
+            raise GitValidationError("remote URL configuration is oversized or invalid")
         fetch_urls = tuple(line for line in fetch.stdout.splitlines() if line)
         push_urls = tuple(line for line in push.stdout.splitlines() if line)
         if not fetch_urls or not push_urls:
             raise GitValidationError("remote must have fetch and push URLs")
-        identities = {_remote_identity(value) for value in (*fetch_urls, *push_urls)}
-        if len(identities) != 1:
+        identities = [_remote_identity(value) for value in (*fetch_urls, *push_urls)]
+        normalized_identities = {
+            (kind, value.casefold() if kind == "github" else value)
+            for kind, value in identities
+        }
+        if len(normalized_identities) != 1:
             raise GitValidationError(
                 "remote fetch and push URLs do not identify the same repository"
             )
-        return fetch_urls, push_urls, identities.pop()
+        identity = identities[0]
+        if self.expected_github_repository is not None and (
+            identity[0] != "github"
+            or identity[1].casefold() != self.expected_github_repository
+        ):
+            raise GitValidationError(
+                "remote does not match the registered GitHub repository"
+            )
+        return fetch_urls, push_urls, identity
+
+    def _assert_remote_identity_unchanged(
+        self,
+        root: Path,
+        remote: str,
+        expected: _RemoteSnapshot,
+    ) -> None:
+        """Reject a remote configuration change across one network operation."""
+        if self._validated_remote_identity(root, remote) != expected:
+            raise GitValidationError("remote configuration changed during the operation")
+
+    @staticmethod
+    def _parse_advertised_head(result: CommandResult) -> tuple[str, str]:
+        if result.stdout_truncated or result.stdout_invalid_utf8:
+            raise GitValidationError("remote HEAD response is oversized or not valid UTF-8")
+        symrefs: list[str] = []
+        revisions: list[str] = []
+        for line in result.stdout.splitlines():
+            if not line:
+                continue
+            value, separator, name = line.partition("\t")
+            if not separator or name != "HEAD":
+                raise GitValidationError("remote HEAD response is malformed")
+            if value.startswith("ref: refs/heads/"):
+                symrefs.append(value.removeprefix("ref: refs/heads/"))
+            elif _SHA_RE.fullmatch(value.lower()):
+                revisions.append(value.lower())
+            else:
+                raise GitValidationError("remote HEAD response is malformed")
+        if len(symrefs) != 1 or len(revisions) != 1:
+            raise GitValidationError("remote default branch could not be resolved")
+        return symrefs[0], revisions[0]
 
     def _validate_ref_component(self, branch: str) -> None:
         if not branch or branch.startswith("-") or ".." in branch or "@{" in branch:
@@ -1256,6 +1671,242 @@ def _safe_task_slug(task_id: str) -> str:
     if not slug:
         slug = "task"
     return slug
+
+
+def _initial_embedded_git_identity(repo_root: Path) -> tuple[int, int] | None:
+    """Snapshot a conventional embedded Git directory without following links."""
+    try:
+        metadata = (Path(repo_root).absolute() / ".git").lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        return None
+    return int(metadata.st_dev), int(metadata.st_ino)
+
+
+def _trusted_child_path(executable: Path, cwd: Path) -> str:
+    """Build a small absolute PATH that cannot resolve helpers from ``cwd``.
+
+    Git invokes transports such as ``ssh`` by name.  Inheriting an ambient PATH
+    containing ``.``, an empty component, or a directory inside a registered
+    project would therefore let project content execute outside the coding
+    sandbox.  Use only the resolved executable's directory and the interpreter's
+    platform default system directories, excluding anything below the child cwd.
+    """
+    try:
+        exact_executable = executable.resolve(strict=True)
+        exact_cwd = Path(cwd).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("child executable and cwd must resolve to existing paths") from exc
+    if not exact_executable.is_file() or not os.access(exact_executable, os.X_OK):
+        raise ValueError("child executable must be an executable regular file")
+
+    raw_candidates = [os.fspath(exact_executable.parent), *os.defpath.split(os.pathsep)]
+    trusted: list[str] = []
+    for raw in raw_candidates:
+        candidate = Path(raw)
+        if not raw or not candidate.is_absolute():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if not resolved.is_dir() or _path_is_within(resolved, exact_cwd):
+            continue
+        value = os.fspath(resolved)
+        if value not in trusted:
+            trusted.append(value)
+    if not trusted:
+        raise ValueError("no trusted executable search path is available")
+    return os.pathsep.join(trusted)
+
+
+def _assert_owned_git_admin_tree(
+    git_dir: Path,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Reject links, special files, mounts, or replacement within an embedded .git.
+
+    The walk uses directory descriptors plus ``O_NOFOLLOW`` so every directory
+    opened for traversal is the exact directory that was inspected.  This keeps
+    refs, objects, and worktree metadata owned by the registered checkout rather
+    than allowing an internal symlink to redirect a Git mutation elsewhere.
+    """
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise GitValidationError("safe Git directory traversal is unavailable")
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        root_descriptor = os.open(git_dir, flags)
+    except OSError as exc:
+        raise GitValidationError("trusted repository Git directory is unsafe") from exc
+
+    pending: list[tuple[int, str]] = [(root_descriptor, ".git")]
+    entries_seen = 0
+    try:
+        root_metadata = os.fstat(root_descriptor)
+        root_identity = (int(root_metadata.st_dev), int(root_metadata.st_ino))
+        if root_identity != expected_identity or not stat.S_ISDIR(root_metadata.st_mode):
+            raise GitValidationError("trusted repository Git directory identity changed")
+        root_device = root_metadata.st_dev
+
+        while pending:
+            descriptor, relative_dir = pending.pop()
+            try:
+                with os.scandir(descriptor) as entries:
+                    for entry in entries:
+                        entries_seen += 1
+                        if entries_seen > _GIT_ADMIN_MAX_ENTRIES:
+                            raise GitValidationError(
+                                "trusted repository Git directory exceeds the safety limit"
+                            )
+                        relative = f"{relative_dir}/{entry.name}"
+                        try:
+                            metadata = entry.stat(follow_symlinks=False)
+                        except OSError as exc:
+                            raise GitValidationError(
+                                f"cannot inspect Git administrative path: {relative}"
+                            ) from exc
+                        if stat.S_ISLNK(metadata.st_mode):
+                            raise GitValidationError(
+                                f"Git administrative paths cannot be symlinks: {relative}"
+                            )
+                        if metadata.st_dev != root_device:
+                            raise GitValidationError(
+                                f"Git administrative path crosses a filesystem: {relative}"
+                            )
+                        if stat.S_ISREG(metadata.st_mode):
+                            if metadata.st_nlink != 1:
+                                raise GitValidationError(
+                                    "Git administrative files cannot use hard links: "
+                                    f"{relative}"
+                                )
+                            continue
+                        if not stat.S_ISDIR(metadata.st_mode):
+                            raise GitValidationError(
+                                f"Git administrative path has an unsafe file type: {relative}"
+                            )
+                        child_descriptor: int | None = None
+                        try:
+                            child_descriptor = os.open(
+                                entry.name,
+                                flags,
+                                dir_fd=descriptor,
+                            )
+                            child_metadata = os.fstat(child_descriptor)
+                        except OSError as exc:
+                            if child_descriptor is not None:
+                                os.close(child_descriptor)
+                            raise GitValidationError(
+                                f"cannot safely open Git administrative directory: {relative}"
+                            ) from exc
+                        inspected_identity = (metadata.st_dev, metadata.st_ino)
+                        opened_identity = (child_metadata.st_dev, child_metadata.st_ino)
+                        if (
+                            opened_identity != inspected_identity
+                            or not stat.S_ISDIR(child_metadata.st_mode)
+                        ):
+                            os.close(child_descriptor)
+                            raise GitValidationError(
+                                "Git administrative directory changed during inspection: "
+                                f"{relative}"
+                            )
+                        pending.append((child_descriptor, relative))
+            finally:
+                os.close(descriptor)
+    finally:
+        for descriptor, _relative in pending:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _base_tracking_ref(remote: str, branch: str) -> str:
+    """Return a controller-owned ref that cannot collide across branch shapes."""
+    digest = hashlib.sha256(branch.encode("utf-8")).hexdigest()
+    return f"refs/mondayos/remotes/{remote}/{digest}"
+
+
+def _attribute_path_batches(paths: tuple[str, ...]) -> Iterator[tuple[str, ...]]:
+    """Bound check-attr argv size while preserving an exact path inventory."""
+    batch: list[str] = []
+    size = 0
+    for path in paths:
+        encoded_size = len(os.fsencode(path)) + 1
+        if encoded_size > _ATTRIBUTE_BATCH_MAX_BYTES:
+            raise GitValidationError("repository path is too long for safe attribute checking")
+        if batch and (
+            len(batch) >= _ATTRIBUTE_BATCH_MAX_PATHS
+            or size + encoded_size > _ATTRIBUTE_BATCH_MAX_BYTES
+        ):
+            yield tuple(batch)
+            batch = []
+            size = 0
+        batch.append(path)
+        size += encoded_size
+    if batch:
+        yield tuple(batch)
+
+
+def _dangerous_local_config_key(key: str) -> bool:
+    if key.startswith("filter."):
+        return True
+    if key.startswith("credential."):
+        return True
+    if key.startswith("http."):
+        return True
+    if key in {
+        "core.askpass",
+        "core.alternaterefscommand",
+        "core.attributesfile",
+        "core.gitproxy",
+        "core.sshcommand",
+        "extensions.partialclone",
+        "fetch.bundleuri",
+        "include.path",
+        "push.gpgsign",
+        "push.pushoption",
+    }:
+        return True
+    if key == "gpg.program" or (key.startswith("gpg.") and key.endswith(".program")):
+        return True
+    if key.startswith("includeif."):
+        return True
+    if key.startswith("remote.") and (
+        key.endswith(".mirror")
+        or key.endswith(".proxy")
+        or key.endswith(".proxyauthmethod")
+        or key.endswith(".receivepack")
+        or key.endswith(".uploadpack")
+        or key.endswith(".promisor")
+        or key.endswith(".partialclonefilter")
+    ):
+        return True
+    return key.startswith("url.") and (
+        key.endswith(".insteadof") or key.endswith(".pushinsteadof")
+    )
+
+
+def _normalize_github_repository(repository: str) -> str:
+    if not isinstance(repository, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",
+        repository,
+    ):
+        raise GitValidationError(
+            "expected GitHub repository must be one owner/repository slug"
+        )
+    return repository.casefold()
 
 
 def _remote_identity(value: str) -> tuple[str, str]:
@@ -1323,79 +1974,9 @@ def _validate_relative_path(raw_path: str) -> str:
 
 
 def _enforce_path_policy(relative: str) -> None:
-    path = PurePosixPath(relative)
-    lower_parts = tuple(part.lower() for part in path.parts)
-    basename = lower_parts[-1]
-    top = lower_parts[0]
-    if ".git" in lower_parts:
-        raise GitValidationError(f"Git internals are protected: {relative}")
-    if basename.startswith(".env"):
-        raise GitValidationError(f"environment files are protected: {relative}")
-    if lower_parts[:2] == (".github", "workflows"):
-        raise GitValidationError(f"workflow definitions are protected: {relative}")
-    if top in {".agents", ".claude", ".codex", ".mondayos"} or basename in {
-        "agents.md",
-        "claude.md",
-        "skill.md",
-        ".cursorrules",
-        ".mcp.json",
-        "copilot-instructions.md",
-    }:
-        raise GitValidationError(f"AI/controller instruction files are protected: {relative}")
-    if basename in {".gitmodules", ".gitattributes"}:
-        raise GitValidationError(f"Git configuration files are protected: {relative}")
-    if basename in {
-        ".pytest.ini",
-        ".pytest.toml",
-        "conftest.py",
-        "pytest.ini",
-        "pytest.toml",
-        "tox.ini",
-    }:
-        raise GitValidationError(f"test harness configuration is protected: {relative}")
-    if top in {"deploy", "deployment", "service", "services"}:
-        raise GitValidationError(f"deployment/service definitions are protected: {relative}")
-    if basename.endswith((".service", ".timer", ".socket", ".plist")) or basename in {
-        "dockerfile",
-        "procfile",
-    } or basename.startswith(("docker-compose.", "compose.")):
-        raise GitValidationError(f"deployment/service definitions are protected: {relative}")
-    if basename.endswith((".pem", ".key", ".p12", ".pfx")) or basename in {
-        "id_rsa",
-        "id_dsa",
-        "id_ecdsa",
-        "id_ed25519",
-    }:
-        raise GitValidationError(f"key material is protected: {relative}")
-    manifests = {
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-        "package.json",
-        "package-lock.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-        "pipfile",
-        "pipfile.lock",
-        "poetry.lock",
-        "uv.lock",
-        "cargo.toml",
-        "cargo.lock",
-        "go.mod",
-        "go.sum",
-        "gemfile",
-        "gemfile.lock",
-        "composer.json",
-        "composer.lock",
-        "pom.xml",
-        "build.gradle",
-        "build.gradle.kts",
-        "gradle.lockfile",
-    }
-    if basename in manifests or (
-        basename.startswith("requirements") and basename.endswith((".txt", ".in"))
-    ):
-        raise GitValidationError(f"dependency manifests and locks are protected: {relative}")
+    reason = protected_path_reason(relative)
+    if reason is not None:
+        raise GitValidationError(f"{reason}: {relative}")
 
 
 def _validate_path_components(root: Path, candidate: Path) -> None:

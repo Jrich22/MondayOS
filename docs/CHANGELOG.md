@@ -13,18 +13,31 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 - An artifact-bound `Monday.build()` workflow and `monday build` CLI. It creates
   a job-owned worktree from the exact remote base, accepts structured text
-  patches from Claude Code with Codex fallback, runs fixed validation and secret
-  checks, requires a fresh high-confidence ChatGPT/Codex review bound to the
-  exact staged artifact, repairs up to three attempts, then commits, non-force
-  pushes, and opens or reconciles a GitHub pull request. It cannot merge or
-  deploy. Codex builder and reviewer sessions run from private non-repository
-  runtimes with model tools disabled; the reviewer receives the controller's
-  bounded exact staged diff and verifies its SHA-256 before launch.
+  patches, runs fixed validation and secret checks, requires a fresh
+  high-confidence ChatGPT/Codex review bound to the exact staged artifact,
+  repairs up to three attempts, then commits, non-force pushes, and opens or
+  reconciles a GitHub pull request. MondayOS self-builds use Claude Code with
+  Codex fallback; registered external targets use Codex only. It cannot merge
+  or deploy. Task and repository guards survive controller exit while a
+  publication child is running; exact-ID recovery verifies the approved remote
+  commit and reconciles the pull request without a second push. Codex builder
+  and reviewer sessions run from private
+  non-repository runtimes with model tools disabled; the reviewer receives the
+  controller's bounded exact staged diff and verifies its SHA-256 before launch.
+- Explicit external-project delivery enrollment through
+  `monday project register --delivery-repository OWNER/REPO`, project-bound
+  tasks, and `monday build --project` selectors. MondayOS keeps controller state
+  under its own root while pinning the target's canonical directory, filesystem
+  identity, and exact GitHub repository. A delivery identity cannot be rebound
+  to another task or target. Analysis-only registrations remain unable to push.
+  Existing target automation may run when the delivery branch is pushed; the
+  workflow still stops at the pull request and never merges or deploys.
 - Opt-in private Telegram live builds via
   `MONDAYOS_TELEGRAM_LIVE_BUILD=true`. Private plain text and `/build` create and
-  deliver a task; `/deliver TASK-ID` delivers an existing task. Durable update
-  identity, progress, restart recovery, and group-chat execution blocking are
-  preserved.
+  deliver a task; `/build PROJECT :: REQUEST` selects an enrolled external
+  target, and `/deliver TASK-ID` restores the task's saved project binding.
+  Durable update identity, progress, restart recovery, and group-chat execution
+  blocking are preserved.
 - Durable Telegram intake and a single background execution worker. Authorized
   minimal requests are atomically queued with the advanced offset in
   `logs/telegram/state.json` and receive an immediate saved/position receipt;
@@ -45,6 +58,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
   and incremental address-space ceilings, plus aggregate memory and
   runtime-storage watchdogs that account for fast exits and open-but-unlinked
   files.
+- External target validation uses only the trusted MondayOS interpreter and
+  sandbox bootstrap. It always runs the staged-diff check and adds sandboxed
+  pytest when the target has `pyproject.toml`; it neither executes the target's
+  virtual environment nor installs dependencies or infers other ecosystem test
+  commands.
 - Candidate-controlled test output is withheld on both success and failure;
   repair models receive only controller-derived check identity and exit status,
   closing encoded-source and prompt-injection channels through failed tests.

@@ -80,9 +80,16 @@ class MondayValidationRunner:
 
     name = "validation"
 
-    def __init__(self, *, source_root: Path | None = None, timeout: float = 900) -> None:
+    def __init__(
+        self,
+        *,
+        source_root: Path | None = None,
+        timeout: float = 900,
+        mondayos_tests: bool = True,
+    ) -> None:
         self._source_root = Path(source_root).resolve() if source_root is not None else None
         self._timeout = timeout
+        self._mondayos_tests = mondayos_tests
 
     def availability(self) -> ToolAvailability:
         """Prove that fixed Git and Python commands run inside the sandbox."""
@@ -194,8 +201,26 @@ class MondayValidationRunner:
         worktree: Path,
         source_root: Path,
         changed_files: list[str],
+        repository_root: Path | None = None,
+        mondayos_tests: bool | None = None,
     ) -> list[ValidationResult]:
         del changed_files  # Reserved for narrower deterministic checks later.
+        run_mondayos_tests = (
+            self._mondayos_tests if mondayos_tests is None else mondayos_tests
+        )
+        # ``source_root`` historically identified both the trusted MondayOS
+        # controller and the repository under test.  Preserve that default for
+        # self-builds, while allowing delivery into a separately registered
+        # repository.  A root fixed at construction remains authoritative for
+        # the interpreter and sandbox bootstrap even if a later caller passes a
+        # different source root.
+        requested_source_root = Path(source_root).resolve()
+        controller_root = self._source_root or requested_source_root
+        target_repository_root = (
+            Path(repository_root).resolve()
+            if repository_root is not None
+            else requested_source_root
+        )
         try:
             git = _trusted_validation_git()
         except OSError as exc:
@@ -219,7 +244,7 @@ class MondayValidationRunner:
             ),
         ]
         if (worktree / "pyproject.toml").is_file():
-            source_python = source_root / ".venv" / "bin" / "python"
+            source_python = controller_root / ".venv" / "bin" / "python"
             python = str(source_python) if source_python.is_file() else sys.executable
             pytest_argv = [
                 python,
@@ -235,9 +260,11 @@ class MondayValidationRunner:
                 str(Path(worktree).resolve()),
                 "tests",
             ]
-            pytest_argv.extend(
-                f"--deselect={selection}" for selection in _SANDBOXED_PYTEST_EXCLUSIONS
-            )
+            if run_mondayos_tests:
+                pytest_argv.extend(
+                    f"--deselect={selection}"
+                    for selection in _SANDBOXED_PYTEST_EXCLUSIONS
+                )
             commands.append(("pytest", pytest_argv, False))
 
         results: list[ValidationResult] = []
@@ -249,9 +276,10 @@ class MondayValidationRunner:
                 command = self._sandboxed(
                     argv,
                     worktree,
-                    source_root,
+                    controller_root,
                     runtime_root,
                     allow_repository_git=allow_repository_git,
+                    repository_root=target_repository_root,
                 )
                 result = _run_process(
                     command,
@@ -266,7 +294,7 @@ class MondayValidationRunner:
                 output = "\n".join(
                     part for part in (result.stdout, result.stderr) if part
                 ).strip()
-                if name == "pytest":
+                if name == "pytest" and run_mondayos_tests:
                     exclusions = ", ".join(_SANDBOXED_PYTEST_EXCLUSIONS)
                     reasons = "; ".join(_SANDBOXED_PYTEST_EXCLUSION_EVIDENCE)
                     output = (
@@ -298,6 +326,7 @@ class MondayValidationRunner:
         runtime_root: Path,
         *,
         allow_repository_git: bool,
+        repository_root: Path | None = None,
     ) -> list[str]:
         if sys.platform != "darwin":
             raise RuntimeError(
@@ -318,6 +347,7 @@ class MondayValidationRunner:
             source_root,
             runtime_root,
             allow_repository_git=allow_repository_git,
+            repository_root=repository_root,
         )
         suffix = "git" if allow_repository_git else "tests"
         profile_path = runtime_root / f"sandbox-{suffix}.sb"
@@ -330,7 +360,7 @@ def _validation_env(runtime_root: Path) -> dict[str, str]:
     temp = runtime_root / "tmp"
     home.mkdir(mode=0o700)
     temp.mkdir(mode=0o700)
-    env = _controller_env()
+    env: dict[str, str] = dict(_controller_env())
     env.update({
         # Force network-aware libraries down a numeric, unreachable proxy path.
         # On macOS, urllib otherwise asks SystemConfiguration and mDNSResponder
@@ -395,10 +425,18 @@ def _sandbox_profile(
     runtime_root: Path,
     *,
     allow_repository_git: bool = False,
+    repository_root: Path | None = None,
 ) -> str:
     worktree_root = worktree.resolve()
     worktree_git = worktree_root / ".git"
-    source_git = (source_root / ".git").resolve()
+    controller_root = source_root.resolve()
+    controller_git = (controller_root / ".git").resolve()
+    target_repository_root = (
+        Path(repository_root).resolve()
+        if repository_root is not None
+        else controller_root
+    )
+    repository_git = (target_repository_root / ".git").resolve()
     allowed_read = [
         "/System/Library",
         "/usr/bin",
@@ -421,12 +459,12 @@ def _sandbox_profile(
         "/var/select/developer_dir",
         "/private/var/select/developer_dir",
         str(worktree_root),
-        str((source_root / ".venv").resolve()),
+        str((controller_root / ".venv").resolve()),
         str(runtime_root.resolve()),
         "/dev/null",
     ]
     if allow_repository_git:
-        allowed_read.append(str(source_git))
+        allowed_read.append(str(repository_git))
     # macOS Seatbelt evaluates traversal of each absolute path separately from
     # access beneath it. Permit only the exact ancestor directories needed to
     # reach the allowlisted roots; without these literals, current macOS aborts
@@ -448,7 +486,8 @@ def _sandbox_profile(
     writable = [str(runtime_root.resolve())]
     writes = "\n".join(f'  (subpath {json.dumps(path)})' for path in writable)
     git_deny = json.dumps(str(worktree_git))
-    source_git_deny = json.dumps(str(source_git))
+    repository_git_deny = json.dumps(str(repository_git))
+    controller_git_deny = json.dumps(str(controller_git))
     sensitive_read_denies = "\n".join(
         (
             '  (subpath "/Library/Keychains")',
@@ -460,14 +499,25 @@ def _sandbox_profile(
             '  (subpath "/opt/homebrew/var")',
         )
     )
-    read_deny = ""
+    denied_git_reads: list[Path] = []
     if not allow_repository_git:
+        denied_git_reads.extend((worktree_git, repository_git))
+    # Controller Git history is never an input to validation of an external
+    # project.  Keep the explicit deny even though default-deny would already
+    # block it, so a future read expansion cannot accidentally disclose it.
+    if controller_git != repository_git:
+        denied_git_reads.append(controller_git)
+    read_deny = ""
+    if denied_git_reads:
+        unique_denied_git_reads = list(dict.fromkeys(denied_git_reads))
+        denied_git_rules = "\n".join(
+            f"  (literal {json.dumps(str(path))})\n"
+            f"  (subpath {json.dumps(str(path))})"
+            for path in unique_denied_git_reads
+        )
         read_deny = (
             "(deny file-read*\n"
-            f"  (literal {git_deny})\n"
-            f"  (subpath {git_deny})\n"
-            f"  (literal {source_git_deny})\n"
-            f"  (subpath {source_git_deny})\n"
+            f"{denied_git_rules}\n"
             ")\n"
         )
     return (
@@ -507,8 +557,10 @@ def _sandbox_profile(
         f"  (subpath {json.dumps(str(worktree_root))})\n"
         f"  (literal {git_deny})\n"
         f"  (subpath {git_deny})\n"
-        f"  (literal {source_git_deny})\n"
-        f"  (subpath {source_git_deny})\n"
+        f"  (literal {repository_git_deny})\n"
+        f"  (subpath {repository_git_deny})\n"
+        f"  (literal {controller_git_deny})\n"
+        f"  (subpath {controller_git_deny})\n"
         ")\n"
         "(deny network*)\n"
     )

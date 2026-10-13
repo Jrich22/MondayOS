@@ -12,7 +12,9 @@ task
   → tool and authentication preflight
   → exact remote-base commit
   → isolated, job-owned Git worktree
-  → Claude Code patch (bounded-context Codex fallback)
+  → implementation patch
+      MondayOS itself: Claude Code, then bounded-context Codex fallback
+      registered external project: bounded-context Codex only
   → fixed controller validation
   → exact staged-artifact fingerprint
   → fresh sterile ChatGPT/Codex review of the exact staged diff
@@ -40,11 +42,62 @@ A pass is valid only with high confidence. Monday recomputes the artifact
 fingerprint immediately before committing; one changed byte makes the review
 stale and stops delivery.
 
-## Current scope
+## Supported targets and trust boundary
 
-This implementation intentionally builds only the trusted MondayOS repository
-configured as `project_root`. Registered external project delivery, automatic
-merge, and deployment are later increments.
+The workflow can build MondayOS itself or one explicitly enrolled registered
+project. MondayOS remains the controller in both cases: tasks, project identity,
+delivery records, model configuration, the trusted Python environment, and the
+sandbox bootstrap stay under the MondayOS root. An external repository is only
+the source target for its isolated worktree, branch, commit, and pull request.
+The workflow never starts a second MondayOS instance from the target repository.
+
+Ordinary project registration remains analysis-only. External delivery requires
+a one-time registration that names both the local checkout and the exact GitHub
+repository it is permitted to target:
+
+```bash
+monday project register customer-portal /path/to/customer-portal \
+  --delivery-repository acme/customer-portal
+```
+
+Use `--overwrite` to replace an existing analysis-only registration with a
+delivery-enabled one. The registry stores the canonical local directory, its
+filesystem identity, and the normalized `OWNER/REPO` identity. Delivery fails
+closed if the directory disappears, becomes a symlink, is replaced, is
+ambiguous, or its `origin` no longer identifies that GitHub repository. A target
+must also be separate from the MondayOS controller directory and must be a
+standalone checkout with its own real `.git` directory. Git linked worktrees are
+rejected as delivery targets, and files inside `.git` may not be symbolic or
+hard links, so an external build cannot mutate another checkout's Git database.
+
+Each external task is explicitly bound to that registered project, and each
+build names the same project:
+
+```bash
+monday task create --title "Add account health endpoint" \
+  --objective "Expose a read-only service health response." \
+  --project customer-portal
+monday build capabilities --project customer-portal
+monday build run TASK-0001 --project customer-portal
+```
+
+The public build surface accepts a registered project name, not a filesystem
+path or arbitrary Git remote. A delivery ID is permanently bound to its task,
+canonical project, local target identity, and expected GitHub repository; it
+cannot be reused to redirect an interrupted or completed delivery.
+
+Publication is guarded by both the task lock and a repository-wide workflow
+lease. The push and pull-request creation processes inherit those guards, so a
+controller exit cannot let another worker publish concurrently. If an exit
+happens after an irreversible operation, retrying the same delivery ID verifies
+that the remote branch still equals the approved commit and then reconciles the
+exact pull request without pushing twice. A different delivery ID for the same
+task and repository is rejected while that state remains unresolved.
+
+External projects use only the controlled-context Codex patch builder. Claude
+Code remains available as the first builder for MondayOS self-builds, with Codex
+as fallback. Both target types use a fresh, independent ChatGPT/Codex session as
+the mandatory final reviewer.
 
 The workflow:
 
@@ -66,6 +119,12 @@ The workflow:
 - disables commit/push hooks and commit signing for the controller-owned action;
 - pushes without force and opens or reconciles one pull request;
 - never merges or deploys.
+
+Explicit delivery enrollment authorizes the branch push and pull-request side
+effect. That push may start CI, preview environments, or other automation that
+the target GitHub repository already associates with pushed branches. MondayOS
+does not configure, approve, wait for, or report those external jobs as part of
+this workflow, and it still never merges or deploys.
 
 On success the task moves to `REVIEW` to represent an open GitHub pull request.
 That status is not a request for the old team-workflow approval command.
@@ -113,6 +172,22 @@ The ordinary development test run still executes these tests outside candidate
 containment. Every contained exclusion and its reason is retained in validation
 evidence for the independent reviewer and pull request.
 
+### External-project validation limits
+
+Every target receives the fixed staged-diff check. When an external worktree
+contains `pyproject.toml`, MondayOS also runs its `tests` directory through the
+controller-owned Python and the same containment boundary. It does not execute
+the target checkout's `.venv`, sandbox bootstrap, `conftest.py`, or third-party
+pytest plugins, and it does not install dependencies. Tests therefore fail if
+they require packages that are unavailable in the trusted MondayOS environment.
+
+No repository-specific test command is inferred or accepted from the task or
+model. In this increment, a target without `pyproject.toml`—including projects
+in other language ecosystems—gets the diff check and independent exact-artifact
+review but no automatic project test suite. Existing target CI may run only as
+a consequence of the later branch push; its result is not a prerequisite for
+MondayOS to open the pull request.
+
 ## Prerequisites
 
 The build workflow uses existing subscription logins rather than Claude or
@@ -130,10 +205,24 @@ OpenAI API keys:
    macOS Seatbelt through the system sandbox library and fails closed on
    unsupported systems.
 
+Authenticated CLI discovery intentionally ignores the caller's `PATH`. Codex is
+accepted from the ChatGPT app bundle, `/opt/homebrew/bin`, `/usr/local/bin`, or
+`/usr/bin`; Claude Code and GitHub CLI are accepted from the same Homebrew/system
+binary locations. Their resolved executable must remain under a trusted app,
+Homebrew, or system installation root. Install a custom copy into one of those
+locations rather than adding an arbitrary directory to `PATH`.
+
 Check readiness without editing anything:
 
 ```bash
 monday build capabilities
+```
+
+For an external target, register it with `--delivery-repository OWNER/REPO` and
+check that exact target instead:
+
+```bash
+monday build capabilities --project customer-portal
 ```
 
 DeepSeek remains available to MondayOS's reasoning/provider layer, but it is not
@@ -147,10 +236,15 @@ monday build run TASK-0001 --id delivery-my-stable-id
 monday build get delivery-my-stable-id
 monday build history --task TASK-0001
 monday build capabilities
+
+monday build run TASK-0002 --project customer-portal
+monday build get delivery-my-stable-id --project customer-portal
+monday build history --project customer-portal
+monday build capabilities --project customer-portal
 ```
 
 Use `--json` on any build command for machine-readable output. A caller-supplied
-delivery ID is idempotent and permanently bound to one task.
+delivery ID is idempotent and permanently bound to one task and target.
 
 ## Telegram
 
@@ -161,10 +255,12 @@ MONDAYOS_TELEGRAM_LIVE_BUILD=true
 ```
 
 With the flag enabled, private plain text and `/build REQUEST` create a task and
-run the autonomous workflow. `/deliver TASK-ID` runs an existing task. Monday
-sends phase updates and the final PR link. Allowlisted group `/build` commands
-continue to use the advisory team workflow; groups can never start terminal code
-execution.
+run the autonomous workflow against MondayOS. Use
+`/build PROJECT :: REQUEST` for an explicitly enrolled external project.
+`/deliver TASK-ID` reads an existing task's saved project binding and selects
+that target automatically. Monday sends phase updates and the final PR link.
+Allowlisted group `/build` commands continue to use the advisory team workflow;
+groups can never start terminal code execution.
 
 Telegram atomically persists each accepted minimal request together with its
 advanced offset in `logs/telegram/state.json`, immediately returns a saved
@@ -183,11 +279,12 @@ response and drains its accepted work synchronously before exiting.
 
 Approved source, the commit, branch, pull request, validation summary, reviewer
 identity/verdict, and reviewed artifact digest are stored on GitHub. Detailed
-restart-safe controller records stay locally under `logs/delivery/`; Telegram
-queue state stays locally in `logs/telegram/state.json`. Both are Git-ignored
-because they contain machine paths or in-progress state. Terminal Telegram
-replay tombstones keep stable identity and outcome data but remove the active
-request text. These records are not credentials, but they are not yet
+restart-safe controller records and all delivery worktrees—including external
+project worktrees—stay locally under the MondayOS controller's `logs/delivery/`;
+Telegram queue state stays locally in `logs/telegram/state.json`. Both are
+Git-ignored because they contain machine paths or in-progress state. Terminal
+Telegram replay tombstones keep stable identity and outcome data but remove the
+active request text. These records are not credentials, but they are not yet
 synchronized to GitHub. Do not describe this increment as storing every runtime
 byte in GitHub.
 
@@ -209,6 +306,30 @@ result.status       # "pr-open" on success
 result.pr_url
 result.commit_sha
 result.attempts
+```
+
+For a registered target, enroll it once, bind the task, and select that project
+for readiness and delivery:
+
+```python
+monday.project(
+    "register",
+    name="customer-portal",
+    path="/path/to/customer-portal",
+    delivery_repository="acme/customer-portal",
+)
+task = monday.task(
+    "create",
+    title="Add account health endpoint",
+    objective="Expose a read-only service health response.",
+    project="customer-portal",
+)
+readiness = monday.build("capabilities", project="customer-portal")
+result = monday.build(
+    "run",
+    task_id=task.task_id,
+    project="customer-portal",
+)
 ```
 
 Other actions are `get`, `history`, and `capabilities`. Existing

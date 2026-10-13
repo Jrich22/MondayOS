@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import os
 import re
+import stat
+import threading
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,6 +25,18 @@ from tasks.task import ApprovalLevel, StatusTransition, Task, TaskPriority, Task
 _TASK_PREFIX = "TASK"
 _SEQUENCES_FILENAME = ".sequences.json"
 _TASK_ID_PATTERN = re.compile(r"^TASK-\d{1,64}(?:-[A-Z0-9]{1,12})?$")
+_PROCESS_LOCKS_GUARD = threading.Lock()
+
+
+@dataclass
+class _ProcessLockEntry:
+    lock: threading.RLock
+    users: int = 0
+    descriptor: int | None = None
+    depth: int = 0
+
+
+_PROCESS_LOCKS: dict[tuple[int, int, str], _ProcessLockEntry] = {}
 
 # Files to skip when scanning for task entries
 _SKIP_NAMES = frozenset({"index.md", "README.md"})
@@ -43,6 +63,128 @@ class TaskManager:
         self._completed_dir = self._tasks_dir / "completed"
         self._sequences_path = self._tasks_dir / _SEQUENCES_FILENAME
         self._parser = TaskParser()
+        self._lock_guard = threading.RLock()
+        self._lock_depth = 0
+        self._locked_task_id = ""
+        self._lock_descriptor: int | None = None
+
+    @contextmanager
+    def lock(self, task_id: EntityId) -> Iterator[int]:
+        """Serialize one task's state transitions across threads and processes."""
+        exact_task_id = str(task_id)
+        if not _TASK_ID_PATTERN.fullmatch(exact_task_id):
+            raise TaskNotFoundError(exact_task_id)
+        active_path = self._active_dir / f"{exact_task_id}.md"
+        completed_path = self._completed_dir / f"{exact_task_id}.md"
+        if not active_path.exists() and not completed_path.exists():
+            raise TaskNotFoundError(exact_task_id)
+        self._lock_guard.acquire()
+        try:
+            if self._lock_depth and self._locked_task_id != exact_task_id:
+                raise RuntimeError("nested task locks must target the same task")
+
+            lock_dir = self._tasks_dir / ".locks"
+            lock_name = hashlib.sha256(exact_task_id.encode("utf-8")).hexdigest()
+            lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+            )
+            if not hasattr(os, "O_NOFOLLOW"):
+                raise OSError("task locks require no-follow filesystem support")
+            directory_flags |= os.O_NOFOLLOW
+            try:
+                directory_descriptor = os.open(lock_dir, directory_flags)
+            except OSError as exc:
+                raise OSError(
+                    "task lock directory must be one controller-owned real directory"
+                ) from exc
+            try:
+                _validate_lock_directory(lock_dir, directory_descriptor)
+                directory_metadata = os.fstat(directory_descriptor)
+                process_key, process_entry = _acquire_process_task_lock(
+                    (directory_metadata.st_dev, directory_metadata.st_ino, lock_name)
+                )
+                try:
+                    descriptor = process_entry.descriptor
+                    if descriptor is None:
+                        flags = (
+                            os.O_RDWR
+                            | os.O_CREAT
+                            | getattr(os, "O_CLOEXEC", 0)
+                            | os.O_NOFOLLOW
+                        )
+                        try:
+                            descriptor = os.open(
+                                f"{lock_name}.lock",
+                                flags,
+                                0o600,
+                                dir_fd=directory_descriptor,
+                            )
+                        except OSError as exc:
+                            raise OSError(
+                                "task lock must be one controller-owned regular file"
+                            ) from exc
+                        try:
+                            _validate_lock_file(
+                                directory_descriptor,
+                                f"{lock_name}.lock",
+                                descriptor,
+                            )
+                            fcntl.flock(descriptor, fcntl.LOCK_EX)
+                            # Both names are attacker-visible while flock blocks.
+                            # Revalidate the pinned directory and file identities
+                            # after acquisition before treating the lock as held.
+                            _validate_lock_directory(lock_dir, directory_descriptor)
+                            _validate_lock_file(
+                                directory_descriptor,
+                                f"{lock_name}.lock",
+                                descriptor,
+                            )
+                        except BaseException:
+                            os.close(descriptor)
+                            raise
+                        process_entry.descriptor = descriptor
+                    else:
+                        # A reentrant acquisition, including through another
+                        # TaskManager instance, must reuse the same open file
+                        # description. A second flock by this thread would wait
+                        # on its own first lock forever on some platforms.
+                        _validate_lock_file(
+                            directory_descriptor,
+                            f"{lock_name}.lock",
+                            descriptor,
+                        )
+                    process_entry.depth += 1
+                    self._lock_depth += 1
+                    if self._lock_depth == 1:
+                        self._locked_task_id = exact_task_id
+                        self._lock_descriptor = descriptor
+                    try:
+                        yield descriptor
+                    finally:
+                        self._lock_depth -= 1
+                        if self._lock_depth == 0:
+                            self._lock_descriptor = None
+                            self._locked_task_id = ""
+                        process_entry.depth -= 1
+                        if process_entry.depth == 0:
+                            held_descriptor = process_entry.descriptor
+                            process_entry.descriptor = None
+                            if held_descriptor is None:
+                                raise RuntimeError("task lock descriptor is unavailable")
+                            # Do not issue LOCK_UN: a publication child may have
+                            # inherited this same open file description. Closing
+                            # our copy keeps its guard locked until the final
+                            # inherited descriptor closes.
+                            os.close(held_descriptor)
+                finally:
+                    _release_process_task_lock(process_key, process_entry)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            self._lock_guard.release()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -59,6 +201,9 @@ class TaskManager:
         context: str = "",
         acceptance_criteria: list[str] | None = None,
         project: str = "",
+        project_delivery_repository: str = "",
+        project_source_device: int | None = None,
+        project_source_inode: int | None = None,
     ) -> Task:
         """
         Create and persist a new task with status BACKLOG.
@@ -70,6 +215,34 @@ class TaskManager:
             raise TaskValidationError("title cannot be empty", field="title")
         if not objective.strip():
             raise TaskValidationError("objective cannot be empty", field="objective")
+        if not isinstance(project_delivery_repository, str):
+            raise TaskValidationError(
+                "project_delivery_repository must be a string",
+                field="project_delivery_repository",
+            )
+        for field_name, value in (
+            ("project_source_device", project_source_device),
+            ("project_source_inode", project_source_inode),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise TaskValidationError(
+                    f"{field_name} must be a non-negative integer or null",
+                    field=field_name,
+                )
+        if bool(project_delivery_repository) != (
+            project_source_device is not None and project_source_inode is not None
+        ):
+            raise TaskValidationError(
+                "project delivery repository and filesystem identity must be recorded together",
+                field="project_delivery_repository",
+            )
+        if project_delivery_repository and not project:
+            raise TaskValidationError(
+                "a project delivery target requires an explicit project",
+                field="project",
+            )
 
         now = datetime.now(tz=UTC)
         task_id = self._next_id()
@@ -94,6 +267,9 @@ class TaskManager:
             objective=objective,
             context=context,
             project=project,
+            project_delivery_repository=project_delivery_repository,
+            project_source_device=project_source_device,
+            project_source_inode=project_source_inode,
             approval_required=approval_required,
             acceptance_criteria=list(acceptance_criteria or []),
             status_history=[initial_transition],
@@ -156,6 +332,16 @@ class TaskManager:
         Raises InvalidTransitionError for illegal transitions.
         Raises TaskNotFoundError if the task does not exist.
         """
+        with self.lock(task_id):
+            return self._update_status_locked(task_id, new_status, changed_by, reason)
+
+    def _update_status_locked(
+        self,
+        task_id: EntityId,
+        new_status: TaskStatus,
+        changed_by: str,
+        reason: str,
+    ) -> Task:
         task = self.get(task_id)
 
         if not task.can_transition_to(new_status):
@@ -183,41 +369,44 @@ class TaskManager:
 
     def assign(self, task_id: EntityId, assignee: str, assigned_by: str) -> Task:
         """Assign a task to an agent or human. Transitions BACKLOG → ASSIGNED."""
-        task = self.update_status(
-            task_id=task_id,
-            new_status=TaskStatus.ASSIGNED,
-            changed_by=assigned_by,
-            reason=f"assigned to {assignee}",
-        )
-        task.assigned_to = assignee
-        task.updated = datetime.now(tz=UTC)
-        self._write(task, directory=self._active_dir)
-        return task
+        with self.lock(task_id):
+            task = self.update_status(
+                task_id=task_id,
+                new_status=TaskStatus.ASSIGNED,
+                changed_by=assigned_by,
+                reason=f"assigned to {assignee}",
+            )
+            task.assigned_to = assignee
+            task.updated = datetime.now(tz=UTC)
+            self._write(task, directory=self._active_dir)
+            return task
 
     def block(self, task_id: EntityId, reason: str, blocked_by: str) -> Task:
         """Mark IN_PROGRESS → BLOCKED with a descriptive reason."""
-        task = self.update_status(
-            task_id=task_id,
-            new_status=TaskStatus.BLOCKED,
-            changed_by=blocked_by,
-            reason=reason,
-        )
-        task.blocked_by = reason
-        task.updated = datetime.now(tz=UTC)
-        self._write(task, directory=self._active_dir)
-        return task
+        with self.lock(task_id):
+            task = self.update_status(
+                task_id=task_id,
+                new_status=TaskStatus.BLOCKED,
+                changed_by=blocked_by,
+                reason=reason,
+            )
+            task.blocked_by = reason
+            task.updated = datetime.now(tz=UTC)
+            self._write(task, directory=self._active_dir)
+            return task
 
     def append_work_log(self, task_id: EntityId, entry: str, author: str) -> Task:
         """Append a dated work log entry to the task."""
-        task = self.get(task_id)
-        now = datetime.now(tz=UTC)
-        date_str = now.strftime("%Y-%m-%d")
-        task.work_log.append(f"{date_str} — {author}: {entry}")
-        task.updated = now
+        with self.lock(task_id):
+            task = self.get(task_id)
+            now = datetime.now(tz=UTC)
+            date_str = now.strftime("%Y-%m-%d")
+            task.work_log.append(f"{date_str} — {author}: {entry}")
+            task.updated = now
 
-        directory = self._completed_dir if task.is_terminal() else self._active_dir
-        self._write(task, directory=directory)
-        return task
+            directory = self._completed_dir if task.is_terminal() else self._active_dir
+            self._write(task, directory=directory)
+            return task
 
     def list_active(
         self,
@@ -306,14 +495,13 @@ class TaskManager:
 
         Raises TaskNotFoundError if not found in active/.
         """
-        if not _TASK_ID_PATTERN.fullmatch(str(task_id)):
-            raise TaskNotFoundError(str(task_id))
-        active_path = self._active_dir / f"{task_id}.md"
-        if not active_path.exists():
-            raise TaskNotFoundError(task_id)
+        with self.lock(task_id):
+            active_path = self._active_dir / f"{task_id}.md"
+            if not active_path.exists():
+                raise TaskNotFoundError(task_id)
 
-        task = self._parser.parse(active_path.read_text(encoding="utf-8"))
-        self._archive(task)
+            task = self._parser.parse(active_path.read_text(encoding="utf-8"))
+            self._archive(task)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -354,3 +542,75 @@ class TaskManager:
         write_atomic(completed_path, self._parser.serialize(task))
         if active_path.exists():
             active_path.unlink()
+
+
+def _acquire_process_task_lock(
+    key: tuple[int, int, str],
+) -> tuple[tuple[int, int, str], _ProcessLockEntry]:
+    with _PROCESS_LOCKS_GUARD:
+        entry = _PROCESS_LOCKS.get(key)
+        if entry is None:
+            entry = _ProcessLockEntry(threading.RLock())
+            _PROCESS_LOCKS[key] = entry
+        entry.users += 1
+    try:
+        entry.lock.acquire()
+    except BaseException:
+        with _PROCESS_LOCKS_GUARD:
+            entry.users -= 1
+            if entry.users == 0 and _PROCESS_LOCKS.get(key) is entry:
+                del _PROCESS_LOCKS[key]
+        raise
+    return key, entry
+
+
+def _release_process_task_lock(
+    key: tuple[int, int, str],
+    entry: _ProcessLockEntry,
+) -> None:
+    entry.lock.release()
+    with _PROCESS_LOCKS_GUARD:
+        entry.users -= 1
+        if entry.users == 0 and _PROCESS_LOCKS.get(key) is entry:
+            del _PROCESS_LOCKS[key]
+
+
+def _validate_lock_directory(path: Path, descriptor: int) -> None:
+    opened = os.fstat(descriptor)
+    visible = path.lstat()
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(visible.st_mode)
+        or stat.S_ISLNK(visible.st_mode)
+        or (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
+        or opened.st_uid != os.geteuid()
+        or visible.st_uid != os.geteuid()
+        or opened.st_mode & 0o022
+        or visible.st_mode & 0o022
+    ):
+        raise OSError("task lock directory must be one controller-owned real directory")
+
+
+def _validate_lock_file(
+    directory_descriptor: int,
+    name: str,
+    descriptor: int,
+) -> None:
+    opened = os.fstat(descriptor)
+    visible = os.stat(
+        name,
+        dir_fd=directory_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(visible.st_mode)
+        or opened.st_nlink != 1
+        or visible.st_nlink != 1
+        or (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
+        or opened.st_uid != os.geteuid()
+        or visible.st_uid != os.geteuid()
+        or opened.st_mode & 0o022
+        or visible.st_mode & 0o022
+    ):
+        raise OSError("task lock must be one controller-owned regular file")

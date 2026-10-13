@@ -3,11 +3,17 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from delivery.backends import ToolAvailability, _controller_env, _run_process
+from delivery.backends import (
+    ToolAvailability,
+    _controller_env,
+    _resolve_trusted_executable,
+    _run_process,
+    _validated_executable_for_target,
+)
 
 _GITHUB_REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -33,13 +39,22 @@ class GhCliClient:
     """Create or reconcile one PR; never merge, close, or mutate another PR."""
 
     def __init__(self, executable: str | None = None) -> None:
-        self._executable = executable or shutil.which("gh") or ""
+        self._trusted_executable = _resolve_trusted_executable("gh", executable)
+        self._executable = (
+            self._trusted_executable.path if self._trusted_executable is not None else ""
+        )
 
     def availability(self) -> ToolAvailability:
-        if not self._executable:
+        try:
+            executable = _validated_executable_for_target(
+                self._trusted_executable,
+                None,
+                "GitHub",
+            )
+        except OSError:
             return ToolAvailability(False, "github", "GitHub CLI is not installed")
         result = _run_process(
-            [self._executable, "auth", "status", "--hostname", "github.com"],
+            [executable, "auth", "status", "--hostname", "github.com"],
             cwd=Path.cwd(),
             timeout=20,
             env=_controller_env(),
@@ -61,14 +76,23 @@ class GhCliClient:
         body: str,
         expected_sha: str,
         timeout: float = 60,
+        inherited_guard_fds: tuple[int, ...] = (),
     ) -> PullRequestResult:
+        try:
+            executable = _validated_executable_for_target(
+                self._trusted_executable,
+                repo_root,
+                "GitHub",
+            )
+        except OSError as exc:
+            return PullRequestResult(False, message=str(exc))
         if not _GITHUB_REPO.fullmatch(repository):
             return PullRequestResult(False, message="Invalid GitHub repository identity")
         if not _COMMIT_SHA.fullmatch(expected_sha):
             return PullRequestResult(False, message="Invalid reviewed commit identity")
         existing = _run_process(
             [
-                self._executable,
+                executable,
                 "pr",
                 "list",
                 "--repo",
@@ -115,7 +139,7 @@ class GhCliClient:
 
         created = _run_process(
             [
-                self._executable,
+                executable,
                 "pr",
                 "create",
                 "--repo",
@@ -132,16 +156,16 @@ class GhCliClient:
             cwd=repo_root,
             timeout=timeout,
             env=_controller_env(),
+            inherited_guard_fds=inherited_guard_fds,
         )
         if created.returncode != 0:
             return PullRequestResult(False, message=created.stderr or "Could not create PR")
         url = created.stdout.strip().splitlines()[-1] if created.stdout.strip() else ""
-        expected_prefix = f"https://github.com/{repository}/pull/"
-        if not url.startswith(expected_prefix):
+        if _pr_url_number(url, repository) is None:
             return PullRequestResult(False, message="GitHub returned no valid PR URL")
         inspected = _run_process(
             [
-                self._executable,
+                executable,
                 "pr",
                 "view",
                 url,
@@ -202,7 +226,42 @@ def _verified_pr(
         or row.get("headRefName") != branch
         or row.get("headRefOid") != expected_sha
         or row.get("isCrossRepository") is not False
-        or url != f"https://github.com/{repository}/pull/{exact_number}"
+        or _pr_url_number(url, repository) != exact_number
     ):
         return None
     return _VerifiedPullRequest(url=url, number=exact_number)
+
+
+def _pr_url_number(url: str, repository: str) -> int | None:
+    """Validate one exact github.com PR URL and return its positive number."""
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc.casefold() != "github.com"
+        or parsed.hostname is None
+        or parsed.hostname.casefold() != "github.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    parts = parsed.path.split("/")
+    if len(parts) != 5 or parts[0] or parts[3] != "pull":
+        return None
+    expected_owner, expected_repo = repository.split("/", 1)
+    owner, repo, raw_number = parts[1], parts[2], parts[4]
+    # The split must end at the number with no trailing slash or extra segment.
+    if owner.casefold() != expected_owner.casefold():
+        return None
+    if repo.casefold() != expected_repo.casefold() or not raw_number.isascii():
+        return None
+    if not raw_number.isdigit():
+        return None
+    number = int(raw_number)
+    return number if number > 0 and raw_number == str(number) else None

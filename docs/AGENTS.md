@@ -13,7 +13,14 @@ record.
 > [APPROVAL_GATES.md](APPROVAL_GATES.md). Real repository delivery is a separate,
 > narrowly bounded controller: [BUILD_WORKFLOW.md](BUILD_WORKFLOW.md) may create an
 > isolated commit and pull request only after deterministic checks and an
-> exact-artifact ChatGPT review. It cannot merge or deploy.
+> exact-artifact ChatGPT review. It can target MondayOS itself or an explicitly
+> enrolled registered project. For an external target, MondayOS keeps ownership
+> of tasks, registry data, delivery records, validation, and review; the target
+> checkout supplies only the repository being changed. External builds use the
+> controlled-context Codex builder, not Claude Code, and still require the
+> independent ChatGPT/Codex reviewer. The controller cannot merge or deploy,
+> although its branch push may start automation already configured in the target
+> GitHub repository.
 
 ## How it fits together
 

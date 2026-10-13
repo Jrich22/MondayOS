@@ -21,7 +21,7 @@ After installation, the `monday` binary is available in your environment.
 - **No business logic in the CLI.** Every command calls the public `Monday` API. The CLI is a thin translation layer: arguments in, formatted text out.
 - **No module bypass.** No internal class (`KnowledgeStore`, `TaskManager`, `ReasoningEngine`) is imported directly. All calls go through `Monday()`.
 - **Pipe-safe output.** No ANSI color codes. Plain text with Unicode separators. Output is safe to pipe, redirect, or parse.
-- **Explicit project root.** The `--project-root` flag controls where tasks and knowledge are persisted. Defaults to the current directory.
+- **Explicit controller root.** The `--project-root` flag controls where MondayOS tasks, knowledge, registry data, and delivery records are persisted. It does not select an external delivery target; use a registered project name for that.
 
 ---
 
@@ -278,6 +278,7 @@ monday task create --title "..." --objective "..." [options]
 | `--type TYPE` | no | `feature` | Task type. |
 | `--priority PRIORITY` | no | `P2` | Priority level. |
 | `--created-by WHO` | no | `human:cli` | Creator identifier. |
+| `--project NAME` | no | — | Bind the task to one registered external project (or `mondayos`). |
 
 **Example:**
 ```bash
@@ -286,6 +287,18 @@ monday task create \
   --objective "Apply exponential backoff on 429 responses." \
   --type fix \
   --priority P1
+```
+
+For external delivery, bind the task when it is created. The project must
+already be registered:
+
+```bash
+monday task create \
+  --title "Implement rate limit handling" \
+  --objective "Apply exponential backoff on 429 responses." \
+  --type fix \
+  --priority P1 \
+  --project customer-portal
 ```
 
 **Output:**
@@ -346,6 +359,46 @@ TASK-0001 marked COMPLETED
 
 ---
 
+## `monday project`
+
+Register and inspect external source repositories. Registration supports
+analysis and onboarding by default; autonomous branch/PR delivery requires the
+additional exact GitHub repository binding.
+
+```bash
+monday project register NAME /absolute/path [--description TEXT] \
+  [--delivery-repository OWNER/REPO] [--overwrite]
+monday project list
+monday project get NAME
+monday project remove NAME
+```
+
+`--delivery-repository OWNER/REPO` is the one-time opt-in that permits MondayOS
+to push a delivery branch and open a pull request for that target. It is an
+identity such as `acme/customer-portal`, not a URL, credential, branch, or local
+path. MondayOS pins it together with the target's canonical local directory and
+filesystem identity. Delivery fails if that binding later changes.
+
+Registration without this flag remains analysis-only and cannot be selected by
+`monday build run`. To upgrade an existing registration, repeat the exact
+registration with `--delivery-repository` and `--overwrite`:
+
+```bash
+monday project register customer-portal /path/to/customer-portal \
+  --description "Customer web application" \
+  --delivery-repository acme/customer-portal \
+  --overwrite
+monday project get customer-portal
+```
+
+The source repository must be a standalone checkout with its own real `.git`
+directory and must be separate from the MondayOS controller root. Git linked
+worktrees and linked files inside `.git` are not accepted as delivery targets.
+A branch push may start CI, preview environments, or other automation already
+configured by the target repository. MondayOS does not merge or deploy.
+
+---
+
 ## `monday build`
 
 Build an existing task in an isolated worktree, run fixed validation, obtain a
@@ -353,19 +406,40 @@ fresh high-confidence ChatGPT/Codex review, and open a GitHub pull request. This
 workflow never merges or deploys.
 
 ```bash
-monday build run TASK-0001 [--id DELIVERY-ID] [--json]
-monday build get DELIVERY-ID [--json]
-monday build history [--task TASK-ID] [--limit N] [--json]
-monday build capabilities [--json]
+monday build run TASK-0001 [--project NAME] [--id DELIVERY-ID] [--json]
+monday build get DELIVERY-ID [--project NAME] [--json]
+monday build history [--task TASK-ID] [--project NAME] [--limit N] [--json]
+monday build capabilities [--project NAME] [--json]
 ```
 
-`capabilities` is read-only and reports Claude Code, Codex/ChatGPT Reviewer, and
-GitHub readiness. It exits with status `1` when the report says `ready: false`,
-including with `--json`, so startup scripts can use it as a real preflight check.
-The JSON response still has `success: true` when the inspection itself completed;
-the runnable verdict is `data.ready`. See
-[BUILD_WORKFLOW.md](BUILD_WORKFLOW.md) for the trust model, prerequisites, repair
-loop, and current MondayOS-repository-only scope.
+Omit `--project` (or pass `--project mondayos`) to select MondayOS itself. For external delivery, the task must
+already be bound to the same registered, delivery-enabled project:
+
+```bash
+monday build capabilities --project customer-portal
+monday build run TASK-0002 --project customer-portal
+monday build history --project customer-portal
+```
+
+`build get --project` asserts that the saved delivery belongs to that project;
+`build history --project` filters the controller's delivery records. No build
+command accepts a raw target path or Git URL.
+
+`capabilities` is read-only and reports the selected builder, ChatGPT/Codex
+Reviewer, validation, repository, and GitHub readiness. MondayOS self-builds can
+use Claude Code with Codex fallback; external projects use the controlled-context
+Codex builder only. All builds require the separate high-confidence
+ChatGPT/Codex review. `capabilities` exits with status `1` when the report says
+`ready: false`, including with `--json`, so startup scripts can use it as a real
+preflight check. The JSON response still has `success: true` when the inspection
+itself completed; the runnable verdict is `data.ready`.
+
+The workflow stops after opening the pull request. It never merges or deploys.
+External validation always includes the staged-diff check and runs sandboxed
+pytest only when the target contains `pyproject.toml`; it does not install target
+dependencies or infer commands for other ecosystems. See
+[BUILD_WORKFLOW.md](BUILD_WORKFLOW.md) for the complete trust model, validation
+limits, and repair loop.
 
 ---
 
@@ -386,6 +460,8 @@ monday telegram [--once] [--identify] [--provider NAME]
 `TELEGRAM_BOT_TOKEN` and `MONDAYOS_TELEGRAM_ALLOWED_USER_IDS` are required.
 Set `MONDAYOS_TELEGRAM_LIVE_BUILD=true` to make private plain text, `/build`, and
 `/deliver` use the autonomous PR workflow. It is off by default.
+`/build PROJECT :: REQUEST` creates a project-bound request, and `/deliver` uses
+the existing task's saved project binding automatically.
 In normal daemon mode, accepted minimal requests are atomically saved in
 `logs/telegram/state.json` before the Telegram offset advances. The bot returns
 a saved receipt with the FIFO queue position and keeps polling while one

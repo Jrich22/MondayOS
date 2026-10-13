@@ -36,6 +36,8 @@ from delivery.store import DeliveryStore
 from delivery.types import DeliveryJob
 from delivery.validation import MondayValidationRunner, _sandbox_profile
 
+_TEST_CLI = os.fspath(Path(sys.executable).resolve())
+
 
 def _patch() -> str:
     return (
@@ -87,10 +89,127 @@ def test_codex_availability_accepts_chatgpt_status_from_either_stream(
         lambda *_args, **_kwargs: _ProcessResult(0, stdout, stderr),
     )
 
-    availability = CodexPatchBuilder("/bin/codex").availability()
+    availability = CodexPatchBuilder(_TEST_CLI).availability()
 
     assert availability.available is True
     assert availability.reason == "logged in with ChatGPT"
+
+
+def test_subscription_cli_discovery_never_uses_ambient_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "path-cli-ran"
+    for name in ("codex", "claude", "gh"):
+        executable = tmp_path / name
+        executable.write_text(
+            f"#!/bin/sh\ntouch '{marker!s}'\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+    monkeypatch.setenv("PATH", os.fspath(tmp_path))
+    candidates = dict(backend_module._TRUSTED_TOOL_CANDIDATES)
+    candidates.update({"codex": (), "claude": (), "gh": ()})
+    monkeypatch.setattr(backend_module, "_TRUSTED_TOOL_CANDIDATES", candidates)
+
+    assert CodexPatchBuilder()._executable == ""
+    assert ClaudeCodePatchBuilder()._executable == ""
+    assert github_module.GhCliClient()._executable == ""
+    assert os.fspath(tmp_path) not in backend_module._controller_env()["PATH"].split(
+        os.pathsep
+    )
+    assert not marker.exists()
+
+
+def test_apple_command_line_tools_git_is_in_a_trusted_installation_root() -> None:
+    candidate = Path(backend_module._TRUSTED_TOOL_CANDIDATES["git"][0])
+
+    assert any(
+        candidate.is_relative_to(root)
+        for root in backend_module._TRUSTED_EXECUTABLE_ROOTS
+    )
+
+
+def test_target_repository_cli_is_rejected_before_any_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _context_repository(tmp_path)
+    marker = tmp_path / "target-cli-ran"
+    executable = tmp_path / "controller-cli"
+    executable.write_text(
+        f"#!/bin/sh\ntouch '{marker!s}'\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setattr(backend_module, "_TRUSTED_EXECUTABLE_ROOTS", (tmp_path,))
+
+    codex = CodexPatchBuilder(os.fspath(executable))
+    claude = ClaudeCodePatchBuilder(os.fspath(executable))
+    github = github_module.GhCliClient(os.fspath(executable))
+    codex_result = codex.propose(
+        worktree=tmp_path,
+        objective="change app",
+        feedback="",
+        timeout=30,
+    )
+    claude_result = claude.propose(
+        worktree=tmp_path,
+        objective="change app",
+        feedback="",
+        timeout=30,
+    )
+    github_result = github.ensure_pull_request(
+        repo_root=tmp_path,
+        repository="owner/repo",
+        base="main",
+        branch="codex/task-12345678",
+        title="Task",
+        body="Body",
+        expected_sha="a" * 40,
+    )
+
+    assert codex_result.success is False
+    assert claude_result.success is False
+    assert github_result.success is False
+    assert "inside the target repository" in codex_result.message
+    assert "inside the target repository" in claude_result.message
+    assert "inside the target repository" in github_result.message
+    assert not marker.exists()
+
+
+def test_pinned_cli_inode_replacement_is_rejected_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    installation = tmp_path / "installation"
+    project.mkdir()
+    installation.mkdir()
+    _context_repository(project)
+    marker = tmp_path / "replacement-ran"
+    executable = installation / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setattr(backend_module, "_TRUSTED_EXECUTABLE_ROOTS", (tmp_path,))
+    builder = CodexPatchBuilder(os.fspath(executable))
+
+    executable.unlink()
+    executable.write_text(
+        f"#!/bin/sh\ntouch '{marker!s}'\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    result = builder.propose(
+        worktree=project,
+        objective="change app",
+        feedback="",
+        timeout=30,
+    )
+
+    assert result.success is False
+    assert "identity changed" in result.message
+    assert not marker.exists()
 
 
 def test_codex_builder_uses_read_only_ephemeral_structured_cli(
@@ -123,7 +242,7 @@ def test_codex_builder_uses_read_only_ephemeral_structured_cli(
         return _ProcessResult(0, "", "")
 
     monkeypatch.setattr(backend_module, "_run_process", fake_run)
-    result = CodexPatchBuilder("/bin/codex").propose(
+    result = CodexPatchBuilder(_TEST_CLI).propose(
         worktree=tmp_path,
         objective="fix it; touch /tmp/never",
         feedback="none",
@@ -135,7 +254,7 @@ def test_codex_builder_uses_read_only_ephemeral_structured_cli(
     assert len(calls) == 2
     for call in calls:
         argv = call["argv"]
-        assert argv[:2] == ["/bin/codex", "exec"]
+        assert argv[:2] == [_TEST_CLI, "exec"]
         assert argv[argv.index("--sandbox") + 1] == "read-only"
         assert "--strict-config" in argv
         assert "--ephemeral" in argv
@@ -189,8 +308,30 @@ def test_codex_context_contains_only_tracked_regular_utf8_files(
     outside.write_text("OUTSIDE = True\n", encoding="utf-8")
     (tmp_path / "linked.py").symlink_to(outside)
     (tmp_path / "untracked.py").write_text("UNTRACKED = True\n", encoding="utf-8")
+    (tmp_path / ".env.production").write_text(
+        "INTERNAL_CODENAME=blue-orchid\n",
+        encoding="utf-8",
+    )
+    protected_files = {
+        ".npmrc": "REGISTRY_ALIAS=violet-comet\n",
+        ".pypirc": "PROFILE_ALIAS=amber-sparrow\n",
+        ".netrc": "MACHINE_ALIAS=silver-maple\n",
+        "credentials/session.json": '{"label":"quiet-river"}\n',
+        "secrets/runtime.txt": "RUNTIME_ALIAS=golden-canyon\n",
+    }
+    for relative, content in protected_files.items():
+        protected = tmp_path / relative
+        protected.parent.mkdir(parents=True, exist_ok=True)
+        protected.write_text(content, encoding="utf-8")
     subprocess.run(
-        ["git", "add", "binary.dat", "linked.py"],
+        [
+            "git",
+            "add",
+            "binary.dat",
+            "linked.py",
+            ".env.production",
+            *protected_files,
+        ],
         cwd=tmp_path,
         check=True,
         capture_output=True,
@@ -212,7 +353,7 @@ def test_codex_context_contains_only_tracked_regular_utf8_files(
         return _ProcessResult(0, "", "")
 
     monkeypatch.setattr(backend_module, "_run_process", fake_run)
-    proposal = CodexPatchBuilder("/bin/codex").propose(
+    proposal = CodexPatchBuilder(_TEST_CLI).propose(
         worktree=tmp_path,
         objective="change app",
         feedback="",
@@ -223,9 +364,103 @@ def test_codex_context_contains_only_tracked_regular_utf8_files(
     manifest_prompt = calls[0]["stdin"]
     context_prompt = calls[1]["stdin"]
     assert "app.py" in manifest_prompt
-    for forbidden in ("binary.dat", "linked.py", "untracked.py", "OUTSIDE = True"):
+    for forbidden in (
+        "binary.dat",
+        "linked.py",
+        "untracked.py",
+        ".env.production",
+        "blue-orchid",
+        ".npmrc",
+        "violet-comet",
+        ".pypirc",
+        "amber-sparrow",
+        ".netrc",
+        "silver-maple",
+        "credentials/session.json",
+        "quiet-river",
+        "secrets/runtime.txt",
+        "golden-canyon",
+        "OUTSIDE = True",
+    ):
         assert forbidden not in manifest_prompt
         assert forbidden not in context_prompt
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        ".env.production",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        "credentials/session.json",
+        "secrets/runtime.txt",
+    ),
+)
+def test_selected_context_revalidates_protected_paths(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    _context_repository(tmp_path)
+    payload = b"INTERNAL_CODENAME=blue-orchid\n"
+    protected = tmp_path / relative
+    protected.parent.mkdir(parents=True, exist_ok=True)
+    protected.write_bytes(payload)
+    entry = backend_module._ManifestEntry(
+        path=relative,
+        size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    with pytest.raises(ValueError, match="protected path") as error:
+        backend_module._selected_repository_context(
+            tmp_path,
+            (relative,),
+            (entry,),
+        )
+    assert relative not in str(error.value)
+    assert "blue-orchid" not in str(error.value)
+
+
+def test_codex_rejects_credential_shaped_filenames_before_model_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    secret = _fixture("ghp_", "abcdefghijklmnopqrstuvwxyz1234567890")
+    secret_path = tmp_path / f"token={secret}"
+    secret_path.write_text("SAFE = True\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "--", secret_path.name],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    model_launched = False
+    real_run = backend_module._run_process
+
+    def fake_run(argv: list[str], **kwargs: Any) -> _ProcessResult:
+        nonlocal model_launched
+        if "--output-last-message" in argv:
+            model_launched = True
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(backend_module, "_run_process", fake_run)
+    proposal = CodexPatchBuilder(_TEST_CLI).propose(
+        worktree=tmp_path,
+        objective="change app",
+        feedback="",
+        timeout=30,
+    )
+
+    assert proposal.success is False
+    assert model_launched is False
+    assert secret not in proposal.message
+    assert proposal.message
 
 
 def test_codex_rejects_selector_path_traversal(
@@ -242,7 +477,7 @@ def test_codex_rejects_selector_path_traversal(
         return _ProcessResult(0, "", "")
 
     monkeypatch.setattr(backend_module, "_run_process", fake_run)
-    proposal = CodexPatchBuilder("/bin/codex").propose(
+    proposal = CodexPatchBuilder(_TEST_CLI).propose(
         worktree=tmp_path,
         objective="change app",
         feedback="",
@@ -276,7 +511,7 @@ def test_codex_context_total_is_bounded(tmp_path: Path, monkeypatch: pytest.Monk
 
     monkeypatch.setattr(backend_module, "_MAX_CONTEXT_BYTES", 10)
     monkeypatch.setattr(backend_module, "_run_process", fake_run)
-    proposal = CodexPatchBuilder("/bin/codex").propose(
+    proposal = CodexPatchBuilder(_TEST_CLI).propose(
         worktree=tmp_path,
         objective="change app",
         feedback="",
@@ -303,7 +538,7 @@ def test_codex_result_file_is_bounded_before_json_read(
 
     monkeypatch.setattr(backend_module, "_MAX_MODEL_RESULT_BYTES", 64)
     monkeypatch.setattr(backend_module, "_run_process", fake_run)
-    proposal = CodexPatchBuilder("/bin/codex").propose(
+    proposal = CodexPatchBuilder(_TEST_CLI).propose(
         worktree=tmp_path,
         objective="change app",
         feedback="",
@@ -339,7 +574,7 @@ def test_codex_reviewer_is_fresh_read_only_and_schema_bound(
     monkeypatch.setattr(backend_module, "_run_process", fake_run)
     staged_diff = _patch()
     diff_sha256 = hashlib.sha256(staged_diff.encode("utf-8")).hexdigest()
-    decision = CodexArtifactReviewer("/bin/codex").review(
+    decision = CodexArtifactReviewer(_TEST_CLI).review(
         worktree=tmp_path,
         objective="objective",
         staged_diff=staged_diff,
@@ -381,7 +616,7 @@ def test_codex_reviewer_rejects_a_diff_digest_mismatch_before_launch(
     monkeypatch.setattr(backend_module, "_run_process", fake_run)
 
     with pytest.raises(ValueError, match="does not match its digest"):
-        CodexArtifactReviewer("/bin/codex").review(
+        CodexArtifactReviewer(_TEST_CLI).review(
             worktree=tmp_path,
             objective="objective",
             staged_diff=_patch(),
@@ -408,7 +643,7 @@ def test_codex_reviewer_rejects_an_oversized_diff_before_launch(
     monkeypatch.setattr(backend_module, "_run_process", fake_run)
 
     with pytest.raises(ValueError, match="safe review limit"):
-        CodexArtifactReviewer("/bin/codex").review(
+        CodexArtifactReviewer(_TEST_CLI).review(
             worktree=tmp_path,
             objective="objective",
             staged_diff=staged_diff,
@@ -452,7 +687,7 @@ def test_reviewer_payload_is_redacted_and_bounded(
 
     monkeypatch.setattr(backend_module, "_run_process", fake_run)
     staged_diff = _patch()
-    decision = CodexArtifactReviewer("/bin/codex").review(
+    decision = CodexArtifactReviewer(_TEST_CLI).review(
         worktree=tmp_path,
         objective="objective",
         staged_diff=staged_diff,
@@ -479,7 +714,7 @@ def test_claude_builder_exposes_read_tools_only(
         return _ProcessResult(0, json.dumps(payload), "")
 
     monkeypatch.setattr(backend_module, "_run_process", fake_run)
-    result = ClaudeCodePatchBuilder("/bin/claude").propose(
+    result = ClaudeCodePatchBuilder(_TEST_CLI).propose(
         worktree=tmp_path,
         objective="change app",
         feedback="",
@@ -540,6 +775,52 @@ def test_process_stdin_is_literal_and_not_shell_interpreted(tmp_path: Path) -> N
 
     assert result.stdout == payload
     assert not marker.exists()
+
+
+def test_process_inherits_only_valid_explicit_guard_descriptors(tmp_path: Path) -> None:
+    guard_path = tmp_path / "publication.lock"
+    descriptor = os.open(guard_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        result = _run_process(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys; value=os.fstat(int(sys.argv[1])); "
+                    "raise SystemExit(0 if (value.st_dev,value.st_ino)=="
+                    "(int(sys.argv[2]),int(sys.argv[3])) else 9)"
+                ),
+                str(descriptor),
+                str(metadata.st_dev),
+                str(metadata.st_ino),
+            ],
+            cwd=tmp_path,
+            timeout=5,
+            env=backend_module._controller_env(),
+            inherited_guard_fds=(descriptor,),
+        )
+        assert result.returncode == 0
+
+        with pytest.raises(ValueError, match="tuple"):
+            _run_process(
+                [sys.executable, "-c", "pass"],
+                cwd=tmp_path,
+                timeout=5,
+                env=backend_module._controller_env(),
+                inherited_guard_fds=[descriptor],  # type: ignore[arg-type]
+            )
+    finally:
+        os.close(descriptor)
+
+    with pytest.raises(ValueError, match="not open"):
+        _run_process(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            timeout=5,
+            env=backend_module._controller_env(),
+            inherited_guard_fds=(descriptor,),
+        )
 
 
 def test_process_runtime_storage_watchdog_fails_closed(tmp_path: Path) -> None:
@@ -854,6 +1135,105 @@ def test_validation_availability_runs_contained_git_and_python_smoke_checks(
     ]
     assert calls[1][5] == str(python)
     assert calls[1][6:8] == ["-I", "-c"]
+
+
+def test_external_validation_uses_only_controller_runtime_and_target_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = tmp_path / "controller"
+    repository = tmp_path / "target-repository"
+    worktree = tmp_path / "target-worktree"
+    controller.mkdir()
+    repository.mkdir()
+    worktree.mkdir()
+    (controller / ".git").mkdir()
+    (repository / ".git").mkdir()
+    (worktree / ".git").write_text("gitdir: external\n", encoding="utf-8")
+    (worktree / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\n",
+        encoding="utf-8",
+    )
+
+    controller_python = controller / ".venv" / "bin" / "python"
+    controller_python.parent.mkdir(parents=True)
+    controller_python.symlink_to(sys.executable)
+    controller_bootstrap = controller / "delivery" / "sandbox_runner.py"
+    controller_bootstrap.parent.mkdir()
+    controller_bootstrap.write_text("# trusted controller bootstrap\n", encoding="utf-8")
+
+    executed = tmp_path / "target-runtime-executed"
+    target_python = worktree / ".venv" / "bin" / "python"
+    target_python.parent.mkdir(parents=True)
+    target_python.write_text(
+        f"#!/bin/sh\ntouch {executed}\nexit 91\n",
+        encoding="utf-8",
+    )
+    target_python.chmod(0o700)
+    target_bootstrap = worktree / "delivery" / "sandbox_runner.py"
+    target_bootstrap.parent.mkdir()
+    target_bootstrap.write_text(
+        f"from pathlib import Path\nPath({str(executed)!r}).touch()\n",
+        encoding="utf-8",
+    )
+
+    commands: list[list[str]] = []
+    profiles: dict[str, str] = {}
+    monkeypatch.setattr(validation_module.sys, "platform", "darwin")
+    monkeypatch.setattr(validation_module, "_trusted_validation_git", lambda: "/usr/bin/git")
+
+    def fake_run(argv: list[str], **_kwargs: Any) -> _ProcessResult:
+        commands.append(argv)
+        profile_path = Path(argv[3])
+        profiles[profile_path.name] = profile_path.read_text(encoding="utf-8")
+        return _ProcessResult(0, "passed", "")
+
+    monkeypatch.setattr(validation_module, "_run_process", fake_run)
+    results = MondayValidationRunner(
+        source_root=controller,
+        timeout=1,
+        mondayos_tests=False,
+    ).run(
+        worktree=worktree,
+        source_root=controller,
+        repository_root=repository,
+        changed_files=["app.py"],
+    )
+
+    assert len(results) == 2
+    assert len(commands) == 2
+    for command in commands:
+        assert command[:3] == [
+            str(controller_python.absolute()),
+            "-I",
+            str(controller_bootstrap.resolve()),
+        ]
+        assert str(target_python) not in command
+        assert str(target_bootstrap) not in command
+    assert results[-1].argv[0] == str(controller_python)
+    assert not any(
+        argument.startswith("--deselect=") for argument in results[-1].argv
+    )
+    assert "Sandboxed validation exclusions" not in results[-1].output
+    assert not executed.exists()
+
+    target_git = json.dumps(str((repository / ".git").resolve()))
+    controller_git = json.dumps(str((controller / ".git").resolve()))
+    git_profile = profiles["sandbox-git.sb"]
+    git_read_allow = git_profile.split("(allow file-read*\n", 1)[1].split(
+        ")\n(deny file-read*",
+        1,
+    )[0]
+    assert f"(subpath {target_git})" in git_read_allow
+    assert f"(subpath {controller_git})" not in git_read_allow
+    assert f"(subpath {controller_git})" in git_profile
+
+    test_profile = profiles["sandbox-tests.sb"]
+    test_read_allow = test_profile.split("(allow file-read*\n", 1)[1].split(
+        ")\n(deny file-read*",
+        1,
+    )[0]
+    assert f"(subpath {target_git})" not in test_read_allow
+    assert f"(subpath {target_git})" in test_profile
 
 
 def test_validation_sandbox_explicitly_denies_worktree_git_writes(tmp_path: Path) -> None:
@@ -1328,32 +1708,89 @@ def test_artifact_digest_changes_for_diff_evidence_or_objective() -> None:
         diff=_patch() + "\n",
         verification_sha256=check,
     )
+    project_bound = artifact_digest(
+        base_sha="a" * 40,
+        objective="one",
+        diff=_patch(),
+        verification_sha256=check,
+        project_name="weather-portal",
+        repository="acme/weather-portal",
+    )
+    repository_bound = artifact_digest(
+        base_sha="a" * 40,
+        objective="one",
+        diff=_patch(),
+        verification_sha256=check,
+        project_name="weather-portal",
+        repository="acme/another-repository",
+    )
     assert first != second
     assert first != third
-    assert all(len(value) == 64 for value in first)
+    assert first != project_bound
+    assert project_bound != repository_bound
+    assert all(len(value) == 64 for pair in (first, project_bound) for value in pair)
+
+
+def test_delivery_job_preserves_the_schema_v1_positional_status_argument() -> None:
+    job = DeliveryJob("delivery-one", "TASK-0001", "objective", "/repo", "running")
+
+    assert job.status == "running"
+    assert job.project_name == ""
 
 
 def test_delivery_store_reserves_identity_and_rejects_tampered_record(tmp_path: Path) -> None:
     store = DeliveryStore(tmp_path)
+    owner_token = "a" * 64
     job = DeliveryJob(
         delivery_id="delivery-one",
         task_id="TASK-0001",
         objective="objective",
         repo_root=str(tmp_path),
         created_at="2026-01-01T00:00:00+00:00",
+        worktree_owner_token=owner_token,
     )
 
+    assert "worktree_owner_token" not in job.to_dict()
     assert store.reserve(job) is None
     existing = store.reserve(job)
     assert existing is not None
     assert existing.task_id == "TASK-0001"
+    assert existing.worktree_owner_token == owner_token
 
     record = store.records / "delivery-one.json"
     payload = json.loads(record.read_text(encoding="utf-8"))
+    assert payload["worktree_owner_token"] == owner_token
     payload["delivery_id"] = "delivery-another"
     record.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="identifies itself"):
         store.get("delivery-one")
+
+
+def test_delivery_store_history_filters_real_records_by_project(tmp_path: Path) -> None:
+    store = DeliveryStore(tmp_path)
+    for delivery_id, project_name in (
+        ("delivery-controller", ""),
+        ("delivery-weather", "weather-portal"),
+        ("delivery-other", "another-project"),
+    ):
+        store.persist(
+            DeliveryJob(
+                delivery_id=delivery_id,
+                task_id="TASK-0001",
+                objective="objective",
+                repo_root=str(tmp_path),
+                project_name=project_name,
+                created_at=delivery_id,
+            )
+        )
+
+    assert [
+        job.delivery_id
+        for job in store.history(project_name="weather-portal")
+    ] == ["delivery-weather"]
+    assert [job.delivery_id for job in store.history(project_name="")] == [
+        "delivery-controller"
+    ]
 
 
 def test_delivery_store_refuses_symlinked_runtime_ancestor(tmp_path: Path) -> None:
@@ -1442,7 +1879,7 @@ def test_github_reuses_only_open_pr_for_exact_reviewed_commit(
     sha = "a" * 40
     row = {
         "number": 7,
-        "url": "https://github.com/owner/repo/pull/7",
+        "url": "https://github.com/Owner/Repo/pull/7",
         "state": "OPEN",
         "baseRefName": "main",
         "headRefName": "codex/task-12345678",
@@ -1455,7 +1892,7 @@ def test_github_reuses_only_open_pr_for_exact_reviewed_commit(
         lambda *_args, **_kwargs: _ProcessResult(0, json.dumps([row]), ""),
     )
 
-    result = github_module.GhCliClient("/bin/gh").ensure_pull_request(
+    result = github_module.GhCliClient(_TEST_CLI).ensure_pull_request(
         repo_root=tmp_path,
         repository="owner/repo",
         base="main",
@@ -1469,7 +1906,7 @@ def test_github_reuses_only_open_pr_for_exact_reviewed_commit(
     assert result.number == 7
 
     row["state"] = "CLOSED"
-    rejected = github_module.GhCliClient("/bin/gh").ensure_pull_request(
+    rejected = github_module.GhCliClient(_TEST_CLI).ensure_pull_request(
         repo_root=tmp_path,
         repository="owner/repo",
         base="main",
@@ -1488,13 +1925,13 @@ def test_github_verifies_new_pr_after_creation(
     responses = iter(
         [
             _ProcessResult(0, "[]", ""),
-            _ProcessResult(0, "https://github.com/owner/repo/pull/9\n", ""),
+            _ProcessResult(0, "https://github.com/Owner/Repo/pull/9\n", ""),
             _ProcessResult(
                 0,
                 json.dumps(
                     {
                         "number": 9,
-                        "url": "https://github.com/owner/repo/pull/9",
+                        "url": "https://github.com/Owner/Repo/pull/9",
                         "state": "OPEN",
                         "baseRefName": "main",
                         "headRefName": "codex/task-12345678",
@@ -1506,20 +1943,30 @@ def test_github_verifies_new_pr_after_creation(
             ),
         ]
     )
-    monkeypatch.setattr(
-        github_module,
-        "_run_process",
-        lambda *_args, **_kwargs: next(responses),
-    )
+    calls: list[dict[str, Any]] = []
 
-    result = github_module.GhCliClient("/bin/gh").ensure_pull_request(
-        repo_root=tmp_path,
-        repository="owner/repo",
-        base="main",
-        branch="codex/task-12345678",
-        title="Task",
-        body="Body",
-        expected_sha=sha,
-    )
+    def fake_run(_argv: list[str], **kwargs: Any) -> _ProcessResult:
+        calls.append(dict(kwargs))
+        return next(responses)
+
+    monkeypatch.setattr(github_module, "_run_process", fake_run)
+    guard = tmp_path / "publication.lock"
+    descriptor = os.open(guard, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        result = github_module.GhCliClient(_TEST_CLI).ensure_pull_request(
+            repo_root=tmp_path,
+            repository="owner/repo",
+            base="main",
+            branch="codex/task-12345678",
+            title="Task",
+            body="Body",
+            expected_sha=sha,
+            inherited_guard_fds=(descriptor,),
+        )
+    finally:
+        os.close(descriptor)
     assert result.success is True
     assert result.number == 9
+    assert calls[0].get("inherited_guard_fds", ()) == ()
+    assert calls[1]["inherited_guard_fds"] == (descriptor,)
+    assert calls[2].get("inherited_guard_fds", ()) == ()

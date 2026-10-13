@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import base64
+import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 from delivery.backends import PatchProposal, ReviewDecision, ToolAvailability
 from delivery.github import PullRequestResult
 from delivery.types import DeliveryJob
 from delivery.validation import MondayValidationRunner, ValidationResult
 from delivery.workflow import DeliveryWorkflow
+from tasks import TaskManager, TaskPriority, TaskType
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -60,6 +65,10 @@ class _Monday:
         title: str = "Change the value",
         objective: str = "Set VALUE to the reviewed target.",
         acceptance_criteria: list[str] | None = None,
+        project: str = "",
+        project_delivery_repository: str = "",
+        project_source_device: int | None = None,
+        project_source_inode: int | None = None,
     ) -> None:
         self.status = "backlog"
         self.calls: list[str] = []
@@ -68,6 +77,10 @@ class _Monday:
         self.acceptance_criteria = acceptance_criteria or [
             "app.py contains the target value"
         ]
+        self.project = project
+        self.project_delivery_repository = project_delivery_repository
+        self.project_source_device = project_source_device
+        self.project_source_inode = project_source_inode
 
     def task(self, action: str, **kwargs: Any) -> SimpleNamespace:
         self.calls.append(action)
@@ -80,6 +93,10 @@ class _Monday:
                     "title": self.title,
                     "objective": self.objective,
                     "acceptance_criteria": self.acceptance_criteria,
+                    "project": self.project,
+                    "project_delivery_repository": self.project_delivery_repository,
+                    "project_source_device": self.project_source_device,
+                    "project_source_inode": self.project_source_inode,
                     "status": self.status,
                 },
             )
@@ -164,8 +181,10 @@ class _Validator:
         self.outcomes = outcomes
         self.output = output
         self.calls = 0
+        self.requests: list[dict[str, Any]] = []
 
-    def run(self, **_: Any) -> list[ValidationResult]:
+    def run(self, **kwargs: Any) -> list[ValidationResult]:
+        self.requests.append(dict(kwargs))
         success = self.outcomes[min(self.calls, len(self.outcomes) - 1)]
         self.calls += 1
         return [
@@ -184,12 +203,14 @@ class _Validator:
 class _GitHub:
     def __init__(self) -> None:
         self.calls = 0
+        self.requests: list[dict[str, Any]] = []
 
     def availability(self) -> ToolAvailability:
         return ToolAvailability(True, "github", "ready")
 
-    def ensure_pull_request(self, **_: Any) -> PullRequestResult:
+    def ensure_pull_request(self, **kwargs: Any) -> PullRequestResult:
         self.calls += 1
+        self.requests.append(dict(kwargs))
         return PullRequestResult(
             True,
             url="https://github.com/owner/project/pull/12",
@@ -247,6 +268,17 @@ def _workflow(
 ) -> tuple[DeliveryWorkflow, _Monday]:
     from delivery.git import GitRepository
 
+    if not (root / "tasks" / "active" / "TASK-0001.md").exists():
+        task_manager = TaskManager(root)
+        for number in range(1, 11):
+            task = task_manager.create(
+                title=f"Delivery fixture {number}",
+                task_type=TaskType.FEATURE,
+                priority=TaskPriority.P2,
+                objective="Exercise the delivery workflow.",
+                created_by="human:test",
+            )
+            assert task.id == f"TASK-{number:04d}"
     controller = monday or _Monday()
     repository = GitRepository(
         root,
@@ -305,6 +337,218 @@ def test_default_validator_is_bound_to_configured_project_root(tmp_path: Path) -
     assert workflow.validator._source_root == tmp_path.resolve()
 
 
+def test_external_target_must_not_overlap_controller_directory(tmp_path: Path) -> None:
+    controller = tmp_path / "mondayos"
+    controller.mkdir()
+    nested = controller / "customer-project"
+    nested.mkdir()
+
+    for target in (controller, nested, tmp_path):
+        try:
+            DeliveryWorkflow(
+                monday=_Monday(project="customer-project"),
+                project_root=controller,
+                repository_root=target,
+                project_name="customer-project",
+                expected_repository="owner/customer-project",
+                reviewer=_Reviewer([_pass()]),
+                github=_GitHub(),
+                repository=object(),
+            )
+        except ValueError as exc:
+            assert "must be separate" in str(exc)
+        else:  # pragma: no cover - controller/target overlap breaks isolation
+            raise AssertionError(f"overlapping target was accepted: {target}")
+
+
+def test_external_project_uses_controller_state_and_delivers_to_target(
+    tmp_path: Path,
+) -> None:
+    from delivery.git import GitRepository
+
+    target, remote = _repository(tmp_path)
+    controller_root = tmp_path / "mondayos"
+    controller_root.mkdir()
+    task = TaskManager(controller_root).create(
+        title="External delivery fixture",
+        task_type=TaskType.FEATURE,
+        priority=TaskPriority.P2,
+        objective="Exercise external project delivery.",
+        created_by="human:test",
+    )
+    target_stat = target.stat()
+    monday = _Monday(
+        project="weatherbot",
+        project_delivery_repository="owner/project",
+        project_source_device=target_stat.st_dev,
+        project_source_inode=target_stat.st_ino,
+    )
+    validator = _Validator([True])
+    github = _GitHub()
+    repository = GitRepository(
+        target,
+        trusted_root=target,
+        runtime_root=controller_root / "logs" / "delivery",
+    )
+    repository.github_slug = lambda remote="origin": "owner/project"  # type: ignore[method-assign]
+    workflow = DeliveryWorkflow(
+        monday=monday,
+        project_root=controller_root,
+        repository_root=target,
+        project_name="weatherbot",
+        expected_repository="owner/project",
+        expected_root_identity=(target_stat.st_dev, target_stat.st_ino),
+        builders=[_Builder([_patch(1, 2)], name="codex-chatgpt")],
+        reviewer=_Reviewer([_pass()]),
+        validator=validator,
+        github=github,
+        repository=repository,
+    )
+
+    job = workflow.run(
+        task_id=task.id,
+        delivery_id="delivery-external-success",
+    )
+
+    assert job.success is True
+    assert job.project_name == "weatherbot"
+    assert job.expected_repository == "owner/project"
+    assert job.repo_root == str(target)
+    assert workflow.store.root == controller_root / "logs" / "delivery"
+    assert (workflow.store.records / "delivery-external-success.json").is_file()
+    assert not (target / "logs" / "delivery").exists()
+    assert (target / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert _git(remote, "show", f"{job.branch}:app.py") == "VALUE = 2"
+    assert validator.requests[0]["source_root"] == controller_root
+    assert validator.requests[0]["repository_root"] == target
+    assert validator.requests[0]["mondayos_tests"] is False
+    assert github.requests[0]["repo_root"] == target
+    assert github.requests[0]["repository"] == "owner/project"
+
+
+def test_existing_task_cannot_follow_removed_and_reregistered_project_name(
+    tmp_path: Path,
+) -> None:
+    from monday import Monday, MondayConfig
+
+    controller = tmp_path / "mondayos"
+    original = tmp_path / "original"
+    replacement = tmp_path / "replacement"
+    controller.mkdir()
+    original.mkdir()
+    replacement.mkdir()
+    monday = Monday(MondayConfig(project_root=controller))
+    assert monday.project(
+        "register",
+        name="weatherbot",
+        path=str(original),
+        delivery_repository="owner/original",
+    ).success
+    task = monday.task(
+        "create",
+        title="Change the value",
+        objective="Set VALUE to the reviewed target.",
+        project="weatherbot",
+    )
+    assert task.success
+    assert task.data["project_delivery_repository"] == "owner/original"
+
+    assert monday.project("remove", name="weatherbot").success
+    assert monday.project(
+        "register",
+        name="weatherbot",
+        path=str(replacement),
+        delivery_repository="owner/replacement",
+    ).success
+    replacement_stat = replacement.stat()
+    builder = _Builder([_patch(1, 2)])
+    workflow = DeliveryWorkflow(
+        monday=monday,
+        project_root=controller,
+        repository_root=replacement,
+        project_name="weatherbot",
+        expected_repository="owner/replacement",
+        expected_root_identity=(replacement_stat.st_dev, replacement_stat.st_ino),
+        builders=[builder],
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+        repository=object(),
+    )
+
+    job = workflow.run(
+        task_id=str(task.task_id),
+        delivery_id="delivery-retargeted-task",
+    )
+
+    assert job.success is False
+    assert job.failure_code == "project-mismatch"
+    assert "different GitHub repository" in job.message
+    assert builder.calls == 0
+
+
+def test_delivery_identity_cannot_be_rebound_to_another_external_project(
+    tmp_path: Path,
+) -> None:
+    controller = tmp_path / "mondayos"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    controller.mkdir()
+    first.mkdir()
+    second.mkdir()
+    first_stat = first.stat()
+    second_stat = second.stat()
+    first_workflow = DeliveryWorkflow(
+        monday=_Monday(project="first"),
+        project_root=controller,
+        repository_root=first,
+        project_name="first",
+        expected_repository="owner/first",
+        expected_root_identity=(first_stat.st_dev, first_stat.st_ino),
+        builders=[_Builder([_patch(1, 2)])],
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+        repository=object(),
+    )
+    reserved = DeliveryJob(
+        delivery_id="delivery-bound-project",
+        task_id="TASK-EXT-0002",
+        objective="safe objective",
+        repo_root=str(first),
+        project_name="first",
+        expected_repository="owner/first",
+        root_device=first_stat.st_dev,
+        root_inode=first_stat.st_ino,
+        created_at="2026-10-12T00:00:00+00:00",
+        updated_at="2026-10-12T00:00:00+00:00",
+    )
+    assert first_workflow.store.reserve(reserved) is None
+    second_workflow = DeliveryWorkflow(
+        monday=_Monday(project="second"),
+        project_root=controller,
+        repository_root=second,
+        project_name="second",
+        expected_repository="owner/second",
+        expected_root_identity=(second_stat.st_dev, second_stat.st_ino),
+        builders=[_Builder([_patch(1, 2)])],
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+        repository=object(),
+    )
+
+    try:
+        second_workflow.run(
+            task_id="TASK-EXT-0002",
+            delivery_id="delivery-bound-project",
+        )
+    except ValueError as exc:
+        assert "already bound" in str(exc)
+    else:  # pragma: no cover - a durable identity may never change target
+        raise AssertionError("delivery identity was rebound")
+
+
 def test_success_reviews_exact_artifact_pushes_branch_and_opens_pr(tmp_path: Path) -> None:
     root, remote = _repository(tmp_path)
     builder = _Builder([_patch(1, 2)])
@@ -314,6 +558,14 @@ def test_success_reviews_exact_artifact_pushes_branch_and_opens_pr(tmp_path: Pat
     workflow, monday = _workflow(
         root, builder=builder, reviewer=reviewer, validator=validator, github=github
     )
+    push_requests: list[dict[str, Any]] = []
+    original_push = workflow.repository.push
+
+    def recording_push(*args: Any, **kwargs: Any) -> str:
+        push_requests.append(dict(kwargs))
+        return original_push(*args, **kwargs)
+
+    workflow.repository.push = recording_push
 
     job = workflow.run(task_id="TASK-0001", delivery_id="delivery-success")
 
@@ -326,6 +578,13 @@ def test_success_reviews_exact_artifact_pushes_branch_and_opens_pr(tmp_path: Pat
     assert (root / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
     assert _git(remote, "show", f"{job.branch}:app.py") == "VALUE = 2"
     assert builder.calls == reviewer.calls == validator.calls == github.calls == 1
+    guard_fds = github.requests[0]["inherited_guard_fds"]
+    assert isinstance(guard_fds, tuple) and len(guard_fds) == 2
+    assert guard_fds[0] != guard_fds[1]
+    assert push_requests[0]["inherited_guard_fds"] == guard_fds
+    for descriptor in guard_fds:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
     same = workflow.run(task_id="TASK-0001", delivery_id="delivery-success")
     assert same.commit_sha == job.commit_sha
@@ -337,6 +596,300 @@ def test_success_reviews_exact_artifact_pushes_branch_and_opens_pr(tmp_path: Pat
         assert "already bound" in str(exc)
     else:  # pragma: no cover - identity confusion must never be tolerated
         raise AssertionError("a delivery identity was reused for another task")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires descriptor inheritance")
+def test_workflow_lease_graceful_unwind_preserves_inherited_child_guard(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    child: subprocess.Popen[bytes] | None = None
+    try:
+        with workflow._workflow_lease() as descriptor:
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,sys; "
+                        "os.fstat(int(sys.argv[1])); "
+                        "os.write(int(sys.argv[2]), b'1'); "
+                        "os.read(int(sys.argv[3]), 1)"
+                    ),
+                    str(descriptor),
+                    str(ready_write),
+                    str(release_read),
+                ],
+                pass_fds=(descriptor, ready_write, release_read),
+            )
+            os.close(ready_write)
+            ready_write = -1
+            os.close(release_read)
+            release_read = -1
+            assert os.read(ready_read, 1) == b"1"
+
+        workflow.lease_timeout = 0.01
+        with pytest.raises(TimeoutError, match="another build"):
+            with workflow._workflow_lease():
+                pass
+
+        os.write(release_write, b"1")
+        assert child.wait(timeout=2) == 0
+        with workflow._workflow_lease():
+            pass
+    finally:
+        for pipe_descriptor in (
+            ready_read,
+            ready_write,
+            release_read,
+            release_write,
+        ):
+            if pipe_descriptor >= 0:
+                os.close(pipe_descriptor)
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+
+
+def test_controller_death_after_push_is_reconciled_without_a_second_push(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    push_calls = 0
+    original_push = workflow.repository.push
+
+    def recording_push(*args: Any, **kwargs: Any) -> str:
+        nonlocal push_calls
+        push_calls += 1
+        return original_push(*args, **kwargs)
+
+    workflow.repository.push = recording_push
+    original_persist = workflow.store.persist
+    crash_armed = True
+
+    def crash_before_pushed_persistence(job: DeliveryJob) -> None:
+        nonlocal crash_armed
+        if crash_armed and job.phase == "pushing" and job.pushed:
+            crash_armed = False
+            raise SystemExit("simulated controller death after push")
+        original_persist(job)
+
+    workflow.store.persist = crash_before_pushed_persistence  # type: ignore[method-assign]
+    with pytest.raises(SystemExit, match="after push"):
+        workflow.run(task_id="TASK-0001", delivery_id="delivery-crash-after-push")
+    workflow.store.persist = original_persist  # type: ignore[method-assign]
+
+    durable = workflow.get("delivery-crash-after-push")
+    assert durable.phase == "pushing"
+    assert durable.pushed is False
+    assert _git(remote, "show", f"{durable.branch}:app.py") == "VALUE = 2"
+
+    recovered = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-crash-after-push",
+    )
+
+    assert recovered.success is True
+    assert recovered.status == "pr-open"
+    assert push_calls == 1
+    assert github.calls == 1
+
+
+def test_controller_death_after_pr_creation_is_reconciled_exactly(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    push_calls = 0
+    original_push = workflow.repository.push
+
+    def recording_push(*args: Any, **kwargs: Any) -> str:
+        nonlocal push_calls
+        push_calls += 1
+        return original_push(*args, **kwargs)
+
+    workflow.repository.push = recording_push
+    original_persist = workflow.store.persist
+    crash_armed = True
+
+    def crash_before_pr_persistence(job: DeliveryJob) -> None:
+        nonlocal crash_armed
+        if crash_armed and job.status == "pr-open":
+            crash_armed = False
+            raise SystemExit("simulated controller death after PR creation")
+        original_persist(job)
+
+    workflow.store.persist = crash_before_pr_persistence  # type: ignore[method-assign]
+    with pytest.raises(SystemExit, match="after PR creation"):
+        workflow.run(task_id="TASK-0001", delivery_id="delivery-crash-after-pr")
+    workflow.store.persist = original_persist  # type: ignore[method-assign]
+
+    durable = workflow.get("delivery-crash-after-pr")
+    assert durable.phase == "pull-request"
+    assert durable.pushed is True
+    assert durable.pr_url == ""
+    assert github.calls == 1
+    assert _git(remote, "show", f"{durable.branch}:app.py") == "VALUE = 2"
+
+    recovered = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-crash-after-pr",
+    )
+
+    assert recovered.success is True
+    assert recovered.pr_url.endswith("/pull/12")
+    assert push_calls == 1
+    # The second idempotent ensure call represents the exact PR lookup that a
+    # production GhCliClient performs before it ever attempts creation.
+    assert github.calls == 2
+
+
+def test_unverified_pr_failure_stays_recoverable_and_retries_exact_identity(
+    tmp_path: Path,
+) -> None:
+    class _UnavailablePr(_GitHub):
+        def ensure_pull_request(self, **kwargs: Any) -> PullRequestResult:
+            self.calls += 1
+            self.requests.append(dict(kwargs))
+            return PullRequestResult(False, message="temporary GitHub query failure")
+
+    root, remote = _repository(tmp_path)
+    unavailable = _UnavailablePr()
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=unavailable,
+    )
+
+    pending = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-pr-temporarily-unverified",
+    )
+
+    assert pending.status == "publication-pending"
+    assert pending.success is False
+    assert pending.terminal is False
+    assert pending.pushed is True
+    assert "Retry this exact delivery identity" in pending.message
+    assert _git(remote, "show", f"{pending.branch}:app.py") == "VALUE = 2"
+
+    recovered_github = _GitHub()
+    workflow.github = recovered_github
+    recovered = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-pr-temporarily-unverified",
+    )
+
+    assert recovered.success is True
+    assert recovered.status == "pr-open"
+    assert unavailable.calls == 1
+    assert recovered_github.calls == 1
+
+
+def test_failure_is_persisted_before_repository_lease_is_released(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    contender, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 3)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    contender.lease_timeout = 0.01
+
+    def fail_during_run(*_args: Any, **_kwargs: Any) -> DeliveryJob:
+        raise RuntimeError("deterministic graceful failure")
+
+    workflow._run_locked = fail_during_run  # type: ignore[method-assign]
+    original_fail = workflow._fail
+    concurrent_snapshots: list[DeliveryJob] = []
+
+    def persist_failure_while_contended(
+        job: DeliveryJob,
+        code: str,
+        message: str,
+    ) -> DeliveryJob:
+        concurrent_snapshots.append(
+            contender.run(
+                task_id="TASK-0001",
+                delivery_id="delivery-failure-linearized",
+            )
+        )
+        return original_fail(job, code, message)
+
+    workflow._fail = persist_failure_while_contended  # type: ignore[method-assign]
+    failed = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-failure-linearized",
+    )
+
+    assert [snapshot.status for snapshot in concurrent_snapshots] == ["running"]
+    assert failed.status == "failed"
+    assert failed.message == "deterministic graceful failure"
+    assert workflow.get(failed.delivery_id).status == "failed"
+
+
+def test_new_delivery_id_cannot_bypass_an_unresolved_delivery(tmp_path: Path) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    _persist_delivery(
+        workflow,
+        delivery_id="delivery-unresolved-original",
+        status="publication-pending",
+        phase="pushing",
+    )
+
+    blocked = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-unresolved-replacement",
+    )
+
+    assert blocked.status == "failed"
+    assert blocked.failure_code == "unresolved-delivery"
+    assert "delivery-unresolved-original" in blocked.message
+    assert builder.calls == 0
 
 
 def test_task_store_failure_after_pr_keeps_published_delivery_successful(
@@ -372,6 +925,46 @@ def test_task_store_failure_after_pr_keeps_published_delivery_successful(
     assert workflow.get(job.delivery_id).status == "pr-open"
     assert _git(remote, "show", f"{job.branch}:app.py") == "VALUE = 2"
     assert github.calls == 1
+
+
+def test_task_becoming_terminal_after_review_stops_before_push_or_pr(
+    tmp_path: Path,
+) -> None:
+    class _TerminalAfterCommit:
+        def __init__(self, repository: Any, monday: _Monday) -> None:
+            self._repository = repository
+            self._monday = monday
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._repository, name)
+
+        def commit(self, *args: Any, **kwargs: Any) -> str:
+            commit = self._repository.commit(*args, **kwargs)
+            self._monday.status = "completed"
+            return commit
+
+    root, remote = _repository(tmp_path)
+    github = _GitHub()
+    workflow, monday = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    workflow.repository = _TerminalAfterCommit(workflow.repository, monday)
+
+    job = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-terminal-before-publish",
+    )
+
+    assert job.success is False
+    assert job.status == "failed"
+    assert job.failure_code == "terminal-task"
+    assert job.pushed is False
+    assert github.calls == 0
+    assert _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/codex") == ""
 
 
 def test_stale_nonterminal_delivery_is_interrupted_under_free_lease(
@@ -763,17 +1356,42 @@ def test_unsafe_proposal_is_a_bounded_patch_attempt_and_can_be_repaired(
     assert _git(remote, "show", f"{job.branch}:app.py") == "VALUE = 2"
 
 
-def test_all_model_and_validation_text_is_redacted_before_job_persistence(
+def test_secret_like_task_input_is_rejected_before_persistence_or_model_call(
     tmp_path: Path,
 ) -> None:
     root, _ = _repository(tmp_path)
     objective_secret = _fixture("sk-", "objectivesecret1234567890")
+    builder = _Builder([_patch(1, 2)])
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+        monday=_Monday(objective=f"Set VALUE safely using {objective_secret}"),
+    )
+
+    try:
+        workflow.run(task_id="TASK-0010", delivery_id="delivery-secret-objective")
+    except ValueError as exc:
+        assert "credential-like material" in str(exc)
+    else:  # pragma: no cover - task secrets must never reach a model or record
+        raise AssertionError("secret-like task input was accepted")
+
+    assert builder.calls == 0
+    assert not (workflow.store.records / "delivery-secret-objective.json").exists()
+
+
+def test_all_model_and_validation_output_is_redacted_before_job_persistence(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
     summary_secret = _fixture("ghp_", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
     validation_secret = _fixture("AKIA", "BBBBBBBBBBBBBBBB")
     review_secret = _fixture("eyJabcde", ".abcde12345", ".signature12345")
     finding_secret = _fixture("12345678", ":", "telegramsecretvalue1234567890")
     recommendation_secret = _fixture("password=", "SuperSecretPassword12345")
-    monday = _Monday(objective=f"Set VALUE safely using {objective_secret}")
+    monday = _Monday()
     builder = _Builder([_patch(1, 2)], summary=f"used {summary_secret}")
     reviewer = _Reviewer(
         [
@@ -802,7 +1420,6 @@ def test_all_model_and_validation_text_is_redacted_before_job_persistence(
 
     assert job.status == "rejected"
     for secret in (
-        objective_secret,
         summary_secret,
         validation_secret,
         review_secret,

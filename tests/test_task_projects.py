@@ -14,13 +14,14 @@ project must never be overwritten by a later run.
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from tasks.manager import TaskManager
 from tasks.migration import backfill_projects, infer_project
 from tasks.parser import TaskParser
-from tasks.task import ApprovalLevel, TaskPriority, TaskType
+from tasks.task import ApprovalLevel, Task, TaskPriority, TaskStatus, TaskType
 
 
 def _manager(tmp: str) -> TaskManager:
@@ -66,6 +67,46 @@ class TestTaskProjectField(unittest.TestCase):
             parser = TaskParser()
             self.assertEqual(parser.parse(parser.serialize(task)).project, "cue-app")
 
+    def test_delivery_target_fingerprint_survives_round_trip(self):
+        with TemporaryDirectory() as tmp:
+            manager = _manager(tmp)
+            task = manager.create(
+                title="Ship it",
+                task_type=TaskType.FEATURE,
+                priority=TaskPriority.P2,
+                objective="do it",
+                created_by="human:test",
+                project="weatherbot",
+                project_delivery_repository="acme/weatherbot",
+                project_source_device=17,
+                project_source_inode=29,
+            )
+
+            restored = manager.get(task.id)
+            self.assertEqual(restored.project_delivery_repository, "acme/weatherbot")
+            self.assertEqual(restored.project_source_device, 17)
+            self.assertEqual(restored.project_source_inode, 29)
+
+    def test_delivery_fields_do_not_shift_the_legacy_positional_constructor(self):
+        now = datetime.now(tz=UTC)
+        task = Task(
+            "TASK-0001",
+            "Ship it",
+            TaskType.FEATURE,
+            TaskStatus.BACKLOG,
+            TaskPriority.P2,
+            now,
+            now,
+            "human:test",
+            "do it",
+            "context",
+            "weatherbot",
+            "agent:builder",
+        )
+
+        self.assertEqual(task.assigned_to, "agent:builder")
+        self.assertEqual(task.project_delivery_repository, "")
+
     def test_a_legacy_task_without_the_field_still_loads(self):
         """A task that will not load is worse than one whose project is unknown."""
         with TemporaryDirectory() as tmp:
@@ -73,7 +114,11 @@ class TestTaskProjectField(unittest.TestCase):
             task = _task(manager, "Legacy work")
             path = Path(tmp) / "tasks" / "active" / f"{task.id}.md"
             path.write_text(path.read_text().replace("project: ''\n", ""))
-            self.assertEqual(manager.get(task.id).project, "")
+            restored = manager.get(task.id)
+            self.assertEqual(restored.project, "")
+            self.assertEqual(restored.project_delivery_repository, "")
+            self.assertIsNone(restored.project_source_device)
+            self.assertIsNone(restored.project_source_inode)
 
     def test_listing_by_project_uses_the_explicit_field_only(self):
         with TemporaryDirectory() as tmp:

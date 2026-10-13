@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-from datetime import datetime, timezone
+import subprocess
+import sys
+import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
+import tasks.manager as task_manager_module
 from tasks import (
     ApprovalLevel,
     InvalidTransitionError,
@@ -25,7 +30,7 @@ from tasks.task import _VALID_TRANSITIONS, StatusTransition
 
 
 def _make_task(status: TaskStatus = TaskStatus.BACKLOG) -> Task:
-    now = datetime.now(tz=timezone.utc)
+    now = datetime.now(tz=UTC)
     return Task(
         id="TASK-0001",
         title="Sample task",
@@ -108,7 +113,7 @@ class TestTask:
 
 class TestStatusTransition:
     def test_transition_records_fields(self) -> None:
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         t = StatusTransition(
             from_status=TaskStatus.BACKLOG,
             to_status=TaskStatus.ASSIGNED,
@@ -153,7 +158,7 @@ class TestTaskParser:
 
     def test_parse_round_trips_status_history(self) -> None:
         parser = TaskParser()
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         task = Task(
             id="TASK-0002",
             title="With history",
@@ -219,6 +224,251 @@ class TestTaskManager:
     def test_create_returns_task(self) -> None:
         task = self._create()
         assert isinstance(task, Task)
+
+    def test_task_lock_serializes_terminal_transition_across_managers(self) -> None:
+        task = self._create()
+        self.mgr.update_status(task.id, TaskStatus.ASSIGNED, changed_by="human:test")
+        self.mgr.update_status(task.id, TaskStatus.IN_PROGRESS, changed_by="human:test")
+        other = TaskManager(self.tmp_path)
+        attempting = threading.Event()
+        finished = threading.Event()
+
+        def complete() -> None:
+            attempting.set()
+            other.update_status(task.id, TaskStatus.COMPLETED, changed_by="human:other")
+            finished.set()
+
+        worker = threading.Thread(target=complete)
+        with self.mgr.lock(task.id):
+            worker.start()
+            assert attempting.wait(1)
+            assert not finished.wait(0.1)
+
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert finished.is_set()
+        assert self.mgr.get(task.id).status == TaskStatus.COMPLETED
+
+    def test_task_lock_rejects_symlinked_lock_directory(self) -> None:
+        task = self._create()
+        redirected = self.tmp_path / "redirected-locks"
+        redirected.mkdir()
+        (self.tmp_path / "tasks" / ".locks").symlink_to(
+            redirected,
+            target_is_directory=True,
+        )
+
+        with pytest.raises(OSError, match="real directory"):
+            self.mgr.update_status(
+                task.id,
+                TaskStatus.ASSIGNED,
+                changed_by="human:test",
+            )
+
+    def test_task_lock_rejects_hard_linked_lock_file(self) -> None:
+        task = self._create()
+        with self.mgr.lock(task.id):
+            pass
+        lock_file = next((self.tmp_path / "tasks" / ".locks").glob("*.lock"))
+        (self.tmp_path / "linked-task.lock").hardlink_to(lock_file)
+
+        with pytest.raises(OSError, match="one controller-owned regular file"):
+            self.mgr.update_status(
+                task.id,
+                TaskStatus.ASSIGNED,
+                changed_by="human:test",
+            )
+
+    def test_task_lock_rejects_unknown_id_before_allocating_lock_state(self) -> None:
+        existing_process_locks = dict(task_manager_module._PROCESS_LOCKS)
+        for task_id in ("../../escape", "TASK-NOT-A-NUMBER", "TASK-9999"):
+            with pytest.raises(TaskNotFoundError):
+                with self.mgr.lock(task_id):
+                    pass
+
+        assert not (self.tmp_path / "tasks" / ".locks").exists()
+        assert task_manager_module._PROCESS_LOCKS == existing_process_locks
+
+    def test_task_lock_yields_one_descriptor_for_nested_scope_and_evicts_entry(
+        self,
+    ) -> None:
+        task = self._create()
+        existing_process_locks = dict(task_manager_module._PROCESS_LOCKS)
+
+        with self.mgr.lock(task.id) as descriptor:
+            assert os.fstat(descriptor).st_nlink == 1
+            with self.mgr.lock(task.id) as nested_descriptor:
+                assert nested_descriptor == descriptor
+            assert len(task_manager_module._PROCESS_LOCKS) == len(existing_process_locks) + 1
+
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+        assert task_manager_module._PROCESS_LOCKS == existing_process_locks
+
+    def test_task_lock_reuses_descriptor_across_manager_instances(self) -> None:
+        task = self._create()
+        other = TaskManager(self.tmp_path)
+        real_flock = task_manager_module.fcntl.flock
+        exclusive_calls = 0
+
+        def count_exclusive(descriptor: int, operation: int) -> None:
+            nonlocal exclusive_calls
+            if operation == task_manager_module.fcntl.LOCK_EX:
+                exclusive_calls += 1
+                if exclusive_calls > 1:
+                    raise AssertionError("nested manager attempted a second flock")
+            real_flock(descriptor, operation)
+
+        with mock.patch.object(task_manager_module.fcntl, "flock", count_exclusive):
+            with self.mgr.lock(task.id) as descriptor:
+                with other.lock(task.id) as nested_descriptor:
+                    assert nested_descriptor == descriptor
+
+        assert exclusive_calls == 1
+
+    def test_task_lock_reuses_descriptor_through_an_alias_path(self) -> None:
+        task = self._create()
+        alias = self.tmp_path.with_name(f"{self.tmp_path.name}-alias")
+        alias.symlink_to(self.tmp_path, target_is_directory=True)
+        try:
+            other = TaskManager(alias)
+            real_flock = task_manager_module.fcntl.flock
+            exclusive_calls = 0
+
+            def count_exclusive(descriptor: int, operation: int) -> None:
+                nonlocal exclusive_calls
+                if operation == task_manager_module.fcntl.LOCK_EX:
+                    exclusive_calls += 1
+                    if exclusive_calls > 1:
+                        raise AssertionError("alias path attempted a second flock")
+                real_flock(descriptor, operation)
+
+            with mock.patch.object(task_manager_module.fcntl, "flock", count_exclusive):
+                with self.mgr.lock(task.id) as descriptor:
+                    with other.lock(task.id) as alias_descriptor:
+                        assert alias_descriptor == descriptor
+
+            assert exclusive_calls == 1
+        finally:
+            alias.unlink(missing_ok=True)
+
+    @pytest.mark.skipif(os.name != "posix", reason="requires descriptor inheritance")
+    def test_task_lock_graceful_unwind_preserves_inherited_child_guard(self) -> None:
+        task = self._create()
+        ready_read, ready_write = os.pipe()
+        release_read, release_write = os.pipe()
+        child: subprocess.Popen[bytes] | None = None
+        waiter: threading.Thread | None = None
+        acquired = threading.Event()
+        try:
+            with self.mgr.lock(task.id) as descriptor:
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,sys; "
+                            "os.fstat(int(sys.argv[1])); "
+                            "os.write(int(sys.argv[2]), b'1'); "
+                            "os.read(int(sys.argv[3]), 1)"
+                        ),
+                        str(descriptor),
+                        str(ready_write),
+                        str(release_read),
+                    ],
+                    pass_fds=(descriptor, ready_write, release_read),
+                )
+                os.close(ready_write)
+                ready_write = -1
+                os.close(release_read)
+                release_read = -1
+                assert os.read(ready_read, 1) == b"1"
+
+            def acquire_after_graceful_unwind() -> None:
+                with TaskManager(self.tmp_path).lock(task.id):
+                    acquired.set()
+
+            waiter = threading.Thread(target=acquire_after_graceful_unwind)
+            waiter.start()
+            assert not acquired.wait(0.1)
+
+            os.write(release_write, b"1")
+            assert child.wait(timeout=2) == 0
+            assert acquired.wait(2)
+            waiter.join(timeout=1)
+            assert not waiter.is_alive()
+        finally:
+            for pipe_descriptor in (
+                ready_read,
+                ready_write,
+                release_read,
+                release_write,
+            ):
+                if pipe_descriptor >= 0:
+                    os.close(pipe_descriptor)
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.wait(timeout=2)
+            if waiter is not None:
+                waiter.join(timeout=2)
+
+    def test_task_lock_rejects_group_writable_directory_and_file(self) -> None:
+        task = self._create()
+        with self.mgr.lock(task.id):
+            pass
+        lock_dir = self.tmp_path / "tasks" / ".locks"
+        lock_file = next(lock_dir.glob("*.lock"))
+
+        lock_dir.chmod(0o770)
+        with pytest.raises(OSError, match="controller-owned real directory"):
+            with self.mgr.lock(task.id):
+                pass
+
+        lock_dir.chmod(0o700)
+        lock_file.chmod(0o660)
+        with pytest.raises(OSError, match="controller-owned regular file"):
+            with self.mgr.lock(task.id):
+                pass
+
+    def test_task_lock_revalidates_directory_identity_after_flock(self) -> None:
+        task = self._create()
+        lock_dir = self.tmp_path / "tasks" / ".locks"
+        displaced = self.tmp_path / "tasks" / ".locks-displaced"
+        real_flock = task_manager_module.fcntl.flock
+        replaced = False
+
+        def replace_directory(descriptor: int, operation: int) -> None:
+            nonlocal replaced
+            real_flock(descriptor, operation)
+            if operation == task_manager_module.fcntl.LOCK_EX and not replaced:
+                replaced = True
+                lock_dir.rename(displaced)
+                lock_dir.mkdir(mode=0o700)
+
+        with mock.patch.object(task_manager_module.fcntl, "flock", replace_directory):
+            with pytest.raises(OSError, match="controller-owned real directory"):
+                with self.mgr.lock(task.id):
+                    pass
+
+    def test_task_lock_revalidates_file_identity_after_flock(self) -> None:
+        task = self._create()
+        lock_dir = self.tmp_path / "tasks" / ".locks"
+        real_flock = task_manager_module.fcntl.flock
+        replaced = False
+
+        def replace_file(descriptor: int, operation: int) -> None:
+            nonlocal replaced
+            real_flock(descriptor, operation)
+            if operation == task_manager_module.fcntl.LOCK_EX and not replaced:
+                replaced = True
+                lock_file = next(lock_dir.glob("*.lock"))
+                lock_file.unlink()
+                lock_file.touch(mode=0o600)
+
+        with mock.patch.object(task_manager_module.fcntl, "flock", replace_file):
+            with pytest.raises(OSError, match="controller-owned regular file"):
+                with self.mgr.lock(task.id):
+                    pass
 
     def test_create_assigns_task_id(self) -> None:
         task = self._create()
@@ -338,7 +588,7 @@ class TestTaskManager:
         assert t2.id in ids
 
     def test_list_active_filters_by_status(self) -> None:
-        t1 = self._create("Backlog task")
+        self._create("Backlog task")
         t2 = self._create("To be assigned")
         self.mgr.update_status(t2.id, TaskStatus.ASSIGNED, changed_by="human:test")
         assigned = self.mgr.list_active(status=TaskStatus.ASSIGNED)

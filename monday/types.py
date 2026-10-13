@@ -404,6 +404,9 @@ class BuildResponse:
         changed_files: Repository-relative files included in the reviewed artifact.
         attempts:      Bounded implementation/verification/review attempt records.
         data:          Full action-specific payload.
+        project_name:  Canonical registered target (empty for MondayOS self-builds).
+        repository:    Verified GitHub ``owner/repository`` target.
+        repo_root:     Controller-pinned local repository root.
     """
 
     action: str
@@ -419,6 +422,9 @@ class BuildResponse:
     changed_files: list[str] = field(default_factory=list)
     attempts: list[dict[str, Any]] = field(default_factory=list)
     data: dict[str, Any] = field(default_factory=dict)
+    project_name: str = ""
+    repository: str = ""
+    repo_root: str = ""
 
 
 @dataclass

@@ -16,6 +16,7 @@ _TASK_ID = re.compile(
 )
 _RUN_ID = re.compile(r"^run-[A-Za-z0-9-]{1,80}$")
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_PROJECT_BUILD_DELIMITER = "::"
 _ROLE_NAMES = {
     "cpo": "Product strategy",
     "lead-engineer": "Technical design",
@@ -181,19 +182,41 @@ class TelegramBotService:
             return
         if command == "build":
             objective = argument.strip()
+            project_name = ""
+            if _PROJECT_BUILD_DELIMITER in argument:
+                project_name, objective = _project_build_request(argument)
+                if not project_name or not objective:
+                    self._client.send_message(
+                        chat_id,
+                        "Use /build PROJECT :: REQUEST to build a registered project.",
+                    )
+                    return
         elif command:
             self._client.send_message(chat_id, "Unknown command. Send /help for options.")
             return
         else:
             objective = text
+            project_name = ""
 
         if not objective:
             self._client.send_message(chat_id, "Tell me what you want MondayOS to build.")
             return
         if chat_type == "private" and self._config.live_build and command in {"", "build"}:
-            self._create_and_deliver(update_id, chat_id, user_id, objective)
+            self._create_and_deliver(
+                update_id,
+                chat_id,
+                user_id,
+                objective,
+                project_name=project_name,
+            )
         else:
-            self._create_and_run(update_id, chat_id, user_id, objective)
+            self._create_and_run(
+                update_id,
+                chat_id,
+                user_id,
+                objective,
+                project_name=project_name,
+            )
 
     def report_error(self, update: dict[str, Any], *, will_retry: bool) -> None:
         """Send a generic failure only to an authorized originating chat."""
@@ -241,7 +264,8 @@ class TelegramBotService:
         objective: str,
         *,
         workflow: str,
-    ) -> tuple[str, bool]:
+        project_name: str = "",
+    ) -> tuple[str, bool, str]:
         """Create or reconcile the one task owned by this Telegram update."""
         job = self._state.job(update_id)
         recorded_workflow = str(job.get("workflow") or "")
@@ -250,35 +274,49 @@ class TelegramBotService:
                 "The saved Telegram request belongs to a different workflow"
             )
         task_id = str(job.get("task_id") or "")
+        # Once an update owns a task, its target is checkpointed with it. A retry
+        # therefore resumes the saved target instead of trusting reparsed input.
+        selected_project = (
+            str(job.get("project_name") or "")
+            if "project_name" in job
+            else project_name.strip()
+        )
         if not task_id:
             task_id = self._find_task_for_update(update_id)
         created = False
         if not task_id:
             marker = self._idempotency_marker(update_id)
-            response = self._monday.task(
-                "create",
-                title=_title(objective),
-                objective=objective,
-                task_type="feature",
-                priority="P2",
-                created_by=f"human:telegram:{user_id}",
-                context=f"Requested through Telegram. Idempotency marker: {marker}",
-            )
+            create_kwargs: dict[str, Any] = {
+                "title": _title(objective),
+                "objective": objective,
+                "task_type": "feature",
+                "priority": "P2",
+                "created_by": f"human:telegram:{user_id}",
+                "context": (
+                    "Requested through Telegram. "
+                    f"Idempotency marker: {marker}"
+                ),
+            }
+            if selected_project:
+                create_kwargs["project"] = selected_project
+            response = self._monday.task("create", **create_kwargs)
             if not response.success or not response.task_id:
                 self._client.send_message(
                     chat_id,
                     f"I could not create the task: {response.message}",
                 )
-                return "", False
+                return "", False, ""
             task_id = str(response.task_id)
+            selected_project = _external_project(response.data)
             created = True
         self._state.set_job(
             update_id,
             task_id=task_id,
             chat_id=chat_id,
             workflow=workflow,
+            project_name=selected_project,
         )
-        return task_id, created
+        return task_id, created, selected_project
 
     def _create_and_run(
         self,
@@ -286,13 +324,16 @@ class TelegramBotService:
         chat_id: int,
         user_id: int,
         objective: str,
+        *,
+        project_name: str = "",
     ) -> None:
-        task_id, _created = self._task_for_request(
+        task_id, _created, _selected_project = self._task_for_request(
             update_id,
             chat_id,
             user_id,
             objective,
             workflow="team-review",
+            project_name=project_name,
         )
         if not task_id:
             return
@@ -309,13 +350,16 @@ class TelegramBotService:
         chat_id: int,
         user_id: int,
         objective: str,
+        *,
+        project_name: str = "",
     ) -> None:
-        task_id, _created = self._task_for_request(
+        task_id, _created, _selected_project = self._task_for_request(
             update_id,
             chat_id,
             user_id,
             objective,
             workflow="live-build",
+            project_name=project_name,
         )
         if not task_id:
             return
@@ -340,11 +384,20 @@ class TelegramBotService:
         recorded_workflow = str(job.get("workflow") or "")
         if recorded_workflow and recorded_workflow != "live-build":
             raise RuntimeError("The saved Telegram request is not a live build")
+        project_name = _external_project(task.data)
+        if (
+            "project_name" in job
+            and str(job.get("project_name") or "") != project_name
+        ):
+            raise RuntimeError(
+                "The saved Telegram delivery belongs to another project"
+            )
         self._state.set_job(
             update_id,
             task_id=task_id,
             chat_id=chat_id,
             workflow="live-build",
+            project_name=project_name,
         )
         if not bool(job.get("live_started_announced")):
             self._client.send_message(
@@ -377,14 +430,17 @@ class TelegramBotService:
             delivery_id=stable_id,
             delivery_reserved=True,
         )
-        response = self._monday.build(
-            "run",
-            task_id=task_id,
-            delivery_id=stable_id,
-            progress_callback=lambda event: self._live_progress(
+        build_kwargs: dict[str, Any] = {
+            "task_id": task_id,
+            "delivery_id": stable_id,
+            "progress_callback": lambda event: self._live_progress(
                 update_id, chat_id, event,
             ),
-        )
+        }
+        project_name = str(job.get("project_name") or "")
+        if project_name:
+            build_kwargs["project"] = project_name
+        response = self._monday.build("run", **build_kwargs)
         result = _delivery_snapshot(response, fallback_id=stable_id)
         if result["delivery_id"] != stable_id:
             raise RuntimeError("MondayOS did not honor the reserved delivery identity")
@@ -717,6 +773,22 @@ def _title(objective: str) -> str:
     return (first[:77].rstrip() + "...") if len(first) > 80 else first
 
 
+def _project_build_request(argument: str) -> tuple[str, str]:
+    """Split the explicit ``PROJECT :: REQUEST`` Telegram build form."""
+    project_name, delimiter, objective = argument.partition(_PROJECT_BUILD_DELIMITER)
+    if not delimiter:
+        return "", argument.strip()
+    return project_name.strip(), objective.strip()
+
+
+def _external_project(task_data: Any) -> str:
+    """Return a task's external target; MondayOS itself needs no selector."""
+    if not isinstance(task_data, dict):
+        return ""
+    project_name = str(task_data.get("project") or "").strip()
+    return "" if project_name.casefold() == "mondayos" else project_name
+
+
 def _team_result(task_id: str, run: dict[str, Any]) -> str:
     status = str(run.get("status") or "failed")
     message = str(run.get("message") or "")
@@ -899,9 +971,13 @@ def _bounded_text(value: Any, limit: int) -> str:
 def _help(*, live_build: bool = False) -> str:
     build = (
         "/build REQUEST — create, build, review, and open a pull request\n"
+        "/build PROJECT :: REQUEST — build a registered project\n"
         "/deliver TASK-ID — build and deliver an existing task\n"
         if live_build
-        else "/build REQUEST — create and run a task\n"
+        else (
+            "/build REQUEST — create and run a task\n"
+            "/build PROJECT :: REQUEST — create a project-bound task\n"
+        )
     )
     intro = (
         "Send a normal text message and Monday will build it, validate it, have ChatGPT "
