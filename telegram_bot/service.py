@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 import uuid
 from typing import Any
 
@@ -15,8 +16,14 @@ _TASK_ID = re.compile(
     re.IGNORECASE,
 )
 _RUN_ID = re.compile(r"^run-[A-Za-z0-9-]{1,80}$")
+_DELIVERY_ID = re.compile(r"^delivery-[A-Za-z0-9-]{1,80}$")
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_FULL_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _PROJECT_BUILD_DELIMITER = "::"
+_FOLLOW_UP_POLL_SECONDS = 30.0
+_FOLLOW_UP_SLOW_POLL_SECONDS = 300.0
+_FOLLOW_UP_MAX_BACKOFF_SECONDS = 300.0
+_TERMINAL_PR_STATES = frozenset({"merged", "closed", "diverged"})
 _ROLE_NAMES = {
     "cpo": "Product strategy",
     "lead-engineer": "Technical design",
@@ -238,6 +245,71 @@ class TelegramBotService:
                 )
             self._client.send_message(context[0], text)
 
+    def poll_follow_up(self, update_id: int, claimed: dict[str, Any]) -> None:
+        """Observe one exact PR lifecycle without exposing check output.
+
+        The public build API owns GitHub identity verification and task
+        reconciliation. Telegram consumes only its small structured outcome;
+        it never requests or retains check logs, annotations, or descriptions.
+        """
+        delivery_id = str(claimed.get("delivery_id") or "")
+        task_id = str(claimed.get("task_id") or "")
+        project_name = str(claimed.get("project_name") or "")
+        chat_id = _integer(claimed.get("chat_id"), 0)
+        pr_url = _github_pr_url(claimed.get("pr_url", ""))
+        if (
+            not _DELIVERY_ID.fullmatch(delivery_id)
+            or not _TASK_ID.fullmatch(task_id)
+            or chat_id == 0
+            or not pr_url
+        ):
+            raise RuntimeError("Saved Telegram lifecycle follow-up is invalid")
+
+        kwargs: dict[str, Any] = {"delivery_id": delivery_id}
+        if project_name:
+            kwargs["project"] = project_name
+        response = self._monday.build("observe", **kwargs)
+        observation = _lifecycle_snapshot(
+            response,
+            delivery_id=delivery_id,
+            task_id=task_id,
+            project_name=project_name,
+            pr_url=pr_url,
+        )
+        if not observation:
+            failures = max(0, _integer(claimed.get("failure_count"), 0)) + 1
+            self._state.defer_follow_up(
+                update_id,
+                delay_seconds=_follow_up_backoff(failures),
+            )
+            return
+
+        pr_state = observation["pr_state"]
+        checks_status = observation["checks_status"]
+        notice_key = _lifecycle_notice_key(pr_state, checks_status)
+        prior_notice = str(claimed.get("last_notified_key") or "")
+        text = _lifecycle_notice(task_id, pr_url, observation)
+        if text and notice_key != prior_notice:
+            self._client.send_message(chat_id, text)
+            prior_notice = notice_key
+
+        terminal = pr_state in _TERMINAL_PR_STATES
+        self._state.update_follow_up(
+            update_id,
+            phase="completed" if terminal else "pending",
+            failure_count=0,
+            next_poll_at=(
+                0.0
+                if terminal
+                else time.time() + _follow_up_poll_interval(checks_status)
+            ),
+            pr_state=pr_state,
+            checks_status=checks_status,
+            merge_commit_sha=observation["merge_commit_sha"],
+            last_observation_key=notice_key,
+            last_notified_key=prior_notice,
+        )
+
     def _authorized_context(self, message: dict[str, Any]) -> tuple[int, int, str] | None:
         sender = message.get("from")
         chat = message.get("chat")
@@ -414,6 +486,13 @@ class TelegramBotService:
             return
         saved_result = job.get("delivery_result")
         if bool(job.get("delivery_terminal")) and isinstance(saved_result, dict):
+            self._ensure_lifecycle_follow_up(
+                update_id,
+                chat_id,
+                task_id,
+                saved_result,
+                str(job.get("project_name") or ""),
+            )
             self._client.send_message(chat_id, _delivery_result(task_id, saved_result))
             self._state.set_job(update_id, delivery_final_sent=True)
             return
@@ -455,6 +534,13 @@ class TelegramBotService:
             delivery_result=result,
         )
         if terminal:
+            self._ensure_lifecycle_follow_up(
+                update_id,
+                chat_id,
+                task_id,
+                result,
+                project_name,
+            )
             self._client.send_message(chat_id, _delivery_result(task_id, result))
             self._state.set_job(update_id, delivery_final_sent=True)
             return
@@ -478,6 +564,44 @@ class TelegramBotService:
         identity = f"telegram:{self._bot_id}:{update_id}".encode()
         digest = hashlib.sha256(identity).hexdigest()[:20]
         return f"delivery-telegram-{digest}"
+
+    def _ensure_lifecycle_follow_up(
+        self,
+        update_id: int,
+        chat_id: int,
+        task_id: str,
+        result: dict[str, Any],
+        project_name: str,
+    ) -> None:
+        """Checkpoint a request-free PR observer before the build is acknowledged."""
+        if str(result.get("status") or "").lower() != "pr-open":
+            return
+        delivery_id = str(result.get("delivery_id") or "")
+        pr_url = _github_pr_url(result.get("pr_url", ""))
+        if not bool(result.get("success")) or not _DELIVERY_ID.fullmatch(delivery_id) or not pr_url:
+            return
+        current = self._state.job(update_id).get("follow_up")
+        if isinstance(current, dict):
+            return
+        self._state.set_job(
+            update_id,
+            follow_up={
+                "kind": "pr-lifecycle",
+                "phase": "pending",
+                "delivery_id": delivery_id,
+                "task_id": task_id,
+                "project_name": project_name,
+                "chat_id": chat_id,
+                "pr_url": pr_url,
+                "failure_count": 0,
+                "next_poll_at": 0.0,
+                "pr_state": "open",
+                "checks_status": "unknown",
+                "merge_commit_sha": "",
+                "last_observation_key": "",
+                "last_notified_key": "",
+            },
+        )
 
     def _live_progress(self, update_id: int, chat_id: int, event: Any) -> None:
         snapshot = _delivery_progress_snapshot(event)
@@ -929,6 +1053,7 @@ def _delivery_result(task_id: str, result: dict[str, Any]) -> str:
     success = bool(result.get("success"))
     if success and pr_url:
         lines = [f"{task_id} passed ChatGPT review.", f"Pull request: {pr_url}"]
+        lines.append("Monday will keep watching GitHub checks and the pull request.")
     else:
         lines = [f"{task_id} live build: {status}."]
         if pr_url:
@@ -945,6 +1070,164 @@ def _delivery_result(task_id: str, result: dict[str, Any]) -> str:
     if message and not success:
         lines.append(message)
     return "\n".join(lines)
+
+
+def _lifecycle_snapshot(
+    response: Any,
+    *,
+    delivery_id: str,
+    task_id: str,
+    project_name: str,
+    pr_url: str,
+) -> dict[str, str]:
+    """Accept only the bounded public observation contract.
+
+    The API may expose fields directly on ``BuildResponse`` or in ``data``. No
+    check names, descriptions, annotations, or logs are copied from either.
+    """
+    if not bool(getattr(response, "success", False)):
+        return {}
+    raw_data = getattr(response, "data", {})
+    data = dict(raw_data) if isinstance(raw_data, dict) else {}
+    nested = data.get("observation")
+    if isinstance(nested, dict):
+        data = {**data, **nested}
+
+    def value(name: str, *aliases: str) -> Any:
+        direct = getattr(response, name, None)
+        if direct not in (None, ""):
+            return direct
+        for key in (name, *aliases):
+            if data.get(key) not in (None, ""):
+                return data[key]
+        return ""
+
+    returned_delivery = str(value("delivery_id") or "")
+    returned_task = str(value("task_id") or "")
+    returned_project = str(value("project_name", "project") or "")
+    returned_url = _github_pr_url(value("pr_url"))
+    if returned_delivery != delivery_id:
+        return {}
+    if returned_task != task_id:
+        return {}
+    if returned_project != project_name:
+        return {}
+    if returned_url != pr_url:
+        return {}
+
+    pr_state = _normalized_pr_state(value("pr_state", "pull_request_state"))
+    checks_status = _normalized_checks_status(
+        value("checks_status", "check_status", "ci_status")
+    )
+    if not pr_state or checks_status not in {
+        "pending", "passed", "failed", "no-checks",
+    }:
+        return {}
+    merge_commit = str(value("merge_commit_sha") or "")
+    if (
+        (pr_state == "merged" and not _FULL_COMMIT_SHA.fullmatch(merge_commit))
+        or (pr_state != "merged" and merge_commit)
+    ):
+        return {}
+    return {
+        "pr_state": pr_state,
+        "checks_status": checks_status or "unknown",
+        "merge_commit_sha": merge_commit.lower(),
+    }
+
+
+def _normalized_pr_state(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("_", "-")
+    aliases = {
+        "opened": "open",
+        "merge": "merged",
+        "head-diverged": "diverged",
+        "sha-diverged": "diverged",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"open", *_TERMINAL_PR_STATES} else ""
+
+
+def _normalized_checks_status(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("_", "-")
+    aliases = {
+        "success": "passed",
+        "succeeded": "passed",
+        "green": "passed",
+        "failure": "failed",
+        "error": "failed",
+        "in-progress": "pending",
+        "queued": "pending",
+        "none": "no-checks",
+        "unconfigured": "no-checks",
+        "timeout": "timed-out",
+    }
+    normalized = aliases.get(normalized, normalized)
+    allowed = {"pending", "passed", "failed", "no-checks", "timed-out", "unknown"}
+    return normalized if normalized in allowed else ""
+
+
+def _lifecycle_notice_key(pr_state: str, checks_status: str) -> str:
+    return pr_state if pr_state in _TERMINAL_PR_STATES else f"open:{checks_status}"
+
+
+def _lifecycle_notice(
+    task_id: str,
+    pr_url: str,
+    observation: dict[str, str],
+) -> str:
+    pr_state = observation["pr_state"]
+    checks_status = observation["checks_status"]
+    if pr_state == "merged":
+        lines = [f"{task_id} was merged on GitHub.", f"Pull request: {pr_url}"]
+        merge_commit = observation.get("merge_commit_sha", "")
+        if merge_commit:
+            lines.append(f"Merge commit: {merge_commit[:12]}")
+        return "\n".join(lines)
+    if pr_state == "closed":
+        return f"{task_id} was closed without merging.\nPull request: {pr_url}"
+    if pr_state == "diverged":
+        return (
+            f"{task_id} no longer points to the ChatGPT-approved commit. "
+            "Monday stopped monitoring it.\n"
+            f"Pull request: {pr_url}"
+        )
+    if checks_status == "pending":
+        return f"GitHub checks are running for {task_id}.\nPull request: {pr_url}"
+    if checks_status == "passed":
+        return (
+            f"GitHub checks passed for {task_id}. The pull request is ready "
+            f"for your merge review.\nPull request: {pr_url}"
+        )
+    if checks_status == "failed":
+        return (
+            f"GitHub checks failed for {task_id}. Monday will keep watching for "
+            f"a rerun or lifecycle change.\nPull request: {pr_url}"
+        )
+    if checks_status == "no-checks":
+        return (
+            f"{task_id} has no configured GitHub checks. ChatGPT review passed, "
+            f"but the repository reported no CI verification.\nPull request: {pr_url}"
+        )
+    if checks_status == "timed-out":
+        return (
+            f"GitHub checks have not completed for {task_id}. Monday will keep "
+            f"watching the pull request.\nPull request: {pr_url}"
+        )
+    return ""
+
+
+def _follow_up_poll_interval(checks_status: str) -> float:
+    return (
+        _FOLLOW_UP_POLL_SECONDS
+        if checks_status in {"pending", "unknown"}
+        else _FOLLOW_UP_SLOW_POLL_SECONDS
+    )
+
+
+def _follow_up_backoff(failure_count: int) -> float:
+    exponent = min(5, max(0, int(failure_count) - 1))
+    return float(min(_FOLLOW_UP_MAX_BACKOFF_SECONDS, 15.0 * (2 ** exponent)))
 
 
 def _delivery_pending_result(task_id: str, result: dict[str, Any]) -> str:

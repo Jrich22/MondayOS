@@ -5,6 +5,7 @@ import json
 import os
 import plistlib
 import threading
+import time
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -30,6 +31,7 @@ from telegram_bot.runner import (
 from telegram_bot.service import (
     TelegramBotService,
     TelegramUpdatePendingError,
+    _lifecycle_snapshot,
     _parse,
     _title,
 )
@@ -116,6 +118,7 @@ class FakeMonday:
         self.build_calls = []
         self.build_executions = 0
         self.delivery_runs = {}
+        self.observe_results = {}
 
     def task(self, action, **kwargs):
         self.task_calls.append((action, kwargs))
@@ -251,6 +254,35 @@ class FakeMonday:
 
     def build(self, action, **kwargs):
         self.build_calls.append((action, dict(kwargs)))
+        if action == "observe":
+            delivery_id = kwargs["delivery_id"]
+            queued = self.observe_results.get(delivery_id)
+            if isinstance(queued, list) and queued:
+                result = dict(queued.pop(0))
+            elif isinstance(queued, dict):
+                result = dict(queued)
+            else:
+                run = self.delivery_runs.get(delivery_id, {})
+                result = {
+                    "delivery_id": delivery_id,
+                    "task_id": run.get("task_id", ""),
+                    "project_name": kwargs.get("project", ""),
+                    "pr_url": run.get("pr_url", ""),
+                    "pr_state": "open",
+                    "checks_status": "pending",
+                    "merge_commit_sha": "",
+                }
+            success = bool(result.pop("success", True))
+            return SimpleNamespace(
+                action="observe",
+                success=success,
+                delivery_id=delivery_id,
+                task_id=str(result.get("task_id") or ""),
+                project_name=str(result.get("project_name") or ""),
+                pr_url=str(result.get("pr_url") or ""),
+                message="observed" if success else "unavailable",
+                data=result,
+            )
         if action != "run":
             raise AssertionError(action)
         delivery_id = kwargs["delivery_id"]
@@ -432,6 +464,50 @@ class TestTelegramParsing(unittest.TestCase):
         chunks = split_message(original)
         self.assertTrue(all(0 < len(chunk) <= 4096 for chunk in chunks))
         self.assertEqual("".join(chunks), original)
+
+    def test_lifecycle_snapshot_requires_exact_complete_public_identity(self):
+        delivery_id = "delivery-telegram-abc123"
+        task_id = "TASK-0001"
+        project_name = "weatherbot"
+        pr_url = "https://github.com/example/mondayos/pull/55"
+
+        def snapshot(**overrides):
+            fields = {
+                "success": True,
+                "delivery_id": delivery_id,
+                "task_id": task_id,
+                "project_name": project_name,
+                "pr_url": pr_url,
+                "pr_state": "open",
+                "checks_status": "pending",
+                "merge_commit_sha": "",
+                "data": {},
+            }
+            fields.update(overrides)
+            return _lifecycle_snapshot(
+                SimpleNamespace(**fields),
+                delivery_id=delivery_id,
+                task_id=task_id,
+                project_name=project_name,
+                pr_url=pr_url,
+            )
+
+        self.assertEqual(snapshot()["pr_state"], "open")
+        for malformed in (
+            {"delivery_id": ""},
+            {"task_id": ""},
+            {"project_name": ""},
+            {"pr_url": ""},
+            {"checks_status": "unknown"},
+            {"pr_state": "merged", "merge_commit_sha": ""},
+            {"pr_state": "open", "merge_commit_sha": "b" * 40},
+            {"pr_state": "merged", "merge_commit_sha": "b" * 7},
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(snapshot(**malformed), {})
+
+        merged = snapshot(pr_state="merged", merge_commit_sha="B" * 40)
+        self.assertEqual(merged["merge_commit_sha"], "b" * 40)
 
 
 class TestTelegramService(TelegramFixture):
@@ -1114,7 +1190,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         loaded.bind_bot_identity(99, "monday_test_bot")
         self.assertEqual(
             json.loads(self.config.state_path.read_text(encoding="utf-8"))["version"],
-            3,
+            4,
         )
 
     def test_enqueue_is_idempotent_and_rejects_changed_duplicate_content(self):
@@ -1378,6 +1454,285 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(
             restarted_state.completed_job(70)["delivery_id"], delivery_id,
         )
+
+    def test_live_build_persists_request_free_pr_follow_up_in_tombstone(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        runner = TelegramRunner(self.client, service, self.state, poll_timeout=1)
+        runner.start()
+        request_text = "/build weatherbot :: Ship the private launch plan"
+        self.client.updates = [_update(update_id=72, text=request_text)]
+
+        self.assertEqual(runner.run_once(), 1)
+
+        tombstone = self.state.completed_job(72)
+        follow_up = tombstone["follow_up"]
+        self.assertNotIn("request", tombstone)
+        self.assertEqual(follow_up["kind"], "pr-lifecycle")
+        self.assertEqual(follow_up["phase"], "pending")
+        self.assertEqual(follow_up["task_id"], "TASK-0001")
+        self.assertEqual(follow_up["project_name"], "weatherbot")
+        self.assertEqual(follow_up["chat_id"], 7)
+        self.assertEqual(
+            follow_up["pr_url"], "https://github.com/example/mondayos/pull/55",
+        )
+        persisted = config.state_path.read_text(encoding="utf-8")
+        self.assertNotIn(request_text, persisted)
+        self.assertNotIn("private launch plan", persisted)
+
+    def test_pr_follow_up_notifies_only_changes_and_stops_after_merge(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        runner = TelegramRunner(self.client, service, self.state, poll_timeout=1)
+        runner.start()
+        self.client.updates = [
+            _update(update_id=73, text="/build weatherbot :: Ship safely"),
+        ]
+        runner.run_once()
+        tombstone = self.state.completed_job(73)
+        delivery_id = tombstone["delivery_id"]
+        base = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "project_name": "weatherbot",
+            "pr_url": "https://github.com/example/mondayos/pull/55",
+            "merge_commit_sha": "",
+        }
+        self.monday.observe_results[delivery_id] = [
+            {**base, "pr_state": "open", "checks_status": "pending"},
+            {**base, "pr_state": "open", "checks_status": "pending"},
+            {**base, "pr_state": "open", "checks_status": "passed"},
+            {
+                **base,
+                "pr_state": "merged",
+                "checks_status": "passed",
+                "merge_commit_sha": "b" * 40,
+            },
+        ]
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        baseline = len(self.client.sent)
+
+        self.assertTrue(worker.run_follow_up_once())
+        self.assertIn("checks are running", self.client.sent[-1][1])
+        first_notice_count = len(self.client.sent)
+
+        self.state.update_follow_up(73, phase="pending", next_poll_at=0.0)
+        self.assertTrue(worker.run_follow_up_once())
+        self.assertEqual(len(self.client.sent), first_notice_count)
+
+        self.state.update_follow_up(73, phase="pending", next_poll_at=0.0)
+        self.assertTrue(worker.run_follow_up_once())
+        self.assertIn("checks passed", self.client.sent[-1][1])
+
+        self.state.update_follow_up(73, phase="pending", next_poll_at=0.0)
+        self.assertTrue(worker.run_follow_up_once())
+        self.assertIn("was merged", self.client.sent[-1][1])
+        self.assertIn("bbbbbbbbbbbb", self.client.sent[-1][1])
+        follow_up = self.state.completed_job(73)["follow_up"]
+        self.assertEqual(follow_up["phase"], "completed")
+        self.assertEqual(follow_up["pr_state"], "merged")
+        self.assertFalse(worker.run_follow_up_once())
+        self.assertGreater(len(self.client.sent), baseline)
+        observe_calls = [
+            kwargs for action, kwargs in self.monday.build_calls
+            if action == "observe"
+        ]
+        self.assertEqual(len(observe_calls), 4)
+        self.assertTrue(all(row["delivery_id"] == delivery_id for row in observe_calls))
+        self.assertTrue(all(row["project"] == "weatherbot" for row in observe_calls))
+
+    def test_pr_follow_up_survives_restart_and_stops_when_closed(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        runner = TelegramRunner(self.client, service, self.state, poll_timeout=1)
+        runner.start()
+        self.client.updates = [_update(update_id=74, text="/build Ship it")]
+        runner.run_once()
+        delivery_id = self.state.completed_job(74)["delivery_id"]
+        self.monday.observe_results[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "project_name": "",
+            "pr_url": "https://github.com/example/mondayos/pull/55",
+            "pr_state": "closed",
+            "checks_status": "failed",
+            "merge_commit_sha": "",
+        }
+
+        restarted_state = TelegramState(config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday, self.client, restarted_state, config,
+        )
+        restarted_service.bind_bot_identity(self.client.get_me())
+        worker = TelegramJobWorker(
+            restarted_service,
+            restarted_state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        self.assertTrue(worker.run_follow_up_once())
+
+        follow_up = restarted_state.completed_job(74)["follow_up"]
+        self.assertEqual(follow_up["phase"], "completed")
+        self.assertEqual(follow_up["pr_state"], "closed")
+        self.assertIn("closed without merging", self.client.sent[-1][1])
+        self.assertNotIn("request", restarted_state.completed_job(74))
+
+    def test_pr_follow_up_outages_back_off_without_persisting_diagnostics(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        runner = TelegramRunner(self.client, service, self.state, poll_timeout=1)
+        runner.start()
+        self.client.updates = [_update(update_id=75, text="/build Ship it")]
+        runner.run_once()
+        delivery_id = self.state.completed_job(75)["delivery_id"]
+        self.monday.observe_results[delivery_id] = [
+            {"success": False, "message": "raw remote log must not persist"},
+            {"success": False, "message": "another private diagnostic"},
+        ]
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        before = time.time()
+
+        self.assertTrue(worker.run_follow_up_once())
+
+        first = self.state.completed_job(75)["follow_up"]
+        self.assertEqual(first["phase"], "retrying")
+        self.assertEqual(first["failure_count"], 1)
+        self.assertGreaterEqual(first["next_poll_at"], before + 14)
+        self.assertLessEqual(first["next_poll_at"], before + 17)
+        self.assertFalse(worker.run_follow_up_once())
+
+        self.state.update_follow_up(75, phase="retrying", next_poll_at=0.0)
+        second_before = time.time()
+        self.assertTrue(worker.run_follow_up_once())
+        second = self.state.completed_job(75)["follow_up"]
+        self.assertEqual(second["failure_count"], 2)
+        self.assertGreaterEqual(second["next_poll_at"], second_before + 29)
+        self.assertLessEqual(second["next_poll_at"], second_before + 32)
+        persisted = config.state_path.read_text(encoding="utf-8")
+        self.assertNotIn("raw remote log", persisted)
+        self.assertNotIn("private diagnostic", persisted)
+
+    def test_blocked_pr_observation_does_not_block_telegram_intake(self):
+        observation_started = threading.Event()
+        release_observation = threading.Event()
+        request_saved = threading.Event()
+        stop = threading.Event()
+        errors = []
+        delivery_id = "delivery-telegram-" + "c" * 20
+
+        class BlockingMonday(FakeMonday):
+            def build(self, action, **kwargs):
+                if action == "observe":
+                    observation_started.set()
+                    if not release_observation.wait(5):
+                        raise AssertionError("test did not release PR observation")
+                return super().build(action, **kwargs)
+
+        class SequencedClient(FakeTelegramClient):
+            def get_updates(self, *, offset, timeout):
+                self.offsets.append(offset)
+                if len(self.offsets) == 1:
+                    if not observation_started.wait(5):
+                        raise AssertionError("PR observation never started")
+                    return [_update(update_id=100, text="/help")]
+                stop.wait(5)
+                return []
+
+            def send_message(self, chat_id, text):
+                result = super().send_message(chat_id, text)
+                if "Request saved" in text:
+                    request_saved.set()
+                return result
+
+        monday = BlockingMonday()
+        monday.delivery_runs[delivery_id] = {
+            "task_id": "TASK-0001",
+            "pr_url": "https://github.com/example/mondayos/pull/55",
+        }
+        client = SequencedClient()
+        self.state.bind_bot_identity(99, "monday_test_bot")
+        self.state.set_job(
+            76,
+            follow_up={
+                "kind": "pr-lifecycle",
+                "phase": "pending",
+                "delivery_id": delivery_id,
+                "task_id": "TASK-0001",
+                "project_name": "",
+                "chat_id": 7,
+                "pr_url": "https://github.com/example/mondayos/pull/55",
+                "failure_count": 0,
+                "next_poll_at": 0.0,
+                "pr_state": "open",
+                "checks_status": "unknown",
+                "merge_commit_sha": "",
+                "last_observation_key": "",
+                "last_notified_key": "",
+            },
+        )
+        self.state.acknowledge(76)
+        service = TelegramBotService(monday, client, self.state, self.config)
+        service.bind_bot_identity(client.get_me())
+        runner = TelegramRunner(
+            client,
+            service,
+            self.state,
+            poll_timeout=1,
+            stop_event=stop,
+        )
+
+        def run() -> None:
+            try:
+                runner.run_forever()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(request_saved.wait(5))
+
+        self.assertEqual(self.state.next_offset, 101)
+        self.assertEqual(self.state.job(100)["phase"], "queued")
+        self.assertTrue(observation_started.is_set())
+
+        runner.stop()
+        release_observation.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.state.job(100)["phase"], "queued")
 
     def test_nonterminal_live_build_remains_pending_until_runner_reconciles_it(self):
         created = self.monday.task(

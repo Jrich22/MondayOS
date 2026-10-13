@@ -6,8 +6,9 @@ import fcntl
 import hashlib
 import json
 import threading
+import time
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, TextIO, TypeGuard
 
 from core.atomic import write_json_atomic
 
@@ -53,10 +54,10 @@ class TelegramState:
                 or legacy_with_state
                 or current_id != normalized_id
                 or self._data.get("bot_username") != normalized_username
-                or self._data.get("version") != 3
+                or self._data.get("version") != 4
             )
             self._data.update({
-                "version": 3,
+                "version": 4,
                 "bot_id": normalized_id,
                 "bot_username": normalized_username,
             })
@@ -214,6 +215,115 @@ class TelegramState:
             value = self._data.setdefault("completed_jobs", {}).get(str(update_id), {})
             return copy.deepcopy(value) if isinstance(value, dict) else {}
 
+    def claim_due_follow_up(
+        self,
+        *,
+        now: float | None = None,
+    ) -> tuple[int, dict[str, Any]] | None:
+        """Claim one due lifecycle follow-up from a request-free tombstone.
+
+        Follow-ups deliberately remain outside the main FIFO.  They contain no
+        Telegram request body and can therefore be polled after the accepted
+        build request has reached its terminal replay tombstone.  A persisted
+        ``polling`` phase is reclaimable after restart; the process lock still
+        guarantees that only one live Telegram worker can claim it at a time.
+        """
+        current = time.time() if now is None else float(now)
+        with self._lock:
+            completed = self._data.setdefault("completed_jobs", {})
+            candidates: list[tuple[float, int]] = []
+            for key, record in completed.items():
+                if not isinstance(record, dict):
+                    continue
+                follow_up = record.get("follow_up")
+                if not _follow_up_active(follow_up):
+                    continue
+                due = _finite_nonnegative(follow_up.get("next_poll_at"), 0.0)
+                if due <= current:
+                    candidates.append((due, int(key)))
+            if not candidates:
+                return None
+            _due, update_id = min(candidates)
+            follow_up = completed[str(update_id)]["follow_up"]
+            follow_up["phase"] = "polling"
+            self._write()
+            return update_id, copy.deepcopy(follow_up)
+
+    def update_follow_up(self, update_id: int, **fields: Any) -> dict[str, Any]:
+        """Update one claimed follow-up without permitting identity rebinding."""
+        normalized_id = _update_id(update_id)
+        with self._lock:
+            record = self._data.setdefault("completed_jobs", {}).get(str(normalized_id))
+            if not isinstance(record, dict):
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has no completed tombstone"
+                )
+            if "request" in record:
+                raise TelegramStateError("completed Telegram tombstones must not retain requests")
+            follow_up = record.get("follow_up")
+            if not isinstance(follow_up, dict):
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has no lifecycle follow-up"
+                )
+            immutable = {
+                "kind", "delivery_id", "task_id", "project_name", "chat_id", "pr_url",
+            }
+            for name in immutable.intersection(fields):
+                if fields[name] != follow_up.get(name):
+                    raise TelegramStateError(
+                        f"Telegram update {normalized_id} follow-up cannot change {name}"
+                    )
+            follow_up.update(copy.deepcopy(fields))
+            self._write()
+            return copy.deepcopy(follow_up)
+
+    def defer_follow_up(
+        self,
+        update_id: int,
+        *,
+        delay_seconds: float,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Retry a failed observation later without retaining remote diagnostics."""
+        normalized_id = _update_id(update_id)
+        current = time.time() if now is None else float(now)
+        delay = min(300.0, max(1.0, float(delay_seconds)))
+        with self._lock:
+            record = self._data.setdefault("completed_jobs", {}).get(str(normalized_id))
+            follow_up = record.get("follow_up") if isinstance(record, dict) else None
+            if not isinstance(follow_up, dict):
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has no lifecycle follow-up"
+                )
+            if not _follow_up_active(follow_up):
+                return copy.deepcopy(follow_up)
+            failures = max(0, int(follow_up.get("failure_count", 0))) + 1
+            follow_up.update({
+                "phase": "retrying",
+                "failure_count": failures,
+                "next_poll_at": current + delay,
+            })
+            # Raw GitHub/CLI errors are intentionally not persisted or sent to
+            # Telegram. The failure counter is enough to drive bounded backoff.
+            follow_up.pop("error", None)
+            self._write()
+            return copy.deepcopy(follow_up)
+
+    def next_follow_up_delay(self, *, now: float | None = None) -> float | None:
+        """Return the bounded wait until the next active lifecycle observation."""
+        current = time.time() if now is None else float(now)
+        with self._lock:
+            due_times: list[float] = []
+            for record in self._data.setdefault("completed_jobs", {}).values():
+                follow_up = record.get("follow_up") if isinstance(record, dict) else None
+                if _follow_up_active(follow_up):
+                    due_times.append(
+                        _finite_nonnegative(follow_up.get("next_poll_at"), current)
+                    )
+            if not due_times:
+                return None
+            return min(300.0, max(0.0, min(due_times) - current))
+
     def is_terminal(self, update_id: int) -> bool:
         with self._lock:
             key = str(update_id)
@@ -235,7 +345,7 @@ class TelegramState:
             completed = self._data.setdefault("completed_jobs", {})
             completed[key] = record
             self._advance(update_id)
-            _bound(completed, 500)
+            _bound_completed(completed, 500)
             self._write()
 
     def _advance(self, update_id: int) -> None:
@@ -265,7 +375,7 @@ class TelegramState:
         with self._lock:
             if not self.path.exists():
                 return {
-                    "version": 3,
+                    "version": 4,
                     "bot_id": None,
                     "bot_username": "",
                     "last_update_id": -1,
@@ -298,7 +408,7 @@ class TelegramState:
 
     def _write(self) -> None:
         with self._lock:
-            self._data["version"] = 3
+            self._data["version"] = 4
             write_json_atomic(self.path, self._data)
 
 
@@ -307,6 +417,38 @@ def _bound(records: dict[str, Any], limit: int) -> None:
         return
     for key in sorted(records, key=int)[:-limit]:
         records.pop(key, None)
+
+
+def _bound_completed(records: dict[str, Any], limit: int) -> None:
+    """Bound replay tombstones without discarding an active PR observer."""
+    if len(records) <= limit:
+        return
+    removable = [
+        key for key in sorted(records, key=int)
+        if not _follow_up_active(
+            records[key].get("follow_up") if isinstance(records[key], dict) else None
+        )
+    ]
+    for key in removable[: max(0, len(records) - limit)]:
+        records.pop(key, None)
+
+
+def _follow_up_active(value: Any) -> TypeGuard[dict[str, Any]]:
+    return (
+        isinstance(value, dict)
+        and value.get("kind") == "pr-lifecycle"
+        and value.get("phase") in {"pending", "polling", "retrying"}
+    )
+
+
+def _finite_nonnegative(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < 0 or parsed == float("inf") or parsed != parsed:
+        return default
+    return parsed
 
 
 def _canonical_request(request: dict[str, Any]) -> tuple[dict[str, Any], str]:

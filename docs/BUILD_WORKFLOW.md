@@ -21,6 +21,13 @@ task
       needs changes → restore exact base → replacement patch (maximum three attempts)
       high-confidence pass → commit → non-force push → pull request
       block/failure → stop without pushing
+
+open pull request
+  → exact-SHA-bound, read-only GitHub observation
+      open → report pending/passed/failed/no configured checks
+      exact reviewed head merged → complete an eligible MondayOS task
+      closed without merge → return a task still in REVIEW to IN_PROGRESS
+      head changed → fail closed as diverged; return REVIEW to IN_PROGRESS
 ```
 
 Monday, not the coding model, owns every mutation. A builder can inspect the
@@ -123,11 +130,22 @@ The workflow:
 Explicit delivery enrollment authorizes the branch push and pull-request side
 effect. That push may start CI, preview environments, or other automation that
 the target GitHub repository already associates with pushed branches. MondayOS
-does not configure, approve, wait for, or report those external jobs as part of
-this workflow, and it still never merges or deploys.
+does not configure, approve, or read logs from those external jobs. Its separate
+observer reports only bounded aggregate check state and PR lifecycle, and it
+still never merges or deploys.
 
 On success the task moves to `REVIEW` to represent an open GitHub pull request.
 That status is not a request for the old team-workflow approval command.
+The delivery result remains `pr-open`; later GitHub state is stored separately
+as an observation so a failed check cannot rewrite the fact that the reviewed
+artifact was delivered. `monday build observe` reads only structured PR and
+check metadata. It never reads check logs, changes the PR, merges, or deploys.
+
+If a newer PR-backed delivery exists for the same task, closing or changing an
+older PR does not reopen the task underneath the newer work. A verified merge of
+an exact reviewed head completes an eligible task idempotently. Completed,
+cancelled, blocked, retargeted, and otherwise human-managed task states are not
+overridden by the observer.
 
 ## Validation containment
 
@@ -186,7 +204,8 @@ model. In this increment, a target without `pyproject.toml`—including projects
 in other language ecosystems—gets the diff check and independent exact-artifact
 review but no automatic project test suite. Existing target CI may run only as
 a consequence of the later branch push; its result is not a prerequisite for
-MondayOS to open the pull request.
+MondayOS to open the pull request. The observer can later report its bounded
+aggregate result without consuming check names, logs, annotations, or output.
 
 ## Prerequisites
 
@@ -234,11 +253,13 @@ a tool-capable coding executor in this increment.
 monday build run TASK-0001
 monday build run TASK-0001 --id delivery-my-stable-id
 monday build get delivery-my-stable-id
+monday build observe delivery-my-stable-id
 monday build history --task TASK-0001
 monday build capabilities
 
 monday build run TASK-0002 --project customer-portal
 monday build get delivery-my-stable-id --project customer-portal
+monday build observe delivery-my-stable-id --project customer-portal
 monday build history --project customer-portal
 monday build capabilities --project customer-portal
 ```
@@ -259,6 +280,11 @@ run the autonomous workflow against MondayOS. Use
 `/build PROJECT :: REQUEST` for an explicitly enrolled external project.
 `/deliver TASK-ID` reads an existing task's saved project binding and selects
 that target automatically. Monday sends phase updates and the final PR link.
+After the request becomes a request-free replay tombstone, Monday keeps
+observing that exact PR in the background. It reports only meaningful changes:
+checks pending, passed, failed, or absent; merge; unmerged closure; or a head SHA
+that no longer matches the ChatGPT-approved commit. Observation outages back off
+and retry without blocking Telegram intake or retaining raw GitHub diagnostics.
 Allowlisted group `/build` commands continue to use the advisory team workflow;
 groups can never start terminal code execution.
 
@@ -284,9 +310,10 @@ project worktrees—stay locally under the MondayOS controller's `logs/delivery/
 Telegram queue state stays locally in `logs/telegram/state.json`. Both are
 Git-ignored because they contain machine paths or in-progress state. Terminal
 Telegram replay tombstones keep stable identity and outcome data but remove the
-active request text. These records are not credentials, but they are not yet
-synchronized to GitHub. Do not describe this increment as storing every runtime
-byte in GitHub.
+active request text. A PR-backed tombstone may also retain the minimal delivery,
+chat, PR, next-poll, and last-notified fields needed for restart-safe lifecycle
+updates. These records are not credentials, but they are not yet synchronized to
+GitHub. Do not describe this increment as storing every runtime byte in GitHub.
 
 Failed worktrees are retained for diagnosis. Earlier rejected candidates are
 removed only when another attempt is about to begin; if the attempt budget is

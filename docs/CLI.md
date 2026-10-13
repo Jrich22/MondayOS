@@ -408,6 +408,7 @@ workflow never merges or deploys.
 ```bash
 monday build run TASK-0001 [--project NAME] [--id DELIVERY-ID] [--json]
 monday build get DELIVERY-ID [--project NAME] [--json]
+monday build observe DELIVERY-ID [--project NAME] [--json]
 monday build history [--task TASK-ID] [--project NAME] [--limit N] [--json]
 monday build capabilities [--project NAME] [--json]
 ```
@@ -424,6 +425,30 @@ monday build history --project customer-portal
 `build get --project` asserts that the saved delivery belongs to that project;
 `build history --project` filters the controller's delivery records. No build
 command accepts a raw target path or Git URL.
+
+`build observe` is a GitHub-read-only snapshot of one successful, PR-backed
+delivery. It reconstructs the target from the durable delivery record and
+requires the same saved repository, base branch, head branch, pull-request
+number and URL, and reviewed commit SHA. For an external delivery, pass the
+same registered project with `--project NAME`; the command also revalidates the
+pinned local repository identity and its GitHub origin. A changed head SHA is
+reported as `diverged` rather than silently following new bytes. The observer
+does not push, update, close, merge, or deploy anything.
+
+The check result is deliberately aggregate-only: `pending`, `passed`, `failed`,
+or `no-checks`, with bounded integer counts in the durable record. Individual
+check names, descriptions, annotations, and logs are not exposed or persisted.
+Text output shows the PR lifecycle and aggregate check state; `--json` returns
+the same bounded observation fields in the full `BuildResponse`.
+
+An open PR observation updates only the saved observation and does not change
+the task, including when checks fail or a previously terminal PR is reopened.
+Task reconciliation happens only after an exact-identity terminal state is
+verified: a verified merge completes an eligible task idempotently, while a
+closed PR or a head that diverged from the reviewed SHA returns a task still in
+`REVIEW` to `IN_PROGRESS`. An older failed PR cannot reopen a task when a newer
+open delivery for that task remains authoritative. Completed, cancelled,
+blocked, or otherwise human-managed states are not overridden.
 
 `capabilities` is read-only and reports the selected builder, ChatGPT/Codex
 Reviewer, validation, repository, and GitHub readiness. MondayOS self-builds can
@@ -453,7 +478,7 @@ monday telegram [--once] [--identify] [--provider NAME]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--once` | off | Ingest one long-poll response, drain the durable inbox synchronously, and exit. Useful during setup. |
+| `--once` | off | Ingest one long-poll response, drain the durable inbox synchronously, and exit. Useful during setup; it does not provide ongoing PR monitoring. |
 | `--identify` | off | Print pending Telegram user/chat IDs and exit. |
 | `--provider NAME` | role defaults | Pin one provider for productive team stages. The final Reviewer still requires OpenAI/ChatGPT (`fake` is available for offline tests). Without a pin, productive roles use their preferred provider with ordered fallback. |
 

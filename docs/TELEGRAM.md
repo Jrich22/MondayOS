@@ -12,6 +12,9 @@ outbound long polling, so it does not open a public port or require a tunnel.
 - With live builds enabled, edits an isolated worktree, validates, automatically
   repairs, requires ChatGPT approval of the exact artifact, and opens a PR.
 - Reports team/build progress back to the originating chat.
+- After a successful live build, durably watches the exact reviewed PR and sends
+  restart-safe follow-ups only when its aggregate checks or lifecycle meaningfully
+  change. Observation failures back off without exposing remote diagnostics.
 - Supports task/system status, active-task listing, and explicit run commands.
 - Supports idempotent approval and rejection of reviewed runs.
 - Atomically saves each accepted, minimal request and the advanced Telegram
@@ -86,6 +89,11 @@ then exit:
 monday telegram --once
 ```
 
+`--once` is a setup and queue-drain mode, not a daemon. It does not run the
+background pull-request follow-up loop and therefore does not provide ongoing
+monitoring. Any saved open-PR follow-up remains durable and resumes the next time
+the normal `monday telegram` service starts.
+
 To discover the numeric ID of someone who has messaged the bot:
 
 ```bash
@@ -157,6 +165,37 @@ builds are enabled; `/deliver` is ignored. Task listings and approval decisions
 (`/tasks`, `/approve`, `/reject`) remain private-chat-only even when the group
 itself is allowlisted.
 
+## Pull-request lifecycle follow-ups
+
+When a private live build reaches `pr-open`, MondayOS checkpoints a request-free
+follow-up record before acknowledging the Telegram job. The saved identity fixes
+the delivery, task, project, originating chat, and PR URL. Each poll then goes
+through the public delivery observer, which also revalidates the saved GitHub
+repository, base branch, head branch, PR number and URL, and exact reviewed commit
+SHA. The observer is read-only at GitHub: it cannot push, edit, close, merge, or
+deploy the pull request.
+
+Telegram receives only the PR lifecycle and one aggregate check state:
+`pending`, `passed`, `failed`, or `no-checks`. It never sends or persists
+individual check names, descriptions, annotations, logs, or raw observation
+errors. Repeated observations are silent; the bot sends a message only for a
+meaningful transition, such as checks becoming pending, passed, failed, or absent,
+or the PR becoming merged, closed, or divergent from the reviewed SHA.
+
+The follow-up phase, next poll time, and last-notified transition are stored in
+the completed job tombstone in `logs/telegram/state.json`, without retaining the
+original request text. A restart can reclaim a poll that was in flight. Pending
+checks are polled more frequently, settled open-PR states more slowly, and
+transient observation failures use exponential backoff capped at five minutes;
+Telegram rate limits are honored separately. Monitoring stops after a verified
+terminal PR state.
+
+Open-PR check results do not change the MondayOS task. Only a verified terminal
+state is reconciled: an exact reviewed merge completes an eligible task, while a
+closed or SHA-diverged PR returns a task still in `REVIEW` to `IN_PROGRESS`
+unless a newer open delivery remains authoritative. Human-managed states are not
+overridden. The bot reports that result but still never merges or deploys it.
+
 ## Always-on Mac mini service
 
 An example launchd definition lives at
@@ -217,6 +256,8 @@ responsive while its single worker performs a team run or live build, so model
 and build concurrency remains one. Restart preserves stable work identities;
 graceful shutdown finishes the active item and leaves later items queued. The
 `--once` setup mode intentionally ingests and drains synchronously instead.
+It does not execute the ongoing PR follow-up loop; use the normal daemon for
+continuous lifecycle monitoring.
 
 Queue state is local operational data under `logs/telegram/` and remains
 Git-ignored. Terminal replay tombstones retain the identity needed for

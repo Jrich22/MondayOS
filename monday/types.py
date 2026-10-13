@@ -390,7 +390,8 @@ class BuildResponse:
     durable job record (or the action-specific listing/capability payload).
 
     Attributes:
-        action:        The build action performed: run | get | history | capabilities.
+        action:        The build action performed: run | get | observe | history |
+                       capabilities.
         success:       True when the requested action succeeded.  For a run this
                        is the delivery job's outcome, not merely successful dispatch.
         message:       Human-readable status or error message.
@@ -407,6 +408,12 @@ class BuildResponse:
         project_name:  Canonical registered target (empty for MondayOS self-builds).
         repository:    Verified GitHub ``owner/repository`` target.
         repo_root:     Controller-pinned local repository root.
+        pr_state:      Latest exact-SHA-bound GitHub state: unobserved, open,
+                       merged, closed, or diverged.
+        checks_status: Aggregate check state without untrusted check output.
+        merge_commit_sha: Verified merge commit when ``pr_state`` is merged.
+        pr_observed_at: UTC timestamp of the latest GitHub observation.
+        task_reconciliation: Result of applying a terminal PR state to the task.
     """
 
     action: str
@@ -425,6 +432,11 @@ class BuildResponse:
     project_name: str = ""
     repository: str = ""
     repo_root: str = ""
+    pr_state: str = "unobserved"
+    checks_status: str = "unobserved"
+    merge_commit_sha: str = ""
+    pr_observed_at: str = ""
+    task_reconciliation: str = ""
 
 
 @dataclass

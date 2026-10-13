@@ -6,6 +6,7 @@ import base64
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -102,10 +103,17 @@ class _Monday:
             )
         if action == "start":
             self.status = "in-progress"
-            return SimpleNamespace(success=True, message="started", data={})
+            return SimpleNamespace(
+                success=True, message="started", data={"status": self.status}
+            )
         if action == "review":
             self.status = "review"
             return SimpleNamespace(success=True, message="review", data={})
+        if action == "complete":
+            self.status = "completed"
+            return SimpleNamespace(
+                success=True, message="completed", data={"status": self.status}
+            )
         raise AssertionError(action)
 
 
@@ -219,6 +227,46 @@ class _GitHub:
         )
 
 
+class _ObserverGitHub(_GitHub):
+    def __init__(
+        self,
+        *,
+        lifecycle: str = "open",
+        checks: str = "pending",
+        success: bool = True,
+        merge_commit_sha: str = "",
+        message: str = "observed",
+        check_counts: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.lifecycle = lifecycle
+        self.checks = checks
+        self.observation_success = success
+        self.merge_commit_sha = merge_commit_sha
+        self.observation_message = message
+        self.check_counts = check_counts
+
+    def observe_pull_request(self, **kwargs: Any) -> SimpleNamespace:
+        self.calls += 1
+        self.requests.append(dict(kwargs))
+        check_counts = self.check_counts
+        if check_counts is None:
+            check_counts = {
+                "total": 0 if self.checks == "no-checks" else 1,
+                "passed": 1 if self.checks == "passed" else 0,
+                "failed": 1 if self.checks == "failed" else 0,
+                "pending": 1 if self.checks == "pending" else 0,
+            }
+        return SimpleNamespace(
+            success=self.observation_success,
+            lifecycle=self.lifecycle,
+            checks=self.checks,
+            check_counts=check_counts,
+            merge_commit_sha=self.merge_commit_sha,
+            message=self.observation_message,
+        )
+
+
 def _patch(old: int, new: int) -> str:
     return (
         "diff --git a/app.py b/app.py\n"
@@ -322,6 +370,499 @@ def _persist_delivery(
     )
     assert workflow.store.reserve(job) is None
     return job
+
+
+def _observable_delivery(workflow: DeliveryWorkflow, root: Path) -> DeliveryJob:
+    metadata = root.resolve().stat()
+    job = DeliveryJob(
+        delivery_id="delivery-observe-1",
+        task_id="TASK-0001",
+        objective="Set VALUE to the reviewed target.",
+        repo_root=str(root.resolve()),
+        status="pr-open",
+        phase="completed",
+        success=True,
+        base_ref="refs/remotes/origin/main",
+        base_branch="main",
+        base_sha="1" * 40,
+        project_name=workflow.project_name,
+        expected_repository=workflow.expected_repository,
+        repository=workflow.expected_repository or "owner/project",
+        branch="codex/task-0001-delivery-observe-1",
+        artifact_sha256="2" * 64,
+        reviewed_artifact_sha256="2" * 64,
+        commit_sha="3" * 40,
+        pushed=True,
+        pr_number=12,
+        pr_url="https://github.com/owner/project/pull/12",
+        root_device=metadata.st_dev,
+        root_inode=metadata.st_ino,
+        created_at="2026-10-13T00:00:00+00:00",
+        updated_at="2026-10-13T00:00:00+00:00",
+    )
+    assert workflow.store.reserve(job) is None
+    return job
+
+
+def test_observe_records_exact_open_pr_and_bounded_check_summary(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(lifecycle="open", checks="pending")
+    monday = _Monday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    original = _observable_delivery(workflow, root)
+
+    observed = workflow.observe(original.delivery_id)
+
+    assert observed.observation_success is True
+    assert observed.pr_state == "open"
+    assert observed.checks_status == "pending"
+    assert observed.check_counts == {
+        "total": 1,
+        "passed": 0,
+        "failed": 0,
+        "pending": 1,
+    }
+    assert observed.task_reconciliation == ""
+    assert monday.status == "review"
+    assert github.requests == [{
+        "repo_root": root.resolve(),
+        "repository": "owner/project",
+        "base": "main",
+        "branch": "codex/task-0001-delivery-observe-1",
+        "number": 12,
+        "url": "https://github.com/owner/project/pull/12",
+        "expected_sha": "3" * 40,
+    }]
+
+
+def test_observe_verified_merge_completes_task_exactly_once(tmp_path: Path) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(
+        lifecycle="merged",
+        checks="passed",
+        merge_commit_sha="4" * 40,
+    )
+    monday = _Monday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+
+    first = workflow.observe(job.delivery_id)
+    second = workflow.observe(job.delivery_id)
+
+    assert first.pr_state == "merged"
+    assert first.merge_commit_sha == "4" * 40
+    assert first.task_reconciliation == "completed"
+    assert second.task_reconciliation == "already-completed"
+    assert monday.status == "completed"
+    assert monday.calls.count("complete") == 1
+
+
+@pytest.mark.parametrize("lifecycle", ["closed", "diverged"])
+def test_observe_terminal_unmerged_pr_returns_task_to_in_progress(
+    tmp_path: Path,
+    lifecycle: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(lifecycle=lifecycle, checks="failed")
+    monday = _Monday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+
+    observed = workflow.observe(job.delivery_id)
+
+    assert observed.pr_state == lifecycle
+    assert observed.task_reconciliation == "reopened"
+    assert monday.status == "in-progress"
+    assert monday.calls.count("start") == 1
+
+
+def test_observe_old_closed_pr_does_not_reopen_task_owned_by_newer_pr(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(lifecycle="closed", checks="failed")
+    monday = _Monday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    old = _observable_delivery(workflow, root)
+    newer = DeliveryJob.from_dict(old.to_dict(include_private=True))
+    newer.delivery_id = "delivery-observe-newer"
+    newer.created_at = "2026-10-13T00:01:00+00:00"
+    newer.branch = "codex/task-0001-delivery-observe-newer"
+    newer.pr_number = 13
+    newer.pr_url = "https://github.com/owner/project/pull/13"
+    assert workflow.store.reserve(newer) is None
+
+    observed = workflow.observe(old.delivery_id)
+
+    assert observed.task_reconciliation == "superseded"
+    assert monday.status == "review"
+    assert monday.calls.count("start") == 0
+
+
+def test_observe_outage_is_retryable_without_overwriting_last_known_state(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(success=False, message="temporary outage")
+    monday = _Monday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    job.pr_state = "open"
+    job.checks_status = "passed"
+    workflow.store.persist(job)
+
+    observed = workflow.observe(job.delivery_id)
+
+    assert observed.observation_success is False
+    assert observed.pr_state == "open"
+    assert observed.checks_status == "passed"
+    assert "temporary outage" in observed.observation_message
+    assert monday.status == "review"
+
+
+def test_observe_rejects_a_non_pr_delivery_before_github(tmp_path: Path) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    job = _persist_delivery(
+        workflow,
+        delivery_id="delivery-not-published",
+        status="failed",
+        phase="failed",
+    )
+    metadata = root.resolve().stat()
+    job.root_device = metadata.st_dev
+    job.root_inode = metadata.st_ino
+    workflow.store.persist(job)
+
+    with pytest.raises(ValueError, match="PR-backed"):
+        workflow.observe(job.delivery_id)
+
+    assert github.requests == []
+
+
+def test_observe_returns_retryable_snapshot_while_publication_lease_is_held(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(lifecycle="open", checks="pending")
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    workflow.lease_timeout = 0.01
+    job = _observable_delivery(workflow, root)
+    job.observation_success = True
+    job.observation_message = "prior durable observation"
+    job.pr_state = "open"
+    job.checks_status = "passed"
+    job.check_counts = {"total": 1, "passed": 1, "failed": 0, "pending": 0}
+    workflow.store.persist(job)
+    lease_held = threading.Event()
+    release_lease = threading.Event()
+
+    def hold_publication_lease() -> None:
+        with workflow._workflow_lease():
+            lease_held.set()
+            assert release_lease.wait(5)
+
+    holder = threading.Thread(target=hold_publication_lease)
+    holder.start()
+    assert lease_held.wait(5)
+    try:
+        busy = workflow.observe(job.delivery_id)
+    finally:
+        release_lease.set()
+        holder.join(5)
+
+    assert not holder.is_alive()
+    assert busy.observation_success is False
+    assert "still finalizing" in busy.observation_message
+    assert github.calls == 0
+    durable = workflow.get(job.delivery_id)
+    assert durable.observation_success is True
+    assert durable.observation_message == "prior durable observation"
+
+    observed = workflow.observe(job.delivery_id)
+    assert observed.observation_success is True
+    assert observed.checks_status == "pending"
+    assert github.calls == 1
+
+
+@pytest.mark.parametrize(
+    "check_counts",
+    [
+        {"total": 1, "passed": 0, "failed": 1},
+        {"total": 2, "passed": 0, "failed": 1, "pending": 0},
+        {"total": 501, "passed": 0, "failed": 501, "pending": 0},
+        {"total": 1, "passed": 0, "failed": 0, "pending": 1},
+        {"total": 1, "passed": 0, "failed": 1, "pending": 0, "name": 1},
+    ],
+)
+def test_observe_rejects_malformed_check_aggregate_without_losing_prior_state(
+    tmp_path: Path,
+    check_counts: dict[str, int],
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(
+        lifecycle="closed",
+        checks="failed",
+        check_counts=check_counts,
+    )
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    job = _observable_delivery(workflow, root)
+    job.pr_state = "open"
+    job.checks_status = "passed"
+    job.check_counts = {"total": 1, "passed": 1, "failed": 0, "pending": 0}
+    workflow.store.persist(job)
+
+    observed = workflow.observe(job.delivery_id)
+
+    assert observed.observation_success is False
+    assert "inconsistent" in observed.observation_message
+    assert observed.pr_state == "open"
+    assert observed.checks_status == "passed"
+    assert observed.check_counts == {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "pending": 0,
+    }
+
+
+def test_observe_reopened_pr_clears_stale_terminal_reconciliation(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(lifecycle="closed", checks="failed")
+    monday = _Monday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+
+    closed = workflow.observe(job.delivery_id)
+    assert closed.task_reconciliation == "reopened"
+    assert closed.task_reconciled_at
+    assert monday.status == "in-progress"
+
+    github.lifecycle = "open"
+    github.checks = "passed"
+    reopened = workflow.observe(job.delivery_id)
+
+    assert reopened.pr_state == "open"
+    assert reopened.task_reconciliation == ""
+    assert reopened.task_reconciled_at == ""
+    assert monday.status == "in-progress"
+    assert monday.calls.count("start") == 1
+
+
+@pytest.mark.parametrize("lifecycle", ["closed", "merged"])
+def test_observe_terminal_pr_does_not_override_human_blocked_task(
+    tmp_path: Path,
+    lifecycle: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(
+        lifecycle=lifecycle,
+        checks="failed" if lifecycle == "closed" else "passed",
+        merge_commit_sha="4" * 40 if lifecycle == "merged" else "",
+    )
+    monday = _Monday()
+    monday.status = "blocked"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+
+    observed = workflow.observe(job.delivery_id)
+
+    assert observed.observation_success is True
+    assert observed.task_reconciliation == "state-unchanged"
+    assert monday.status == "blocked"
+    assert "start" not in monday.calls
+    assert "complete" not in monday.calls
+
+
+def test_observe_terminal_pr_refuses_retargeted_task(tmp_path: Path) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(lifecycle="closed", checks="failed")
+    monday = _Monday(project="other-project")
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+
+    observed = workflow.observe(job.delivery_id)
+
+    assert observed.observation_success is True
+    assert observed.task_reconciliation == "target-changed"
+    assert monday.status == "review"
+    assert "start" not in monday.calls
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("artifact_sha256", ""),
+        ("reviewed_artifact_sha256", ""),
+        ("base_sha", ""),
+        ("pushed", False),
+        ("phase", "pull-request"),
+    ],
+)
+def test_observe_rejects_incomplete_reviewed_artifact_binding(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    job = _observable_delivery(workflow, root)
+    setattr(job, field, value)
+    workflow.store.persist(job)
+
+    with pytest.raises(ValueError, match="PR-backed|exact reviewed"):
+        workflow.observe(job.delivery_id)
+
+    assert github.calls == 0
+
+
+def test_observe_task_reconciliation_respects_real_task_lock(
+    tmp_path: Path,
+) -> None:
+    from monday import Monday, MondayConfig
+
+    root, _ = _repository(tmp_path)
+    github_called = threading.Event()
+
+    class _SignalingGitHub(_ObserverGitHub):
+        def observe_pull_request(self, **kwargs: Any) -> SimpleNamespace:
+            result = super().observe_pull_request(**kwargs)
+            github_called.set()
+            return result
+
+    monday = Monday(MondayConfig(project_root=root))
+    github = _SignalingGitHub(lifecycle="closed", checks="failed")
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,  # type: ignore[arg-type]
+    )
+    assert monday.task("start", task_id="TASK-0001").success
+    assert monday.task(
+        "review",
+        task_id="TASK-0001",
+        changed_by="human:test",
+        reason="PR opened",
+    ).success
+    job = _observable_delivery(workflow, root)
+    observed: list[DeliveryJob] = []
+    errors: list[BaseException] = []
+
+    def run_observer() -> None:
+        try:
+            observed.append(workflow.observe(job.delivery_id))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    manager = TaskManager(root)
+    with manager.lock("TASK-0001"):
+        observer = threading.Thread(target=run_observer)
+        observer.start()
+        assert github_called.wait(5)
+        assert monday.task("start", task_id="TASK-0001").success
+        manager.block("TASK-0001", "human hold", "human:test")
+
+    observer.join(5)
+    assert not observer.is_alive()
+    assert errors == []
+    assert observed[0].task_reconciliation == "state-unchanged"
+    assert manager.get("TASK-0001").status.value == "blocked"
 
 
 def test_default_validator_is_bound_to_configured_project_root(tmp_path: Path) -> None:
@@ -754,6 +1295,31 @@ def test_controller_death_after_pr_creation_is_reconciled_exactly(
     assert durable.pr_url == ""
     assert github.calls == 1
     assert _git(remote, "show", f"{durable.branch}:app.py") == "VALUE = 2"
+
+    original_finish = workflow._finish_published
+
+    def finish_while_repository_lease_is_held(*args: Any, **kwargs: Any) -> DeliveryJob:
+        lock_paths = list((workflow.store.root / "workflow-locks").glob("*.lock"))
+        assert len(lock_paths) == 1
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl,os,sys; "
+                    "fd=os.open(sys.argv[1], os.O_RDWR); "
+                    "\ntry: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+                    "\nexcept BlockingIOError: raise SystemExit(0)"
+                    "\nraise SystemExit(1)"
+                ),
+                str(lock_paths[0]),
+            ],
+            check=False,
+        )
+        assert probe.returncode == 0
+        return original_finish(*args, **kwargs)
+
+    workflow._finish_published = finish_while_repository_lease_is_held  # type: ignore[method-assign]
 
     recovered = workflow.run(
         task_id="TASK-0001",

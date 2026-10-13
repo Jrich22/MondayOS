@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import time
 import uuid
@@ -189,6 +190,140 @@ class DeliveryWorkflow:
             project_name=canonical_project,
             limit=limit,
         )
+
+    def observe(self, delivery_id: str) -> DeliveryJob:
+        """Observe one PR without changing its reviewed branch or GitHub state.
+
+        Delivery and pull-request lifecycle are deliberately separate.  Opening
+        the PR is an immutable successful build result; this method records what
+        GitHub later reports for that exact reviewed head and reconciles the task
+        only after a verified merge or terminal closure.
+        """
+        with self._observation_lease(delivery_id):
+            try:
+                with self._workflow_lease():
+                    return self._observe_locked(delivery_id)
+            except _WorkflowLeaseTimeoutError:
+                # Publication owns this lease until its PR record, task
+                # transition, and local cleanup have all settled. Do not write
+                # a stale snapshot over the live worker's in-memory job.
+                job = self.store.get(delivery_id)
+                self._require_observation_binding(job)
+                self._require_observable_pull_request(job)
+                job.observation_success = False
+                job.observation_message = (
+                    "The delivery is still finalizing; retry pull-request observation."
+                )
+                return job
+
+    def _observe_locked(self, delivery_id: str) -> DeliveryJob:
+        """Observe while holding the target repository's workflow lease."""
+        job = self.store.get(delivery_id)
+        self._require_observation_binding(job)
+        self._require_observable_pull_request(job)
+        try:
+            self.repository.validate_trusted_root()
+            actual_repository = self.repository.github_slug()
+            if actual_repository.casefold() != job.repository.casefold():
+                raise ArtifactSecurityError(
+                    "Delivery repository no longer matches the target origin"
+                )
+            observed = self.github.observe_pull_request(
+                repo_root=self.repository_root,
+                repository=job.repository,
+                base=job.base_branch,
+                branch=job.branch,
+                number=job.pr_number,
+                url=job.pr_url,
+                expected_sha=job.commit_sha,
+            )
+        except Exception as exc:
+            job.observation_success = False
+            job.observation_message = _safe_text(
+                f"GitHub observation is temporarily unavailable: {_safe_message(exc)}",
+                2_000,
+            )
+            job.pr_observed_at = _now()
+            job.updated_at = job.pr_observed_at
+            self.store.persist(job)
+            return job
+
+        job.pr_observed_at = _now()
+        job.updated_at = job.pr_observed_at
+        job.observation_success = bool(getattr(observed, "success", False))
+        if not job.observation_success:
+            job.observation_message = _safe_text(
+                getattr(observed, "message", "GitHub observation is unavailable"),
+                2_000,
+            )
+            self.store.persist(job)
+            return job
+
+        pr_state = str(getattr(observed, "lifecycle", "unavailable"))
+        checks_status = str(getattr(observed, "checks", "unobserved"))
+        merge_commit_sha = str(getattr(observed, "merge_commit_sha", ""))
+        if (
+            pr_state not in {"open", "merged", "closed", "diverged"}
+            or checks_status not in {"pending", "passed", "failed", "no-checks"}
+            or (
+                pr_state == "merged"
+                and not re.fullmatch(
+                    r"[0-9a-f]{40}(?:[0-9a-f]{24})?", merge_commit_sha
+                )
+            )
+            or (pr_state != "merged" and merge_commit_sha)
+        ):
+            job.observation_success = False
+            job.observation_message = (
+                "GitHub returned an inconsistent pull-request observation; "
+                "retry observation."
+            )
+            self.store.persist(job)
+            return job
+        raw_counts = getattr(observed, "check_counts", None)
+        if not isinstance(raw_counts, dict):
+            raw_counts = {
+                "total": getattr(observed, "total_checks", 0),
+                "pending": getattr(observed, "pending_checks", 0),
+                "passed": getattr(observed, "passed_checks", 0),
+                "failed": getattr(observed, "failed_checks", 0),
+            }
+        check_counts = _validated_check_counts(raw_counts, checks_status)
+        if check_counts is None:
+            job.observation_success = False
+            job.observation_message = (
+                "GitHub returned an inconsistent pull-request check summary; "
+                "retry observation."
+            )
+            self.store.persist(job)
+            return job
+        job.pr_state = pr_state
+        job.checks_status = checks_status
+        job.check_counts = check_counts
+        job.merge_commit_sha = merge_commit_sha
+        if pr_state == "open":
+            # A terminal PR can later be reopened. Its old task action is not
+            # the reconciliation for the newly observed open state.
+            job.task_reconciliation = ""
+            job.task_reconciled_at = ""
+        job.observation_message = self._observation_message(job)
+        self.store.persist(job)
+
+        if job.pr_state in {"merged", "closed", "diverged"}:
+            try:
+                self._reconcile_observed_task(job)
+            except Exception:
+                # The exact GitHub state remains useful, but task-store
+                # unavailability is retryable and must not crash the observer.
+                job.observation_success = False
+                job.task_reconciliation = "failed"
+                job.observation_message = (
+                    f"{self._observation_message(job)} Task reconciliation is "
+                    "temporarily unavailable; retry observation."
+                )
+            job.updated_at = _now()
+            self.store.persist(job)
+        return job
 
     def run(
         self,
@@ -441,6 +576,193 @@ class DeliveryWorkflow:
             )
         return ""
 
+    def _require_observation_binding(self, job: DeliveryJob) -> None:
+        """Require the observer to be constructed for the job's pinned target."""
+        if job.project_name != self.project_name:
+            raise ValueError(
+                "Delivery belongs to another project; select its registered target"
+            )
+        if job.repo_root != str(self.repository_root):
+            raise ValueError("Delivery belongs to another repository root")
+        if (job.root_device, job.root_inode) != (self.root_device, self.root_inode):
+            raise ValueError("Delivery repository identity no longer matches its record")
+        if job.expected_repository != self.expected_repository:
+            raise ValueError("Delivery belongs to another GitHub repository")
+
+    @staticmethod
+    def _require_observable_pull_request(job: DeliveryJob) -> None:
+        if (
+            not job.success
+            or job.status != "pr-open"
+            or job.phase != "completed"
+            or not job.pushed
+        ):
+            raise ValueError("Only a successful PR-backed delivery can be observed")
+        if (
+            not job.repository
+            or not job.base_branch
+            or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", job.base_sha)
+            or not job.branch
+            or job.pr_number <= 0
+            or not job.pr_url
+            or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", job.commit_sha)
+            or not re.fullmatch(r"[0-9a-f]{64}", job.artifact_sha256)
+            or job.artifact_sha256 != job.reviewed_artifact_sha256
+        ):
+            raise ArtifactSecurityError(
+                "Delivery record is missing its exact reviewed pull-request identity"
+            )
+
+    @staticmethod
+    def _observation_message(job: DeliveryJob) -> str:
+        if job.pr_state == "merged":
+            short = job.merge_commit_sha[:12]
+            suffix = f" as merge commit {short}" if short else ""
+            return f"The exact reviewed pull request was merged{suffix}."
+        if job.pr_state == "closed":
+            return "The pull request was closed without merging the reviewed commit."
+        if job.pr_state == "diverged":
+            return "The pull request head no longer matches the reviewed commit."
+        if job.pr_state == "open":
+            labels = {
+                "pending": "GitHub checks are still pending",
+                "passed": "GitHub checks passed",
+                "failed": "GitHub checks failed",
+                "no-checks": "the repository reports no checks",
+            }
+            detail = labels.get(job.checks_status, "GitHub check state is unknown")
+            return f"The pull request is open; {detail}."
+        return "GitHub returned an unsupported pull-request state."
+
+    def _reconcile_observed_task(self, job: DeliveryJob) -> None:
+        """Apply a verified terminal PR outcome to the MondayOS task once."""
+        task_manager = TaskManager(self.controller_root)
+        with task_manager.lock(job.task_id):
+            task = self.monday.task("get", task_id=job.task_id)
+            if not getattr(task, "success", False):
+                job.observation_success = False
+                job.task_reconciliation = "failed"
+                job.observation_message = (
+                    f"{self._observation_message(job)} The task could not be read; "
+                    "retry observation."
+                )
+                return
+            task_data = dict(getattr(task, "data", {}) or {})
+            target_error = self._task_target_error(task_data)
+            if target_error:
+                job.task_reconciliation = "target-changed"
+                job.task_reconciled_at = _now()
+                job.observation_message = (
+                    f"{self._observation_message(job)} The task target changed; "
+                    "no task state was changed."
+                )
+                return
+            status = str(task_data.get("status", ""))
+            now = _now()
+
+            if job.pr_state == "merged":
+                if status == "completed":
+                    job.task_reconciliation = "already-completed"
+                    job.task_reconciled_at = now
+                    job.observation_message = self._observation_message(job)
+                    return
+                if status == "cancelled":
+                    job.task_reconciliation = "terminal-unchanged"
+                    job.task_reconciled_at = now
+                    job.observation_message = (
+                        f"{self._observation_message(job)} The task was already cancelled."
+                    )
+                    return
+                if status not in {"in-progress", "review"}:
+                    job.task_reconciliation = "state-unchanged"
+                    job.task_reconciled_at = now
+                    job.observation_message = (
+                        f"{self._observation_message(job)} The task remains {status}; "
+                        "no human-managed state was overridden."
+                    )
+                    return
+                result = self.monday.task(
+                    "complete",
+                    task_id=job.task_id,
+                    changed_by=f"delivery-observer:{job.delivery_id}",
+                    reason=(
+                        f"Exact reviewed pull request merged: {job.pr_url} "
+                        f"({job.merge_commit_sha})"
+                    ),
+                )
+                if getattr(result, "success", False):
+                    job.task_reconciliation = "completed"
+                    job.task_reconciled_at = now
+                    job.observation_message = (
+                        f"{self._observation_message(job)} The task is now complete."
+                    )
+                    return
+            else:
+                newer = self._newer_open_delivery(job)
+                if newer is not None:
+                    job.task_reconciliation = "superseded"
+                    job.task_reconciled_at = now
+                    job.observation_message = (
+                        f"{self._observation_message(job)} A newer pull request "
+                        f"({newer.delivery_id}) remains authoritative for the task."
+                    )
+                    return
+                if status == "in-progress":
+                    job.task_reconciliation = "already-in-progress"
+                    job.task_reconciled_at = now
+                    job.observation_message = self._observation_message(job)
+                    return
+                if status in {"completed", "cancelled"}:
+                    job.task_reconciliation = "terminal-unchanged"
+                    job.task_reconciled_at = now
+                    job.observation_message = (
+                        f"{self._observation_message(job)} The task is already {status}."
+                    )
+                    return
+                if status != "review":
+                    job.task_reconciliation = "state-unchanged"
+                    job.task_reconciled_at = now
+                    job.observation_message = (
+                        f"{self._observation_message(job)} The task remains {status}; "
+                        "no human-managed state was overridden."
+                    )
+                    return
+                result = self.monday.task("start", task_id=job.task_id)
+                result_data = dict(getattr(result, "data", {}) or {})
+                if (
+                    getattr(result, "success", False)
+                    and result_data.get("status") == "in-progress"
+                ):
+                    job.task_reconciliation = "reopened"
+                    job.task_reconciled_at = now
+                    job.observation_message = (
+                        f"{self._observation_message(job)} The task returned to IN_PROGRESS."
+                    )
+                    return
+
+        job.observation_success = False
+        job.task_reconciliation = "failed"
+        job.observation_message = (
+            f"{self._observation_message(job)} Task reconciliation failed; "
+            "retry observation."
+        )
+
+    def _newer_open_delivery(self, job: DeliveryJob) -> DeliveryJob | None:
+        """Return a newer PR-backed delivery that supersedes a failed PR."""
+        current_key = (job.created_at, job.delivery_id)
+        for candidate in self.store.history(task_id=job.task_id, limit=0):
+            if (
+                candidate.delivery_id != job.delivery_id
+                and candidate.repo_root == job.repo_root
+                and candidate.project_name == job.project_name
+                and candidate.status == "pr-open"
+                and candidate.success
+                and candidate.pr_state not in {"merged", "closed", "diverged"}
+                and (candidate.created_at, candidate.delivery_id) > current_key
+            ):
+                return candidate
+        return None
+
     def _reconcile_interrupted(
         self,
         job: DeliveryJob,
@@ -467,15 +789,21 @@ class DeliveryWorkflow:
                         )
                     except Exception as exc:
                         result = self._publication_pending(current, exc)
+                self._notify(result, progress_callback)
+                if result.success and recovered_worktree is not None:
+                    # Final task transition and cleanup remain inside the same
+                    # repository lease as publication recovery. An observer
+                    # must never persist against a stale in-memory finalizer.
+                    return self._finish_published(
+                        result,
+                        recovered_worktree,
+                        progress_callback,
+                    )
+                return result
         except _WorkflowLeaseTimeoutError:
             current = self.store.get(job.delivery_id)
             self._require_binding(current, job)
             return current
-
-        self._notify(result, progress_callback)
-        if result.success and recovered_worktree is not None:
-            return self._finish_published(result, recovered_worktree, progress_callback)
-        return result
 
     def _blocking_delivery(self, requested: DeliveryJob) -> DeliveryJob | None:
         for existing in self.store.history(task_id=requested.task_id, limit=0):
@@ -1169,6 +1497,31 @@ class DeliveryWorkflow:
         return job
 
     @contextmanager
+    def _observation_lease(self, delivery_id: str) -> Iterator[None]:
+        """Serialize read/reconcile cycles for one durable delivery identity."""
+        if not re.fullmatch(r"delivery-[A-Za-z0-9-]{1,80}", delivery_id):
+            raise ValueError("Invalid delivery identity")
+        path = self.store.root / f".{delivery_id}.observe.lock"
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
+            metadata = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or metadata.st_mode & 0o077
+            ):
+                raise ValueError("delivery observation lock is not controller-owned")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
     def _workflow_lease(self) -> Iterator[int]:
         lock_dir = self.store.root / "workflow-locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
@@ -1329,6 +1682,34 @@ def _safe_text_list(
     else:
         items = [values]
     return [_safe_text(item, item_limit) for item in items]
+
+
+def _validated_check_counts(value: Any, aggregate: str) -> dict[str, int] | None:
+    """Validate one bounded aggregate without retaining check names or logs."""
+    required = {"total", "passed", "failed", "pending"}
+    if not isinstance(value, dict) or set(value) != required:
+        return None
+    if any(
+        isinstance(value[key], bool)
+        or not isinstance(value[key], int)
+        or not 0 <= value[key] <= 500
+        for key in required
+    ):
+        return None
+    counts = {key: int(value[key]) for key in required}
+    if counts["total"] != (
+        counts["passed"] + counts["failed"] + counts["pending"]
+    ):
+        return None
+    consistent = {
+        "no-checks": counts["total"] == 0,
+        "passed": counts["total"] > 0 and counts["passed"] == counts["total"],
+        "pending": counts["pending"] > 0 and counts["failed"] == 0,
+        "failed": counts["failed"] > 0,
+    }
+    if not consistent.get(aggregate, False):
+        return None
+    return counts
 
 
 def _validation_success(result: Any) -> bool:

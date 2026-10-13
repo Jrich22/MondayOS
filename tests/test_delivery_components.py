@@ -1970,3 +1970,303 @@ def test_github_verifies_new_pr_after_creation(
     assert calls[0].get("inherited_guard_fds", ()) == ()
     assert calls[1]["inherited_guard_fds"] == (descriptor,)
     assert calls[2].get("inherited_guard_fds", ()) == ()
+
+
+def _observed_pr_row(
+    *,
+    state: str = "OPEN",
+    head_sha: str = "a" * 40,
+    checks: list[object] | None = None,
+    merge_sha: str = "",
+) -> dict[str, object]:
+    return {
+        "number": 7,
+        "url": "https://github.com/Owner/Repo/pull/7",
+        "state": state,
+        "mergeCommit": {"oid": merge_sha} if merge_sha else None,
+        "baseRefName": "main",
+        "headRefName": "codex/task-12345678",
+        "headRefOid": head_sha,
+        "isCrossRepository": False,
+        "statusCheckRollup": [] if checks is None else checks,
+    }
+
+
+def _observe_pr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    row: object,
+) -> github_module.PullRequestObservation:
+    monkeypatch.setattr(
+        github_module,
+        "_run_process",
+        lambda *_args, **_kwargs: _ProcessResult(0, json.dumps(row), ""),
+    )
+    return github_module.GhCliClient(_TEST_CLI).observe_pull_request(
+        repo_root=tmp_path,
+        repository="owner/repo",
+        base="main",
+        branch="codex/task-12345678",
+        number=7,
+        url="https://github.com/Owner/Repo/pull/7",
+        expected_sha="a" * 40,
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw_state", "expected_lifecycle", "merge_sha"),
+    [
+        ("OPEN", "open", ""),
+        ("CLOSED", "closed", ""),
+        ("MERGED", "merged", "b" * 40),
+    ],
+)
+def test_github_observer_classifies_exact_pr_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_state: str,
+    expected_lifecycle: str,
+    merge_sha: str,
+) -> None:
+    result = _observe_pr(
+        tmp_path,
+        monkeypatch,
+        _observed_pr_row(state=raw_state, merge_sha=merge_sha),
+    )
+
+    assert result.success is True
+    assert result.lifecycle == expected_lifecycle
+    assert result.checks == "no-checks"
+    assert result.merge_commit_sha == merge_sha
+    assert result.total_checks == 0
+
+
+@pytest.mark.parametrize(
+    ("checks", "expected_state", "expected_counts"),
+    [
+        ([], "no-checks", (0, 0, 0, 0)),
+        (
+            [
+                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"__typename": "StatusContext", "state": "SUCCESS"},
+            ],
+            "passed",
+            (2, 0, 2, 0),
+        ),
+        (
+            [
+                {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": ""},
+                {"__typename": "StatusContext", "state": "SUCCESS"},
+            ],
+            "pending",
+            (2, 1, 1, 0),
+        ),
+        (
+            [
+                {"__typename": "CheckRun", "status": "QUEUED", "conclusion": ""},
+                {"__typename": "StatusContext", "state": "ERROR"},
+                {"__typename": "StatusContext", "state": "SUCCESS"},
+            ],
+            "failed",
+            (3, 1, 1, 1),
+        ),
+    ],
+)
+def test_github_observer_classifies_only_structured_check_rollup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checks: list[object],
+    expected_state: str,
+    expected_counts: tuple[int, int, int, int],
+) -> None:
+    result = _observe_pr(tmp_path, monkeypatch, _observed_pr_row(checks=checks))
+
+    assert result.success is True
+    assert result.checks == expected_state
+    assert (
+        result.total_checks,
+        result.pending_checks,
+        result.passed_checks,
+        result.failed_checks,
+    ) == expected_counts
+
+
+def test_github_observer_reports_diverged_head_without_trusting_it_as_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checks = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+    result = _observe_pr(
+        tmp_path,
+        monkeypatch,
+        _observed_pr_row(head_sha="c" * 40, checks=checks),
+    )
+
+    assert result.success is True
+    assert result.lifecycle == "diverged"
+    assert result.checks == "passed"
+    assert result.merge_commit_sha == ""
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("number", 8),
+        ("url", "https://github.com/Owner/Repo/pull/8"),
+        ("baseRefName", "release"),
+        ("headRefName", "codex/other-12345678"),
+        ("isCrossRepository", True),
+    ],
+)
+def test_github_observer_rejects_mismatched_pr_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    row = _observed_pr_row()
+    row[field] = value
+
+    result = _observe_pr(tmp_path, monkeypatch, row)
+
+    assert result.success is False
+    assert result.lifecycle == "unavailable"
+    assert result.checks == "no-checks"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"state": "UNKNOWN"},
+        {"state": "UNKNOWN", "headRefOid": "c" * 40},
+        {"headRefOid": "not-a-sha"},
+        {"statusCheckRollup": None},
+        {"statusCheckRollup": [{"__typename": "Unknown", "state": "SUCCESS"}]},
+        {"statusCheckRollup": [{}] * 501},
+        {"state": "MERGED", "mergeCommit": None},
+        {"state": "MERGED", "mergeCommit": None, "headRefOid": "c" * 40},
+        {"state": "OPEN", "mergeCommit": {"oid": "b" * 40}},
+    ],
+)
+def test_github_observer_fails_closed_on_malformed_or_inconsistent_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+) -> None:
+    row = _observed_pr_row()
+    row.update(overrides)
+
+    result = _observe_pr(tmp_path, monkeypatch, row)
+
+    assert result.success is False
+    assert result.lifecycle == "unavailable"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repository", "../repo"),
+        ("base", "-main"),
+        ("branch", "codex/../main"),
+        ("number", True),
+        ("url", "https://github.com/owner/repo/pull/8"),
+        ("url", 7),
+        ("expected_sha", "bad"),
+        ("expected_sha", None),
+        ("timeout", float("inf")),
+        ("timeout", 10**400),
+    ],
+)
+def test_github_observer_rejects_invalid_inputs_before_querying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    def unexpected_run(*_args: object, **_kwargs: object) -> _ProcessResult:
+        raise AssertionError("invalid input must not invoke gh")
+
+    monkeypatch.setattr(github_module, "_run_process", unexpected_run)
+    kwargs: dict[str, object] = {
+        "repo_root": tmp_path,
+        "repository": "owner/repo",
+        "base": "main",
+        "branch": "codex/task-12345678",
+        "number": 7,
+        "url": "https://github.com/Owner/Repo/pull/7",
+        "expected_sha": "a" * 40,
+        "timeout": 60,
+    }
+    kwargs[field] = value
+
+    result = github_module.GhCliClient(_TEST_CLI).observe_pull_request(**kwargs)  # type: ignore[arg-type]
+
+    assert result.success is False
+    assert result.lifecycle == "unavailable"
+
+
+def test_github_observer_uses_one_bounded_read_only_structured_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> _ProcessResult:
+        calls.append((argv, kwargs))
+        return _ProcessResult(0, json.dumps(_observed_pr_row()), "")
+
+    monkeypatch.setattr(github_module, "_run_process", fake_run)
+    result = github_module.GhCliClient(_TEST_CLI).observe_pull_request(
+        repo_root=tmp_path,
+        repository="owner/repo",
+        base="main",
+        branch="codex/task-12345678",
+        number=7,
+        url="https://github.com/Owner/Repo/pull/7",
+        expected_sha="a" * 40,
+        timeout=12,
+    )
+
+    assert result.success is True
+    assert len(calls) == 1
+    argv, call_kwargs = calls[0]
+    assert argv[1:5] == ["pr", "view", "https://github.com/Owner/Repo/pull/7", "--repo"]
+    assert argv[5:8] == ["owner/repo", "--json", github_module._PR_OBSERVATION_FIELDS]
+    assert "statusCheckRollup" in argv[-1]
+    assert not {"merge", "checks", "run", "api"}.intersection(argv)
+    assert call_kwargs["cwd"] == tmp_path
+    assert call_kwargs["timeout"] == 12.0
+    assert "inherited_guard_fds" not in call_kwargs
+
+
+@pytest.mark.parametrize(
+    ("response", "stdout"),
+    [
+        (1, "{}"),
+        (0, "not-json"),
+        (0, "[]"),
+    ],
+)
+def test_github_observer_returns_unavailable_for_query_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response: int,
+    stdout: str,
+) -> None:
+    monkeypatch.setattr(
+        github_module,
+        "_run_process",
+        lambda *_args, **_kwargs: _ProcessResult(response, stdout, "sensitive output"),
+    )
+
+    result = github_module.GhCliClient(_TEST_CLI).observe_pull_request(
+        repo_root=tmp_path,
+        repository="owner/repo",
+        base="main",
+        branch="codex/task-12345678",
+        number=7,
+        url="https://github.com/Owner/Repo/pull/7",
+        expected_sha="a" * 40,
+    )
+
+    assert result.success is False
+    assert result.lifecycle == "unavailable"
+    assert "sensitive output" not in result.message
