@@ -187,14 +187,21 @@ the completed job tombstone in `logs/telegram/state.json`, without retaining the
 original request text. A restart can reclaim a poll that was in flight. Pending
 checks are polled more frequently, settled open-PR states more slowly, and
 transient observation failures use exponential backoff capped at five minutes;
-Telegram rate limits are honored separately. Monitoring stops after a verified
-terminal PR state.
+Telegram rate limits are honored separately for up to 24 hours. A permanent
+Telegram destination failure, such as a blocked bot or deleted chat, ends that
+watcher in a request-free `notification-failed` state instead of retrying
+forever. Each watcher has a durable 30-day lifetime, and at most 500 can be
+active at once. If that capacity is full, the final build message says that
+monitoring did not start; the pull request itself is unaffected. Monitoring
+also stops after a verified terminal PR state.
 
 Open-PR check results do not change the MondayOS task. Only a verified terminal
 state is reconciled: an exact reviewed merge completes an eligible task, while a
 closed or SHA-diverged PR returns a task still in `REVIEW` to `IN_PROGRESS`
-unless a newer open delivery remains authoritative. Human-managed states are not
-overridden. The bot reports that result but still never merges or deploys it.
+unless a newer open delivery remains authoritative. A newer open delivery also
+prevents an older merged PR from completing the task underneath newer work.
+Human-managed states are not overridden. The bot reports that result but still
+never merges or deploys it.
 
 ## Always-on Mac mini service
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -21,9 +22,26 @@ _GITHUB_REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _GIT_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+\-]{0,254}$")
 _MAX_STATUS_CHECKS = 500
+_STATUS_CHECK_PAGE_SIZE = 100
+_MAX_STATUS_CHECK_PAGES = _MAX_STATUS_CHECKS // _STATUS_CHECK_PAGE_SIZE
+_GITHUB_API_VERSION = "2022-11-28"
+_CHECK_RUNS_JQ = (
+    "{total_count, check_runs: [.check_runs[] | "
+    "{id, head_sha, status, conclusion}]}"
+)
+_COMMIT_STATUSES_JQ = (
+    "{sha, state, total_count, statuses: [.statuses[] | {id, state}]}"
+)
+
 _PR_OBSERVATION_FIELDS = (
-    "number,url,state,mergeCommit,baseRefName,headRefName,headRefOid,"
-    "isCrossRepository,statusCheckRollup"
+    "number",
+    "url",
+    "state",
+    "mergeCommit",
+    "baseRefName",
+    "headRefName",
+    "headRefOid",
+    "isCrossRepository",
 )
 
 PullRequestLifecycle = Literal["open", "merged", "closed", "diverged", "unavailable"]
@@ -68,6 +86,14 @@ class _CheckRollupSummary:
     pending: int
     passed: int
     failed: int
+
+
+@dataclass(frozen=True)
+class _RestCheckPage:
+    checks: list[object]
+    total_checks: int
+    identifiers: frozenset[int]
+    aggregate_state: str = ""
 
 
 class GhCliClient:
@@ -140,27 +166,178 @@ class GhCliClient:
         except OSError as exc:
             return _unavailable_observation(str(exc))
 
-        observed = _run_process(
-            [
-                executable,
-                "pr",
-                "view",
-                url,
-                "--repo",
-                repository,
-                "--json",
-                _PR_OBSERVATION_FIELDS,
-            ],
-            cwd=repo_root,
-            timeout=observation_timeout,
-            env=_controller_env(),
-        )
-        if observed.returncode != 0:
-            return _unavailable_observation("Could not observe GitHub pull request")
-        try:
-            row = json.loads(observed.stdout or "{}")
-        except json.JSONDecodeError:
+        deadline = time.monotonic() + observation_timeout
+
+        def read_json(arguments: list[str]) -> tuple[object | None, str]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, "GitHub observation timed out"
+            observed = _run_process(
+                [executable, *arguments],
+                cwd=repo_root,
+                timeout=remaining,
+                env=_controller_env(),
+            )
+            if observed.returncode != 0:
+                return None, "Could not observe GitHub pull request"
+            try:
+                return json.loads(observed.stdout or "{}"), ""
+            except json.JSONDecodeError:
+                return None, "GitHub returned malformed PR observation"
+
+        identity_arguments = [
+            "pr",
+            "view",
+            url,
+            "--repo",
+            repository,
+            "--json",
+            ",".join(_PR_OBSERVATION_FIELDS),
+        ]
+        initial_payload, error = read_json(identity_arguments)
+        if error:
+            return _unavailable_observation(error)
+        initial_row = _validated_observation_row(initial_payload)
+        if initial_row is None:
             return _unavailable_observation("GitHub returned malformed PR observation")
+        initial = _observation_from_row(
+            {**initial_row, "statusCheckRollup": []},
+            repository=repository,
+            base=base,
+            branch=branch,
+            number=number,
+            url=url,
+            expected_sha=expected_sha,
+        )
+        if not initial.success or initial.lifecycle == "diverged":
+            return initial
+
+        owner, name = repository.split("/", 1)
+        endpoint_root = f"repos/{owner}/{name}/commits/{expected_sha}"
+        checks: list[object] = []
+        check_ids: set[int] = set()
+        check_total: int | None = None
+        for page_number in range(1, _MAX_STATUS_CHECK_PAGES + 1):
+            payload, error = read_json(
+                [
+                    "api",
+                    f"{endpoint_root}/check-runs",
+                    "--method",
+                    "GET",
+                    "-H",
+                    "Accept: application/vnd.github+json",
+                    "-H",
+                    f"X-GitHub-Api-Version: {_GITHUB_API_VERSION}",
+                    "-F",
+                    "filter=latest",
+                    "-F",
+                    f"per_page={_STATUS_CHECK_PAGE_SIZE}",
+                    "-F",
+                    f"page={page_number}",
+                    "--jq",
+                    _CHECK_RUNS_JQ,
+                ]
+            )
+            if error:
+                return _unavailable_observation(error)
+            page = _check_run_page_from_payload(payload, expected_sha=expected_sha)
+            if page is None:
+                return _unavailable_observation("GitHub returned malformed check-run data")
+            if check_total is None:
+                check_total = page.total_checks
+            elif page.total_checks != check_total:
+                return _unavailable_observation(
+                    "GitHub check-run count changed during observation"
+                )
+            if check_ids.intersection(page.identifiers):
+                return _unavailable_observation("GitHub returned duplicate check runs")
+            check_ids.update(page.identifiers)
+            checks.extend(page.checks)
+            if len(checks) > page.total_checks:
+                return _unavailable_observation("GitHub returned too many check runs")
+            if len(checks) == page.total_checks:
+                break
+            if len(page.checks) != _STATUS_CHECK_PAGE_SIZE:
+                return _unavailable_observation("GitHub returned incomplete check-run data")
+        else:
+            return _unavailable_observation("GitHub returned incomplete check-run data")
+
+        status_checks: list[object] = []
+        status_ids: set[int] = set()
+        status_total: int | None = None
+        combined_status = ""
+        for page_number in range(1, _MAX_STATUS_CHECK_PAGES + 1):
+            payload, error = read_json(
+                [
+                    "api",
+                    f"{endpoint_root}/status",
+                    "--method",
+                    "GET",
+                    "-H",
+                    "Accept: application/vnd.github+json",
+                    "-H",
+                    f"X-GitHub-Api-Version: {_GITHUB_API_VERSION}",
+                    "-F",
+                    f"per_page={_STATUS_CHECK_PAGE_SIZE}",
+                    "-F",
+                    f"page={page_number}",
+                    "--jq",
+                    _COMMIT_STATUSES_JQ,
+                ]
+            )
+            if error:
+                return _unavailable_observation(error)
+            page = _commit_status_page_from_payload(payload, expected_sha=expected_sha)
+            if page is None:
+                return _unavailable_observation("GitHub returned malformed commit-status data")
+            if status_total is None:
+                status_total = page.total_checks
+                combined_status = page.aggregate_state
+                if len(checks) + status_total > _MAX_STATUS_CHECKS:
+                    return _unavailable_observation(
+                        "Pull request has too many checks for bounded observation"
+                    )
+            elif (
+                page.total_checks != status_total
+                or page.aggregate_state != combined_status
+            ):
+                return _unavailable_observation(
+                    "GitHub commit-status summary changed during observation"
+                )
+            if status_ids.intersection(page.identifiers):
+                return _unavailable_observation("GitHub returned duplicate commit statuses")
+            status_ids.update(page.identifiers)
+            status_checks.extend(page.checks)
+            if len(status_checks) > page.total_checks:
+                return _unavailable_observation("GitHub returned too many commit statuses")
+            if len(status_checks) == page.total_checks:
+                break
+            if len(page.checks) != _STATUS_CHECK_PAGE_SIZE:
+                return _unavailable_observation(
+                    "GitHub returned incomplete commit-status data"
+                )
+        else:
+            return _unavailable_observation("GitHub returned incomplete commit-status data")
+
+        status_summary = _summarize_check_rollup(status_checks)
+        expected_combined_status = _expected_combined_status(status_summary)
+        if status_summary is None or combined_status != expected_combined_status:
+            return _unavailable_observation(
+                "GitHub returned an inconsistent commit-status summary"
+            )
+        checks.extend(status_checks)
+
+        final_payload, error = read_json(identity_arguments)
+        if error:
+            return _unavailable_observation(error)
+        row = _validated_observation_row(final_payload)
+        if row is None:
+            return _unavailable_observation("GitHub returned malformed PR observation")
+        if row.get("headRefOid") != expected_sha:
+            return _unavailable_observation(
+                "Pull-request head changed during GitHub observation"
+            )
+        row["statusCheckRollup"] = checks
         return _observation_from_row(
             row,
             repository=repository,
@@ -310,7 +487,139 @@ class GhCliClient:
         )
 
 
-def _observation_from_row(
+def _validated_observation_row(payload: object) -> dict[str, object] | None:
+    """Require every identity field requested from ``gh pr view``."""
+    if not isinstance(payload, dict) or any(
+        field not in payload for field in _PR_OBSERVATION_FIELDS
+    ):
+        return None
+    return {field: payload[field] for field in _PR_OBSERVATION_FIELDS}
+
+
+def _check_run_page_from_payload(
+    payload: object,
+    *,
+    expected_sha: str,
+) -> _RestCheckPage | None:
+    if not isinstance(payload, dict) or not {"total_count", "check_runs"} <= payload.keys():
+        return None
+    total = payload["total_count"]
+    raw_checks = payload["check_runs"]
+    if not _valid_rest_page_shape(total, raw_checks):
+        return None
+    checks: list[object] = []
+    identifiers: set[int] = set()
+    assert isinstance(raw_checks, list)
+    for raw_check in raw_checks:
+        if not isinstance(raw_check, dict) or not {
+            "id",
+            "head_sha",
+            "status",
+            "conclusion",
+        } <= raw_check.keys():
+            return None
+        identifier = raw_check["id"]
+        status = raw_check["status"]
+        conclusion = raw_check["conclusion"]
+        if (
+            isinstance(identifier, bool)
+            or not isinstance(identifier, int)
+            or identifier <= 0
+            or identifier in identifiers
+            or raw_check["head_sha"] != expected_sha
+            or not isinstance(status, str)
+            or (conclusion is not None and not isinstance(conclusion, str))
+        ):
+            return None
+        normalized: dict[str, object] = {
+            "__typename": "CheckRun",
+            "status": status.upper(),
+            "conclusion": conclusion.upper() if isinstance(conclusion, str) else None,
+        }
+        if _classify_check(normalized) is None:
+            return None
+        identifiers.add(identifier)
+        checks.append(normalized)
+    assert isinstance(total, int)
+    return _RestCheckPage(checks, total, frozenset(identifiers))
+
+
+def _commit_status_page_from_payload(
+    payload: object,
+    *,
+    expected_sha: str,
+) -> _RestCheckPage | None:
+    if not isinstance(payload, dict) or not {
+        "sha",
+        "state",
+        "total_count",
+        "statuses",
+    } <= payload.keys():
+        return None
+    total = payload["total_count"]
+    raw_checks = payload["statuses"]
+    aggregate_state = payload["state"]
+    if (
+        payload["sha"] != expected_sha
+        or not isinstance(aggregate_state, str)
+        or aggregate_state not in {"pending", "success", "failure"}
+        or not _valid_rest_page_shape(total, raw_checks)
+    ):
+        return None
+    checks: list[object] = []
+    identifiers: set[int] = set()
+    assert isinstance(raw_checks, list)
+    for raw_check in raw_checks:
+        if not isinstance(raw_check, dict) or not {"id", "state"} <= raw_check.keys():
+            return None
+        identifier = raw_check["id"]
+        state = raw_check["state"]
+        if (
+            isinstance(identifier, bool)
+            or not isinstance(identifier, int)
+            or identifier <= 0
+            or identifier in identifiers
+            or not isinstance(state, str)
+        ):
+            return None
+        normalized: dict[str, object] = {
+            "__typename": "StatusContext",
+            "state": state.upper(),
+        }
+        if _classify_check(normalized) is None:
+            return None
+        identifiers.add(identifier)
+        checks.append(normalized)
+    assert isinstance(total, int)
+    return _RestCheckPage(
+        checks,
+        total,
+        frozenset(identifiers),
+        aggregate_state=aggregate_state,
+    )
+
+
+def _valid_rest_page_shape(total: object, checks: object) -> bool:
+    return (
+        not isinstance(total, bool)
+        and isinstance(total, int)
+        and 0 <= total <= _MAX_STATUS_CHECKS
+        and isinstance(checks, list)
+        and len(checks) <= _STATUS_CHECK_PAGE_SIZE
+    )
+
+
+def _expected_combined_status(summary: _CheckRollupSummary | None) -> str:
+    if summary is None:
+        return ""
+    if summary.failed:
+        return "failure"
+    if summary.pending or summary.total == 0:
+        return "pending"
+    return "success"
+
+
+def _observation_identity_error(
     row: object,
     *,
     repository: str,
@@ -318,10 +627,9 @@ def _observation_from_row(
     branch: str,
     number: int,
     url: str,
-    expected_sha: str,
-) -> PullRequestObservation:
+) -> str:
     if not isinstance(row, dict):
-        return _unavailable_observation("GitHub returned malformed PR observation")
+        return "GitHub returned malformed PR observation"
     observed_number = row.get("number")
     observed_url = row.get("url")
     if (
@@ -335,13 +643,35 @@ def _observation_from_row(
         or row.get("headRefName") != branch
         or row.get("isCrossRepository") is not False
     ):
-        return _unavailable_observation(
-            "Observed pull request does not match the requested identity"
-        )
-
+        return "Observed pull request does not match the requested identity"
     observed_sha = row.get("headRefOid")
     if not isinstance(observed_sha, str) or not _COMMIT_SHA.fullmatch(observed_sha):
-        return _unavailable_observation("GitHub returned malformed PR commit identity")
+        return "GitHub returned malformed PR commit identity"
+    return ""
+
+
+def _observation_from_row(
+    row: object,
+    *,
+    repository: str,
+    base: str,
+    branch: str,
+    number: int,
+    url: str,
+    expected_sha: str,
+) -> PullRequestObservation:
+    identity_error = _observation_identity_error(
+        row,
+        repository=repository,
+        base=base,
+        branch=branch,
+        number=number,
+        url=url,
+    )
+    if identity_error:
+        return _unavailable_observation(identity_error)
+    assert isinstance(row, dict)
+    observed_sha = str(row["headRefOid"])
     checks = _summarize_check_rollup(row.get("statusCheckRollup"))
     if checks is None:
         return _unavailable_observation("GitHub returned malformed PR check data")

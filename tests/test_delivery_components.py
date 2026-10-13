@@ -1992,15 +1992,116 @@ def _observed_pr_row(
     }
 
 
+def _rest_check_run(
+    identifier: int,
+    *,
+    sha: str = "a" * 40,
+    status: str = "completed",
+    conclusion: str | None = "success",
+) -> dict[str, object]:
+    return {
+        "id": identifier,
+        "head_sha": sha,
+        "status": status,
+        "conclusion": conclusion,
+    }
+
+
+def _rest_commit_status(identifier: int, *, state: str = "success") -> dict[str, object]:
+    return {"id": identifier, "state": state}
+
+
+def _rest_check_run_payload(
+    checks: list[object], *, total_count: int | None = None
+) -> dict[str, object]:
+    return {
+        "total_count": len(checks) if total_count is None else total_count,
+        "check_runs": checks,
+    }
+
+
+def _rest_commit_status_payload(
+    checks: list[object],
+    *,
+    sha: str = "a" * 40,
+    total_count: int | None = None,
+    state: str | None = None,
+) -> dict[str, object]:
+    states = [
+        str(check.get("state", ""))
+        for check in checks
+        if isinstance(check, dict)
+    ]
+    if state is None:
+        if any(item in {"failure", "error"} for item in states):
+            state = "failure"
+        elif not states or any(item in {"pending", "expected"} for item in states):
+            state = "pending"
+        else:
+            state = "success"
+    return {
+        "sha": sha,
+        "state": state,
+        "total_count": len(checks) if total_count is None else total_count,
+        "statuses": checks,
+    }
+
+
 def _observe_pr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     row: object,
 ) -> github_module.PullRequestObservation:
+    payload_row: object = row
+    raw_checks: object = []
+    if isinstance(row, dict):
+        payload_row = dict(row)
+        raw_checks = payload_row.pop("statusCheckRollup", [])
+    check_runs: list[object] = []
+    statuses: list[object] = []
+    if isinstance(raw_checks, list):
+        for index, check in enumerate(raw_checks, start=1):
+            if isinstance(check, dict) and check.get("__typename") == "StatusContext":
+                statuses.append(
+                    _rest_commit_status(index, state=str(check.get("state", "")).lower())
+                )
+            elif isinstance(check, dict) and check.get("__typename") == "CheckRun":
+                conclusion = check.get("conclusion")
+                check_runs.append(
+                    _rest_check_run(
+                        index,
+                        sha=str(row.get("headRefOid", "")),
+                        status=str(check.get("status", "")).lower(),
+                        conclusion=(
+                            str(conclusion).lower() if isinstance(conclusion, str) else None
+                        ),
+                    )
+                )
+            else:
+                check_runs.append({})
+
+    def fake_run(argv: list[str], **_kwargs: object) -> _ProcessResult:
+        if argv[1:3] == ["pr", "view"]:
+            return _ProcessResult(0, json.dumps(payload_row), "")
+        if argv[1] == "api" and str(argv[2]).endswith("/check-runs"):
+            return _ProcessResult(0, json.dumps(_rest_check_run_payload(check_runs)), "")
+        if argv[1] == "api" and str(argv[2]).endswith("/status"):
+            return _ProcessResult(
+                0,
+                json.dumps(
+                    _rest_commit_status_payload(
+                        statuses,
+                        sha=str(row.get("headRefOid", "")) if isinstance(row, dict) else "",
+                    )
+                ),
+                "",
+            )
+        raise AssertionError(f"unexpected GitHub observer command: {argv!r}")
+
     monkeypatch.setattr(
         github_module,
         "_run_process",
-        lambda *_args, **_kwargs: _ProcessResult(0, json.dumps(row), ""),
+        fake_run,
     )
     return github_module.GhCliClient(_TEST_CLI).observe_pull_request(
         repo_root=tmp_path,
@@ -2072,7 +2173,7 @@ def test_github_observer_classifies_exact_pr_lifecycle(
         ),
     ],
 )
-def test_github_observer_classifies_only_structured_check_rollup(
+def test_github_observer_classifies_only_structured_rest_check_data(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     checks: list[object],
@@ -2091,7 +2192,7 @@ def test_github_observer_classifies_only_structured_check_rollup(
     ) == expected_counts
 
 
-def test_github_observer_reports_diverged_head_without_trusting_it_as_exact(
+def test_github_observer_reports_diverged_head_without_reading_replacement_checks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     checks = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]
@@ -2103,7 +2204,8 @@ def test_github_observer_reports_diverged_head_without_trusting_it_as_exact(
 
     assert result.success is True
     assert result.lifecycle == "diverged"
-    assert result.checks == "passed"
+    assert result.checks == "no-checks"
+    assert result.total_checks == 0
     assert result.merge_commit_sha == ""
 
 
@@ -2139,7 +2241,6 @@ def test_github_observer_rejects_mismatched_pr_identity(
         {"state": "UNKNOWN"},
         {"state": "UNKNOWN", "headRefOid": "c" * 40},
         {"headRefOid": "not-a-sha"},
-        {"statusCheckRollup": None},
         {"statusCheckRollup": [{"__typename": "Unknown", "state": "SUCCESS"}]},
         {"statusCheckRollup": [{}] * 501},
         {"state": "MERGED", "mergeCommit": None},
@@ -2154,6 +2255,18 @@ def test_github_observer_fails_closed_on_malformed_or_inconsistent_data(
 ) -> None:
     row = _observed_pr_row()
     row.update(overrides)
+
+    result = _observe_pr(tmp_path, monkeypatch, row)
+
+    assert result.success is False
+    assert result.lifecycle == "unavailable"
+
+
+def test_github_observer_fails_closed_when_pr_identity_field_is_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _observed_pr_row()
+    del row["mergeCommit"]
 
     result = _observe_pr(tmp_path, monkeypatch, row)
 
@@ -2204,14 +2317,20 @@ def test_github_observer_rejects_invalid_inputs_before_querying(
     assert result.lifecycle == "unavailable"
 
 
-def test_github_observer_uses_one_bounded_read_only_structured_query(
+def test_github_observer_uses_minimal_read_only_rest_queries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    row = _observed_pr_row()
+    row.pop("statusCheckRollup")
     calls: list[tuple[list[str], dict[str, object]]] = []
 
     def fake_run(argv: list[str], **kwargs: object) -> _ProcessResult:
         calls.append((argv, kwargs))
-        return _ProcessResult(0, json.dumps(_observed_pr_row()), "")
+        if argv[1:3] == ["pr", "view"]:
+            return _ProcessResult(0, json.dumps(row), "")
+        if str(argv[2]).endswith("/check-runs"):
+            return _ProcessResult(0, json.dumps(_rest_check_run_payload([])), "")
+        return _ProcessResult(0, json.dumps(_rest_commit_status_payload([])), "")
 
     monkeypatch.setattr(github_module, "_run_process", fake_run)
     result = github_module.GhCliClient(_TEST_CLI).observe_pull_request(
@@ -2226,15 +2345,271 @@ def test_github_observer_uses_one_bounded_read_only_structured_query(
     )
 
     assert result.success is True
-    assert len(calls) == 1
-    argv, call_kwargs = calls[0]
-    assert argv[1:5] == ["pr", "view", "https://github.com/Owner/Repo/pull/7", "--repo"]
-    assert argv[5:8] == ["owner/repo", "--json", github_module._PR_OBSERVATION_FIELDS]
-    assert "statusCheckRollup" in argv[-1]
-    assert not {"merge", "checks", "run", "api"}.intersection(argv)
-    assert call_kwargs["cwd"] == tmp_path
-    assert call_kwargs["timeout"] == 12.0
-    assert "inherited_guard_fds" not in call_kwargs
+    assert result.checks == "no-checks"
+    assert len(calls) == 4
+    assert calls[0][0] == calls[3][0]
+    assert "statusCheckRollup" not in calls[0][0][-1]
+    for argv, call_kwargs in calls:
+        assert call_kwargs["cwd"] == tmp_path
+        assert 0 < call_kwargs["timeout"] <= 12.0
+        assert "inherited_guard_fds" not in call_kwargs
+        assert not {"merge", "checks", "run"}.intersection(argv)
+    for argv, _kwargs in calls[1:3]:
+        assert argv[1] == "api"
+        assert argv[3:5] == ["--method", "GET"]
+        assert f"commits/{'a' * 40}/" in argv[2]
+        jq_filter = argv[argv.index("--jq") + 1]
+        assert not {"name", "description", "annotations", "output"}.intersection(
+            jq_filter.replace("{", " ").replace("}", " ").split()
+        )
+    assert "filter=latest" in calls[1][0]
+
+
+def test_github_observer_rest_check_runs_catch_a_failure_omitted_by_rollup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _observed_pr_row()
+    row.pop("statusCheckRollup")
+    all_runs = [_rest_check_run(index) for index in range(1, 101)] + [
+        _rest_check_run(101, conclusion="failure")
+    ]
+    check_calls = 0
+
+    def fake_run(argv: list[str], **_kwargs: object) -> _ProcessResult:
+        nonlocal check_calls
+        if argv[1:3] == ["pr", "view"]:
+            return _ProcessResult(0, json.dumps(row), "")
+        if str(argv[2]).endswith("/check-runs"):
+            check_calls += 1
+            page = int(next(item.split("=", 1)[1] for item in argv if item.startswith("page=")))
+            start = (page - 1) * 100
+            return _ProcessResult(
+                0,
+                json.dumps(_rest_check_run_payload(all_runs[start : start + 100], total_count=101)),
+                "",
+            )
+        return _ProcessResult(0, json.dumps(_rest_commit_status_payload([])), "")
+
+    monkeypatch.setattr(github_module, "_run_process", fake_run)
+    result = github_module.GhCliClient(_TEST_CLI).observe_pull_request(
+        repo_root=tmp_path,
+        repository="owner/repo",
+        base="main",
+        branch="codex/task-12345678",
+        number=7,
+        url="https://github.com/Owner/Repo/pull/7",
+        expected_sha="a" * 40,
+    )
+
+    assert result.success is True
+    assert result.checks == "failed"
+    assert result.total_checks == 101
+    assert result.passed_checks == 100
+    assert result.failed_checks == 1
+    assert check_calls == 2
+
+
+def test_github_observer_accepts_exactly_500_checks_across_both_rest_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _observed_pr_row()
+    row.pop("statusCheckRollup")
+    runs = [_rest_check_run(index) for index in range(1, 251)]
+    statuses = [_rest_commit_status(index) for index in range(1, 251)]
+
+    def fake_run(argv: list[str], **_kwargs: object) -> _ProcessResult:
+        if argv[1:3] == ["pr", "view"]:
+            return _ProcessResult(0, json.dumps(row), "")
+        page = int(next(item.split("=", 1)[1] for item in argv if item.startswith("page=")))
+        start = (page - 1) * 100
+        if str(argv[2]).endswith("/check-runs"):
+            payload = _rest_check_run_payload(runs[start : start + 100], total_count=250)
+        else:
+            payload = _rest_commit_status_payload(
+                statuses[start : start + 100], total_count=250, state="success"
+            )
+        return _ProcessResult(0, json.dumps(payload), "")
+
+    monkeypatch.setattr(github_module, "_run_process", fake_run)
+    result = github_module.GhCliClient(_TEST_CLI).observe_pull_request(
+        repo_root=tmp_path,
+        repository="owner/repo",
+        base="main",
+        branch="codex/task-12345678",
+        number=7,
+        url="https://github.com/Owner/Repo/pull/7",
+        expected_sha="a" * 40,
+    )
+
+    assert result.success is True
+    assert result.checks == "passed"
+    assert result.total_checks == 500
+    assert result.passed_checks == 500
+
+
+def test_github_observer_rejects_more_than_500_combined_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _observed_pr_row()
+    row.pop("statusCheckRollup")
+
+    def fake_run(argv: list[str], **_kwargs: object) -> _ProcessResult:
+        if argv[1:3] == ["pr", "view"]:
+            return _ProcessResult(0, json.dumps(row), "")
+        if str(argv[2]).endswith("/check-runs"):
+            return _ProcessResult(
+                0,
+                json.dumps(_rest_check_run_payload([_rest_check_run(1)])),
+                "",
+            )
+        return _ProcessResult(
+            0,
+            json.dumps(
+                _rest_commit_status_payload(
+                    [_rest_commit_status(index) for index in range(1, 101)],
+                    total_count=500,
+                    state="success",
+                )
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(github_module, "_run_process", fake_run)
+    result = github_module.GhCliClient(_TEST_CLI).observe_pull_request(
+        repo_root=tmp_path,
+        repository="owner/repo",
+        base="main",
+        branch="codex/task-12345678",
+        number=7,
+        url="https://github.com/Owner/Repo/pull/7",
+        expected_sha="a" * 40,
+    )
+
+    assert result.success is False
+    assert result.lifecycle == "unavailable"
+
+
+@pytest.mark.parametrize("mode", ["truncated", "count-change", "duplicate", "wrong-sha"])
+def test_github_observer_fails_closed_on_ambiguous_check_run_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    row = _observed_pr_row()
+    row.pop("statusCheckRollup")
+    calls = 0
+
+    def fake_run(argv: list[str], **_kwargs: object) -> _ProcessResult:
+        nonlocal calls
+        if argv[1:3] == ["pr", "view"]:
+            return _ProcessResult(0, json.dumps(row), "")
+        if not str(argv[2]).endswith("/check-runs"):
+            raise AssertionError("status query must not follow invalid check-run data")
+        calls += 1
+        if mode == "truncated":
+            payload = _rest_check_run_payload([_rest_check_run(1)], total_count=2)
+        elif mode == "wrong-sha":
+            payload = _rest_check_run_payload([_rest_check_run(1, sha="b" * 40)])
+        elif calls == 1:
+            payload = _rest_check_run_payload(
+                [_rest_check_run(index) for index in range(1, 101)], total_count=101
+            )
+        elif mode == "count-change":
+            payload = _rest_check_run_payload([_rest_check_run(101)], total_count=102)
+        else:
+            payload = _rest_check_run_payload([_rest_check_run(1)], total_count=101)
+        return _ProcessResult(0, json.dumps(payload), "")
+
+    monkeypatch.setattr(github_module, "_run_process", fake_run)
+    result = github_module.GhCliClient(_TEST_CLI).observe_pull_request(
+        repo_root=tmp_path,
+        repository="owner/repo",
+        base="main",
+        branch="codex/task-12345678",
+        number=7,
+        url="https://github.com/Owner/Repo/pull/7",
+        expected_sha="a" * 40,
+    )
+
+    assert result.success is False
+    assert result.lifecycle == "unavailable"
+
+
+@pytest.mark.parametrize(
+    "status_payload",
+    [
+        _rest_commit_status_payload(
+            [_rest_commit_status(1)],
+            sha="b" * 40,
+        ),
+        _rest_commit_status_payload(
+            [_rest_commit_status(1)],
+            state="failure",
+        ),
+        _rest_commit_status_payload(
+            [_rest_commit_status(1)],
+            total_count=2,
+            state="success",
+        ),
+    ],
+)
+def test_github_observer_fails_closed_on_ambiguous_commit_status_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_payload: dict[str, object],
+) -> None:
+    row = _observed_pr_row()
+    row.pop("statusCheckRollup")
+
+    def fake_run(argv: list[str], **_kwargs: object) -> _ProcessResult:
+        if argv[1:3] == ["pr", "view"]:
+            return _ProcessResult(0, json.dumps(row), "")
+        if str(argv[2]).endswith("/check-runs"):
+            return _ProcessResult(0, json.dumps(_rest_check_run_payload([])), "")
+        return _ProcessResult(0, json.dumps(status_payload), "")
+
+    monkeypatch.setattr(github_module, "_run_process", fake_run)
+    result = github_module.GhCliClient(_TEST_CLI).observe_pull_request(
+        repo_root=tmp_path,
+        repository="owner/repo",
+        base="main",
+        branch="codex/task-12345678",
+        number=7,
+        url="https://github.com/Owner/Repo/pull/7",
+        expected_sha="a" * 40,
+    )
+
+    assert result.success is False
+    assert result.lifecycle == "unavailable"
+
+
+def test_github_observer_fails_closed_if_head_changes_during_rest_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_row = _observed_pr_row()
+    first_row.pop("statusCheckRollup")
+    final_row = _observed_pr_row(head_sha="b" * 40)
+    final_row.pop("statusCheckRollup")
+    identity_rows = iter([first_row, final_row])
+
+    def fake_run(argv: list[str], **_kwargs: object) -> _ProcessResult:
+        if argv[1:3] == ["pr", "view"]:
+            return _ProcessResult(0, json.dumps(next(identity_rows)), "")
+        if str(argv[2]).endswith("/check-runs"):
+            return _ProcessResult(0, json.dumps(_rest_check_run_payload([])), "")
+        return _ProcessResult(0, json.dumps(_rest_commit_status_payload([])), "")
+
+    monkeypatch.setattr(github_module, "_run_process", fake_run)
+    result = github_module.GhCliClient(_TEST_CLI).observe_pull_request(
+        repo_root=tmp_path,
+        repository="owner/repo",
+        base="main",
+        branch="codex/task-12345678",
+        number=7,
+        url="https://github.com/Owner/Repo/pull/7",
+        expected_sha="a" * 40,
+    )
+
+    assert result.success is False
+    assert result.lifecycle == "unavailable"
 
 
 @pytest.mark.parametrize(

@@ -659,6 +659,15 @@ class DeliveryWorkflow:
                 return
             status = str(task_data.get("status", ""))
             now = _now()
+            newer = self._newer_open_delivery(job)
+            if newer is not None:
+                job.task_reconciliation = "superseded"
+                job.task_reconciled_at = now
+                job.observation_message = (
+                    f"{self._observation_message(job)} A newer pull request "
+                    f"({newer.delivery_id}) remains authoritative for the task."
+                )
+                return
 
             if job.pr_state == "merged":
                 if status == "completed":
@@ -698,15 +707,6 @@ class DeliveryWorkflow:
                     )
                     return
             else:
-                newer = self._newer_open_delivery(job)
-                if newer is not None:
-                    job.task_reconciliation = "superseded"
-                    job.task_reconciled_at = now
-                    job.observation_message = (
-                        f"{self._observation_message(job)} A newer pull request "
-                        f"({newer.delivery_id}) remains authoritative for the task."
-                    )
-                    return
                 if status == "in-progress":
                     job.task_reconciliation = "already-in-progress"
                     job.task_reconciled_at = now
@@ -748,7 +748,7 @@ class DeliveryWorkflow:
         )
 
     def _newer_open_delivery(self, job: DeliveryJob) -> DeliveryJob | None:
-        """Return a newer PR-backed delivery that supersedes a failed PR."""
+        """Return a newer open delivery that supersedes this PR outcome."""
         current_key = (job.created_at, job.delivery_id)
         for candidate in self.store.history(task_id=job.task_id, limit=0):
             if (

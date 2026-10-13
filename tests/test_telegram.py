@@ -1478,12 +1478,51 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(follow_up["task_id"], "TASK-0001")
         self.assertEqual(follow_up["project_name"], "weatherbot")
         self.assertEqual(follow_up["chat_id"], 7)
+        self.assertGreater(follow_up["expires_at"], follow_up["created_at"])
         self.assertEqual(
             follow_up["pr_url"], "https://github.com/example/mondayos/pull/55",
         )
         persisted = config.state_path.read_text(encoding="utf-8")
         self.assertNotIn(request_text, persisted)
         self.assertNotIn("private launch plan", persisted)
+
+    def test_live_build_reports_when_pr_watcher_capacity_is_full(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        runner = TelegramRunner(self.client, service, self.state, poll_timeout=1)
+        runner.start()
+        self.state.set_job(720)
+        self.state.start_follow_up(
+            720,
+            {
+                "kind": "pr-lifecycle",
+                "phase": "pending",
+                "next_poll_at": time.time() + 3_600,
+            },
+        )
+        self.state.acknowledge(720)
+        self.client.updates = [_update(update_id=721, text="/build Ship safely")]
+
+        with patch("telegram_bot.state._MAX_ACTIVE_FOLLOW_UPS", 1):
+            self.assertEqual(runner.run_once(), 1)
+
+        follow_up = self.state.completed_job(721)["follow_up"]
+        self.assertEqual(follow_up["phase"], "not-started-capacity")
+        payload = json.loads(config.state_path.read_text(encoding="utf-8"))
+        active = [
+            record["follow_up"]
+            for record in payload["completed_jobs"].values()
+            if record.get("follow_up", {}).get("phase")
+            in {"pending", "polling", "retrying"}
+        ]
+        self.assertEqual(len(active), 1)
+        self.assertIn("500-watcher limit is full", self.client.sent[-1][1])
+        self.assertIn("pull request is unaffected", self.client.sent[-1][1].lower())
 
     def test_pr_follow_up_notifies_only_changes_and_stops_after_merge(self):
         config = TelegramConfig(
@@ -1643,6 +1682,108 @@ class TestTelegramStateAndRunner(TelegramFixture):
         persisted = config.state_path.read_text(encoding="utf-8")
         self.assertNotIn("raw remote log", persisted)
         self.assertNotIn("private diagnostic", persisted)
+
+    def test_pr_follow_up_honors_telegram_rate_limit_beyond_observer_cap(self):
+        self.state.set_job(
+            76,
+            follow_up={
+                "kind": "pr-lifecycle",
+                "phase": "pending",
+                "next_poll_at": 0.0,
+                "failure_count": 0,
+            },
+        )
+        self.state.acknowledge(76)
+        service = MagicMock()
+        service.poll_follow_up.side_effect = TelegramRateLimitError(3_600)
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        before = time.time()
+
+        self.assertTrue(worker.run_follow_up_once())
+
+        follow_up = self.state.completed_job(76)["follow_up"]
+        self.assertEqual(follow_up["phase"], "retrying")
+        self.assertEqual(follow_up["failure_count"], 1)
+        self.assertGreaterEqual(follow_up["next_poll_at"], before + 3_599)
+        self.assertLessEqual(follow_up["next_poll_at"], before + 3_602)
+        self.assertFalse(worker.run_follow_up_once())
+
+    def test_permanent_telegram_failure_stops_pr_follow_up_without_diagnostic(self):
+        self.state.set_job(
+            77,
+            follow_up={
+                "kind": "pr-lifecycle",
+                "phase": "pending",
+                "next_poll_at": 0.0,
+                "failure_count": 0,
+            },
+        )
+        self.state.acknowledge(77)
+        service = MagicMock()
+        service.poll_follow_up.side_effect = TelegramAPIError(
+            "private destination diagnostic",
+            retryable=False,
+            status_code=403,
+        )
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        self.assertTrue(worker.run_follow_up_once())
+
+        follow_up = self.state.completed_job(77)["follow_up"]
+        self.assertEqual(follow_up["phase"], "notification-failed")
+        self.assertEqual(follow_up["failure_count"], 1)
+        self.assertEqual(follow_up["next_poll_at"], 0.0)
+        self.assertFalse(worker.run_follow_up_once())
+        persisted = self.config.state_path.read_text(encoding="utf-8")
+        self.assertNotIn("private destination diagnostic", persisted)
+
+    def test_pr_follow_up_expiry_survives_restart_and_frees_capacity(self):
+        first = {
+            "kind": "pr-lifecycle",
+            "phase": "pending",
+            "next_poll_at": 1_000.0,
+            "failure_count": 0,
+        }
+        self.state.set_job(78)
+        with (
+            patch("telegram_bot.state._MAX_ACTIVE_FOLLOW_UPS", 1),
+            patch("telegram_bot.state._FOLLOW_UP_MAX_AGE_SECONDS", 10),
+        ):
+            started = self.state.start_follow_up(78, first, now=100.0)
+            self.state.acknowledge(78)
+            self.assertEqual(started["expires_at"], 110.0)
+
+            restarted = TelegramState(self.config.state_path)
+            self.assertIsNone(restarted.claim_due_follow_up(now=111.0))
+            self.assertEqual(
+                restarted.completed_job(78)["follow_up"]["phase"],
+                "expired",
+            )
+
+            restarted.set_job(79)
+            second = restarted.start_follow_up(79, first, now=111.0)
+
+        self.assertEqual(second["phase"], "pending")
+        self.assertEqual(second["expires_at"], 121.0)
+
+    def test_completed_telegram_tombstones_remain_bounded(self):
+        with patch("telegram_bot.state._MAX_COMPLETED_JOBS", 3):
+            for update_id in range(80, 84):
+                self.state.set_job(update_id)
+                self.state.acknowledge(update_id)
+
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(payload["completed_jobs"]), ["81", "82", "83"])
 
     def test_blocked_pr_observation_does_not_block_telegram_intake(self):
         observation_started = threading.Event()

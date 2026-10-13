@@ -502,11 +502,25 @@ def test_observe_terminal_unmerged_pr_returns_task_to_in_progress(
     assert monday.calls.count("start") == 1
 
 
-def test_observe_old_closed_pr_does_not_reopen_task_owned_by_newer_pr(
+@pytest.mark.parametrize(
+    ("lifecycle", "checks", "merge_commit_sha"),
+    [
+        ("closed", "failed", ""),
+        ("merged", "passed", "4" * 40),
+    ],
+)
+def test_observe_old_terminal_pr_does_not_change_task_owned_by_newer_pr(
     tmp_path: Path,
+    lifecycle: str,
+    checks: str,
+    merge_commit_sha: str,
 ) -> None:
     root, _ = _repository(tmp_path)
-    github = _ObserverGitHub(lifecycle="closed", checks="failed")
+    github = _ObserverGitHub(
+        lifecycle=lifecycle,
+        checks=checks,
+        merge_commit_sha=merge_commit_sha,
+    )
     monday = _Monday()
     monday.status = "review"
     workflow, _ = _workflow(
@@ -531,6 +545,7 @@ def test_observe_old_closed_pr_does_not_reopen_task_owned_by_newer_pr(
     assert observed.task_reconciliation == "superseded"
     assert monday.status == "review"
     assert monday.calls.count("start") == 0
+    assert monday.calls.count("complete") == 0
 
 
 def test_observe_outage_is_retryable_without_overwriting_last_known_state(

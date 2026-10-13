@@ -50,9 +50,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
   request-free tombstone retains the exact delivery/PR identity, polling state,
   and last meaningful transition; duplicate states stay silent, transient
   observation failures back off, and terminal merged, closed, or diverged states
-  stop the watcher. No check names, logs, or raw remote diagnostics are retained
-  or sent. The normal daemon provides this monitoring; `--once` only ingests and
-  drains queued requests and does not keep watching afterward.
+  stop the watcher. Watchers are also bounded to 500 active records and 30 days;
+  capacity refusal is explicit, and permanent Telegram destination failures stop
+  without retaining diagnostics. No check names, logs, or raw remote diagnostics
+  are retained or sent. The normal daemon provides this monitoring; `--once`
+  only ingests and drains queued requests and does not keep watching afterward.
 - Durable Telegram intake and a single background execution worker. Authorized
   minimal requests are atomically queued with the advanced offset in
   `logs/telegram/state.json` and receive an immediate saved/position receipt;

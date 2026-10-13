@@ -486,14 +486,21 @@ class TelegramBotService:
             return
         saved_result = job.get("delivery_result")
         if bool(job.get("delivery_terminal")) and isinstance(saved_result, dict):
-            self._ensure_lifecycle_follow_up(
+            follow_up_phase = self._ensure_lifecycle_follow_up(
                 update_id,
                 chat_id,
                 task_id,
                 saved_result,
                 str(job.get("project_name") or ""),
             )
-            self._client.send_message(chat_id, _delivery_result(task_id, saved_result))
+            self._client.send_message(
+                chat_id,
+                _delivery_result(
+                    task_id,
+                    saved_result,
+                    follow_up_phase=follow_up_phase,
+                ),
+            )
             self._state.set_job(update_id, delivery_final_sent=True)
             return
 
@@ -534,14 +541,21 @@ class TelegramBotService:
             delivery_result=result,
         )
         if terminal:
-            self._ensure_lifecycle_follow_up(
+            follow_up_phase = self._ensure_lifecycle_follow_up(
                 update_id,
                 chat_id,
                 task_id,
                 result,
                 project_name,
             )
-            self._client.send_message(chat_id, _delivery_result(task_id, result))
+            self._client.send_message(
+                chat_id,
+                _delivery_result(
+                    task_id,
+                    result,
+                    follow_up_phase=follow_up_phase,
+                ),
+            )
             self._state.set_job(update_id, delivery_final_sent=True)
             return
 
@@ -572,20 +586,20 @@ class TelegramBotService:
         task_id: str,
         result: dict[str, Any],
         project_name: str,
-    ) -> None:
+    ) -> str:
         """Checkpoint a request-free PR observer before the build is acknowledged."""
         if str(result.get("status") or "").lower() != "pr-open":
-            return
+            return ""
         delivery_id = str(result.get("delivery_id") or "")
         pr_url = _github_pr_url(result.get("pr_url", ""))
         if not bool(result.get("success")) or not _DELIVERY_ID.fullmatch(delivery_id) or not pr_url:
-            return
+            return ""
         current = self._state.job(update_id).get("follow_up")
         if isinstance(current, dict):
-            return
-        self._state.set_job(
+            return str(current.get("phase") or "")
+        follow_up = self._state.start_follow_up(
             update_id,
-            follow_up={
+            {
                 "kind": "pr-lifecycle",
                 "phase": "pending",
                 "delivery_id": delivery_id,
@@ -602,6 +616,7 @@ class TelegramBotService:
                 "last_notified_key": "",
             },
         )
+        return str(follow_up.get("phase") or "")
 
     def _live_progress(self, update_id: int, chat_id: int, event: Any) -> None:
         snapshot = _delivery_progress_snapshot(event)
@@ -1046,14 +1061,25 @@ def _delivery_terminal(status: str) -> bool:
     }
 
 
-def _delivery_result(task_id: str, result: dict[str, Any]) -> str:
+def _delivery_result(
+    task_id: str,
+    result: dict[str, Any],
+    *,
+    follow_up_phase: str = "",
+) -> str:
     status = str(result.get("status") or "failed")
     pr_url = _github_pr_url(result.get("pr_url", ""))
     commit = str(result.get("commit_sha") or "")
     success = bool(result.get("success"))
     if success and pr_url:
         lines = [f"{task_id} passed ChatGPT review.", f"Pull request: {pr_url}"]
-        lines.append("Monday will keep watching GitHub checks and the pull request.")
+        if follow_up_phase == "not-started-capacity":
+            lines.append(
+                "Monday did not start automatic PR monitoring because the "
+                "500-watcher limit is full. The pull request is unaffected."
+            )
+        else:
+            lines.append("Monday will keep watching GitHub checks and the pull request.")
     else:
         lines = [f"{task_id} live build: {status}."]
         if pr_url:

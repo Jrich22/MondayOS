@@ -99,12 +99,17 @@ class TelegramJobWorker:
         try:
             poller(update_id, follow_up)
         except TelegramRateLimitError as exc:
-            self._state.defer_follow_up(
+            self._state.defer_rate_limited_follow_up(
                 update_id,
-                delay_seconds=max(1, exc.retry_after),
+                retry_after=exc.retry_after,
             )
-        except TelegramAPIError:
-            self._state.defer_follow_up(update_id, delay_seconds=60)
+        except TelegramAPIError as exc:
+            if exc.retryable:
+                self._state.defer_follow_up(update_id, delay_seconds=60)
+            else:
+                # A blocked bot or deleted chat will never recover by polling.
+                # Stop this watcher without retaining Telegram's diagnostic.
+                self._state.mark_follow_up_notification_failed(update_id)
         except Exception:
             # Observation failures are deliberately isolated from accepted
             # work. The tombstone remains restart-safe and retains no raw

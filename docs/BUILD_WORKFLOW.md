@@ -139,13 +139,16 @@ That status is not a request for the old team-workflow approval command.
 The delivery result remains `pr-open`; later GitHub state is stored separately
 as an observation so a failed check cannot rewrite the fact that the reviewed
 artifact was delivered. `monday build observe` reads only structured PR and
-check metadata. It never reads check logs, changes the PR, merges, or deploys.
+check metadata. It follows the REST totals for latest check runs and combined
+commit statuses, paginating at most 500 combined checks; partial responses,
+inconsistent pagination, or a larger result fail closed as unavailable. It
+never reads check logs, changes the PR, merges, or deploys.
 
-If a newer PR-backed delivery exists for the same task, closing or changing an
-older PR does not reopen the task underneath the newer work. A verified merge of
-an exact reviewed head completes an eligible task idempotently. Completed,
-cancelled, blocked, retargeted, and otherwise human-managed task states are not
-overridden by the observer.
+If a newer PR-backed delivery exists for the same task, any terminal outcome for
+an older PR is recorded but does not change the task underneath the newer work.
+Otherwise, a verified merge of an exact reviewed head completes an eligible task
+idempotently. Completed, cancelled, blocked, retargeted, and otherwise
+human-managed task states are not overridden by the observer.
 
 ## Validation containment
 

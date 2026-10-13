@@ -1052,12 +1052,13 @@ descriptions, annotations, and logs are neither exposed nor persisted. The
 observer may persist this bounded local record, but it cannot mutate GitHub: it
 does not push, edit, close, merge, or deploy.
 
-Task reconciliation occurs only after a verified terminal PR state. An exact
-reviewed merge completes an eligible task idempotently. A closed or SHA-diverged
-PR returns a task still in `REVIEW` to `IN_PROGRESS`, unless a newer open
-delivery remains authoritative. Open check states, including `failed`, never
-change task status. Completed, cancelled, blocked, retargeted, or otherwise
-human-managed states are not overridden.
+Task reconciliation occurs only after a verified terminal PR state. A newer open
+delivery remains authoritative over every outcome from an older PR, including a
+merge. Otherwise, an exact reviewed merge completes an eligible task
+idempotently, while a closed or SHA-diverged PR returns a task still in `REVIEW`
+to `IN_PROGRESS`. Open check states, including `failed`, never change task
+status. Completed, cancelled, blocked, retargeted, or otherwise human-managed
+states are not overridden.
 
 Observation is serialized with publication finalization by the repository
 workflow lease. Any terminal task transition is then performed under the same
@@ -1070,8 +1071,11 @@ daemon persists the follow-up phase, next poll time, last observation, and last
 notified transition, so an in-flight poll is reclaimable after restart. It sends
 only meaningful aggregate/lifecycle transitions, stays silent on duplicates,
 backs off transient failures without retaining their raw diagnostics, and stops
-after a verified terminal state. `monday telegram --once` drains accepted work
-and exits; it is not an ongoing lifecycle monitor.
+after a verified terminal state. A watcher also stops after 30 days or a
+permanent Telegram destination failure. At most 500 watchers are active; a new
+one is visibly declined without affecting its PR when that capacity is full.
+`monday telegram --once` drains accepted work and exits; it is not an ongoing
+lifecycle monitor.
 
 ### Alternatives Considered
 
