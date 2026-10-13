@@ -81,6 +81,18 @@ class DeliveryJob:
     root_device: int = 0
     root_inode: int = 0
     worktree_owner_token: str = ""
+    # Pull-request lifecycle is observed after the immutable delivery result.
+    # These fields never change the reviewed artifact or the original build
+    # outcome; they record what GitHub later reported for that exact commit.
+    pr_state: str = "unobserved"
+    checks_status: str = "unobserved"
+    check_counts: dict[str, int] = field(default_factory=dict)
+    merge_commit_sha: str = ""
+    pr_observed_at: str = ""
+    observation_success: bool = False
+    observation_message: str = ""
+    task_reconciliation: str = ""
+    task_reconciled_at: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -129,4 +141,33 @@ class DeliveryJob:
             message=str(data.get("message", "")),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
+            pr_state=str(data.get("pr_state", data.get("pr_lifecycle", "unobserved"))),
+            checks_status=str(data.get("checks_status", "unobserved")),
+            check_counts=_check_counts(data.get("check_counts")),
+            merge_commit_sha=str(data.get("merge_commit_sha", "")),
+            pr_observed_at=str(data.get("pr_observed_at", "")),
+            observation_success=bool(data.get("observation_success", False)),
+            observation_message=str(data.get("observation_message", "")),
+            task_reconciliation=str(data.get("task_reconciliation", "")),
+            task_reconciled_at=str(data.get("task_reconciled_at", "")),
         )
+
+
+def _check_counts(value: object) -> dict[str, int]:
+    """Read only a complete, bounded aggregate from a durable record."""
+    required = {"total", "passed", "failed", "pending"}
+    if not isinstance(value, dict) or set(value) != required:
+        return {}
+    if any(
+        isinstance(value[key], bool)
+        or not isinstance(value[key], int)
+        or not 0 <= value[key] <= 500
+        for key in required
+    ):
+        return {}
+    counts = {key: int(value[key]) for key in required}
+    if counts["total"] != (
+        counts["passed"] + counts["failed"] + counts["pending"]
+    ):
+        return {}
+    return counts

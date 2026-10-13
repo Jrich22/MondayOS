@@ -86,15 +86,48 @@ class TelegramJobWorker:
         self._state.acknowledge(update_id)
         return True
 
+    def run_follow_up_once(self) -> bool:
+        """Observe one due PR lifecycle without rehydrating request text."""
+        claimed = self._state.claim_due_follow_up()
+        if claimed is None:
+            return False
+        update_id, follow_up = claimed
+        poller = getattr(self._service, "poll_follow_up", None)
+        if not callable(poller):
+            self._state.defer_follow_up(update_id, delay_seconds=300)
+            return True
+        try:
+            poller(update_id, follow_up)
+        except TelegramRateLimitError as exc:
+            self._state.defer_rate_limited_follow_up(
+                update_id,
+                retry_after=exc.retry_after,
+            )
+        except TelegramAPIError as exc:
+            if exc.retryable:
+                self._state.defer_follow_up(update_id, delay_seconds=60)
+            else:
+                # A blocked bot or deleted chat will never recover by polling.
+                # Stop this watcher without retaining Telegram's diagnostic.
+                self._state.mark_follow_up_notification_failed(update_id)
+        except Exception:
+            # Observation failures are deliberately isolated from accepted
+            # work. The tombstone remains restart-safe and retains no raw
+            # remote diagnostic text.
+            self._state.defer_follow_up(update_id, delay_seconds=60)
+        return True
+
     def run_forever(self) -> None:
         backoff = 1
         while not self._stop.is_set():
             try:
                 worked = self.run_once()
-                if worked:
+                followed_up = self.run_follow_up_once()
+                if worked or followed_up:
                     backoff = 1
                     continue
-                self._wake.wait()
+                delay = self._state.next_follow_up_delay()
+                self._wake.wait(timeout=delay)
                 self._wake.clear()
             except TelegramRateLimitError as exc:
                 print(str(exc), file=sys.stderr)

@@ -26,6 +26,13 @@ class _Job:
             "pr_url": "https://github.com/acme/mondayos/pull/7",
             "changed_files": ["monday/api.py"],
             "attempts": [{"number": 1, "status": "passed"}],
+            "pr_state": "open",
+            "checks_status": "pending",
+            "merge_commit_sha": "",
+            "pr_observed_at": "2026-10-13T00:00:00+00:00",
+            "observation_success": True,
+            "observation_message": "The pull request is open; checks are pending.",
+            "task_reconciliation": "",
             "message": "Pull request opened.",
         }
         self.payload.update(overrides)
@@ -50,6 +57,10 @@ class _Workflow:
 
     def get(self, delivery_id: str) -> _Job:
         self.calls.append(("get", {"delivery_id": delivery_id}))
+        return self.job
+
+    def observe(self, delivery_id: str) -> _Job:
+        self.calls.append(("observe", {"delivery_id": delivery_id}))
         return self.job
 
     def history(self, **kwargs: object) -> list[object]:
@@ -84,6 +95,11 @@ def test_build_response_is_part_of_the_public_package() -> None:
     assert response.project_name == ""
     assert response.repository == ""
     assert response.repo_root == ""
+    assert response.pr_state == "unobserved"
+    assert response.checks_status == "unobserved"
+    assert response.merge_commit_sha == ""
+    assert response.pr_observed_at == ""
+    assert response.task_reconciliation == ""
 
 
 def test_build_run_passes_identity_and_callbacks_without_invoking_real_tools(
@@ -142,6 +158,33 @@ def test_build_get_reports_successful_lookup_even_for_failed_job(tmp_path: Path)
     assert response.success is True
     assert response.status == "failed"
     assert workflow.calls == [("get", {"delivery_id": "delivery-test-1"})]
+
+
+def test_build_observe_surfaces_pr_lifecycle_and_observation_outcome(
+    tmp_path: Path,
+) -> None:
+    workflow = _Workflow()
+
+    response = _call_build(
+        _monday(tmp_path), workflow, "observe", delivery_id="delivery-test-1"
+    )
+
+    assert response.success is True
+    assert response.pr_state == "open"
+    assert response.checks_status == "pending"
+    assert response.pr_observed_at == "2026-10-13T00:00:00+00:00"
+    assert response.message == "The pull request is open; checks are pending."
+    assert workflow.calls == [("observe", {"delivery_id": "delivery-test-1"})]
+
+    workflow.job = _Job(
+        observation_success=False,
+        observation_message="GitHub observation is temporarily unavailable.",
+    )
+    unavailable = _call_build(
+        _monday(tmp_path), workflow, "observe", delivery_id="delivery-test-1"
+    )
+    assert unavailable.success is False
+    assert "unavailable" in unavailable.message
 
 
 def test_build_history_normalizes_objects_and_dicts(tmp_path: Path) -> None:
@@ -238,6 +281,43 @@ def test_build_project_selector_pins_registered_target_in_workflow_constructor(
             "checkpoint_callback": None,
         },
     )]
+
+
+def test_build_observe_reconstructs_the_registered_external_target(
+    tmp_path: Path,
+) -> None:
+    controller = tmp_path / "controller"
+    target = tmp_path / "weather-portal"
+    target.mkdir(parents=True)
+    monday = _monday(controller)
+    assert monday.project(
+        "register",
+        name="Weather Portal",
+        path=str(target),
+        delivery_repository="Acme/Weather-Portal",
+    ).success
+    workflow = _Workflow()
+    workflow.job = _Job(project_name="weather-portal")
+    constructor = mock.Mock(return_value=workflow)
+
+    with mock.patch("delivery.workflow.DeliveryWorkflow", constructor):
+        response = monday.build(
+            "observe",
+            delivery_id="delivery-test-1",
+            project="Weather Portal",
+        )
+
+    target_stat = target.stat()
+    assert response.success is True
+    constructor.assert_called_once_with(
+        project_root=controller,
+        monday=monday,
+        repository_root=target.resolve(),
+        project_name="weather-portal",
+        expected_repository="acme/weather-portal",
+        expected_root_identity=(target_stat.st_dev, target_stat.st_ino),
+    )
+    assert workflow.calls == [("observe", {"delivery_id": "delivery-test-1"})]
 
 
 def test_build_refuses_analysis_only_project_before_constructing_workflow(
@@ -515,6 +595,10 @@ def test_build_cli_forwards_explicit_project_to_every_selector_aware_action(
     run = _response()
     get = _response()
     get.action = "get"
+    observe = _response()
+    observe.action = "observe"
+    observe.pr_state = "open"
+    observe.checks_status = "pending"
     history = BuildResponse(action="history", success=True, data={"jobs": [], "count": 0})
     capabilities = BuildResponse(
         action="capabilities", success=True, data={"ready": True}
@@ -523,7 +607,7 @@ def test_build_cli_forwards_explicit_project_to_every_selector_aware_action(
     with mock.patch.object(
         Monday,
         "build",
-        side_effect=[run, get, history, capabilities],
+        side_effect=[run, get, observe, history, capabilities],
     ) as build:
         assert _cli(
             "--project-root",
@@ -539,6 +623,15 @@ def test_build_cli_forwards_explicit_project_to_every_selector_aware_action(
             str(tmp_path),
             "build",
             "get",
+            "delivery-test-1",
+            "--project",
+            "weather-portal",
+        )[0] == 0
+        assert _cli(
+            "--project-root",
+            str(tmp_path),
+            "build",
+            "observe",
             "delivery-test-1",
             "--project",
             "weather-portal",
@@ -569,6 +662,11 @@ def test_build_cli_forwards_explicit_project_to_every_selector_aware_action(
         ),
         mock.call(
             "get",
+            delivery_id="delivery-test-1",
+            project="weather-portal",
+        ),
+        mock.call(
+            "observe",
             delivery_id="delivery-test-1",
             project="weather-portal",
         ),

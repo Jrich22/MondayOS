@@ -1,6 +1,6 @@
 # MondayOS — Architectural Decision Records
 
-**Last Updated:** 2026-10-04
+**Last Updated:** 2026-10-13
 
 This file is the canonical log of all architectural decisions made for MondayOS. Decisions are recorded in the format described in [DOCUMENTATION_STANDARDS.md](DOCUMENTATION_STANDARDS.md).
 
@@ -1004,3 +1004,98 @@ merge, or deployment.
   but they cannot silently authorize a different artifact.
 - Merge and deployment automation require a separate decision and are outside
   this ADR.
+
+---
+
+## ADR-023: Pull-Request Observation Is Exact-Artifact and Aggregate-Only
+
+**Date:** 2026-10-13
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+ADR-022 makes an open pull request the terminal result of autonomous delivery,
+not a release. GitHub can later run checks, accept a human merge, close the PR,
+or move its head. MondayOS needs to report those changes and reconcile its local
+task without turning observation into a new mutation authority or trusting a
+different artifact than the one ChatGPT reviewed.
+
+CI output is also repository-controlled input. Individual check names,
+descriptions, annotations, and logs are unnecessary for lifecycle reporting and
+would create a new untrusted-text channel into durable records and Telegram.
+
+### Decision
+
+MondayOS provides a separate, GitHub-read-only observation operation for a
+successful PR-backed delivery:
+
+```bash
+monday build observe DELIVERY-ID [--project NAME] [--json]
+```
+
+The observer reconstructs authority from the durable delivery record. Before it
+accepts an observation, the selected target must still match the pinned project,
+canonical repository directory and filesystem identity, and GitHub origin. The
+GitHub response must match the saved repository, base branch, head branch,
+pull-request number and URL, same-repository relationship, and reviewed commit
+SHA. A head that no longer equals that SHA is a terminal `diverged` result; the
+observer never silently follows replacement bytes. An unavailable or
+inconsistent response fails closed and does not replace the last verified
+lifecycle state.
+
+Check information is reduced to bounded counts and exactly one aggregate state:
+`pending`, `passed`, `failed`, or `no-checks`. Individual check names,
+descriptions, annotations, and logs are neither exposed nor persisted. The
+observer may persist this bounded local record, but it cannot mutate GitHub: it
+does not push, edit, close, merge, or deploy.
+
+Task reconciliation occurs only after a verified terminal PR state. A newer open
+delivery remains authoritative over every outcome from an older PR, including a
+merge. Otherwise, an exact reviewed merge completes an eligible task
+idempotently, while a closed or SHA-diverged PR returns a task still in `REVIEW`
+to `IN_PROGRESS`. Open check states, including `failed`, never change task
+status. Completed, cancelled, blocked, retargeted, or otherwise human-managed
+states are not overridden.
+
+Observation is serialized with publication finalization by the repository
+workflow lease. Any terminal task transition is then performed under the same
+per-task lock used by normal MondayOS and human-triggered mutations, with the
+task target revalidated inside that lock.
+
+For private Telegram live builds, the completed request becomes a request-free
+tombstone with an immutable delivery, task, project, chat, and PR identity. The
+daemon persists the follow-up phase, next poll time, last observation, and last
+notified transition, so an in-flight poll is reclaimable after restart. It sends
+only meaningful aggregate/lifecycle transitions, stays silent on duplicates,
+backs off transient failures without retaining their raw diagnostics, and stops
+after a verified terminal state. A watcher also stops after 30 days or a
+permanent Telegram destination failure. At most 500 watchers are active; a new
+one is visibly declined without affecting its PR when that capacity is full.
+`monday telegram --once` drains accepted work and exits; it is not an ongoing
+lifecycle monitor.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Follow a branch or the latest PR for a task | Either can be rebound to bytes that were never validated or reviewed. |
+| Persist and forward individual CI results | Names, annotations, and logs are untrusted text and are not needed for a lifecycle decision. |
+| Reconcile tasks from check success or failure | Checks can be rerun and do not establish that the PR was merged, closed, or still points to the reviewed commit. |
+| Let the observer merge, close, or deploy | That would cross the release boundary established by ADR-022. |
+| Use inbound GitHub webhooks for the first implementation | A public receiver, secret management, and replay verification add an unnecessary inbound surface to the outbound-only control plane. |
+
+### Consequences
+
+- The successful `pr-open` delivery result remains immutable while later GitHub
+  state is recorded separately against the exact reviewed SHA.
+- CLI observation is an explicit one-shot snapshot. Continuous Telegram
+  follow-up requires the normal daemon; `--once` does not provide it.
+- Notifications are restart-safe and low-noise, and transient GitHub or Telegram
+  failures defer observation instead of weakening identity checks.
+- Operators receive only bounded lifecycle/check summaries. Detailed CI
+  investigation remains in GitHub.
+- MondayOS can complete or reopen its local task after verified terminal
+  evidence, but merge and deployment remain human/external actions.

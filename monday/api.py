@@ -1806,6 +1806,9 @@ class Monday:
                            ``checkpoint_callback``.
             get          — retrieve one durable delivery. Requires ``delivery_id``.
                            Optional: ``project`` identity assertion.
+            observe      — read the exact pull request and checks, then reconcile a
+                           verified merge/closure. Requires ``delivery_id`` and the
+                           registered ``project`` for external deliveries.
             history      — list deliveries. Optional: ``task_id``, ``project``, and ``limit``.
             capabilities — report builder, reviewer, target, and GitHub readiness.
                            Optional: registered ``project``.
@@ -1830,7 +1833,7 @@ class Monday:
             if (
                 selected_project
                 and canonical_project != "mondayos"
-                and action in {"run", "capabilities"}
+                and action in {"run", "observe", "capabilities"}
             ):
                 entry = ProjectRegistry(self._config.project_root / "config").resolve(
                     selected_project
@@ -1869,6 +1872,10 @@ class Monday:
                     raise ValueError("Delivery does not belong to the selected project")
                 return _build_response_from_job("get", job, run_outcome=False)
 
+            if action == "observe":
+                job = workflow.observe(str(kwargs.get("delivery_id", "")))
+                return _build_response_from_job("observe", job, run_outcome=False)
+
             if action == "history":
                 history_kwargs: dict[str, Any] = {
                     "task_id": kwargs.get("task_id"),
@@ -1905,7 +1912,7 @@ class Monday:
                 success=False,
                 message=(
                     f"Unknown action {action!r}. "
-                    "Valid actions: run, get, history, capabilities"
+                    "Valid actions: run, get, observe, history, capabilities"
                 ),
             )
         except (
@@ -3613,10 +3620,19 @@ def _build_response_from_job(
     attempts = [
         _delivery_payload(item) for item in raw_attempts
     ] if isinstance(raw_attempts, list) else []
-    succeeded = bool(data.get("success", False)) if run_outcome else True
+    if run_outcome:
+        succeeded = bool(data.get("success", False))
+    elif action == "observe":
+        succeeded = bool(data.get("observation_success", False))
+    else:
+        succeeded = True
     delivery_id = str(data.get("delivery_id", ""))
     status = str(data.get("status", ""))
-    message = str(data.get("message", ""))
+    message = str(
+        data.get("observation_message", "")
+        if action == "observe"
+        else data.get("message", "")
+    )
     if not message:
         message = f"{delivery_id} is {status}".strip()
     return BuildResponse(
@@ -3636,6 +3652,11 @@ def _build_response_from_job(
         project_name=str(data.get("project_name", "")),
         repository=str(data.get("repository", "")),
         repo_root=str(data.get("repo_root", "")),
+        pr_state=str(data.get("pr_state", "unobserved")),
+        checks_status=str(data.get("checks_status", "unobserved")),
+        merge_commit_sha=str(data.get("merge_commit_sha", "")),
+        pr_observed_at=str(data.get("pr_observed_at", "")),
+        task_reconciliation=str(data.get("task_reconciliation", "")),
     )
 
 

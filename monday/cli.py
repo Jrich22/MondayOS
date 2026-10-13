@@ -1851,6 +1851,7 @@ def _register_build(subparsers: Any) -> None:
             "  monday build run TASK-0001\n"
             "  monday build run TASK-0002 --project customer-portal\n"
             "  monday build get delivery-abc123\n"
+            "  monday build observe delivery-abc123\n"
             "  monday build history --task TASK-0001\n"
             "  monday build capabilities\n"
         ),
@@ -1891,6 +1892,24 @@ def _register_build(subparsers: Any) -> None:
         "--json", "-j", action="store_true", help="Output the delivery record as JSON."
     )
     p_get.set_defaults(func=_cmd_build_get)
+
+    p_observe = build_sub.add_parser(
+        "observe",
+        help="Read the exact PR/check state and reconcile a merge or closure.",
+    )
+    p_observe.add_argument(
+        "delivery_id", metavar="DELIVERY-ID", help="PR-backed delivery to observe."
+    )
+    p_observe.add_argument(
+        "--project",
+        default="",
+        metavar="NAME",
+        help="Select the registered target for an external delivery.",
+    )
+    p_observe.add_argument(
+        "--json", "-j", action="store_true", help="Output the observation as JSON."
+    )
+    p_observe.set_defaults(func=_cmd_build_observe)
 
     p_history = build_sub.add_parser("history", help="List past delivery jobs.")
     p_history.add_argument("--task", dest="task_id", metavar="TASK-ID", help="Filter by task.")
@@ -1946,6 +1965,12 @@ def _print_build(response: Any) -> int:
         print(f"  Commit  : {response.commit_sha}")
     if response.pr_url:
         print(f"  PR      : {response.pr_url}")
+    if response.pr_state and response.pr_state != "unobserved":
+        print(f"  PR state: {response.pr_state}")
+    if response.checks_status and response.checks_status != "unobserved":
+        print(f"  Checks  : {response.checks_status}")
+    if response.merge_commit_sha:
+        print(f"  Merge   : {response.merge_commit_sha}")
     if response.changed_files:
         print(f"  Files   : {len(response.changed_files)}")
         for path in response.changed_files:
@@ -1982,6 +2007,19 @@ def _cmd_build_get(args: argparse.Namespace) -> int:
     if args.project:
         kwargs["project"] = args.project
     r = _monday(args).build("get", **kwargs)
+    if args.json:
+        print(_json.dumps(_build_json(r), indent=2, sort_keys=True))
+        return 0 if r.success else 1
+    return _print_build(r)
+
+
+def _cmd_build_observe(args: argparse.Namespace) -> int:
+    import json as _json
+
+    kwargs: dict[str, Any] = {"delivery_id": args.delivery_id}
+    if args.project:
+        kwargs["project"] = args.project
+    r = _monday(args).build("observe", **kwargs)
     if args.json:
         print(_json.dumps(_build_json(r), indent=2, sort_keys=True))
         return 0 if r.success else 1

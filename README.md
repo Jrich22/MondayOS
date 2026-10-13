@@ -52,8 +52,8 @@ The full vision is in [docs/VISION.md](docs/VISION.md).
 | **Project management** | `monday project` / `onboard` | Register and onboard external repositories; explicitly enroll selected repositories for PR delivery |
 | **AI provider layer** | _(config)_ | Interchangeable Claude / OpenAI / DeepSeek / Ollama providers with fallback |
 | **Execution orchestrator** | `monday execute` | Delegate a task to an AI provider through a safe, policy-driven pipeline |
-| **Autonomous builds** | `monday build` | Build in an isolated worktree, validate, repair, require ChatGPT review, and open a PR |
-| **Telegram control plane** | `monday telegram` | Durably queue requests, keep intake responsive, and run one agent-team or private live-build job at a time |
+| **Autonomous builds** | `monday build` | Build in an isolated worktree, validate, repair, require ChatGPT review, open a PR, and observe its exact GitHub lifecycle |
+| **Telegram control plane** | `monday telegram` | Durably queue requests, keep intake responsive, run one build at a time, and report later PR/check changes |
 
 Source, configuration templates, and product documentation are stored as
 human-readable files in Git. Operational state (agent runs, execution logs, and
@@ -175,6 +175,7 @@ monday execute TASK-0001 --mode autonomous --enable-autonomous
 # Artifact-bound delivery (real edits, tests, ChatGPT review, PR only)
 monday build capabilities
 monday build run TASK-0001
+monday build observe DELIVERY-ID
 
 # External delivery uses a registered project, never an ad hoc path
 monday project register customer-portal /path/to/customer-portal \
@@ -183,6 +184,7 @@ monday task create --title "Add health endpoint" \
   --objective "Expose service health." --project customer-portal
 monday build capabilities --project customer-portal
 monday build run TASK-0002 --project customer-portal
+monday build observe DELIVERY-ID --project customer-portal
 ```
 
 Full command reference: [docs/CLI.md](docs/CLI.md).
@@ -190,7 +192,9 @@ Full command reference: [docs/CLI.md](docs/CLI.md).
 Telegram setup and the always-on Mac mini service are documented in
 [docs/TELEGRAM.md](docs/TELEGRAM.md). Accepted requests are atomically persisted
 to a local, Git-ignored FIFO queue before Telegram is acknowledged; one
-background worker runs Monday/model jobs while intake continues polling.
+background worker runs Monday/model jobs while intake continues polling. After
+a live build opens a PR, request-free follow-up state survives restarts and
+reports meaningful GitHub check, merge, closure, or head-divergence changes.
 
 ---
 

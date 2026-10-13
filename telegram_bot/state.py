@@ -6,10 +6,17 @@ import fcntl
 import hashlib
 import json
 import threading
+import time
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, TextIO, TypeGuard
 
 from core.atomic import write_json_atomic
+
+_MAX_OBSERVATION_RETRY_SECONDS = 300.0
+_MAX_TELEGRAM_RATE_LIMIT_SECONDS = 86_400.0
+_MAX_ACTIVE_FOLLOW_UPS = 500
+_MAX_COMPLETED_JOBS = 1_000
+_FOLLOW_UP_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 
 
 class TelegramStateError(RuntimeError):
@@ -53,10 +60,10 @@ class TelegramState:
                 or legacy_with_state
                 or current_id != normalized_id
                 or self._data.get("bot_username") != normalized_username
-                or self._data.get("version") != 3
+                or self._data.get("version") != 4
             )
             self._data.update({
-                "version": 3,
+                "version": 4,
                 "bot_id": normalized_id,
                 "bot_username": normalized_username,
             })
@@ -214,6 +221,224 @@ class TelegramState:
             value = self._data.setdefault("completed_jobs", {}).get(str(update_id), {})
             return copy.deepcopy(value) if isinstance(value, dict) else {}
 
+    def claim_due_follow_up(
+        self,
+        *,
+        now: float | None = None,
+    ) -> tuple[int, dict[str, Any]] | None:
+        """Claim one due lifecycle follow-up from a request-free tombstone.
+
+        Follow-ups deliberately remain outside the main FIFO.  They contain no
+        Telegram request body and can therefore be polled after the accepted
+        build request has reached its terminal replay tombstone.  A persisted
+        ``polling`` phase is reclaimable after restart; the process lock still
+        guarantees that only one live Telegram worker can claim it at a time.
+        """
+        current = time.time() if now is None else float(now)
+        with self._lock:
+            expired = self._expire_follow_ups(current)
+            completed = self._data.setdefault("completed_jobs", {})
+            candidates: list[tuple[float, int]] = []
+            for key, record in completed.items():
+                if not isinstance(record, dict):
+                    continue
+                follow_up = record.get("follow_up")
+                if not _follow_up_active(follow_up):
+                    continue
+                due = _finite_nonnegative(follow_up.get("next_poll_at"), 0.0)
+                if due <= current:
+                    candidates.append((due, int(key)))
+            if not candidates:
+                if expired:
+                    self._write()
+                return None
+            _due, update_id = min(candidates)
+            follow_up = completed[str(update_id)]["follow_up"]
+            follow_up["phase"] = "polling"
+            self._write()
+            return update_id, copy.deepcopy(follow_up)
+
+    def start_follow_up(
+        self,
+        update_id: int,
+        follow_up: dict[str, Any],
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Atomically start one bounded, expiring lifecycle watcher."""
+        normalized_id = _update_id(update_id)
+        current = time.time() if now is None else _finite_nonnegative(now, time.time())
+        candidate = copy.deepcopy(follow_up)
+        if (
+            not isinstance(candidate, dict)
+            or candidate.get("kind") != "pr-lifecycle"
+            or candidate.get("phase") != "pending"
+        ):
+            raise TelegramStateError("Invalid Telegram lifecycle follow-up")
+        with self._lock:
+            record = self._data.setdefault("jobs", {}).get(str(normalized_id))
+            if not isinstance(record, dict):
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} is not queued"
+                )
+            existing = record.get("follow_up")
+            if isinstance(existing, dict):
+                return copy.deepcopy(existing)
+            self._expire_follow_ups(current)
+            active = sum(
+                1
+                for bucket in ("jobs", "completed_jobs")
+                for value in self._data.setdefault(bucket, {}).values()
+                if isinstance(value, dict)
+                and _follow_up_active(value.get("follow_up"))
+            )
+            candidate.update({
+                "created_at": current,
+                "expires_at": current + _FOLLOW_UP_MAX_AGE_SECONDS,
+            })
+            if active >= _MAX_ACTIVE_FOLLOW_UPS:
+                candidate.update({
+                    "phase": "not-started-capacity",
+                    "next_poll_at": 0.0,
+                })
+            record["follow_up"] = candidate
+            self._write()
+            return copy.deepcopy(candidate)
+
+    def update_follow_up(self, update_id: int, **fields: Any) -> dict[str, Any]:
+        """Update one claimed follow-up without permitting identity rebinding."""
+        normalized_id = _update_id(update_id)
+        with self._lock:
+            record = self._data.setdefault("completed_jobs", {}).get(str(normalized_id))
+            if not isinstance(record, dict):
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has no completed tombstone"
+                )
+            if "request" in record:
+                raise TelegramStateError("completed Telegram tombstones must not retain requests")
+            follow_up = record.get("follow_up")
+            if not isinstance(follow_up, dict):
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has no lifecycle follow-up"
+                )
+            immutable = {
+                "kind", "delivery_id", "task_id", "project_name", "chat_id", "pr_url",
+                "created_at", "expires_at",
+            }
+            for name in immutable.intersection(fields):
+                if fields[name] != follow_up.get(name):
+                    raise TelegramStateError(
+                        f"Telegram update {normalized_id} follow-up cannot change {name}"
+                    )
+            follow_up.update(copy.deepcopy(fields))
+            self._write()
+            return copy.deepcopy(follow_up)
+
+    def defer_follow_up(
+        self,
+        update_id: int,
+        *,
+        delay_seconds: float,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Retry a failed observation later without retaining remote diagnostics."""
+        return self._defer_follow_up(
+            update_id,
+            delay_seconds=delay_seconds,
+            maximum_delay=_MAX_OBSERVATION_RETRY_SECONDS,
+            now=now,
+        )
+
+    def defer_rate_limited_follow_up(
+        self,
+        update_id: int,
+        *,
+        retry_after: float,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Honor Telegram's retry window independently of observer backoff."""
+        return self._defer_follow_up(
+            update_id,
+            delay_seconds=retry_after,
+            maximum_delay=_MAX_TELEGRAM_RATE_LIMIT_SECONDS,
+            now=now,
+        )
+
+    def mark_follow_up_notification_failed(self, update_id: int) -> dict[str, Any]:
+        """Stop a watcher after Telegram permanently rejects its destination."""
+        normalized_id = _update_id(update_id)
+        with self._lock:
+            record = self._data.setdefault("completed_jobs", {}).get(str(normalized_id))
+            follow_up = record.get("follow_up") if isinstance(record, dict) else None
+            if not isinstance(follow_up, dict):
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has no lifecycle follow-up"
+                )
+            if not _follow_up_active(follow_up):
+                return copy.deepcopy(follow_up)
+            failures = max(0, int(follow_up.get("failure_count", 0))) + 1
+            follow_up.update({
+                "phase": "notification-failed",
+                "failure_count": failures,
+                "next_poll_at": 0.0,
+            })
+            # The Telegram diagnostic can contain destination-specific data.
+            # The terminal phase is sufficient for operators and eviction.
+            follow_up.pop("error", None)
+            self._write()
+            return copy.deepcopy(follow_up)
+
+    def _defer_follow_up(
+        self,
+        update_id: int,
+        *,
+        delay_seconds: float,
+        maximum_delay: float,
+        now: float | None,
+    ) -> dict[str, Any]:
+        normalized_id = _update_id(update_id)
+        current = time.time() if now is None else _finite_nonnegative(now, time.time())
+        delay = _bounded_delay(delay_seconds, maximum_delay)
+        with self._lock:
+            record = self._data.setdefault("completed_jobs", {}).get(str(normalized_id))
+            follow_up = record.get("follow_up") if isinstance(record, dict) else None
+            if not isinstance(follow_up, dict):
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has no lifecycle follow-up"
+                )
+            if not _follow_up_active(follow_up):
+                return copy.deepcopy(follow_up)
+            failures = max(0, int(follow_up.get("failure_count", 0))) + 1
+            follow_up.update({
+                "phase": "retrying",
+                "failure_count": failures,
+                "next_poll_at": current + delay,
+            })
+            # Raw GitHub/CLI/Telegram errors are intentionally not persisted or
+            # sent. The failure counter is enough to drive bounded backoff.
+            follow_up.pop("error", None)
+            self._write()
+            return copy.deepcopy(follow_up)
+
+    def next_follow_up_delay(self, *, now: float | None = None) -> float | None:
+        """Return the bounded wait until the next active lifecycle observation."""
+        current = time.time() if now is None else float(now)
+        with self._lock:
+            expired = self._expire_follow_ups(current)
+            due_times: list[float] = []
+            for record in self._data.setdefault("completed_jobs", {}).values():
+                follow_up = record.get("follow_up") if isinstance(record, dict) else None
+                if _follow_up_active(follow_up):
+                    due_times.append(min(
+                        _finite_nonnegative(follow_up.get("next_poll_at"), current),
+                        _finite_nonnegative(follow_up.get("expires_at"), current),
+                    ))
+            if expired:
+                self._write()
+            if not due_times:
+                return None
+            return min(300.0, max(0.0, min(due_times) - current))
+
     def is_terminal(self, update_id: int) -> bool:
         with self._lock:
             key = str(update_id)
@@ -235,8 +460,33 @@ class TelegramState:
             completed = self._data.setdefault("completed_jobs", {})
             completed[key] = record
             self._advance(update_id)
-            _bound(completed, 500)
+            _bound_completed(completed, _MAX_COMPLETED_JOBS)
             self._write()
+
+    def _expire_follow_ups(self, now: float) -> bool:
+        changed = False
+        for bucket in ("jobs", "completed_jobs"):
+            for record in self._data.setdefault(bucket, {}).values():
+                follow_up = record.get("follow_up") if isinstance(record, dict) else None
+                if not _follow_up_active(follow_up):
+                    continue
+                expires_at = _finite_nonnegative(follow_up.get("expires_at"), 0.0)
+                if expires_at <= 0:
+                    created_at = _finite_nonnegative(
+                        follow_up.get("created_at"),
+                        now,
+                    )
+                    follow_up.update({
+                        "created_at": created_at,
+                        "expires_at": created_at + _FOLLOW_UP_MAX_AGE_SECONDS,
+                    })
+                    expires_at = created_at + _FOLLOW_UP_MAX_AGE_SECONDS
+                    changed = True
+                if expires_at <= now:
+                    follow_up.update({"phase": "expired", "next_poll_at": 0.0})
+                    follow_up.pop("error", None)
+                    changed = True
+        return changed
 
     def _advance(self, update_id: int) -> None:
         with self._lock:
@@ -265,7 +515,7 @@ class TelegramState:
         with self._lock:
             if not self.path.exists():
                 return {
-                    "version": 3,
+                    "version": 4,
                     "bot_id": None,
                     "bot_username": "",
                     "last_update_id": -1,
@@ -298,7 +548,7 @@ class TelegramState:
 
     def _write(self) -> None:
         with self._lock:
-            self._data["version"] = 3
+            self._data["version"] = 4
             write_json_atomic(self.path, self._data)
 
 
@@ -307,6 +557,43 @@ def _bound(records: dict[str, Any], limit: int) -> None:
         return
     for key in sorted(records, key=int)[:-limit]:
         records.pop(key, None)
+
+
+def _bound_completed(records: dict[str, Any], limit: int) -> None:
+    """Bound replay tombstones without discarding an active PR observer."""
+    if len(records) <= limit:
+        return
+    removable = [
+        key for key in sorted(records, key=int)
+        if not _follow_up_active(
+            records[key].get("follow_up") if isinstance(records[key], dict) else None
+        )
+    ]
+    for key in removable[: max(0, len(records) - limit)]:
+        records.pop(key, None)
+
+
+def _follow_up_active(value: Any) -> TypeGuard[dict[str, Any]]:
+    return (
+        isinstance(value, dict)
+        and value.get("kind") == "pr-lifecycle"
+        and value.get("phase") in {"pending", "polling", "retrying"}
+    )
+
+
+def _finite_nonnegative(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return default
+    if parsed < 0 or parsed == float("inf") or parsed != parsed:
+        return default
+    return parsed
+
+
+def _bounded_delay(value: Any, maximum: float) -> float:
+    parsed = _finite_nonnegative(value, 1.0)
+    return min(maximum, max(1.0, parsed))
 
 
 def _canonical_request(request: dict[str, Any]) -> tuple[dict[str, Any], str]:

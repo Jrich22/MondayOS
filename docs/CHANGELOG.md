@@ -24,6 +24,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
   and reviewer sessions run from private
   non-repository runtimes with model tools disabled; the reviewer receives the
   controller's bounded exact staged diff and verifies its SHA-256 before launch.
+- A GitHub-read-only, exact-SHA pull-request lifecycle observer through
+  `Monday.build("observe")` and
+  `monday build observe DELIVERY-ID [--project NAME] [--json]`. It revalidates
+  the saved repository, base, head, PR number/URL, and reviewed commit before
+  recording lifecycle state. Checks are reduced to `pending`, `passed`,
+  `failed`, or `no-checks` plus bounded counts; names, annotations, and logs are
+  not exposed or persisted. Only verified merged, closed, or SHA-diverged states
+  reconcile the task. Observation cannot merge or deploy.
 - Explicit external-project delivery enrollment through
   `monday project register --delivery-repository OWNER/REPO`, project-bound
   tasks, and `monday build --project` selectors. MondayOS keeps controller state
@@ -38,6 +46,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
   target, and `/deliver TASK-ID` restores the task's saved project binding.
   Durable update identity, progress, restart recovery, and group-chat execution
   blocking are preserved.
+- Restart-safe Telegram follow-ups for successful live-build pull requests. A
+  request-free tombstone retains the exact delivery/PR identity, polling state,
+  and last meaningful transition; duplicate states stay silent, transient
+  observation failures back off, and terminal merged, closed, or diverged states
+  stop the watcher. Watchers are also bounded to 500 active records and 30 days;
+  capacity refusal is explicit, and permanent Telegram destination failures stop
+  without retaining diagnostics. No check names, logs, or raw remote diagnostics
+  are retained or sent. The normal daemon provides this monitoring; `--once`
+  only ingests and drains queued requests and does not keep watching afterward.
 - Durable Telegram intake and a single background execution worker. Authorized
   minimal requests are atomically queued with the advanced offset in
   `logs/telegram/state.json` and receive an immediate saved/position receipt;
