@@ -49,7 +49,7 @@ The full vision is in [docs/VISION.md](docs/VISION.md).
 | **Knowledge migration** | `monday migrate` | Import existing project docs (CHANGELOG, ADRs, roadmaps…) into the knowledge base |
 | **Repository doctor** | `monday doctor` | Health inspection across git, tests, code quality, docs, tasks, config |
 | **Engineering advisor** | `monday advise` | Synthesise risks, next actions, and a recommended sprint goal |
-| **Project management** | `monday project` / `onboard` | Register and onboard external repositories |
+| **Project management** | `monday project` / `onboard` | Register and onboard external repositories; explicitly enroll selected repositories for PR delivery |
 | **AI provider layer** | _(config)_ | Interchangeable Claude / OpenAI / DeepSeek / Ollama providers with fallback |
 | **Execution orchestrator** | `monday execute` | Delegate a task to an AI provider through a safe, policy-driven pipeline |
 | **Autonomous builds** | `monday build` | Build in an isolated worktree, validate, repair, require ChatGPT review, and open a PR |
@@ -175,6 +175,14 @@ monday execute TASK-0001 --mode autonomous --enable-autonomous
 # Artifact-bound delivery (real edits, tests, ChatGPT review, PR only)
 monday build capabilities
 monday build run TASK-0001
+
+# External delivery uses a registered project, never an ad hoc path
+monday project register customer-portal /path/to/customer-portal \
+  --delivery-repository acme/customer-portal
+monday task create --title "Add health endpoint" \
+  --objective "Expose service health." --project customer-portal
+monday build capabilities --project customer-portal
+monday build run TASK-0002 --project customer-portal
 ```
 
 Full command reference: [docs/CLI.md](docs/CLI.md).
@@ -220,6 +228,29 @@ The generated report answers: what MondayOS knows about the project, what
 documentation exists, what knowledge is missing, what engineering risks exist,
 what to build next, and what tasks to create. A real example lives at
 [projects/weatherbot/ONBOARDING_REPORT.md](projects/weatherbot/ONBOARDING_REPORT.md).
+
+Registration without `--delivery-repository` is analysis-only. To authorize
+MondayOS to push a branch and open a pull request, register the project with an
+exact GitHub `OWNER/REPO` identity:
+
+```bash
+monday project register weatherbot /path/to/WeatherBot \
+  --description "CLI weather fetcher and alert system" \
+  --delivery-repository example/weatherbot \
+  --overwrite
+monday task create --title "Improve forecast output" \
+  --objective "Make severe-weather warnings easier to scan." \
+  --project weatherbot
+monday build run TASK-0002 --project weatherbot
+```
+
+MondayOS remains the controller and stores task and delivery records under its
+own root; the registered repository is only the code target. External builds
+use the controlled-context Codex builder and a separate ChatGPT/Codex reviewer,
+then stop after the pull request is open. The target must be a standalone clone
+with its own real `.git` directory; Git linked worktrees and linked files inside
+`.git` are rejected. Builds never merge or deploy. Pushing the branch can still
+start CI or other automation already configured in the target GitHub repository.
 
 ---
 

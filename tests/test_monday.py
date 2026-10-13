@@ -25,7 +25,6 @@ from monday import (
     TeamCheckpointError,
 )
 
-
 # ---------------------------------------------------------------------------
 # Import contract
 # ---------------------------------------------------------------------------
@@ -667,7 +666,7 @@ class TestTask:
 
     def test_task_complete_marks_task_done(self) -> None:
         # create → assign → in_progress → complete (via Monday.task)
-        from tasks import TaskManager, TaskStatus, TaskType, TaskPriority
+        from tasks import TaskManager, TaskPriority, TaskStatus, TaskType
         mgr = TaskManager(self.tmp_path)
         task = mgr.create(
             title="Complete me",
@@ -687,6 +686,39 @@ class TestTask:
         r = self.monday.task("complete")
         assert r.success is False
         assert "task_id" in r.message.lower()
+
+    def test_task_start_rejects_completed_task(self) -> None:
+        created = self.monday.task(
+            "create",
+            title="Terminal task",
+            objective="Must not restart after completion.",
+        )
+        assert self.monday.task("start", task_id=created.task_id).success
+        assert self.monday.task("complete", task_id=created.task_id).success
+
+        restarted = self.monday.task("start", task_id=created.task_id)
+
+        assert not restarted.success
+        assert restarted.data["status"] == "completed"
+        assert "terminal" in restarted.message
+
+    def test_task_start_reports_unsafe_lock_storage_without_raising(self) -> None:
+        created = self.monday.task(
+            "create",
+            title="Unsafe lock storage",
+            objective="Return a typed failure.",
+        )
+        redirected = self.tmp_path / "redirected-locks"
+        redirected.mkdir()
+        (self.tmp_path / "tasks" / ".locks").symlink_to(
+            redirected,
+            target_is_directory=True,
+        )
+
+        response = self.monday.task("start", task_id=created.task_id)
+
+        assert not response.success
+        assert "real directory" in response.message
 
     def test_task_get_retrieves_by_id(self) -> None:
         created = self.monday.task(

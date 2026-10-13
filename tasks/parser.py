@@ -98,6 +98,32 @@ class TaskParser:
                     f"Invalid status_history entry: {exc}", source_path=source_path
                 ) from exc
 
+        project_delivery_repository = fm.get("project_delivery_repository", "") or ""
+        if not isinstance(project_delivery_repository, str):
+            raise TaskParseError(
+                "Invalid project_delivery_repository: expected a string",
+                source_path=source_path,
+            )
+        project_source_device = _optional_nonnegative_int(
+            fm.get("project_source_device"), "project_source_device", source_path
+        )
+        project_source_inode = _optional_nonnegative_int(
+            fm.get("project_source_inode"), "project_source_inode", source_path
+        )
+        if bool(project_delivery_repository) != (
+            project_source_device is not None and project_source_inode is not None
+        ):
+            raise TaskParseError(
+                "Project delivery repository and filesystem identity must be recorded together",
+                source_path=source_path,
+            )
+        project = str(fm.get("project", "") or "")
+        if project_delivery_repository and not project:
+            raise TaskParseError(
+                "A project delivery target requires an explicit project",
+                source_path=source_path,
+            )
+
         return Task(
             id=str(fm["id"]),
             title=str(fm["title"]),
@@ -112,7 +138,10 @@ class TaskParser:
             # `.get` with a default, not `fm["project"]`: every task written
             # before explicit association lacks the key, and a task that will not
             # load is worse than one whose project is unknown.
-            project=str(fm.get("project", "") or ""),
+            project=project,
+            project_delivery_repository=project_delivery_repository,
+            project_source_device=project_source_device,
+            project_source_inode=project_source_inode,
             assigned_to=str(fm["assigned_to"]) if fm.get("assigned_to") else None,
             parent_task_id=str(fm["parent_task_id"]) if fm.get("parent_task_id") else None,
             child_task_ids=list(fm.get("child_task_ids") or []),
@@ -145,6 +174,9 @@ class TaskParser:
             "parent_task_id": task.parent_task_id,
             "priority": task.priority.value,
             "project": task.project,
+            "project_delivery_repository": task.project_delivery_repository,
+            "project_source_device": task.project_source_device,
+            "project_source_inode": task.project_source_inode,
             "status": task.status.value,
             "status_history": [
                 {
@@ -169,6 +201,17 @@ class TaskParser:
             width=120,
         )
         return f"---\n{fm_yaml}---\n"
+
+
+def _optional_nonnegative_int(value: Any, field: str, source_path: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TaskParseError(
+            f"Invalid {field}: expected a non-negative integer or null",
+            source_path=source_path,
+        )
+    return value
 
 
 def _parse_dt(value: Any) -> datetime:

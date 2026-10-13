@@ -52,7 +52,7 @@ class DeliveryStore:
         path = self._path(job.delivery_id)
         if path.is_symlink():
             raise ValueError("delivery record path must not be a symlink")
-        write_json_atomic(path, job.to_dict())
+        write_json_atomic(path, job.to_dict(include_private=True))
 
     def get(self, delivery_id: str) -> DeliveryJob:
         self._validate_id(delivery_id)
@@ -76,13 +76,21 @@ class DeliveryStore:
             )
         return job
 
-    def history(self, *, task_id: str | None = None, limit: int = 20) -> list[DeliveryJob]:
+    def history(
+        self,
+        *,
+        task_id: str | None = None,
+        project_name: str | None = None,
+        limit: int = 20,
+    ) -> list[DeliveryJob]:
         self._ensure_runtime_tree()
         jobs: list[DeliveryJob] = []
         for path in sorted(self.records.glob("delivery-*.json")):
             jobs.append(self.get(path.stem))
         if task_id is not None:
             jobs = [job for job in jobs if job.task_id == task_id]
+        if project_name is not None:
+            jobs = [job for job in jobs if job.project_name == project_name]
         jobs.sort(key=lambda job: job.created_at, reverse=True)
         return jobs[: max(0, limit)] if limit else jobs
 

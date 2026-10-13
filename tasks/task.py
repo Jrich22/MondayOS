@@ -102,6 +102,12 @@ class Task:
     work_log: list[str] = field(default_factory=list)
     status_history: list[StatusTransition] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Immutable delivery target recorded when this task is created. Appended to
+    # preserve the positional constructor contract for every older Task field.
+    # These values are empty for controller, analysis-only, and legacy tasks.
+    project_delivery_repository: str = ""
+    project_source_device: int | None = None
+    project_source_inode: int | None = None
 
     def is_terminal(self) -> bool:
         """True if the task has reached COMPLETED or CANCELLED."""

@@ -33,6 +33,11 @@ class _Job:
     def to_dict(self) -> dict[str, object]:
         return dict(self.payload)
 
+    @property
+    def project_name(self) -> str:
+        """Mirror the real DeliveryJob attribute used for identity assertions."""
+        return str(self.payload.get("project_name", ""))
+
 
 class _Workflow:
     def __init__(self) -> None:
@@ -76,6 +81,9 @@ def test_build_response_is_part_of_the_public_package() -> None:
     assert response.action == "capabilities"
     assert response.changed_files == []
     assert response.attempts == []
+    assert response.project_name == ""
+    assert response.repository == ""
+    assert response.repo_root == ""
 
 
 def test_build_run_passes_identity_and_callbacks_without_invoking_real_tools(
@@ -187,6 +195,256 @@ def test_build_constructs_delivery_workflow_lazily_without_policy_injection(
     assert isinstance(constructed["monday"], Monday)
 
 
+def test_build_project_selector_pins_registered_target_in_workflow_constructor(
+    tmp_path: Path,
+) -> None:
+    controller = tmp_path / "controller"
+    target = tmp_path / "weather-portal"
+    target.mkdir(parents=True)
+    monday = _monday(controller)
+    registration = monday.project(
+        "register",
+        name="Weather Portal",
+        path=str(target),
+        delivery_repository="Acme/Weather-Portal",
+    )
+    assert registration.success is True
+
+    workflow = _Workflow()
+    constructor = mock.Mock(return_value=workflow)
+    with mock.patch("delivery.workflow.DeliveryWorkflow", constructor):
+        response = monday.build(
+            "run",
+            task_id="TASK-0001",
+            project="Weather Portal",
+        )
+
+    target_stat = target.stat()
+    assert response.success is True
+    constructor.assert_called_once_with(
+        project_root=controller,
+        monday=monday,
+        repository_root=target.resolve(),
+        project_name="weather-portal",
+        expected_repository="acme/weather-portal",
+        expected_root_identity=(target_stat.st_dev, target_stat.st_ino),
+    )
+    assert workflow.calls == [(
+        "run",
+        {
+            "task_id": "TASK-0001",
+            "delivery_id": None,
+            "progress_callback": None,
+            "checkpoint_callback": None,
+        },
+    )]
+
+
+def test_build_refuses_analysis_only_project_before_constructing_workflow(
+    tmp_path: Path,
+) -> None:
+    controller = tmp_path / "controller"
+    target = tmp_path / "analysis-only"
+    target.mkdir(parents=True)
+    monday = _monday(controller)
+    assert monday.project("register", name="analysis", path=str(target)).success
+
+    with mock.patch("delivery.workflow.DeliveryWorkflow") as constructor:
+        response = monday.build("run", task_id="TASK-0001", project="analysis")
+
+    assert response.success is False
+    assert "analysis only" in response.message
+    constructor.assert_not_called()
+
+
+def test_build_missing_project_is_a_typed_failure_before_workflow_creation(
+    tmp_path: Path,
+) -> None:
+    with mock.patch("delivery.workflow.DeliveryWorkflow") as constructor:
+        response = _monday(tmp_path).build(
+            "run", task_id="TASK-0001", project="not-registered"
+        )
+
+    assert response.success is False
+    assert "not registered" in response.message
+    constructor.assert_not_called()
+
+
+def test_build_refuses_project_whose_registered_directory_vanished(
+    tmp_path: Path,
+) -> None:
+    controller = tmp_path / "controller"
+    target = tmp_path / "vanished"
+    target.mkdir(parents=True)
+    monday = _monday(controller)
+    assert monday.project(
+        "register",
+        name="vanished",
+        path=str(target),
+        delivery_repository="acme/vanished",
+    ).success
+    target.rmdir()
+
+    with mock.patch("delivery.workflow.DeliveryWorkflow") as constructor:
+        response = monday.build("capabilities", project="vanished")
+
+    assert response.success is False
+    assert "no longer exists" in response.message
+    constructor.assert_not_called()
+
+
+def test_build_history_canonicalizes_project_filter_without_retargeting_workflow(
+    tmp_path: Path,
+) -> None:
+    workflow = _Workflow()
+
+    response = _call_build(
+        _monday(tmp_path),
+        workflow,
+        "history",
+        project="Weather Portal",
+        task_id="TASK-0001",
+        limit=4,
+    )
+
+    assert response.success is True
+    assert workflow.calls == [(
+        "history",
+        {
+            "task_id": "TASK-0001",
+            "limit": 4,
+            "project_name": "weather-portal",
+        },
+    )]
+
+
+def test_build_self_project_selector_maps_to_controller_records(tmp_path: Path) -> None:
+    workflow = _Workflow()
+
+    history = _call_build(
+        _monday(tmp_path),
+        workflow,
+        "history",
+        project="MondayOS",
+    )
+    lookup = _call_build(
+        _monday(tmp_path),
+        workflow,
+        "get",
+        delivery_id="delivery-test-1",
+        project="mondayos",
+    )
+
+    assert history.success is True
+    assert lookup.success is True
+    assert workflow.calls == [
+        ("history", {"task_id": None, "limit": 20, "project_name": ""}),
+        ("get", {"delivery_id": "delivery-test-1"}),
+    ]
+
+
+def test_build_get_project_selector_is_a_durable_identity_assertion(
+    tmp_path: Path,
+) -> None:
+    workflow = _Workflow()
+    workflow.job = _Job(project_name="weather-portal")
+
+    matching = _call_build(
+        _monday(tmp_path),
+        workflow,
+        "get",
+        delivery_id="delivery-test-1",
+        project="Weather Portal",
+    )
+    mismatched = _call_build(
+        _monday(tmp_path),
+        workflow,
+        "get",
+        delivery_id="delivery-test-1",
+        project="another-project",
+    )
+
+    assert matching.success is True
+    assert matching.project_name == "weather-portal"
+    assert mismatched.success is False
+    assert "does not belong" in mismatched.message
+
+
+def test_build_response_surfaces_target_identity_metadata(tmp_path: Path) -> None:
+    workflow = _Workflow()
+    workflow.job = _Job(
+        project_name="weather-portal",
+        repository="acme/weather-portal",
+        repo_root="/srv/repos/weather-portal",
+    )
+
+    response = _call_build(_monday(tmp_path), workflow, "run", task_id="TASK-0001")
+
+    assert response.project_name == "weather-portal"
+    assert response.repository == "acme/weather-portal"
+    assert response.repo_root == "/srv/repos/weather-portal"
+
+
+def test_task_creation_binds_registered_project_to_canonical_identity(
+    tmp_path: Path,
+) -> None:
+    controller = tmp_path / "controller"
+    target = tmp_path / "target"
+    target.mkdir(parents=True)
+    monday = _monday(controller)
+    assert monday.project(
+        "register", name="Weather Portal", path=str(target)
+    ).success
+
+    response = monday.task(
+        "create",
+        title="Add forecast",
+        objective="Show a seven-day forecast.",
+        project="Weather Portal",
+    )
+
+    assert response.success is True
+    assert response.data["project"] == "weather-portal"
+
+
+def test_task_creation_accepts_a_registered_unicode_analysis_project(
+    tmp_path: Path,
+) -> None:
+    controller = tmp_path / "controller"
+    target = tmp_path / "target"
+    target.mkdir(parents=True)
+    monday = _monday(controller)
+    assert monday.project("register", name="Café", path=str(target)).success
+
+    response = monday.task(
+        "create",
+        title="Analyze feedback",
+        objective="Summarize the feedback.",
+        project="CAFÉ",
+    )
+
+    assert response.success is True
+    assert response.data["project"] == "café"
+
+
+def test_task_creation_rejects_unknown_project_without_persisting_task(
+    tmp_path: Path,
+) -> None:
+    monday = _monday(tmp_path)
+
+    response = monday.task(
+        "create",
+        title="Add forecast",
+        objective="Show a seven-day forecast.",
+        project="not-registered",
+    )
+
+    assert response.success is False
+    assert "Invalid task project" in response.message
+    assert "not registered" in response.message
+    assert monday.task("list").data["count"] == 0
+
+
 def test_build_unknown_action_and_malformed_results_fail_as_responses(tmp_path: Path) -> None:
     unknown = _call_build(_monday(tmp_path), _Workflow(), "merge")
     assert unknown.success is False
@@ -249,6 +507,127 @@ def test_build_cli_run_forwards_reserved_id_and_prints_json(tmp_path: Path) -> N
     build.assert_called_once_with(
         "run", task_id="TASK-0001", delivery_id="delivery-test-1"
     )
+
+
+def test_build_cli_forwards_explicit_project_to_every_selector_aware_action(
+    tmp_path: Path,
+) -> None:
+    run = _response()
+    get = _response()
+    get.action = "get"
+    history = BuildResponse(action="history", success=True, data={"jobs": [], "count": 0})
+    capabilities = BuildResponse(
+        action="capabilities", success=True, data={"ready": True}
+    )
+
+    with mock.patch.object(
+        Monday,
+        "build",
+        side_effect=[run, get, history, capabilities],
+    ) as build:
+        assert _cli(
+            "--project-root",
+            str(tmp_path),
+            "build",
+            "run",
+            "TASK-0001",
+            "--project",
+            "weather-portal",
+        )[0] == 0
+        assert _cli(
+            "--project-root",
+            str(tmp_path),
+            "build",
+            "get",
+            "delivery-test-1",
+            "--project",
+            "weather-portal",
+        )[0] == 0
+        assert _cli(
+            "--project-root",
+            str(tmp_path),
+            "build",
+            "history",
+            "--project",
+            "weather-portal",
+        )[0] == 0
+        assert _cli(
+            "--project-root",
+            str(tmp_path),
+            "build",
+            "capabilities",
+            "--project",
+            "weather-portal",
+        )[0] == 0
+
+    assert build.call_args_list == [
+        mock.call(
+            "run",
+            task_id="TASK-0001",
+            delivery_id=None,
+            project="weather-portal",
+        ),
+        mock.call(
+            "get",
+            delivery_id="delivery-test-1",
+            project="weather-portal",
+        ),
+        mock.call(
+            "history",
+            task_id=None,
+            limit=20,
+            project="weather-portal",
+        ),
+        mock.call("capabilities", project="weather-portal"),
+    ]
+
+
+def test_project_and_task_cli_persist_delivery_enrollment_and_binding(
+    tmp_path: Path,
+) -> None:
+    controller = tmp_path / "controller"
+    target = tmp_path / "weather-portal"
+    target.mkdir(parents=True)
+
+    register_code, register_output = _cli(
+        "--project-root",
+        str(controller),
+        "project",
+        "register",
+        "Weather Portal",
+        str(target),
+        "--delivery-repository",
+        "Acme/Weather-Portal",
+    )
+    task_code, _ = _cli(
+        "--project-root",
+        str(controller),
+        "task",
+        "create",
+        "--title",
+        "Add forecast",
+        "--objective",
+        "Show a seven-day forecast.",
+        "--project",
+        "Weather Portal",
+    )
+
+    monday = _monday(controller)
+    registered = monday.project("get", name="Weather Portal")
+    tasks = monday.task("list")
+    assert register_code == 0
+    assert "acme/weather-portal" in register_output
+    assert registered.data["delivery_repository"] == "acme/weather-portal"
+    assert task_code == 0
+    assert tasks.data["count"] == 1
+    assert tasks.data["tasks"][0]["project"] == "weather-portal"
+    assert (
+        tasks.data["tasks"][0]["project_delivery_repository"]
+        == "acme/weather-portal"
+    )
+    target_stat = target.stat()
+    assert tasks.data["tasks"][0]["project_source_device"] == target_stat.st_dev
+    assert tasks.data["tasks"][0]["project_source_inode"] == target_stat.st_ino
 
 
 def test_build_cli_get_renders_pull_request(tmp_path: Path) -> None:

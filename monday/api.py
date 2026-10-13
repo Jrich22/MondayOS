@@ -16,7 +16,8 @@ from typing import TYPE_CHECKING, Any
 
 from brain import Brain, BrainConfig, create_provider
 from brain.reasoner import ReasoningEngine
-from core.project import ProjectRegistry
+from core.identity import require_slug
+from core.project import ProjectNotFoundError, ProjectRegistry
 from events import EventBus
 from events.types import Event, EventType
 from knowledge import KnowledgeStore
@@ -380,6 +381,40 @@ class Monday:
             approval_raw = kwargs.get("approval_required", "human-review")
             context = kwargs.get("context", "")
             acceptance_criteria = kwargs.get("acceptance_criteria")
+            project_raw = str(kwargs.get("project", "") or "").strip()
+            project = ""
+            project_delivery_repository = ""
+            project_source_device: int | None = None
+            project_source_inode: int | None = None
+            if project_raw:
+                try:
+                    project = require_slug(project_raw)
+                    if project != "mondayos":
+                        project_entry = ProjectRegistry(
+                            self._config.project_root / "config"
+                        ).resolve(
+                            project_raw
+                        )
+                        if project_entry.delivery_repository:
+                            if (
+                                project_entry.source_device is None
+                                or project_entry.source_inode is None
+                            ):
+                                raise ValueError(
+                                    "delivery-enabled project is missing its filesystem "
+                                    "identity; re-register it before creating tasks"
+                                )
+                            project_delivery_repository = project_entry.delivery_repository
+                            project_source_device = project_entry.source_device
+                            project_source_inode = project_entry.source_inode
+                except (ProjectNotFoundError, ValueError) as exc:
+                    return TaskResponse(
+                        action="create",
+                        success=False,
+                        task_id=None,
+                        data={},
+                        message=f"Invalid task project: {exc}",
+                    )
 
             try:
                 task_type = TaskType(task_type_raw)
@@ -422,7 +457,10 @@ class Monday:
                 # Explicit project association (increment 2). Empty means the
                 # caller did not state one, which stays "unknown" rather than
                 # being guessed from the title.
-                project=str(kwargs.get("project", "")),
+                project=project,
+                project_delivery_repository=project_delivery_repository,
+                project_source_device=project_source_device,
+                project_source_inode=project_source_inode,
             )
 
             self.__bus.publish(
@@ -514,29 +552,38 @@ class Monday:
                 message="task_id is required for action 'start'",
             )
         try:
-            task = self.__tasks.get(task_id)
-            changed_by = f"workflow:{self._session_id}"
-            if task.status == TaskStatus.BACKLOG:
-                task = self.__tasks.update_status(
-                    task_id=task_id,
-                    new_status=TaskStatus.ASSIGNED,
-                    changed_by=changed_by,
-                    reason="workflow start",
-                )
-            if task.status == TaskStatus.ASSIGNED:
-                task = self.__tasks.update_status(
-                    task_id=task_id,
-                    new_status=TaskStatus.IN_PROGRESS,
-                    changed_by=changed_by,
-                    reason="workflow start",
-                )
-            if task.status in (TaskStatus.BLOCKED, TaskStatus.REVIEW):
-                task = self.__tasks.update_status(
-                    task_id=task_id,
-                    new_status=TaskStatus.IN_PROGRESS,
-                    changed_by=changed_by,
-                    reason="workflow restart",
-                )
+            with self.__tasks.lock(task_id):
+                task = self.__tasks.get(task_id)
+                if task.is_terminal():
+                    return TaskResponse(
+                        action="start",
+                        success=False,
+                        task_id=task.id,
+                        data=_task_to_dict(task),
+                        message=f"{task.id} is terminal ({task.status.value})",
+                    )
+                changed_by = f"workflow:{self._session_id}"
+                if task.status == TaskStatus.BACKLOG:
+                    task = self.__tasks.update_status(
+                        task_id=task_id,
+                        new_status=TaskStatus.ASSIGNED,
+                        changed_by=changed_by,
+                        reason="workflow start",
+                    )
+                if task.status == TaskStatus.ASSIGNED:
+                    task = self.__tasks.update_status(
+                        task_id=task_id,
+                        new_status=TaskStatus.IN_PROGRESS,
+                        changed_by=changed_by,
+                        reason="workflow start",
+                    )
+                if task.status in (TaskStatus.BLOCKED, TaskStatus.REVIEW):
+                    task = self.__tasks.update_status(
+                        task_id=task_id,
+                        new_status=TaskStatus.IN_PROGRESS,
+                        changed_by=changed_by,
+                        reason="workflow restart",
+                    )
             return TaskResponse(
                 action="start",
                 success=True,
@@ -544,7 +591,7 @@ class Monday:
                 data=_task_to_dict(task),
                 message=f"{task.id} is now {task.status.value}",
             )
-        except TaskNotFoundError as exc:
+        except (OSError, TaskNotFoundError) as exc:
             return TaskResponse(
                 action="start",
                 success=False,
@@ -587,7 +634,7 @@ class Monday:
                 data=_task_to_dict(updated),
                 message=f"{updated.id} moved to REVIEW",
             )
-        except TaskNotFoundError as exc:
+        except (OSError, TaskNotFoundError) as exc:
             return TaskResponse(
                 action="review",
                 success=False,
@@ -637,7 +684,7 @@ class Monday:
                 data=_task_to_dict(updated),
                 message=f"{updated.id} assigned to {assignee}",
             )
-        except TaskNotFoundError as exc:
+        except (OSError, TaskNotFoundError) as exc:
             return TaskResponse(
                 action="assign",
                 success=False,
@@ -688,7 +735,7 @@ class Monday:
                 data=_task_to_dict(updated),
                 message=f"{updated.id} marked COMPLETED",
             )
-        except TaskNotFoundError as exc:
+        except (OSError, TaskNotFoundError) as exc:
             return TaskResponse(
                 action="complete",
                 success=False,
@@ -1126,6 +1173,7 @@ class Monday:
         path: str = "",
         description: str = "",
         overwrite: bool = False,
+        delivery_repository: str = "",
     ) -> ProjectResponse:
         """
         Register, list, retrieve, or remove external projects.
@@ -1141,6 +1189,8 @@ class Monday:
             name:        Project name slug (required for register/get/remove).
             path:        Absolute source path (required for register).
             description: Optional human-readable description (for register).
+            delivery_repository: Exact ``owner/repository`` GitHub identity that
+                                 explicitly enables autonomous branch/PR delivery.
             overwrite:   If True, replace existing registration (for register).
 
         Returns:
@@ -1159,7 +1209,13 @@ class Monday:
                     message="'name' and 'path' are required for action 'register'",
                 )
             try:
-                entry = registry.register(name, path, description=description, overwrite=overwrite)
+                entry = registry.register(
+                    name,
+                    path,
+                    description=description,
+                    delivery_repository=delivery_repository,
+                    overwrite=overwrite,
+                )
                 return ProjectResponse(
                     action="register",
                     success=True,
@@ -1171,22 +1227,25 @@ class Monday:
                 return ProjectResponse(
                     action="register", success=False, project_name=name, message=str(exc)
                 )
-            except ValueError as exc:
+            except (OSError, ValueError) as exc:
                 return ProjectResponse(
                     action="register", success=False, project_name=name, message=str(exc)
                 )
 
         if action == "list":
-            entries = registry.list()
-            return ProjectResponse(
-                action="list",
-                success=True,
-                data={
-                    "projects": [e.to_dict() for e in entries],
-                    "count": len(entries),
-                },
-                message=f"{len(entries)} project(s) registered",
-            )
+            try:
+                entries = registry.list()
+                return ProjectResponse(
+                    action="list",
+                    success=True,
+                    data={
+                        "projects": [e.to_dict() for e in entries],
+                        "count": len(entries),
+                    },
+                    message=f"{len(entries)} project(s) registered",
+                )
+            except (OSError, ValueError) as exc:
+                return ProjectResponse(action="list", success=False, message=str(exc))
 
         if action == "get":
             if not name:
@@ -1202,7 +1261,7 @@ class Monday:
                     data=entry.to_dict(),
                     message=f"Project {name!r} — {entry.source_path}",
                 )
-            except ProjectNotFoundError as exc:
+            except (OSError, ProjectNotFoundError, ValueError) as exc:
                 return ProjectResponse(
                     action="get", success=False, project_name=name, message=str(exc)
                 )
@@ -1220,7 +1279,7 @@ class Monday:
                     project_name=name,
                     message=f"Project {name!r} removed from registry",
                 )
-            except ProjectNotFoundError as exc:
+            except (OSError, ProjectNotFoundError, ValueError) as exc:
                 return ProjectResponse(
                     action="remove", success=False, project_name=name, message=str(exc)
                 )
@@ -1262,8 +1321,8 @@ class Monday:
         registry = ProjectRegistry(self._config.project_root / "config")
 
         try:
-            entry = registry.get(project_name)
-        except ProjectNotFoundError as exc:
+            entry = registry.resolve(project_name)
+        except (OSError, ProjectNotFoundError, ValueError) as exc:
             return OnboardResponse(
                 action="onboard",
                 success=False,
@@ -1281,33 +1340,49 @@ class Monday:
             )
 
         # Create a Monday instance pointing at the external project
-        project_monday = Monday(MondayConfig(project_root=source_path))
+        try:
+            project_monday = Monday(MondayConfig(project_root=source_path))
 
         # ── Step 1: Migrate ─────────────────────────────────────────────────
-        migrate_resp = project_monday.migrate(action="run")
-        migrate_summary = migrate_resp.message
+            migrate_resp = project_monday.migrate(action="run")
+            migrate_summary = migrate_resp.message
 
         # ── Step 2: Doctor ───────────────────────────────────────────────────
-        doctor_resp = project_monday.doctor()
+            doctor_resp = project_monday.doctor()
 
         # ── Step 3: Advise ───────────────────────────────────────────────────
-        advise_resp = project_monday.advise()
+            advise_resp = project_monday.advise()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return OnboardResponse(
+                action="onboard",
+                success=False,
+                project_name=project_name,
+                message=str(exc),
+            )
 
         # ── Step 4: Generate report ─────────────────────────────────────────
-        if reports_dir is None:
-            reports_dir = self._config.project_root / "projects" / project_name
-        reports_dir = Path(reports_dir)
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        report_path = reports_dir / "ONBOARDING_REPORT.md"
+        try:
+            if reports_dir is None:
+                reports_dir = self._config.project_root / "projects" / project_name
+            reports_dir = Path(reports_dir)
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            report_path = reports_dir / "ONBOARDING_REPORT.md"
 
-        report_md = _generate_onboarding_report(
-            project_name=project_name,
-            entry=entry,
-            migrate_resp=migrate_resp,
-            doctor_resp=doctor_resp,
-            advise_resp=advise_resp,
-        )
-        report_path.write_text(report_md, encoding="utf-8")
+            report_md = _generate_onboarding_report(
+                project_name=project_name,
+                entry=entry,
+                migrate_resp=migrate_resp,
+                doctor_resp=doctor_resp,
+                advise_resp=advise_resp,
+            )
+            report_path.write_text(report_md, encoding="utf-8")
+        except (OSError, TypeError, ValueError) as exc:
+            return OnboardResponse(
+                action="onboard",
+                success=False,
+                project_name=project_name,
+                message=str(exc),
+            )
 
         success = doctor_resp.success and advise_resp.success
 
@@ -1727,11 +1802,13 @@ class Monday:
 
         Actions:
             run          — execute one delivery. Requires ``task_id``. Optional:
-                           ``delivery_id``, ``progress_callback``, and
+                           registered ``project``, ``delivery_id``, ``progress_callback``, and
                            ``checkpoint_callback``.
             get          — retrieve one durable delivery. Requires ``delivery_id``.
-            history      — list deliveries. Optional: ``task_id`` and ``limit``.
-            capabilities — report local builder, reviewer, and GitHub readiness.
+                           Optional: ``project`` identity assertion.
+            history      — list deliveries. Optional: ``task_id``, ``project``, and ``limit``.
+            capabilities — report builder, reviewer, target, and GitHub readiness.
+                           Optional: registered ``project``.
 
         Delivery policy is not injectable through this public method. The
         mandatory reviewer and controller-owned validation are fixed by the
@@ -1740,10 +1817,41 @@ class Monday:
         try:
             from delivery.workflow import DeliveryWorkflow
 
-            workflow = DeliveryWorkflow(
-                project_root=self._config.project_root,
-                monday=self,
+            selected_project = str(kwargs.get("project", "") or "").strip()
+            canonical_project = (
+                require_slug(selected_project)
+                if selected_project
+                else ""
             )
+            workflow_kwargs: dict[str, Any] = {
+                "project_root": self._config.project_root,
+                "monday": self,
+            }
+            if (
+                selected_project
+                and canonical_project != "mondayos"
+                and action in {"run", "capabilities"}
+            ):
+                entry = ProjectRegistry(self._config.project_root / "config").resolve(
+                    selected_project
+                )
+                if not entry.delivery_repository:
+                    raise ValueError(
+                        f"Project {selected_project!r} is registered for analysis only. "
+                        "Re-register it with an exact delivery repository before building."
+                    )
+                if entry.source_device is None or entry.source_inode is None:
+                    raise ValueError(
+                        f"Project {selected_project!r} predates delivery enrollment. "
+                        "Re-register it before building."
+                    )
+                workflow_kwargs.update({
+                    "repository_root": entry.path,
+                    "project_name": canonical_project,
+                    "expected_repository": entry.delivery_repository,
+                    "expected_root_identity": (entry.source_device, entry.source_inode),
+                })
+            workflow = DeliveryWorkflow(**workflow_kwargs)
 
             if action == "run":
                 job = workflow.run(
@@ -1756,13 +1864,21 @@ class Monday:
 
             if action == "get":
                 job = workflow.get(str(kwargs.get("delivery_id", "")))
+                expected_project = "" if canonical_project == "mondayos" else canonical_project
+                if canonical_project and str(getattr(job, "project_name", "")) != expected_project:
+                    raise ValueError("Delivery does not belong to the selected project")
                 return _build_response_from_job("get", job, run_outcome=False)
 
             if action == "history":
-                raw_history = workflow.history(
-                    task_id=kwargs.get("task_id"),
-                    limit=int(kwargs.get("limit", 20)),
-                )
+                history_kwargs: dict[str, Any] = {
+                    "task_id": kwargs.get("task_id"),
+                    "limit": int(kwargs.get("limit", 20)),
+                }
+                if selected_project:
+                    history_kwargs["project_name"] = (
+                        "" if canonical_project == "mondayos" else canonical_project
+                    )
+                raw_history = workflow.history(**history_kwargs)
                 if isinstance(raw_history, dict):
                     raw_jobs = raw_history.get("jobs", raw_history.get("runs", []))
                 else:
@@ -1792,7 +1908,14 @@ class Monday:
                     "Valid actions: run, get, history, capabilities"
                 ),
             )
-        except (OSError, RuntimeError, TypeError, ValueError, LookupError) as exc:
+        except (
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            LookupError,
+            ProjectNotFoundError,
+        ) as exc:
             return BuildResponse(action=action, success=False, message=str(exc))
 
     def publish(self, action: str = "confluence", **kwargs: Any) -> PublishResponse:
@@ -3510,6 +3633,9 @@ def _build_response_from_job(
         changed_files=changed_files,
         attempts=attempts,
         data=data,
+        project_name=str(data.get("project_name", "")),
+        repository=str(data.get("repository", "")),
+        repo_root=str(data.get("repo_root", "")),
     )
 
 
@@ -3554,6 +3680,9 @@ def _task_to_dict(task: Any) -> dict[str, Any]:
         "objective": task.objective,
         "context": task.context,
         "project": task.project,
+        "project_delivery_repository": task.project_delivery_repository,
+        "project_source_device": task.project_source_device,
+        "project_source_inode": task.project_source_inode,
         "assigned_to": task.assigned_to,
         "acceptance_criteria": list(task.acceptance_criteria),
         "created": task.created.isoformat(),

@@ -113,6 +113,8 @@ With live builds disabled (the default):
 ```text
 normal text             create and run a task
 /build REQUEST          create and run a task
+/build PROJECT :: REQUEST
+                        create a task explicitly bound to a registered project
 /run TASK-ID            run an existing task
 /status [TASK-ID]       system or task status
 /tasks                  list active tasks
@@ -126,9 +128,21 @@ With `MONDAYOS_TELEGRAM_LIVE_BUILD=true` in a private chat:
 ```text
 normal text             create, build, validate, review, and open a PR
 /build REQUEST          create, build, validate, review, and open a PR
+/build PROJECT :: REQUEST
+                        do the same in that registered project's repository
 /deliver TASK-ID        deliver an existing task through a PR
 /run TASK-ID            run the advisory agent team (unchanged)
 ```
+
+`PROJECT` is a registered MondayOS project name, never a filesystem path or Git
+URL. Live delivery additionally requires that project to have been explicitly
+enrolled with its exact GitHub repository identity. Spaces around `::` are
+optional; when the delimiter is present, both the project name and request are
+required. `/deliver` reads the saved project binding from the task, so a
+project-bound task is delivered to that registered repository automatically;
+unbound and `mondayos` tasks continue to target MondayOS itself. The Telegram
+checkpoint also saves the selected project, and a retry cannot rebind the same
+update to another target.
 
 Only allowlisted Telegram users are processed. Unauthorized messages are ignored
 without revealing whether the bot controls MondayOS. Group messages are ignored
@@ -153,11 +167,12 @@ and load it with launchd. It contains no credentials; `monday telegram` reads th
 Git-ignored project `.env` at startup.
 
 The example defines an explicit, minimal `PATH` because launchd does not inherit
-your interactive shell setup. It includes the Codex CLI bundled with the ChatGPT
-app, Apple Silicon Homebrew, Intel Homebrew, and macOS system tool locations. If
-you installed Codex, Claude Code, or GitHub CLI somewhere else, add that exact
-executable directory to the copied plist before loading it. Never put tokens or
-API keys in the plist.
+your interactive shell setup. Delivery does not trust that ambient `PATH` when
+choosing authenticated tools: it resolves Codex from the ChatGPT app bundle or
+standard Homebrew/system locations, and Claude Code and GitHub CLI from standard
+Homebrew/system locations. Install those tools in one of those supported
+locations; adding an arbitrary directory to the plist does not enroll it as a
+trusted executable. Never put tokens or API keys in the plist.
 
 ```bash
 chmod 600 .env
@@ -183,8 +198,8 @@ launchctl bootout "gui/$(id -u)" \
 Diagnostics are written to `logs/telegram-stdout.log` and
 `logs/telegram-stderr.log`. A startup failure is usually an invalid bot token,
 an empty user allowlist, an unreplaced plist path, a required CLI installed
-outside the plist's explicit `PATH`, or another worker already holding
-`logs/telegram/bot.lock`.
+outside the supported trusted locations described above, or another worker
+already holding `logs/telegram/bot.lock`.
 
 ## Current boundary
 
@@ -192,8 +207,10 @@ The default Telegram behavior still runs the advisory team and requires its
 existing human approval. The opt-in private live-build path performs real code
 delivery through `Monday.build()`: isolated patch application, fixed tests,
 bounded repair, exact-artifact ChatGPT review, commit, push, and pull request.
-It does **not** merge, deploy, operate on registered external repositories, or
-transcribe voice.
+It can target MondayOS itself or an explicitly enrolled registered project. It
+does **not** accept an ad hoc path or Git URL, merge, deploy, or transcribe
+voice. A delivery branch push may start automation already configured in the
+selected GitHub repository.
 
 Accepted work runs through the durable FIFO queue. The polling intake stays
 responsive while its single worker performs a team run or live build, so model

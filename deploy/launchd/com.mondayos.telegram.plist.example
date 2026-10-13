@@ -17,9 +17,10 @@
   <key>EnvironmentVariables</key>
   <dict>
     <!-- LaunchAgents do not inherit an interactive shell PATH. Keep this list
-         explicit so the signed ChatGPT Codex CLI, Homebrew Claude/GitHub CLIs,
-         and macOS system tools are discoverable without loading shell startup
-         files. This contains executable locations only, never credentials. -->
+         explicit for ordinary process helpers. Autonomous delivery separately
+         resolves authenticated Codex, Claude, and GitHub tools only from its
+         fixed trusted app/Homebrew/system locations; adding another PATH entry
+         does not trust it. This contains locations only, never credentials. -->
     <key>PATH</key>
     <string>/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>

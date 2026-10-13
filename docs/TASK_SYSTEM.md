@@ -38,6 +38,10 @@ priority: {P0 | P1 | P2 | P3}
 created: {YYYY-MM-DDThh:mm:ssZ}
 updated: {YYYY-MM-DDThh:mm:ssZ}
 created_by: {human:{name} | agent:{agent-id}}
+project: {registered-project-slug | ""}
+project_delivery_repository: {github-owner/repository | ""}
+project_source_device: {filesystem-device-id | null}
+project_source_inode: {filesystem-inode-id | null}
 assigned_to: {human:{name} | agent:{agent-id} | unassigned}
 parent_task: {TASK-NNNN | null}
 child_tasks: [{TASK-NNNN, ...}]
@@ -89,6 +93,13 @@ findings. For docs tasks: links to created/updated docs.}
 | {ISO timestamp} | assigned | in-progress | {agent-id} | Started execution |
 | {ISO timestamp} | in-progress | completed | {agent-id} | All acceptance criteria met |
 ```
+
+The delivery repository and two filesystem identity fields are written together
+when a task is created for a delivery-enabled external project. They bind the
+task to the exact repository and directory identity that existed at creation
+time. Legacy, MondayOS-internal, and analysis-only tasks leave them empty.
+External delivery refuses a missing or mismatched binding instead of following
+a project name that was later removed and re-registered.
 
 ---
 

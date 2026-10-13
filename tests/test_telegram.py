@@ -126,6 +126,7 @@ class FakeMonday:
                 "title": kwargs["title"],
                 "objective": kwargs["objective"],
                 "context": kwargs.get("context", ""),
+                "project": kwargs.get("project", ""),
                 "status": "backlog",
                 "priority": kwargs.get("priority", "P2"),
             }
@@ -547,6 +548,85 @@ class TestTelegramService(TelegramFixture):
         self.assertIn("passed ChatGPT review", combined)
         self.assertIn("https://github.com/example/mondayos/pull/55", combined)
 
+    def test_private_build_can_explicitly_target_a_registered_project(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            provider="fake",
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+
+        service.handle_update(
+            _update(text="/build weatherbot :: Ship a forecast endpoint")
+        )
+
+        create = next(call for call in self.monday.task_calls if call[0] == "create")
+        self.assertEqual(create[1]["project"], "weatherbot")
+        self.assertEqual(create[1]["objective"], "Ship a forecast endpoint")
+        self.assertEqual(create[1]["title"], "Ship a forecast endpoint")
+        self.assertEqual(self.monday.build_calls[-1][1]["project"], "weatherbot")
+        self.assertEqual(self.state.job(10)["project_name"], "weatherbot")
+
+    def test_project_build_delimiter_allows_optional_surrounding_spaces(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            provider="fake",
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        cases = [
+            (20, "/build weatherbot:: Ship it", "weatherbot"),
+            (21, "/build weatherbot ::Ship it", "weatherbot"),
+            (22, "/build Weather Portal::Ship it", "Weather Portal"),
+        ]
+
+        for update_id, text, expected_project in cases:
+            with self.subTest(text=text):
+                service.handle_update(_update(update_id=update_id, text=text))
+                create = [call for call in self.monday.task_calls if call[0] == "create"][-1]
+                self.assertEqual(create[1]["project"], expected_project)
+                self.assertEqual(create[1]["objective"], "Ship it")
+                self.assertEqual(
+                    self.monday.build_calls[-1][1]["project"],
+                    expected_project,
+                )
+
+        self.assertNotIn("", [task["project"] for task in self.monday.tasks.values()])
+
+    def test_project_build_requires_both_selector_and_request(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+
+        service.handle_update(_update(text="/build weatherbot ::"))
+
+        self.assertFalse(self.monday.tasks)
+        self.assertEqual(self.monday.build_executions, 0)
+        self.assertIn("/build PROJECT :: REQUEST", self.client.sent[-1][1])
+
+    def test_project_build_with_empty_selector_never_falls_back_to_controller(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+
+        service.handle_update(_update(text="/build :: Ship it"))
+
+        self.assertFalse(self.monday.tasks)
+        self.assertEqual(self.monday.build_executions, 0)
+        self.assertIn("/build PROJECT :: REQUEST", self.client.sent[-1][1])
+
     def test_nonterminal_live_delivery_stays_retryable_until_reconciled(self):
         created = self.monday.task(
             "create",
@@ -624,6 +704,82 @@ class TestTelegramService(TelegramFixture):
             action == "create"
             for action, _kwargs in self.monday.task_calls[initial_task_calls:]
         ))
+        self.assertNotIn("project", self.monday.build_calls[-1][1])
+
+    def test_private_deliver_routes_a_project_bound_task_to_its_target(self):
+        created = self.monday.task(
+            "create",
+            title="Existing",
+            objective="Ship it",
+            priority="P2",
+            project="weatherbot",
+        )
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+
+        service.handle_update(
+            _update(update_id=21, text=f"/deliver {created.task_id}")
+        )
+
+        self.assertEqual(self.monday.build_calls[-1][1]["project"], "weatherbot")
+        self.assertEqual(self.state.job(21)["project_name"], "weatherbot")
+
+    def test_private_deliver_keeps_explicit_mondayos_task_on_self_target(self):
+        created = self.monday.task(
+            "create",
+            title="Existing",
+            objective="Ship it",
+            priority="P2",
+            project="mondayos",
+        )
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+
+        service.handle_update(
+            _update(update_id=23, text=f"/deliver {created.task_id}")
+        )
+
+        self.assertNotIn("project", self.monday.build_calls[-1][1])
+        self.assertEqual(self.state.job(23)["project_name"], "")
+
+    def test_deliver_refuses_to_rebind_a_saved_update_to_another_project(self):
+        created = self.monday.task(
+            "create",
+            title="Existing",
+            objective="Ship it",
+            priority="P2",
+            project="weatherbot",
+        )
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        self.state.set_job(
+            22,
+            task_id=created.task_id,
+            workflow="live-build",
+            project_name="another-project",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "another project"):
+            service.handle_update(
+                _update(update_id=22, text=f"/deliver {created.task_id}")
+            )
+
+        self.assertEqual(self.monday.build_executions, 0)
 
     def test_live_build_duplicate_update_reuses_task_and_delivery(self):
         config = TelegramConfig(

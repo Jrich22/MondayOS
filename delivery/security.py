@@ -13,6 +13,191 @@ class ArtifactSecurityError(ValueError):
     """A proposed artifact violated the delivery security policy."""
 
 
+def protected_path_reason(relative: str) -> str | None:
+    """Return why a normalized repository path must stay outside model control.
+
+    The same predicate protects both mutation and model-context boundaries so a
+    tracked file cannot become readable merely because it is not being edited.
+    """
+    path = PurePosixPath(relative)
+    lower_parts = tuple(part.casefold() for part in path.parts)
+    if not lower_parts:
+        return "protected repository path"
+    basename = lower_parts[-1]
+    top = lower_parts[0]
+    if ".git" in lower_parts:
+        return "Git internals are protected"
+    if basename.startswith(".env"):
+        return "environment files are protected"
+    credential_directories = {
+        ".aws",
+        ".azure",
+        ".credentials",
+        ".docker",
+        ".gcp",
+        ".gnupg",
+        ".kube",
+        ".secrets",
+        ".ssh",
+        "credential",
+        "credentials",
+        "secret",
+        "secrets",
+    }
+    credential_files = {
+        ".authinfo",
+        ".authinfo.gpg",
+        ".boto",
+        ".curlrc",
+        ".dockerconfigjson",
+        ".git-credentials",
+        ".gitconfig",
+        ".htpasswd",
+        ".my.cnf",
+        ".netrc",
+        ".npmrc",
+        ".pgpass",
+        ".pypirc",
+        ".s3cfg",
+        ".vault-token",
+        ".wgetrc",
+        "_netrc",
+        "application_default_credentials.json",
+        "auth.json",
+        "client_secret.json",
+        "credentials.json",
+        "kubeconfig",
+        "secret.json",
+        "secrets.json",
+        "service-account-key.json",
+        "service-account.json",
+        "service_account_key.json",
+        "service_account.json",
+    }
+    credential_config_tree = any(
+        lower_parts[index : index + 2] in {
+            (".config", "gcloud"),
+            (".config", "gh"),
+            (".config", "hub"),
+        }
+        for index in range(len(lower_parts) - 1)
+    )
+    if (
+        any(part in credential_directories for part in lower_parts)
+        or basename in credential_files
+        or credential_config_tree
+        or basename.startswith("client_secret_")
+        or (basename.startswith("firebase-adminsdk-") and basename.endswith(".json"))
+        or basename.endswith((".credentials", ".secret", ".secrets", ".tfstate"))
+        or ".tfstate." in basename
+    ):
+        return "credential and secret configuration is protected"
+    if top in {".buildkite", ".circleci", ".github", ".gitlab"}:
+        return "CI workflow definitions are protected"
+    if top in {".agents", ".claude", ".codex", ".mondayos"} or basename in {
+        "agents.md",
+        "claude.md",
+        "skill.md",
+        ".cursorrules",
+        ".mcp.json",
+        "copilot-instructions.md",
+    }:
+        return "AI/controller instruction files are protected"
+    if basename in {".gitmodules", ".gitattributes"}:
+        return "Git configuration files are protected"
+    if basename in {
+        ".pytest.ini",
+        ".pytest.toml",
+        "conftest.py",
+        "pytest.ini",
+        "pytest.toml",
+        "tox.ini",
+    }:
+        return "test harness configuration is protected"
+    if top in {
+        ".aws",
+        ".azure",
+        ".gcp",
+        "charts",
+        "deploy",
+        "deployment",
+        "helm",
+        "infra",
+        "k8s",
+        "kubernetes",
+        "service",
+        "services",
+        "terraform",
+    }:
+        return "deployment/service definitions are protected"
+    if basename.endswith((".service", ".timer", ".socket", ".plist")) or basename in {
+        "dockerfile",
+        "procfile",
+        ".drone.yml",
+        ".travis.yml",
+        "appveyor.yml",
+        "azure-pipelines.yml",
+        "bitbucket-pipelines.yml",
+        "buildspec.yml",
+        "buildspec.yaml",
+        "cloudbuild.yml",
+        "cloudbuild.yaml",
+        "firebase.json",
+        "fly.toml",
+        "jenkinsfile",
+        "netlify.toml",
+        "railway.json",
+        "render.yaml",
+        "render.yml",
+        "serverless.yaml",
+        "serverless.yml",
+        "vercel.json",
+    } or basename.startswith(("docker-compose.", "compose.")):
+        return "deployment/service definitions are protected"
+    if basename.endswith((".pem", ".key", ".p12", ".pfx")) or basename in {
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+    }:
+        return "key material is protected"
+    manifests = {
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "pipfile",
+        "pipfile.lock",
+        "poetry.lock",
+        "uv.lock",
+        "cargo.toml",
+        "cargo.lock",
+        "go.mod",
+        "go.sum",
+        "gemfile",
+        "gemfile.lock",
+        "composer.json",
+        "composer.lock",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "gradle.lockfile",
+    }
+    if basename in manifests or (
+        basename.startswith("requirements") and basename.endswith((".txt", ".in"))
+    ):
+        return "dependency manifests and locks are protected"
+    return None
+
+
+def is_protected_path(relative: str) -> bool:
+    """Whether a normalized path is excluded from delivery mutation and context."""
+    return protected_path_reason(relative) is not None
+
+
 _PATCH_PATH = re.compile(r"^diff --git a/(.+) b/(.+)$")
 _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
@@ -113,14 +298,18 @@ def artifact_digest(
     objective: str,
     diff: str,
     verification_sha256: str,
+    project_name: str = "",
+    repository: str = "",
 ) -> tuple[str, str]:
-    """Bind review authorization to the exact base, task, diff, and checks."""
+    """Bind review authorization to the exact target, base, task, diff, and checks."""
     diff_sha256 = hashlib.sha256(diff.encode("utf-8")).hexdigest()
     envelope = json.dumps(
         {
             "base_sha": base_sha,
             "objective": objective,
             "diff_sha256": diff_sha256,
+            "project_name": project_name,
+            "repository": repository,
             "verification_sha256": verification_sha256,
         },
         sort_keys=True,
