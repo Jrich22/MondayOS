@@ -100,6 +100,8 @@ def test_build_response_is_part_of_the_public_package() -> None:
     assert response.merge_commit_sha == ""
     assert response.pr_observed_at == ""
     assert response.task_reconciliation == ""
+    assert response.failure_class == ""
+    assert response.retry_after_seconds == 0
 
 
 def test_build_run_passes_identity_and_callbacks_without_invoking_real_tools(
@@ -145,6 +147,34 @@ def test_build_run_uses_job_outcome_as_response_success(tmp_path: Path) -> None:
     assert response.success is False
     assert response.status == "failed"
     assert response.message == "No reviewer"
+
+
+def test_build_run_exposes_only_valid_structured_retry_metadata(tmp_path: Path) -> None:
+    workflow = _Workflow()
+    workflow.job = _Job(
+        success=False,
+        status="failed",
+        failure_class="transient",
+        retry_after_seconds=75,
+    )
+
+    response = _call_build(_monday(tmp_path), workflow, "run", task_id="TASK-0001")
+
+    assert response.failure_class == "transient"
+    assert response.retry_after_seconds == 75
+    assert response.data["failure_class"] == "transient"
+
+    workflow.job = _Job(
+        success=False,
+        status="failed",
+        failure_class="transient because the message said so",
+        retry_after_seconds=75,
+    )
+    malformed = _call_build(_monday(tmp_path), workflow, "run", task_id="TASK-0001")
+    assert malformed.failure_class == ""
+    assert malformed.retry_after_seconds == 0
+    assert malformed.data["failure_class"] == ""
+    assert malformed.data["retry_after_seconds"] == 0
 
 
 def test_build_get_reports_successful_lookup_even_for_failed_job(tmp_path: Path) -> None:
@@ -200,6 +230,8 @@ def test_build_history_normalizes_objects_and_dicts(tmp_path: Path) -> None:
         "delivery-test-1",
         "delivery-test-2",
     ]
+    assert all(job["failure_class"] == "" for job in response.data["jobs"])
+    assert all(job["retry_after_seconds"] == 0 for job in response.data["jobs"])
     assert workflow.calls == [("history", {"task_id": "TASK-0001", "limit": 5})]
 
 

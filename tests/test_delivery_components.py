@@ -33,7 +33,7 @@ from delivery.security import (
     verification_digest,
 )
 from delivery.store import DeliveryStore
-from delivery.types import DeliveryJob
+from delivery.types import MAX_DELIVERY_RETRY_AFTER_SECONDS, DeliveryJob
 from delivery.validation import MondayValidationRunner, _sandbox_profile
 
 _TEST_CLI = os.fspath(Path(sys.executable).resolve())
@@ -1738,6 +1738,47 @@ def test_delivery_job_preserves_the_schema_v1_positional_status_argument() -> No
     assert job.project_name == ""
 
 
+def test_delivery_job_failure_classification_is_bounded_and_legacy_safe() -> None:
+    transient = DeliveryJob(
+        "delivery-transient",
+        "TASK-0001",
+        "objective",
+        "/repo",
+        failure_class="transient",
+        retry_after_seconds=MAX_DELIVERY_RETRY_AFTER_SECONDS + 1,
+    )
+
+    payload = transient.to_dict()
+    assert payload["failure_class"] == "transient"
+    assert payload["retry_after_seconds"] == MAX_DELIVERY_RETRY_AFTER_SECONDS
+    restored = DeliveryJob.from_dict(payload)
+    assert restored.failure_class == "transient"
+    assert restored.retry_after_seconds == MAX_DELIVERY_RETRY_AFTER_SECONDS
+
+    legacy = dict(payload)
+    legacy.pop("failure_class")
+    legacy.pop("retry_after_seconds")
+    restored_legacy = DeliveryJob.from_dict(legacy)
+    assert restored_legacy.failure_class == ""
+    assert restored_legacy.retry_after_seconds == 0
+
+    malformed = dict(payload, failure_class="Transient", retry_after_seconds=30)
+    restored_malformed = DeliveryJob.from_dict(malformed)
+    assert restored_malformed.failure_class == ""
+    assert restored_malformed.retry_after_seconds == 0
+
+    unsafe = DeliveryJob(
+        "delivery-unsafe-class",
+        "TASK-0001",
+        "objective",
+        "/repo",
+        failure_class="transient please retry",
+        retry_after_seconds=30,
+    ).to_dict()
+    assert unsafe["failure_class"] == ""
+    assert unsafe["retry_after_seconds"] == 0
+
+
 def test_delivery_store_reserves_identity_and_rejects_tampered_record(tmp_path: Path) -> None:
     store = DeliveryStore(tmp_path)
     owner_token = "a" * 64
@@ -1764,6 +1805,42 @@ def test_delivery_store_reserves_identity_and_rejects_tampered_record(tmp_path: 
     record.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="identifies itself"):
         store.get("delivery-one")
+
+
+def test_delivery_store_round_trips_structured_transient_failure(tmp_path: Path) -> None:
+    store = DeliveryStore(tmp_path)
+    job = DeliveryJob(
+        delivery_id="delivery-transient-store",
+        task_id="TASK-0001",
+        objective="objective",
+        repo_root=str(tmp_path),
+        status="failed",
+        phase="failed",
+        failure_code="builder-unavailable",
+        failure_class="transient",
+        retry_after_seconds=75,
+    )
+
+    store.persist(job)
+    restored = store.get(job.delivery_id)
+
+    assert restored.failure_class == "transient"
+    assert restored.retry_after_seconds == 75
+    payload = json.loads(
+        (store.records / "delivery-transient-store.json").read_text(encoding="utf-8")
+    )
+    assert payload["failure_class"] == "transient"
+    assert payload["retry_after_seconds"] == 75
+
+    payload["failure_class"] = "temporary outage"
+    payload["retry_after_seconds"] = 75
+    (store.records / "delivery-transient-store.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    fail_closed = store.get(job.delivery_id)
+    assert fail_closed.failure_class == ""
+    assert fail_closed.retry_after_seconds == 0
 
 
 def test_delivery_store_history_filters_real_records_by_project(tmp_path: Path) -> None:

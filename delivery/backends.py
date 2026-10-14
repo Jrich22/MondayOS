@@ -172,6 +172,8 @@ class ToolAvailability:
     available: bool
     tool: str
     reason: str
+    failure_class: str = ""
+    retry_after_seconds: int = 0
 
 
 @dataclass(frozen=True)
@@ -181,6 +183,8 @@ class PatchProposal:
     patch: str = ""
     summary: str = ""
     message: str = ""
+    failure_class: str = ""
+    retry_after_seconds: int = 0
 
 
 @dataclass(frozen=True)
@@ -363,7 +367,13 @@ class CodexPatchBuilder:
                 ),
             )
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            return PatchProposal(False, self.name, message=_redact(str(exc)))
+            timed_out = isinstance(exc, subprocess.TimeoutExpired)
+            return PatchProposal(
+                False,
+                self.name,
+                message=_redact(str(exc)),
+                failure_class="transient" if timed_out else "",
+            )
 
 
 class ClaudeCodePatchBuilder:
@@ -483,7 +493,13 @@ class CodexArtifactReviewer:
 
     def availability(self) -> ToolAvailability:
         availability = self._builder.availability()
-        return ToolAvailability(availability.available, self.name, availability.reason)
+        return ToolAvailability(
+            availability.available,
+            self.name,
+            availability.reason,
+            failure_class=availability.failure_class,
+            retry_after_seconds=availability.retry_after_seconds,
+        )
 
     def review(
         self,

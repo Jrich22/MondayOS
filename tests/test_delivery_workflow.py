@@ -15,6 +15,7 @@ import pytest
 
 from delivery.backends import PatchProposal, ReviewDecision, ToolAvailability
 from delivery.github import PullRequestResult
+from delivery.security import ArtifactSecurityError
 from delivery.types import DeliveryJob
 from delivery.validation import MondayValidationRunner, ValidationResult
 from delivery.workflow import DeliveryWorkflow
@@ -1733,6 +1734,29 @@ def test_reviewer_requested_change_runs_full_validation_and_review_again(
     assert _git(remote, "show", f"{job.branch}:app.py") == "VALUE = 3"
 
 
+def test_reviewer_block_is_a_non_retryable_policy_outcome(tmp_path: Path) -> None:
+    root, remote = _repository(tmp_path)
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer(
+            [ReviewDecision("block", "high", "The proposed change violates policy")]
+        ),
+        validator=_Validator([True]),
+        github=github,
+    )
+
+    job = workflow.run(task_id="TASK-0003", delivery_id="delivery-review-policy-block")
+
+    assert job.status == "rejected"
+    assert job.failure_code == "review-blocked"
+    assert job.failure_class == "policy"
+    assert job.retry_after_seconds == 0
+    assert github.calls == 0
+    assert _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/codex") == ""
+
+
 def test_unavailable_reviewer_fails_before_worktree_or_builder(tmp_path: Path) -> None:
     root, _ = _repository(tmp_path)
     builder = _Builder([_patch(1, 2)])
@@ -1750,9 +1774,121 @@ def test_unavailable_reviewer_fails_before_worktree_or_builder(tmp_path: Path) -
 
     assert job.success is False
     assert job.failure_code == "reviewer-unavailable"
+    assert job.failure_class == "permanent"
+    assert job.retry_after_seconds == 0
     assert builder.calls == github.calls == 0
     assert monday.calls == ["get"]
     assert not (root / "logs" / "delivery" / "worktrees").exists()
+
+
+def test_structured_temporary_reviewer_outage_is_durable_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    class _TemporarilyUnavailableReviewer(_Reviewer):
+        def availability(self) -> ToolAvailability:
+            return ToolAvailability(
+                False,
+                self.name,
+                "review service is unavailable",
+                failure_class="transient",
+                retry_after_seconds=45,
+            )
+
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _TemporarilyUnavailableReviewer([_pass()])
+    github = _GitHub()
+    workflow, monday = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=_Validator([True]),
+        github=github,
+    )
+
+    job = workflow.run(
+        task_id="TASK-0004",
+        delivery_id="delivery-temporary-reviewer-outage",
+    )
+
+    assert job.status == "failed"
+    assert job.failure_code == "reviewer-unavailable"
+    assert job.failure_class == "transient"
+    assert job.retry_after_seconds == 45
+    assert workflow.get(job.delivery_id).to_dict() == job.to_dict()
+
+    same = workflow.run(task_id="TASK-0004", delivery_id=job.delivery_id)
+    assert same.failure_class == "transient"
+    assert same.retry_after_seconds == 45
+    assert builder.calls == github.calls == 0
+    assert monday.calls == ["get", "get"]
+
+
+def test_typed_github_availability_timeout_is_transient(tmp_path: Path) -> None:
+    class _TimedOutGitHub(_GitHub):
+        def availability(self) -> ToolAvailability:
+            raise subprocess.TimeoutExpired("gh auth status", 20)
+
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    github = _TimedOutGitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+
+    job = workflow.run(
+        task_id="TASK-0004",
+        delivery_id="delivery-github-availability-timeout",
+    )
+
+    assert job.status == "failed"
+    assert job.failure_code == "github-unavailable"
+    assert job.failure_class == "transient"
+    assert job.retry_after_seconds == 0
+    assert job.commit_sha == ""
+    assert job.pushed is False
+    assert job.pr_url == ""
+    assert builder.calls == github.calls == 0
+
+
+def test_typed_reviewer_runtime_timeout_is_transient_before_commit(
+    tmp_path: Path,
+) -> None:
+    class _TimedOutReviewer(_Reviewer):
+        def review(self, **_: Any) -> ReviewDecision:
+            self.calls += 1
+            raise subprocess.TimeoutExpired(self.name, 30)
+
+    root, remote = _repository(tmp_path)
+    reviewer = _TimedOutReviewer([_pass()])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=reviewer,
+        validator=_Validator([True]),
+        github=github,
+    )
+
+    job = workflow.run(
+        task_id="TASK-0004",
+        delivery_id="delivery-reviewer-runtime-timeout",
+    )
+
+    assert job.status == "failed"
+    assert job.failure_code == "runtime"
+    assert job.failure_class == "transient"
+    assert job.retry_after_seconds == 0
+    assert job.commit_sha == ""
+    assert job.pushed is False
+    assert job.pr_url == ""
+    assert reviewer.calls == 2
+    assert github.calls == 0
+    assert _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/codex") == ""
 
 
 def test_invalid_repository_identity_fails_preflight_before_builder_or_fetch(
@@ -1786,6 +1922,8 @@ def test_invalid_repository_identity_fails_preflight_before_builder_or_fetch(
     assert capabilities["repository"]["available"] is False
     assert capabilities["validation"]["available"] is True
     assert job.failure_code == "repository-unavailable"
+    assert job.failure_class == "policy"
+    assert job.retry_after_seconds == 0
     assert builder.calls == github.calls == 0
     assert monday.calls == ["get"]
     assert not (root / "logs" / "delivery" / "worktrees").exists()
@@ -1826,6 +1964,8 @@ def test_repair_budget_exhaustion_never_pushes(tmp_path: Path) -> None:
 
     assert job.success is False
     assert job.failure_code == "repair-exhausted"
+    assert job.failure_class == "permanent"
+    assert job.retry_after_seconds == 0
     assert len(job.attempts) == 2
     assert github.calls == 0
     assert _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/codex") == ""
@@ -1894,11 +2034,91 @@ def test_all_builder_provider_failures_stop_before_any_patch_or_push(
 
     assert job.success is False
     assert job.failure_code == "builders-failed"
+    # The word "temporary" in provider-controlled prose is not a retry signal.
+    assert job.failure_class == "permanent"
+    assert job.retry_after_seconds == 0
     assert job.attempt == 0
     assert job.attempts == []
     assert "claude-code: subscription unavailable" in job.message
     assert "codex-chatgpt: temporary model outage" in job.message
     assert claude.calls == codex.calls == 1
+    assert github.calls == 0
+    assert _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/codex") == ""
+
+
+def test_typed_builder_timeouts_are_classified_without_reading_provider_prose(
+    tmp_path: Path,
+) -> None:
+    class _TimedOutBuilder(_FailingBuilder):
+        def propose(self, **_: Any) -> PatchProposal:
+            self.calls += 1
+            raise subprocess.TimeoutExpired(self.name, 30)
+
+    root, remote = _repository(tmp_path)
+    builder = _TimedOutBuilder(name="codex-chatgpt", message="ignored")
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        max_attempts=1,
+    )
+
+    job = workflow.run(
+        task_id="TASK-0008",
+        delivery_id="delivery-builder-timeout",
+    )
+
+    assert job.status == "failed"
+    assert job.failure_code == "builders-failed"
+    assert job.failure_class == "transient"
+    assert job.retry_after_seconds == 0
+    assert job.attempt == 0
+    assert job.commit_sha == ""
+    assert job.pushed is False
+    assert job.pr_url == ""
+    assert workflow.get(job.delivery_id).failure_class == "transient"
+    assert builder.calls == 1
+    assert github.calls == 0
+    assert _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/codex") == ""
+
+
+def test_builder_policy_error_dominates_a_wrapping_timeout(tmp_path: Path) -> None:
+    class _PolicyWrappedBuilder(_FailingBuilder):
+        def propose(self, **_: Any) -> PatchProposal:
+            self.calls += 1
+            try:
+                raise ArtifactSecurityError("unsafe artifact")
+            except ArtifactSecurityError as exc:
+                raise TimeoutError("typed wrapper") from exc
+
+    root, remote = _repository(tmp_path)
+    builder = _PolicyWrappedBuilder(name="codex-chatgpt", message="ignored")
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        max_attempts=1,
+    )
+
+    job = workflow.run(
+        task_id="TASK-0008",
+        delivery_id="delivery-builder-policy-chain",
+    )
+
+    assert job.status == "failed"
+    assert job.failure_code == "builders-failed"
+    assert job.failure_class == "policy"
+    assert job.retry_after_seconds == 0
+    assert job.commit_sha == ""
+    assert job.pushed is False
+    assert job.pr_url == ""
+    assert builder.calls == 1
     assert github.calls == 0
     assert _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/codex") == ""
 

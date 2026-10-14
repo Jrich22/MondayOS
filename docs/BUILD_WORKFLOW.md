@@ -300,9 +300,13 @@ otherwise ignored content is not queued.
 
 Queued, running, waiting, and retrying work is recovered after restart with
 stable Telegram job, task, run, and delivery identities. Unexpected poison work
-is bounded to three attempts. A graceful stop finishes the active build and
-leaves later work queued; `monday telegram --once` instead ingests one poll
-response and drains its accepted work synchronously before exiting.
+is bounded to three handler attempts. A controller-classified transient failure
+before commit or push instead creates a request-free, deterministic delivery
+retry outside the FIFO. It uses increasing delays, at most six delivery runs,
+and a 24-hour lifetime; policy, permanent, unclassified, and publication-started
+failures never receive a fresh identity. A graceful stop finishes the active
+build and leaves later work queued; `monday telegram --once` instead ingests one
+poll response and drains its accepted work synchronously before exiting.
 
 ## Records and GitHub truth
 
@@ -315,8 +319,11 @@ Git-ignored because they contain machine paths or in-progress state. Terminal
 Telegram replay tombstones keep stable identity and outcome data but remove the
 active request text. A PR-backed tombstone may also retain the minimal delivery,
 chat, PR, next-poll, and last-notified fields needed for restart-safe lifecycle
-updates. These records are not credentials, but they are not yet synchronized to
-GitHub. Do not describe this increment as storing every runtime byte in GitHub.
+updates. A transient pre-publication failure may retain a separate request-free
+retry checkpoint with the bound task, project, chat, deterministic delivery
+identity, attempt number, and due/expiry times. These records are not
+credentials, but they are not yet synchronized to GitHub. Do not describe this
+increment as storing every runtime byte in GitHub.
 
 Failed worktrees are retained for diagnosis. Earlier rejected candidates are
 removed only when another attempt is about to begin; if the attempt budget is
