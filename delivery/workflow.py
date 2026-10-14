@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 import uuid
@@ -40,7 +42,12 @@ from delivery.security import (
     verification_digest,
 )
 from delivery.store import DeliveryStore
-from delivery.types import DeliveryAttempt, DeliveryJob
+from delivery.types import (
+    DeliveryAttempt,
+    DeliveryJob,
+    bounded_delivery_retry_after_seconds,
+    normalize_delivery_failure_class,
+)
 from delivery.validation import MondayValidationRunner, ValidationResult
 from tasks.manager import TaskManager
 
@@ -54,6 +61,34 @@ class _WorkflowLeaseTimeoutError(TimeoutError):
 
 class _BuilderProviderError(RuntimeError):
     """A builder was reachable but did not return a usable patch proposal."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_class: str = "",
+        retry_after_seconds: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
+        self.retry_after_seconds = retry_after_seconds
+
+
+_TRANSIENT_ERRNOS = frozenset(
+    {
+        errno.EAGAIN,
+        errno.EBUSY,
+        errno.ECONNABORTED,
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.EHOSTDOWN,
+        errno.EHOSTUNREACH,
+        errno.ENETDOWN,
+        errno.ENETRESET,
+        errno.ENETUNREACH,
+        errno.ETIMEDOUT,
+    }
+)
 
 
 class DeliveryWorkflow:
@@ -435,6 +470,10 @@ class DeliveryWorkflow:
                             job,
                             "repository-unavailable",
                             repository_ready["reason"],
+                            failure_class=repository_ready.get("failure_class", ""),
+                            retry_after_seconds=repository_ready.get(
+                                "retry_after_seconds", 0
+                            ),
                         )
                     validation_ready = self._validation_readiness()
                     if not validation_ready["available"]:
@@ -442,14 +481,25 @@ class DeliveryWorkflow:
                             job,
                             "validation-unavailable",
                             validation_ready["reason"],
+                            failure_class=validation_ready.get("failure_class", ""),
+                            retry_after_seconds=validation_ready.get(
+                                "retry_after_seconds", 0
+                            ),
                         )
-                    builders, builder_reasons = self._select_builders()
+                    (
+                        builders,
+                        builder_reasons,
+                        builder_failure_class,
+                        builder_retry_after,
+                    ) = self._select_builders()
                     if not builders:
                         detail = "; ".join(builder_reasons) or "No builders are configured"
                         return self._fail(
                             job,
                             "builder-unavailable",
                             f"No authenticated coding builder is available. {detail}",
+                            failure_class=builder_failure_class,
+                            retry_after_seconds=builder_retry_after,
                         )
                     reviewer_ready = self._availability(self.reviewer)
                     if not reviewer_ready["available"]:
@@ -457,10 +507,18 @@ class DeliveryWorkflow:
                             job,
                             "reviewer-unavailable",
                             reviewer_ready["reason"],
+                            failure_class=reviewer_ready["failure_class"],
+                            retry_after_seconds=reviewer_ready["retry_after_seconds"],
                         )
                     github_ready = self._availability(self.github)
                     if not github_ready["available"]:
-                        return self._fail(job, "github-unavailable", github_ready["reason"])
+                        return self._fail(
+                            job,
+                            "github-unavailable",
+                            github_ready["reason"],
+                            failure_class=github_ready["failure_class"],
+                            retry_after_seconds=github_ready["retry_after_seconds"],
+                        )
                     job.builder = _safe_text(builders[0].name, 200)
                     self.store.persist(job)
                     return self._run_locked(
@@ -477,7 +535,22 @@ class DeliveryWorkflow:
                     if reservation_owned:
                         if self._publication_started(job):
                             return self._publication_pending(job, exc)
-                        return self._fail(job, _failure_code(exc), _safe_message(exc))
+                        failure_class = _exception_failure_class(exc)
+                        if not failure_class:
+                            # Preserve the schema-v1 override contract used by
+                            # embedders that wrap _fail(job, code, message).
+                            return self._fail(
+                                job,
+                                _failure_code(exc),
+                                _safe_message(exc),
+                            )
+                        return self._fail(
+                            job,
+                            _failure_code(exc),
+                            _safe_message(exc),
+                            failure_class=failure_class,
+                            retry_after_seconds=_exception_retry_after_seconds(exc),
+                        )
                     raise
         except _WorkflowLeaseTimeoutError as exc:
             # A duplicate caller must never terminalize a record whose original
@@ -491,13 +564,27 @@ class DeliveryWorkflow:
             if existing is not None:
                 self._require_binding(existing, job)
                 return existing
-            return self._fail(job, "workflow-busy", _safe_message(exc))
+            return self._fail(
+                job,
+                "workflow-busy",
+                _safe_message(exc),
+                failure_class="transient",
+            )
         except Exception as exc:  # fail closed at the durable workflow boundary
             existing = self.store.reserve(job)
             if existing is not None:
                 self._require_binding(existing, job)
                 return existing
-            return self._fail(job, _failure_code(exc), _safe_message(exc))
+            failure_class = _exception_failure_class(exc)
+            if not failure_class:
+                return self._fail(job, _failure_code(exc), _safe_message(exc))
+            return self._fail(
+                job,
+                _failure_code(exc),
+                _safe_message(exc),
+                failure_class=failure_class,
+                retry_after_seconds=_exception_retry_after_seconds(exc),
+            )
 
     def _existing_job(self, delivery_id: str) -> DeliveryJob | None:
         try:
@@ -864,6 +951,8 @@ class DeliveryWorkflow:
             job.pushed = True
             job.status = "running"
             job.failure_code = ""
+            job.failure_class = ""
+            job.retry_after_seconds = 0
             self._update(
                 job,
                 phase="pull-request",
@@ -886,6 +975,8 @@ class DeliveryWorkflow:
                 return self._publication_pending(
                     job,
                     RuntimeError(result.message or "GitHub pull request state is unverified"),
+                    failure_class=getattr(result, "failure_class", ""),
+                    retry_after_seconds=getattr(result, "retry_after_seconds", 0),
                 )
             return self._record_pr_success(job, result.url, result.number)
 
@@ -898,6 +989,8 @@ class DeliveryWorkflow:
         job.phase = "interrupted"
         job.success = False
         job.failure_code = "interrupted-run"
+        job.failure_class = "permanent"
+        job.retry_after_seconds = 0
         job.message = (
             "The previous build worker ended before this delivery finished. "
             "Start a new build request so MondayOS creates a new delivery identity; "
@@ -945,8 +1038,8 @@ class DeliveryWorkflow:
         feedback = ""
         builder_index = 0
         patch_attempts = 0
-        pending_provider_failures: list[dict[str, str]] = []
-        all_provider_failures: list[dict[str, str]] = []
+        pending_provider_failures: list[dict[str, Any]] = []
+        all_provider_failures: list[dict[str, Any]] = []
         while patch_attempts < self.max_attempts:
             if patch_attempts:
                 # A repair is a complete replacement proposal against the
@@ -980,7 +1073,19 @@ class DeliveryWorkflow:
                         reason = candidate_proposal.message or (
                             "Builder did not produce a patch"
                         )
-                        raise _BuilderProviderError(reason)
+                        raise _BuilderProviderError(
+                            reason,
+                            failure_class=getattr(
+                                candidate_proposal,
+                                "failure_class",
+                                "",
+                            ),
+                            retry_after_seconds=getattr(
+                                candidate_proposal,
+                                "retry_after_seconds",
+                                0,
+                            ),
+                        )
                 except Exception as exc:
                     failure = _provider_failure(candidate_name, exc)
                     pending_provider_failures.append(failure)
@@ -1007,10 +1112,15 @@ class DeliveryWorkflow:
 
             if proposal is None or builder is None:
                 detail = _provider_failure_summary(all_provider_failures)
+                failure_class, retry_after_seconds = _provider_failure_outcome(
+                    all_provider_failures
+                )
                 return self._fail(
                     job,
                     "builders-failed",
                     f"All available coding providers failed; nothing was pushed. {detail}",
+                    failure_class=failure_class,
+                    retry_after_seconds=retry_after_seconds,
                 )
 
             patch_attempts += 1
@@ -1255,6 +1365,8 @@ class DeliveryWorkflow:
                 pending = self._publication_pending(
                     job,
                     RuntimeError(result.message or "GitHub pull request state is unverified"),
+                    failure_class=getattr(result, "failure_class", ""),
+                    retry_after_seconds=getattr(result, "retry_after_seconds", 0),
                 )
             else:
                 pending = None
@@ -1272,17 +1384,34 @@ class DeliveryWorkflow:
         job.phase = "completed"
         job.success = True
         job.failure_code = ""
+        job.failure_class = ""
+        job.retry_after_seconds = 0
         job.message = f"ChatGPT approved the exact artifact and PR #{number} is open"
         job.updated_at = _now()
         self.store.persist(job)
         return job
 
-    def _publication_pending(self, job: DeliveryJob, exc: BaseException) -> DeliveryJob:
+    def _publication_pending(
+        self,
+        job: DeliveryJob,
+        exc: BaseException,
+        *,
+        failure_class: str = "",
+        retry_after_seconds: int = 0,
+    ) -> DeliveryJob:
         job.status = "publication-pending"
         if job.phase == "completed":
             job.phase = "pull-request"
         job.success = False
         job.failure_code = ""
+        classified = normalize_delivery_failure_class(failure_class)
+        if not classified:
+            classified = _exception_failure_class(exc) or "permanent"
+        job.failure_class = classified
+        job.retry_after_seconds = _classified_retry_after_seconds(
+            retry_after_seconds or _exception_retry_after_seconds(exc),
+            failure_class=classified,
+        )
         job.message = _safe_text(
             (
                 "Publication may have crossed an irreversible boundary and could not "
@@ -1333,16 +1462,31 @@ class DeliveryWorkflow:
                 pass
         return job
 
-    def _select_builders(self) -> tuple[list[PatchBuilder], list[str]]:
+    def _select_builders(
+        self,
+    ) -> tuple[list[PatchBuilder], list[str], str, int]:
         available: list[PatchBuilder] = []
         reasons: list[str] = []
+        unavailable: list[dict[str, Any]] = []
         for builder in self.builders:
             availability = self._availability(builder)
             if availability["available"]:
                 available.append(builder)
             else:
                 reasons.append(f"{availability['tool']}: {availability['reason']}")
-        return available, reasons
+                unavailable.append(availability)
+        if available:
+            return available, reasons, "", 0
+        if any(item["failure_class"] == "policy" for item in unavailable):
+            return available, reasons, "policy", 0
+        if unavailable and all(
+            item["failure_class"] == "transient" for item in unavailable
+        ):
+            retry_after_seconds = max(
+                int(item["retry_after_seconds"]) for item in unavailable
+            )
+            return available, reasons, "transient", retry_after_seconds
+        return available, reasons, "permanent", 0
 
     def _review(
         self,
@@ -1367,21 +1511,47 @@ class DeliveryWorkflow:
             except Exception as exc:
                 last_error = exc
         assert last_error is not None
-        raise RuntimeError(f"Independent reviewer failed twice: {_safe_message(last_error)}")
+        failure_class = _exception_failure_class(last_error)
+        error = RuntimeError(
+            f"Independent reviewer failed twice: {_safe_message(last_error)}"
+        )
+        error.failure_class = failure_class  # type: ignore[attr-defined]
+        error.retry_after_seconds = (  # type: ignore[attr-defined]
+            _exception_retry_after_seconds(last_error)
+        )
+        raise error from last_error
 
     def _availability(self, tool: Any) -> dict[str, Any]:
         try:
             result: ToolAvailability = tool.availability()
+            failure_class = ""
+            retry_after_seconds = 0
+            if not bool(result.available):
+                failure_class = normalize_delivery_failure_class(
+                    getattr(result, "failure_class", "")
+                )
+                retry_after_seconds = _classified_retry_after_seconds(
+                    getattr(result, "retry_after_seconds", 0),
+                    failure_class=failure_class,
+                )
             return {
                 "available": bool(result.available),
                 "tool": _safe_text(result.tool, 200),
                 "reason": _safe_text(result.reason, 2_000),
+                "failure_class": failure_class,
+                "retry_after_seconds": retry_after_seconds,
             }
         except Exception as exc:
+            failure_class = _exception_failure_class(exc)
             return {
                 "available": False,
                 "tool": _safe_text(getattr(tool, "name", type(tool).__name__), 200),
                 "reason": _safe_message(exc),
+                "failure_class": failure_class,
+                "retry_after_seconds": _classified_retry_after_seconds(
+                    _exception_retry_after_seconds(exc),
+                    failure_class=failure_class,
+                ),
             }
 
     def _repository_readiness(self) -> dict[str, Any]:
@@ -1402,10 +1572,16 @@ class DeliveryWorkflow:
                 "repository": repository,
             }
         except Exception as exc:
+            failure_class = _exception_failure_class(exc)
             return {
                 "available": False,
                 "tool": "repository",
                 "reason": _safe_message(exc),
+                "failure_class": failure_class,
+                "retry_after_seconds": _classified_retry_after_seconds(
+                    _exception_retry_after_seconds(exc),
+                    failure_class=failure_class,
+                ),
             }
 
     def _validation_readiness(self) -> dict[str, Any]:
@@ -1439,10 +1615,16 @@ class DeliveryWorkflow:
                 env=_controller_env(),
             )
         except Exception as exc:
+            failure_class = _exception_failure_class(exc)
             return {
                 "available": False,
                 "tool": "validation",
                 "reason": f"validation environment check failed: {_safe_message(exc)}",
+                "failure_class": failure_class,
+                "retry_after_seconds": _classified_retry_after_seconds(
+                    _exception_retry_after_seconds(exc),
+                    failure_class=failure_class,
+                ),
             }
         if result.returncode != 0:
             return {
@@ -1476,11 +1658,29 @@ class DeliveryWorkflow:
             # retried by the Telegram controller without replaying mutations.
             return
 
-    def _fail(self, job: DeliveryJob, code: str, message: str) -> DeliveryJob:
+    def _fail(
+        self,
+        job: DeliveryJob,
+        code: str,
+        message: str,
+        *,
+        failure_class: str | None = None,
+        retry_after_seconds: int = 0,
+    ) -> DeliveryJob:
         job.status = "failed"
         job.phase = "failed"
         job.success = False
         job.failure_code = code
+        classified = (
+            _failure_class_for_code(code)
+            if failure_class is None
+            else normalize_delivery_failure_class(failure_class) or "permanent"
+        )
+        job.failure_class = classified
+        job.retry_after_seconds = _classified_retry_after_seconds(
+            retry_after_seconds,
+            failure_class=classified,
+        )
         job.message = _safe_text(message or code, 2_000)
         job.updated_at = _now()
         self.store.persist(job)
@@ -1491,6 +1691,8 @@ class DeliveryWorkflow:
         job.phase = "review-blocked"
         job.success = False
         job.failure_code = "review-blocked"
+        job.failure_class = "policy"
+        job.retry_after_seconds = 0
         job.message = _safe_text(message, 2_000)
         job.updated_at = _now()
         self.store.persist(job)
@@ -1642,7 +1844,7 @@ def _sanitize_review(decision: ReviewDecision) -> ReviewDecision:
 
 def _attempt_dict(
     attempt: DeliveryAttempt,
-    provider_failures: list[dict[str, str]],
+    provider_failures: list[dict[str, Any]],
 ) -> dict[str, Any]:
     payload = attempt.to_dict()
     if provider_failures:
@@ -1650,14 +1852,22 @@ def _attempt_dict(
     return payload
 
 
-def _provider_failure(builder: str, exc: BaseException) -> dict[str, str]:
-    return {
+def _provider_failure(builder: str, exc: BaseException) -> dict[str, Any]:
+    failure_class = _exception_failure_class(exc)
+    payload: dict[str, Any] = {
         "builder": _safe_text(builder, 200),
         "message": _safe_message(exc),
     }
+    if failure_class:
+        payload["failure_class"] = failure_class
+        payload["retry_after_seconds"] = _classified_retry_after_seconds(
+            _exception_retry_after_seconds(exc),
+            failure_class=failure_class,
+        )
+    return payload
 
 
-def _provider_failure_summary(failures: list[dict[str, str]]) -> str:
+def _provider_failure_summary(failures: list[dict[str, Any]]) -> str:
     if not failures:
         return "No provider diagnostic was returned."
     return _safe_text(
@@ -1667,6 +1877,27 @@ def _provider_failure_summary(failures: list[dict[str, str]]) -> str:
         ),
         2_000,
     )
+
+
+def _provider_failure_outcome(
+    failures: list[dict[str, Any]],
+) -> tuple[str, int]:
+    """Retry only when every exhausted provider reported a typed outage."""
+    if any(item.get("failure_class") == "policy" for item in failures):
+        return "policy", 0
+    if failures and all(item.get("failure_class") == "transient" for item in failures):
+        retry_after_seconds = max(
+            bounded_delivery_retry_after_seconds(
+                item.get("retry_after_seconds"),
+                failure_class="transient",
+            )
+            for item in failures
+        )
+        return (
+            "transient",
+            retry_after_seconds,
+        )
+    return "permanent", 0
 
 
 def _safe_text_list(
@@ -1786,6 +2017,92 @@ def _safe_text(value: Any, limit: int) -> str:
     except Exception:
         text = type(value).__name__
     return str(_redact(text))[:limit]
+
+
+def _failure_class_for_code(code: str) -> str:
+    if code in {
+        "artifact-security",
+        "git-validation",
+        "project-mismatch",
+        "review-blocked",
+        "terminal-task",
+        "unresolved-delivery",
+    }:
+        return "policy"
+    return "permanent"
+
+
+def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(seen) < 8:
+        seen.add(id(current))
+        yield current
+        next_exception = current.__cause__
+        if next_exception is None and not current.__suppress_context__:
+            next_exception = current.__context__
+        current = next_exception
+
+
+def _exception_failure_class(exc: BaseException) -> str:
+    """Classify only explicit markers and typed controller exceptions.
+
+    Exception messages are intentionally ignored: model, CLI, and remote-tool
+    prose is untrusted and cannot authorize an automatic retry.
+    """
+    classified = ""
+    for current in _exception_chain(exc):
+        explicit = normalize_delivery_failure_class(
+            getattr(current, "failure_class", "")
+        )
+        if explicit == "policy" or isinstance(
+            current,
+            (ArtifactSecurityError, GitValidationError),
+        ):
+            return "policy"
+        if explicit == "permanent":
+            classified = "permanent"
+            continue
+        if explicit == "transient" and not classified:
+            classified = "transient"
+        if isinstance(
+            current,
+            (subprocess.TimeoutExpired, TimeoutError, ConnectionError),
+        ) and not classified:
+            classified = "transient"
+        if (
+            isinstance(current, OSError)
+            and current.errno in _TRANSIENT_ERRNOS
+            and not classified
+        ):
+            classified = "transient"
+    return classified
+
+
+def _exception_retry_after_seconds(exc: BaseException) -> int:
+    if _exception_failure_class(exc) != "transient":
+        return 0
+    for current in _exception_chain(exc):
+        retry_after_seconds = bounded_delivery_retry_after_seconds(
+            getattr(current, "retry_after_seconds", 0),
+            failure_class="transient",
+        )
+        if retry_after_seconds:
+            return retry_after_seconds
+    return 0
+
+
+def _classified_retry_after_seconds(
+    value: object,
+    *,
+    failure_class: str,
+) -> int:
+    if failure_class != "transient":
+        return 0
+    return bounded_delivery_retry_after_seconds(
+        value,
+        failure_class="transient",
+    )
 
 
 def _failure_code(exc: BaseException) -> str:

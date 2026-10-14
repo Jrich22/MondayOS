@@ -54,6 +54,8 @@ class PullRequestResult:
     url: str = ""
     number: int = 0
     message: str = ""
+    failure_class: str = ""
+    retry_after_seconds: int = 0
 
 
 @dataclass(frozen=True)

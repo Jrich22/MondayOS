@@ -4,6 +4,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+DELIVERY_FAILURE_CLASSES = frozenset({"transient", "permanent", "policy"})
+MAX_DELIVERY_RETRY_AFTER_SECONDS = 86_400
+
 
 @dataclass
 class DeliveryAttempt:
@@ -93,6 +96,10 @@ class DeliveryJob:
     observation_message: str = ""
     task_reconciliation: str = ""
     task_reconciled_at: str = ""
+    # Appended for schema compatibility. Empty/unknown values are deliberately
+    # not retryable; retry hints are honored only for classified transients.
+    failure_class: str = ""
+    retry_after_seconds: int = 0
 
     @property
     def terminal(self) -> bool:
@@ -100,12 +107,19 @@ class DeliveryJob:
 
     def to_dict(self, *, include_private: bool = False) -> dict[str, Any]:
         payload = asdict(self)
+        failure_class = normalize_delivery_failure_class(self.failure_class)
+        payload["failure_class"] = failure_class
+        payload["retry_after_seconds"] = bounded_delivery_retry_after_seconds(
+            self.retry_after_seconds,
+            failure_class=failure_class,
+        )
         if not include_private:
             payload.pop("worktree_owner_token", None)
         return payload
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DeliveryJob:
+        failure_class = normalize_delivery_failure_class(data.get("failure_class"))
         return cls(
             delivery_id=str(data.get("delivery_id", "")),
             task_id=str(data.get("task_id", "")),
@@ -150,7 +164,34 @@ class DeliveryJob:
             observation_message=str(data.get("observation_message", "")),
             task_reconciliation=str(data.get("task_reconciliation", "")),
             task_reconciled_at=str(data.get("task_reconciled_at", "")),
+            failure_class=failure_class,
+            retry_after_seconds=bounded_delivery_retry_after_seconds(
+                data.get("retry_after_seconds"),
+                failure_class=failure_class,
+            ),
         )
+
+
+def normalize_delivery_failure_class(value: object) -> str:
+    """Accept only the exact durable taxonomy; prose can never enable retries."""
+    if isinstance(value, str) and value in DELIVERY_FAILURE_CLASSES:
+        return value
+    return ""
+
+
+def bounded_delivery_retry_after_seconds(
+    value: object,
+    *,
+    failure_class: str,
+) -> int:
+    """Return one bounded retry hint only for classified transient failures."""
+    if (
+        failure_class != "transient"
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+    ):
+        return 0
+    return min(max(0, value), MAX_DELIVERY_RETRY_AFTER_SECONDS)
 
 
 def _check_counts(value: object) -> dict[str, int]:

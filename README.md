@@ -53,7 +53,7 @@ The full vision is in [docs/VISION.md](docs/VISION.md).
 | **AI provider layer** | _(config)_ | Interchangeable Claude / OpenAI / DeepSeek / Ollama providers with fallback |
 | **Execution orchestrator** | `monday execute` | Delegate a task to an AI provider through a safe, policy-driven pipeline |
 | **Autonomous builds** | `monday build` | Build in an isolated worktree, validate, repair, require ChatGPT review, open a PR, and observe its exact GitHub lifecycle |
-| **Telegram control plane** | `monday telegram` | Durably queue requests, keep intake responsive, run one build at a time, and report later PR/check changes |
+| **Telegram control plane** | `monday telegram` | Durably queue requests, recover from classified temporary delivery outages, and report later PR/check changes |
 
 Source, configuration templates, and product documentation are stored as
 human-readable files in Git. Operational state (agent runs, execution logs, and

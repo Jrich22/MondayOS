@@ -1890,7 +1890,7 @@ class Monday:
                     raw_jobs = raw_history.get("jobs", raw_history.get("runs", []))
                 else:
                     raw_jobs = raw_history
-                jobs = [_delivery_payload(item) for item in (raw_jobs or [])]
+                jobs = [_delivery_job_payload(item) for item in (raw_jobs or [])]
                 return BuildResponse(
                     action="history",
                     success=True,
@@ -3606,6 +3606,23 @@ def _delivery_payload(value: Any) -> dict[str, Any]:
     raise TypeError("Delivery workflow returned an unsupported result")
 
 
+def _delivery_job_payload(value: Any) -> dict[str, Any]:
+    """Normalize retry metadata on one public delivery-job snapshot."""
+    from delivery.types import (
+        bounded_delivery_retry_after_seconds,
+        normalize_delivery_failure_class,
+    )
+
+    data = _delivery_payload(value)
+    failure_class = normalize_delivery_failure_class(data.get("failure_class"))
+    data["failure_class"] = failure_class
+    data["retry_after_seconds"] = bounded_delivery_retry_after_seconds(
+        data.get("retry_after_seconds"),
+        failure_class=failure_class,
+    )
+    return data
+
+
 def _build_response_from_job(
     action: str,
     job: Any,
@@ -3613,7 +3630,9 @@ def _build_response_from_job(
     run_outcome: bool,
 ) -> BuildResponse:
     """Map an internal delivery job to the stable Monday public response."""
-    data = _delivery_payload(job)
+    data = _delivery_job_payload(job)
+    failure_class = str(data["failure_class"])
+    retry_after_seconds = int(data["retry_after_seconds"])
     raw_changed = data.get("changed_files", [])
     changed_files = [str(item) for item in raw_changed] if isinstance(raw_changed, list) else []
     raw_attempts = data.get("attempts", [])
@@ -3657,6 +3676,8 @@ def _build_response_from_job(
         merge_commit_sha=str(data.get("merge_commit_sha", "")),
         pr_observed_at=str(data.get("pr_observed_at", "")),
         task_reconciliation=str(data.get("task_reconciliation", "")),
+        failure_class=failure_class,
+        retry_after_seconds=retry_after_seconds,
     )
 
 

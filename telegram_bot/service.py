@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import Any
 
-from telegram_bot.client import TelegramClient
+from telegram_bot.client import TelegramAPIError, TelegramClient, TelegramRateLimitError
 from telegram_bot.config import TelegramConfig
 from telegram_bot.state import TelegramState
 
@@ -17,12 +17,17 @@ _TASK_ID = re.compile(
 )
 _RUN_ID = re.compile(r"^run-[A-Za-z0-9-]{1,80}$")
 _DELIVERY_ID = re.compile(r"^delivery-[A-Za-z0-9-]{1,80}$")
+_PROJECT_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _FULL_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _PROJECT_BUILD_DELIMITER = "::"
 _FOLLOW_UP_POLL_SECONDS = 30.0
 _FOLLOW_UP_SLOW_POLL_SECONDS = 300.0
 _FOLLOW_UP_MAX_BACKOFF_SECONDS = 300.0
+_DELIVERY_RETRY_DELAYS_SECONDS = (60, 300, 900, 3_600, 10_800)
+_DELIVERY_RETRY_RECONCILE_SECONDS = 60
+_DELIVERY_RETRY_WINDOW_SECONDS = 24 * 60 * 60
+_MAX_DELIVERY_RUNS = 1 + len(_DELIVERY_RETRY_DELAYS_SECONDS)
 _TERMINAL_PR_STATES = frozenset({"merged", "closed", "diverged"})
 _ROLE_NAMES = {
     "cpo": "Product strategy",
@@ -260,10 +265,14 @@ class TelegramBotService:
         if (
             not _DELIVERY_ID.fullmatch(delivery_id)
             or not _TASK_ID.fullmatch(task_id)
-            or chat_id == 0
             or not pr_url
         ):
             raise RuntimeError("Saved Telegram lifecycle follow-up is invalid")
+        if chat_id <= 0 or chat_id not in self._config.allowed_user_ids:
+            raise TelegramAPIError(
+                "Saved Telegram destination is no longer allowed",
+                retryable=False,
+            )
 
         kwargs: dict[str, Any] = {"delivery_id": delivery_id}
         if project_name:
@@ -309,6 +318,238 @@ class TelegramBotService:
             last_observation_key=notice_key,
             last_notified_key=prior_notice,
         )
+
+    def retry_delivery(self, update_id: int, claimed: dict[str, Any]) -> None:
+        """Run one due request-free delivery retry under its saved binding."""
+        delivery_id = str(claimed.get("delivery_id") or "")
+        root_delivery_id = str(claimed.get("root_delivery_id") or "")
+        task_id = str(claimed.get("task_id") or "")
+        project_name = str(claimed.get("project_name") or "")
+        chat_id = _integer(claimed.get("chat_id"), 0)
+        attempt = _integer(claimed.get("attempt"), 0)
+        maximum = _integer(claimed.get("max_attempts"), 0)
+        attempt_started = claimed.get("attempt_started")
+        post_expiry_reconciliation_started = claimed.get(
+            "post_expiry_reconciliation_started"
+        )
+        expires_at = _finite_timestamp(claimed.get("expires_at"))
+        if (
+            not _DELIVERY_ID.fullmatch(delivery_id)
+            or not _DELIVERY_ID.fullmatch(root_delivery_id)
+            or not _TASK_ID.fullmatch(task_id)
+            or bool(project_name and not _PROJECT_ID.fullmatch(project_name))
+            or not 2 <= attempt <= maximum <= _MAX_DELIVERY_RUNS
+            or not isinstance(attempt_started, bool)
+            or not isinstance(post_expiry_reconciliation_started, bool)
+            or (post_expiry_reconciliation_started and not attempt_started)
+            or delivery_id != _retry_delivery_id(root_delivery_id, attempt)
+        ):
+            raise RuntimeError("Saved Telegram delivery retry is invalid")
+        if chat_id <= 0 or chat_id not in self._config.allowed_user_ids:
+            raise TelegramAPIError(
+                "Saved Telegram destination is no longer allowed",
+                retryable=False,
+            )
+
+        staged = claimed.get("outcome")
+        if isinstance(staged, dict):
+            outcome_phase = str(claimed.get("outcome_phase") or "")
+            completed = self._state.completed_job(update_id)
+            follow_up = completed.get("follow_up")
+            follow_up_phase = (
+                str(follow_up.get("phase") or "")
+                if isinstance(follow_up, dict)
+                else ""
+            )
+            self._client.send_message(
+                chat_id,
+                _delivery_retry_outcome_notice(
+                    task_id,
+                    staged,
+                    attempt=attempt,
+                    outcome_phase=outcome_phase,
+                    follow_up_phase=follow_up_phase,
+                ),
+            )
+            self._state.finish_delivery_retry(update_id)
+            return
+
+        now = time.time()
+        if expires_at <= now and not attempt_started:
+            result = _expired_delivery_snapshot(delivery_id)
+            result = self._state.stage_delivery_retry_outcome(
+                update_id,
+                phase="expired",
+                result=result,
+            )
+            self._client.send_message(
+                chat_id,
+                _delivery_retry_outcome_notice(
+                    task_id,
+                    result,
+                    attempt=attempt,
+                    outcome_phase="expired",
+                    follow_up_phase="",
+                ),
+            )
+            self._state.finish_delivery_retry(update_id)
+            return
+        if expires_at <= now and post_expiry_reconciliation_started:
+            self._finish_uncertain_delivery_retry(
+                update_id,
+                chat_id=chat_id,
+                task_id=task_id,
+                delivery_id=delivery_id,
+                attempt=attempt,
+            )
+            return
+
+        kwargs: dict[str, Any] = {
+            "task_id": task_id,
+            "delivery_id": delivery_id,
+        }
+        if project_name:
+            kwargs["project"] = project_name
+        post_expiry_reconciliation = expires_at <= now
+        self._state.start_delivery_retry_attempt(
+            update_id,
+            delivery_id=delivery_id,
+            post_expiry_reconciliation=post_expiry_reconciliation,
+        )
+        response = self._monday.build("run", **kwargs)
+        authoritative_snapshot = _has_explicit_delivery_snapshot(response)
+        result = _delivery_snapshot(response, fallback_id=delivery_id)
+        if not authoritative_snapshot:
+            if post_expiry_reconciliation:
+                self._finish_uncertain_delivery_retry(
+                    update_id,
+                    chat_id=chat_id,
+                    task_id=task_id,
+                    delivery_id=delivery_id,
+                    attempt=attempt,
+                )
+                return
+            self._state.defer_delivery_retry(
+                update_id,
+                delay_seconds=_DELIVERY_RETRY_RECONCILE_SECONDS,
+            )
+            return
+        if result["delivery_id"] != delivery_id:
+            raise RuntimeError("MondayOS did not honor the saved retry identity")
+
+        if not _delivery_terminal(str(result.get("status") or "")):
+            # Publication reconciliation must keep this exact identity. A new
+            # delivery is authorized only for a classified pre-publication
+            # transient terminal result.
+            if post_expiry_reconciliation:
+                self._finish_uncertain_delivery_retry(
+                    update_id,
+                    chat_id=chat_id,
+                    task_id=task_id,
+                    delivery_id=delivery_id,
+                    attempt=attempt,
+                )
+                return
+            self._state.defer_delivery_retry(
+                update_id,
+                delay_seconds=_DELIVERY_RETRY_RECONCILE_SECONDS,
+            )
+            return
+
+        if _safe_transient_delivery_failure(result) and attempt < maximum:
+            next_attempt = attempt + 1
+            delay = _delivery_retry_delay(
+                next_attempt,
+                result.get("retry_after_seconds", 0),
+            )
+            if time.time() + delay < expires_at:
+                next_delivery_id = _retry_delivery_id(root_delivery_id, next_attempt)
+                rescheduled = self._state.reschedule_delivery_retry(
+                    update_id,
+                    delivery_id=next_delivery_id,
+                    attempt=next_attempt,
+                    delay_seconds=delay,
+                    failure_code=str(
+                        result.get("failure_code") or "temporary-outage"
+                    ),
+                )
+                if rescheduled.get("phase") != "deadline-exceeded":
+                    try:
+                        self._client.send_message(
+                            chat_id,
+                            _delivery_retry_notice(
+                                task_id,
+                                next_attempt,
+                                maximum,
+                                delay,
+                            ),
+                        )
+                    except TelegramRateLimitError:
+                        raise
+                    except TelegramAPIError as exc:
+                        if not exc.retryable:
+                            raise
+                    return
+
+        follow_up_phase = self._ensure_lifecycle_follow_up(
+            update_id,
+            chat_id,
+            task_id,
+            result,
+            project_name,
+        )
+        outcome_phase = (
+            "completed"
+            if bool(result.get("success"))
+            else (
+                "expired"
+                if result.get("failure_code") == "retry-expired"
+                else "failed"
+            )
+        )
+        result = self._state.stage_delivery_retry_outcome(
+            update_id,
+            phase=outcome_phase,
+            result=result,
+        )
+        self._client.send_message(
+            chat_id,
+            _delivery_retry_outcome_notice(
+                task_id,
+                result,
+                attempt=attempt,
+                outcome_phase=outcome_phase,
+                follow_up_phase=follow_up_phase,
+            ),
+        )
+        self._state.finish_delivery_retry(update_id)
+
+    def _finish_uncertain_delivery_retry(
+        self,
+        update_id: int,
+        *,
+        chat_id: int,
+        task_id: str,
+        delivery_id: str,
+        attempt: int,
+    ) -> None:
+        """Stop bounded recovery without claiming whether publication occurred."""
+        result = self._state.stage_delivery_retry_outcome(
+            update_id,
+            phase="uncertain",
+            result=_uncertain_delivery_snapshot(delivery_id),
+        )
+        self._client.send_message(
+            chat_id,
+            _delivery_retry_outcome_notice(
+                task_id,
+                result,
+                attempt=attempt,
+                outcome_phase="uncertain",
+                follow_up_phase="",
+            ),
+        )
+        self._state.finish_delivery_retry(update_id)
 
     def _authorized_context(self, message: dict[str, Any]) -> tuple[int, int, str] | None:
         sender = message.get("from")
@@ -486,6 +727,26 @@ class TelegramBotService:
             return
         saved_result = job.get("delivery_result")
         if bool(job.get("delivery_terminal")) and isinstance(saved_result, dict):
+            retry = self._state.delivery_retry(update_id)
+            if retry:
+                now = time.time()
+                expires_at = _finite_timestamp(retry.get("expires_at"))
+                if expires_at > now:
+                    delay = max(
+                        1,
+                        int(_finite_timestamp(retry.get("next_attempt_at")) - now),
+                    )
+                    self._client.send_message(
+                        chat_id,
+                        _delivery_retry_notice(
+                            task_id,
+                            _integer(retry.get("attempt"), 0),
+                            _integer(retry.get("max_attempts"), 0),
+                            delay,
+                        ),
+                    )
+                self._state.set_job(update_id, delivery_final_sent=True)
+                return
             follow_up_phase = self._ensure_lifecycle_follow_up(
                 update_id,
                 chat_id,
@@ -493,13 +754,19 @@ class TelegramBotService:
                 saved_result,
                 str(job.get("project_name") or ""),
             )
+            text = _delivery_result(
+                task_id,
+                saved_result,
+                follow_up_phase=follow_up_phase,
+            )
+            unavailable = _delivery_retry_unavailable_notice(
+                job.get("delivery_retry")
+            )
+            if unavailable:
+                text = f"{text}\n{unavailable}"
             self._client.send_message(
                 chat_id,
-                _delivery_result(
-                    task_id,
-                    saved_result,
-                    follow_up_phase=follow_up_phase,
-                ),
+                text,
             )
             self._state.set_job(update_id, delivery_final_sent=True)
             return
@@ -541,6 +808,65 @@ class TelegramBotService:
             delivery_result=result,
         )
         if terminal:
+            retry_unavailable = ""
+            if _safe_transient_delivery_failure(result):
+                next_attempt = 2
+                delay = _delivery_retry_delay(
+                    next_attempt,
+                    result.get("retry_after_seconds", 0),
+                )
+                if delay < _DELIVERY_RETRY_WINDOW_SECONDS:
+                    retry = self._state.schedule_delivery_retry(
+                        update_id,
+                        {
+                            "kind": "delivery-retry",
+                            "root_delivery_id": stable_id,
+                            "delivery_id": _retry_delivery_id(stable_id, next_attempt),
+                            "task_id": task_id,
+                            "project_name": project_name,
+                            "chat_id": chat_id,
+                            "attempt": next_attempt,
+                            "max_attempts": _MAX_DELIVERY_RUNS,
+                            "failure_code": str(
+                                result.get("failure_code") or "temporary-outage"
+                            ),
+                        },
+                        delay_seconds=delay,
+                    )
+                    if retry.get("phase") not in {
+                        "not-started-capacity",
+                        "not-started-deadline",
+                    }:
+                        self._client.send_message(
+                            chat_id,
+                            _delivery_retry_notice(
+                                task_id,
+                                next_attempt,
+                                _MAX_DELIVERY_RUNS,
+                                delay,
+                            ),
+                        )
+                        self._state.set_job(update_id, delivery_final_sent=True)
+                        return
+                    retry_phase = str(retry.get("phase") or "")
+                else:
+                    retry_phase = "not-started-deadline"
+                if retry_phase in {
+                    "not-started-capacity",
+                    "not-started-deadline",
+                }:
+                    summary = {
+                        "phase": retry_phase,
+                        "root_delivery_id": stable_id,
+                        "delivery_id": stable_id,
+                        "attempt": 1,
+                        "max_attempts": _MAX_DELIVERY_RUNS,
+                        "failure_code": str(
+                            result.get("failure_code") or "temporary-outage"
+                        ),
+                    }
+                    self._state.set_job(update_id, delivery_retry=summary)
+                    retry_unavailable = _delivery_retry_unavailable_notice(summary)
             follow_up_phase = self._ensure_lifecycle_follow_up(
                 update_id,
                 chat_id,
@@ -548,14 +874,14 @@ class TelegramBotService:
                 result,
                 project_name,
             )
-            self._client.send_message(
-                chat_id,
-                _delivery_result(
-                    task_id,
-                    result,
-                    follow_up_phase=follow_up_phase,
-                ),
+            text = _delivery_result(
+                task_id,
+                result,
+                follow_up_phase=follow_up_phase,
             )
+            if retry_unavailable:
+                text = f"{text}\n{retry_unavailable}"
+            self._client.send_message(chat_id, text)
             self._state.set_job(update_id, delivery_final_sent=True)
             return
 
@@ -594,7 +920,8 @@ class TelegramBotService:
         pr_url = _github_pr_url(result.get("pr_url", ""))
         if not bool(result.get("success")) or not _DELIVERY_ID.fullmatch(delivery_id) or not pr_url:
             return ""
-        current = self._state.job(update_id).get("follow_up")
+        durable = self._state.job(update_id) or self._state.completed_job(update_id)
+        current = durable.get("follow_up")
         if isinstance(current, dict):
             return str(current.get("phase") or "")
         follow_up = self._state.start_follow_up(
@@ -963,6 +1290,15 @@ def _delivery_snapshot(response: Any, *, fallback_id: str) -> dict[str, Any]:
         attempts = len(raw_attempts)
     else:
         attempts = max(0, _integer(raw_attempts, 0))
+    failure_class = str(value("failure_class", "") or "").strip().lower()
+    if failure_class not in {"", "transient", "permanent", "policy"}:
+        failure_class = ""
+    retry_after = max(
+        0,
+        min(86_400, _integer(value("retry_after_seconds", 0), 0)),
+    )
+    raw_pr_url = value("pr_url", "")
+    pr_url = _github_pr_url(raw_pr_url)
     return {
         "delivery_id": str(value("delivery_id", fallback_id) or fallback_id),
         "success": success,
@@ -970,10 +1306,100 @@ def _delivery_snapshot(response: Any, *, fallback_id: str) -> dict[str, Any]:
         "phase": _bounded_text(phase, 80),
         "branch": _bounded_text(value("branch", ""), 160),
         "commit_sha": _bounded_text(value("commit_sha", ""), 64),
-        "pr_url": _github_pr_url(value("pr_url", "")),
+        "pr_url": pr_url,
+        "publication_uncertain": bool(str(raw_pr_url or "").strip()) and not pr_url,
+        "pushed": bool(value("pushed", False)),
         "changed_files": changed_files,
         "attempts": attempts,
-        "message": _bounded_text(value("message", ""), 300),
+        "failure_code": _safe_failure_code(value("failure_code", "")),
+        "failure_class": failure_class,
+        "retry_after_seconds": retry_after,
+        "message": (
+            ""
+            if failure_class == "transient"
+            else _bounded_text(value("message", ""), 300)
+        ),
+    }
+
+
+def _has_explicit_delivery_snapshot(response: Any) -> bool:
+    """Require durable identity and status instead of trusting fallback fields."""
+    data = getattr(response, "data", {})
+    payload = data if isinstance(data, dict) else {}
+
+    def explicit(name: str) -> Any:
+        direct = getattr(response, name, None)
+        return direct if direct not in (None, "") else payload.get(name)
+
+    return bool(str(explicit("delivery_id") or "").strip()) and bool(
+        str(explicit("status") or "").strip()
+    )
+
+
+def _safe_transient_delivery_failure(result: dict[str, Any]) -> bool:
+    """Authorize a fresh identity only before publication can have begun."""
+    return (
+        str(result.get("status") or "").lower() == "failed"
+        and str(result.get("failure_class") or "") == "transient"
+        and not bool(result.get("pushed"))
+        and not str(result.get("commit_sha") or "")
+        and not str(result.get("pr_url") or "")
+        and not bool(result.get("publication_uncertain"))
+    )
+
+
+def _retry_delivery_id(root_delivery_id: str, attempt: int) -> str:
+    value = f"{root_delivery_id}-r{attempt}"
+    if not _DELIVERY_ID.fullmatch(value):
+        raise RuntimeError("Telegram delivery retry identity is invalid")
+    return value
+
+
+def _delivery_retry_delay(attempt: int, retry_after: Any) -> int:
+    index = max(0, min(len(_DELIVERY_RETRY_DELAYS_SECONDS) - 1, attempt - 2))
+    controller_delay = _DELIVERY_RETRY_DELAYS_SECONDS[index]
+    provider_delay = max(0, min(86_400, _integer(retry_after, 0)))
+    return max(controller_delay, provider_delay)
+
+
+def _expired_delivery_snapshot(delivery_id: str) -> dict[str, Any]:
+    return {
+        "delivery_id": delivery_id,
+        "success": False,
+        "status": "failed",
+        "phase": "failed",
+        "branch": "",
+        "commit_sha": "",
+        "pr_url": "",
+        "publication_uncertain": False,
+        "pushed": False,
+        "changed_files": [],
+        "attempts": 0,
+        "failure_code": "retry-expired",
+        "failure_class": "permanent",
+        "retry_after_seconds": 0,
+        "message": "Automatic recovery window expired.",
+    }
+
+
+def _uncertain_delivery_snapshot(delivery_id: str) -> dict[str, Any]:
+    """Represent a bounded stop without asserting that publication failed."""
+    return {
+        "delivery_id": delivery_id,
+        "success": False,
+        "status": "publication-pending",
+        "phase": "reconciliation-required",
+        "branch": "",
+        "commit_sha": "",
+        "pr_url": "",
+        "publication_uncertain": True,
+        "pushed": False,
+        "changed_files": [],
+        "attempts": 0,
+        "failure_code": "reconciliation-unresolved",
+        "failure_class": "",
+        "retry_after_seconds": 0,
+        "message": "",
     }
 
 
@@ -1092,10 +1518,100 @@ def _delivery_result(
     changed = result.get("changed_files")
     if isinstance(changed, list) and changed:
         lines.append(f"Changed files: {len(changed)}")
-    message = _bounded_text(result.get("message", ""), 300)
+    message = (
+        ""
+        if str(result.get("failure_class") or "") == "transient"
+        else _bounded_text(result.get("message", ""), 300)
+    )
     if message and not success:
         lines.append(message)
     return "\n".join(lines)
+
+
+def _delivery_retry_notice(
+    task_id: str,
+    attempt: int,
+    maximum: int,
+    delay_seconds: int,
+) -> str:
+    if delay_seconds < 120:
+        wait = "about a minute"
+    elif delay_seconds < 7_200:
+        wait = f"about {max(2, round(delay_seconds / 60))} minutes"
+    else:
+        wait = f"about {max(2, round(delay_seconds / 3_600))} hours"
+    return (
+        f"{task_id} hit a temporary model or tool outage. Monday saved the "
+        f"checkpoint and will try automatically in {wait} "
+        f"(delivery run {attempt}/{maximum}). New requests can continue meanwhile."
+    )
+
+
+def _delivery_retry_unavailable_notice(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    phase = str(value.get("phase") or "")
+    if phase == "not-started-capacity":
+        return (
+            "Monday could not start automatic recovery because the 500-retry "
+            "safety limit is full. New requests are unaffected."
+        )
+    if phase == "not-started-deadline":
+        return (
+            "The provider retry window was outside Monday's 24-hour recovery "
+            "window, so no automatic retry was started."
+        )
+    return ""
+
+
+def _delivery_retry_result(
+    task_id: str,
+    result: dict[str, Any],
+    *,
+    attempt: int,
+    follow_up_phase: str,
+) -> str:
+    base = _delivery_result(
+        task_id,
+        result,
+        follow_up_phase=follow_up_phase,
+    )
+    if bool(result.get("success")):
+        return f"Monday recovered automatically on delivery run {attempt}.\n{base}"
+    if str(result.get("failure_class") or "") == "transient":
+        return (
+            f"Monday made {attempt} delivery runs, but the temporary outage did "
+            f"not recover within the retry limit.\n{base}"
+        )
+    return f"Monday retried the delivery automatically.\n{base}"
+
+
+def _delivery_retry_outcome_notice(
+    task_id: str,
+    result: dict[str, Any],
+    *,
+    attempt: int,
+    outcome_phase: str,
+    follow_up_phase: str,
+) -> str:
+    if outcome_phase == "uncertain":
+        return (
+            f"{task_id} may have published changes, but Monday could not verify "
+            "the exact delivery state after its recovery window. Automatic "
+            f"retries stopped safely. Review delivery {result.get('delivery_id', '')} "
+            "in MondayOS or GitHub before starting new work."
+        )
+    if outcome_phase == "expired":
+        return (
+            f"{task_id} could not recover from the temporary outage within "
+            "24 hours. Monday preserved every delivery checkpoint."
+        )
+    return _delivery_retry_result(
+        task_id,
+        result,
+        attempt=attempt,
+        follow_up_phase=follow_up_phase,
+    )
 
 
 def _lifecycle_snapshot(
@@ -1275,6 +1791,23 @@ def _github_pr_url(value: Any) -> str:
 
 def _bounded_text(value: Any, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
+
+
+def _safe_failure_code(value: Any) -> str:
+    code = str(value or "").strip().lower()
+    if len(code) > 80 or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", code):
+        return ""
+    return code
+
+
+def _finite_timestamp(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if parsed <= 0 or parsed == float("inf") or parsed != parsed:
+        return 0.0
+    return parsed
 
 
 def _help(*, live_build: bool = False) -> str:

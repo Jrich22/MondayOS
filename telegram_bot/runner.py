@@ -117,14 +117,57 @@ class TelegramJobWorker:
             self._state.defer_follow_up(update_id, delay_seconds=60)
         return True
 
+    def run_delivery_retry_once(self) -> bool:
+        """Run one due request-free retry without blocking the main FIFO."""
+        claimed = self._state.claim_due_delivery_retry()
+        if claimed is None:
+            return False
+        update_id, retry = claimed
+        retrier = getattr(self._service, "retry_delivery", None)
+        if not callable(retrier):
+            self._state.defer_delivery_retry(update_id, delay_seconds=300)
+            return True
+        try:
+            retrier(update_id, retry)
+        except TelegramRateLimitError as exc:
+            self._state.defer_delivery_retry(
+                update_id,
+                delay_seconds=exc.retry_after,
+            )
+        except TelegramAPIError as exc:
+            if exc.retryable:
+                self._state.defer_delivery_retry(update_id, delay_seconds=60)
+            else:
+                self._state.stop_delivery_retry(
+                    update_id,
+                    phase="notification-failed",
+                )
+        except Exception:
+            # Never persist model, CLI, GitHub, or Telegram diagnostics. The
+            # exact retry identity is safe to reconcile after a short delay.
+            self._state.defer_delivery_retry(update_id, delay_seconds=60)
+        return True
+
     def run_forever(self) -> None:
         backoff = 1
         while not self._stop.is_set():
             try:
-                worked = self.run_once()
+                pending_delivery = False
+                try:
+                    worked = self.run_once()
+                except TelegramUpdatePendingError:
+                    # One long-running FIFO delivery must not starve durable
+                    # retry notifications or PR lifecycle observation.
+                    worked = False
+                    pending_delivery = True
+                retried = self.run_delivery_retry_once()
                 followed_up = self.run_follow_up_once()
-                if worked or followed_up:
+                if worked or retried or followed_up:
                     backoff = 1
+                    continue
+                if pending_delivery:
+                    self._wait(backoff)
+                    backoff = min(60, backoff * 2)
                     continue
                 delay = self._state.next_follow_up_delay()
                 self._wake.wait(timeout=delay)
@@ -140,9 +183,6 @@ class TelegramJobWorker:
                 backoff = min(60, backoff * 2)
             except TelegramUpdateRetryError as exc:
                 print(str(exc), file=sys.stderr)
-                self._wait(backoff)
-                backoff = min(60, backoff * 2)
-            except TelegramUpdatePendingError:
                 self._wait(backoff)
                 backoff = min(60, backoff * 2)
 

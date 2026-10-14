@@ -414,6 +414,8 @@ class BuildResponse:
         merge_commit_sha: Verified merge commit when ``pr_state`` is merged.
         pr_observed_at: UTC timestamp of the latest GitHub observation.
         task_reconciliation: Result of applying a terminal PR state to the task.
+        failure_class: Machine-readable empty/transient/permanent/policy outcome.
+        retry_after_seconds: Bounded retry delay for transient failures only.
     """
 
     action: str
@@ -437,6 +439,8 @@ class BuildResponse:
     merge_commit_sha: str = ""
     pr_observed_at: str = ""
     task_reconciliation: str = ""
+    failure_class: str = ""
+    retry_after_seconds: int = 0
 
 
 @dataclass

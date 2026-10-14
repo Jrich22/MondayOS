@@ -12,6 +12,9 @@ outbound long polling, so it does not open a public port or require a tunnel.
 - With live builds enabled, edits an isolated worktree, validates, automatically
   repairs, requires ChatGPT approval of the exact artifact, and opens a PR.
 - Reports team/build progress back to the originating chat.
+- Automatically retries a live build when the delivery controller explicitly
+  classifies a pre-publication model or tool failure as temporary. Delayed
+  retries are request-free, survive restarts, and do not block newer requests.
 - After a successful live build, durably watches the exact reviewed PR and sends
   restart-safe follow-ups only when its aggregate checks or lifecycle meaningfully
   change. Observation failures back off without exposing remote diagnostics.
@@ -90,9 +93,10 @@ monday telegram --once
 ```
 
 `--once` is a setup and queue-drain mode, not a daemon. It does not run the
-background pull-request follow-up loop and therefore does not provide ongoing
-monitoring. Any saved open-PR follow-up remains durable and resumes the next time
-the normal `monday telegram` service starts.
+background delivery-retry or pull-request follow-up loops and therefore does not
+provide ongoing recovery or monitoring. Saved retries and open-PR follow-ups
+remain durable and resume the next time the normal `monday telegram` service
+starts.
 
 To discover the numeric ID of someone who has messaged the bot:
 
@@ -108,8 +112,9 @@ At startup MondayOS verifies the bot identity and removes any prior webhook
 without dropping queued updates. Polling and webhooks cannot be used at the same
 time, so this ensures one predictable delivery path.
 
-The saved offset, durable FIFO jobs, retries, and replay tombstones in
-`logs/telegram/state.json` are bound to the bot's numeric Telegram identity.
+The saved offset, durable FIFO jobs, delivery-retry checkpoints, and replay
+tombstones in `logs/telegram/state.json` are bound to the bot's numeric Telegram
+identity.
 Renaming the same bot keeps its state. Replacing the token with a different bot
 clears the old bot's update state before polling, so one bot's offset cannot
 silently discard another bot's pending messages.
@@ -202,6 +207,39 @@ unless a newer open delivery remains authoritative. A newer open delivery also
 prevents an older merged PR from completing the task underneath newer work.
 Human-managed states are not overridden. The bot reports that result but still
 never merges or deploys it.
+
+## Automatic delivery recovery
+
+A live delivery can fail before commit or push because a model session, network
+connection, or required tool is temporarily unavailable. MondayOS retries only
+when the delivery controller provides the structured `transient` failure class;
+words such as "temporary" or "rate limit" in model, CLI, or remote diagnostic
+text never authorize a retry. Policy failures, validation/repair exhaustion,
+reviewer verdicts, missing setup, and unclassified failures remain terminal.
+
+Before acknowledging the original Telegram job, MondayOS saves a request-free
+retry checkpoint containing the task, registered project, originating chat, and
+a deterministic next delivery identity. The original request text is then
+removed in the normal replay tombstone. A delayed retry runs outside the main
+FIFO, so new Telegram requests continue while it waits. Restarts reclaim the
+same checkpoint, and a crash during a retry reconciles that exact identity
+instead of opening a duplicate pull request.
+
+Each retry is a new immutable delivery record linked by deterministic identity.
+MondayOS makes at most six delivery runs over a bounded 24-hour window, using
+increasing delays and any longer controller-provided retry hint. It never starts
+a fresh identity after a commit, push, pull request, or uncertain publication;
+those states must reconcile the original delivery. Telegram receives only
+generic scheduled, recovered, or exhausted notices—raw provider diagnostics and
+credentials are neither copied into retry state nor sent to the chat.
+
+The 24-hour cutoff prevents an unstarted retry from beginning late. If an exact
+retry identity was already invoked before the cutoff, MondayOS still reconciles
+that same identity after restart so a commit or pull request cannot be lost or
+misreported as an expiration. Post-cutoff reconciliation is bounded: if the
+exact identity still cannot be verified, MondayOS records a neutral
+`publication-pending` outcome, stops automatic retries, releases scheduler
+capacity, and asks the operator to inspect that delivery in MondayOS or GitHub.
 
 ## Always-on Mac mini service
 
