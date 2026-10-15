@@ -202,6 +202,9 @@ remain responsive without exposing request text. One background worker runs
 Monday/model jobs while intake continues polling. After
 a live build opens a PR, request-free follow-up state survives restarts and
 reports meaningful GitHub check, merge, closure, or head-divergence changes.
+PR observation and task reconciliation continue independently when Telegram is
+rate-limited, blocked, or no longer allowlisted; message retries use their own
+bounded request-free outbox.
 
 ---
 

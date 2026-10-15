@@ -112,10 +112,11 @@ monday telegram --once
 ```
 
 `--once` is a setup and queue-drain mode, not a daemon. It does not run the
-background delivery-retry or pull-request follow-up loops and therefore does not
-provide ongoing recovery or monitoring. Saved retries and open-PR follow-ups
-remain durable and resume the next time the normal `monday telegram` service
-starts.
+background delivery-retry, pull-request follow-up, or lifecycle-notice loops and
+therefore does not provide ongoing recovery or monitoring. Saved retries,
+open-PR follow-ups, and lifecycle notices remain durable and resume the next
+time the normal `monday telegram` service starts, where GitHub is observed
+before a saved lifecycle notice is sent.
 
 To discover the numeric ID of someone who has messaged the bot:
 
@@ -225,27 +226,48 @@ SHA. The observer is read-only at GitHub: it cannot push, edit, close, merge, or
 deploy the pull request.
 
 Telegram receives only the PR lifecycle and one aggregate check state:
-`pending`, `passed`, `failed`, or `no-checks`. It never sends or persists
-individual check names, descriptions, annotations, logs, or raw observation
-errors. Repeated observations are silent; the bot sends a message only for a
-meaningful transition, such as checks becoming pending, passed, failed, or absent,
-or the PR becoming merged, closed, or divergent from the reviewed SHA.
+`pending`, `passed`, `failed`, `no-checks`, `timed-out`, or `unknown`. It never
+sends or persists individual check names, descriptions, annotations, logs, or
+raw observation errors. An open `unknown` state is checkpointed silently.
+Repeated observations are silent; the bot sends a message only for a meaningful
+reportable transition, such as checks becoming pending, passed, failed, absent,
+or timed out, or the PR becoming merged, closed, or divergent from the reviewed
+SHA.
 
-The follow-up phase, next poll time, and last-notified transition are stored in
-the completed job tombstone in `logs/telegram/state.json`, without retaining the
-original request text. A restart can reclaim a poll that was in flight. Pending
-checks are polled more frequently, settled open-PR states more slowly, and
-transient observation failures use exponential backoff capped at five minutes;
-Telegram rate limits are honored separately for up to 24 hours. Untrusted
-`retry_after` values are normalized before they reach logs or time arithmetic;
-invalid values use a safe default and oversized values are capped at 24 hours.
-A permanent
-Telegram destination failure, such as a blocked bot or deleted chat, ends that
-watcher in a request-free `notification-failed` state instead of retrying
-forever. Each watcher has a durable 30-day lifetime, and at most 500 can be
-active at once. If that capacity is full, the final build message says that
-monitoring did not start; the pull request itself is unaffected. Monitoring
-also stops after a verified terminal PR state.
+The follow-up phase, next poll time, and last observation are stored in the
+completed job tombstone in `logs/telegram/state.json`, without retaining the
+original request text. Each accepted observation atomically advances or
+completes that watcher and stages at most one source-bound semantic message in
+a separate lifecycle-notice outbox. A newer transition supersedes an unsent
+older one, so a terminal result cannot sit behind a stale open-check message.
+A restart can reclaim a poll that was in flight or deliver an already-recorded
+notice without observing GitHub again.
+
+GitHub and Telegram use independent clocks. Pending checks are polled more
+frequently, settled open-PR states more slowly, and transient observation
+failures use exponential backoff capped at five minutes. Telegram rate limits
+create a durable lane-wide pause for current and newly created lifecycle notices
+for up to 24 hours; they never defer GitHub observation or task reconciliation.
+Untrusted `retry_after` values are
+normalized before they reach logs or time arithmetic; invalid values use a safe
+default and oversized values are capped at 24 hours. A revoked allowlist,
+blocked bot, deleted chat, or other permanent destination failure terminalizes
+and scrubs only the notice. The watcher continues until a verified terminal PR
+state or its durable 30-day lifetime. At most 500 watchers and 500 unresolved
+lifecycle notices can be active. Capacity exhaustion fails closed without
+changing the pull request or retaining request text.
+When that 30-day watcher lifetime expires, any unsent open-state notice is
+resolved and scrubbed atomically so a later restart cannot send stale monitoring
+status or leave health wedged behind an expired watcher.
+
+The same separation applies when automatic delivery recovery opens the pull
+request: a delayed or permanently undeliverable retry-outcome message cannot
+pause or terminate the new PR watcher.
+
+Lifecycle-message delivery is at-least-once. A crash after Telegram accepts a
+fixed message but before MondayOS checkpoints it may repeat that same message.
+It cannot repeat GitHub observation merely to recover delivery, recreate the
+build, or apply a second non-idempotent task mutation.
 
 Open-PR check results do not drive MondayOS task state. An observation may
 repair the delivery's separately recorded, explicitly `review-pending` initial
@@ -289,8 +311,8 @@ without retaining their route.
 Existing state with more than 25 pending jobs remains loadable and drains
 normally; the cap applies to new admission. `monday telegram --health` reports
 the current usage, unresolved acceptance receipts, and unresolved refusal
-notices, plus unresolved live-build delivery notices. It is unhealthy at or
-above the cap or while any of those outboxes remains unresolved.
+notices, plus unresolved live-build delivery and PR lifecycle notices. It is
+unhealthy at or above the cap or while any of those outboxes remains unresolved.
 
 `/queue` lists only jobs owned by the same allowlisted user: requests from that
 private chat plus requests that user submitted in an allowed group. `/cancel
