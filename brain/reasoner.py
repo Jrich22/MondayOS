@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from knowledge.store import KnowledgeStore
@@ -503,6 +503,6 @@ def _fmt_date(dt: Any) -> str:
     if dt is None:
         return "unknown"
     try:
-        return dt.strftime("%Y-%m-%d")
+        return cast(str, dt.strftime("%Y-%m-%d"))
     except Exception:
         return str(dt)

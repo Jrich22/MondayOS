@@ -25,6 +25,7 @@ from __future__ import annotations
 import re
 from typing import Any, Protocol
 
+from brain.providers.base import safe_provider_identifier
 from growth.generation.claim_risk import classify_claims
 from growth.generation.model_writer import (
     GENERATION_METHOD_MODEL,
@@ -145,8 +146,11 @@ class Copywriter:
     @property
     def provider_name(self) -> str:
         """The provider identifier when a model wrote the draft, else empty."""
-        name = getattr(self._writer, "provider_name", "")
-        return str(name) if name else ""
+        try:
+            name = getattr(self._writer, "provider_name", "")
+        except Exception:  # noqa: BLE001 - writer provenance is untrusted metadata
+            return "custom"
+        return safe_provider_identifier(name, fallback="custom") if name else ""
 
     def draft(
         self,

@@ -17,6 +17,7 @@ from advisor.reasoning import (
     synthesize_risks,
     synthesize_sprint_goal,
 )
+from brain.providers.base import safe_provider_identifier
 
 if TYPE_CHECKING:
     from brain.providers.base import AIProvider
@@ -183,8 +184,12 @@ class AdvisorEngine:
                 advisory.sprint_goal = enriched_goal
 
             advisory.confidence = min(0.95, advisory.confidence + 0.10)
-            if self._provider.name not in advisory.data_sources:  # type: ignore[union-attr]
-                advisory.data_sources.append(self._provider.name)  # type: ignore[union-attr]
+            provider_name = safe_provider_identifier(
+                self._provider,
+                fallback="custom",
+            )
+            if provider_name not in advisory.data_sources:
+                advisory.data_sources.append(provider_name)
         except Exception:
             pass  # AI enrichment is best-effort — provider errors must never propagate
 

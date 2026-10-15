@@ -8,6 +8,7 @@ execution path uses fakes/stubs only.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import types
@@ -24,7 +25,16 @@ from agents.adapters import (
 )
 from agents.roles import DEFAULT_ROLE_PROVIDERS
 from brain.providers.anthropic import AnthropicProvider
-from brain.providers.base import AIProvider, ProviderAvailability, ProviderResponse
+from brain.providers.base import (
+    AIProvider,
+    ProviderAvailability,
+    ProviderResponse,
+    safe_provider_availability,
+    safe_provider_identifier,
+    safe_provider_stop_reason,
+    safe_provider_token_count,
+)
+from brain.providers.deepseek import DeepSeekProvider
 from brain.providers.factory import ProviderConfig
 from brain.providers.ollama import OllamaProvider
 from brain.providers.openai import OpenAIProvider
@@ -144,6 +154,77 @@ class TestProviderAvailability(unittest.TestCase):
         )
         self.assertIn("set OPENAI_API_KEY", av.instructions())
 
+    def test_safe_availability_drops_valid_shaped_hostile_metadata(self):
+        secret = "PRIVATEPROMPT123456"
+        raw = ProviderAvailability(
+            available=False,
+            provider="sk-proj-LEAKME123456",
+            model=secret,
+            reason=secret,
+            env_var="LEAKMESECRET",
+        )
+
+        safe = safe_provider_availability(raw, provider="openai")
+        rendered = json.dumps(safe.to_dict()) + safe.instructions()
+
+        self.assertEqual(safe.provider, "openai")
+        self.assertEqual(safe.model, "openai-model")
+        self.assertEqual(safe.code, "missing-credential")
+        self.assertEqual(safe.env_var, "OPENAI_API_KEY")
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn("LEAKME", rendered)
+
+    def test_safe_availability_rejects_a_canonical_provider_mismatch(self):
+        safe = safe_provider_availability(
+            ProviderAvailability(available=True, provider="deepseek"),
+            provider="openai",
+        )
+
+        self.assertFalse(safe.available)
+        self.assertEqual(safe.provider, "openai")
+        self.assertEqual(safe.code, "provider-status-invalid")
+
+    def test_safe_availability_rejects_subclasses_before_accessing_fields(self):
+        secret = "HOSTILE-AVAILABILITY-ACCESSOR-92841"
+
+        class HostileAvailability(ProviderAvailability):
+            @property
+            def available(self):
+                raise RuntimeError(secret)
+
+            @property
+            def provider(self):
+                raise RuntimeError(secret)
+
+        raw = object.__new__(HostileAvailability)
+
+        safe = safe_provider_availability(raw, provider="openai")
+        rendered = json.dumps(raw.to_dict()) + raw.instructions()
+
+        self.assertFalse(safe.available)
+        self.assertEqual(safe.provider, "openai")
+        self.assertEqual(safe.code, "provider-status-invalid")
+        self.assertNotIn(secret, rendered)
+
+    def test_provider_scalar_sanitizers_require_exact_builtin_types(self):
+        secret = "HOSTILE-SCALAR-ACCESSOR-72914"
+
+        class HostileString(str):
+            def strip(self, *args, **kwargs):
+                raise RuntimeError(secret)
+
+        class HostileInt(int):
+            def __index__(self):
+                raise RuntimeError(secret)
+
+        self.assertEqual(
+            safe_provider_identifier(HostileString("openai"), fallback="custom"),
+            "custom",
+        )
+        self.assertEqual(safe_provider_stop_reason(HostileString("length")), "")
+        self.assertEqual(safe_provider_token_count(HostileInt(42)), 0)
+        self.assertEqual(safe_provider_token_count(True), 0)
+
 
 # ---------------------------------------------------------------------------
 # Resolution
@@ -155,6 +236,12 @@ class TestResolution(unittest.TestCase):
         self.assertIsInstance(build_provider_for("anthropic"), AnthropicProvider)
         self.assertIsInstance(build_provider_for("ollama"), OllamaProvider)
         self.assertIsInstance(build_provider_for("fake"), FakeAgentProvider)
+
+    def test_agent_resolution_accepts_supported_provider_aliases(self):
+        for alias in ("open_ai", "open-ai"):
+            self.assertIsInstance(build_provider_for(alias), OpenAIProvider)
+        for alias in ("deep_seek", "deep-seek"):
+            self.assertIsInstance(build_provider_for(alias), DeepSeekProvider)
 
     def test_build_unknown_none(self):
         self.assertIsNone(build_provider_for("nope"))
@@ -358,6 +445,23 @@ class TestRuntimeGate(unittest.TestCase):
         got = self.monday.task("get", task_id=self.task_id)
         self.assertEqual(got.data["status"], "backlog")
 
+    def test_unavailable_provider_prose_is_not_persisted_or_returned(self):
+        secret = "availability leaked credential LEAK-ME-987654321"
+        pool = [_UnavailableProvider("openai", secret)]
+
+        with mock.patch("agents.runtime.build_provider_pool", return_value=pool):
+            r = self.monday.agent("run", task_id=self.task_id, role="cpo")
+
+        persisted = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (self.root / "logs" / "agents").glob("*.json")
+        )
+        self.assertFalse(r.success)
+        self.assertEqual(r.status, "unavailable")
+        self.assertNotIn(secret, r.message)
+        self.assertNotIn(secret, str(r.data))
+        self.assertNotIn(secret, persisted)
+
     def test_role_default_honors_explicit_highest_capability_policy(self):
         low = _TieredFake("low", 1)
         high = _TieredFake("high", 9)
@@ -373,7 +477,7 @@ class TestRuntimeGate(unittest.TestCase):
             )
 
         self.assertTrue(r.success)
-        self.assertEqual(r.provider_used, "high")
+        self.assertEqual(r.provider_used, "custom")
         self.assertEqual(low.calls, [])
         self.assertTrue(high.calls)
 
@@ -443,6 +547,8 @@ class TestRuntimeGate(unittest.TestCase):
             r = self.monday.agent("run", task_id=self.task_id, role="cpo", mode="dry-run")
         self.assertTrue(r.success)
         self.assertEqual(r.status, "dry-run")
+        self.assertEqual(r.provider_used, "")
+        self.assertEqual(r.data["provider_model"], "")
 
     def test_execution_report_records_model(self):
         r = self.monday.agent("run", task_id=self.task_id, role="qa", provider="fake")

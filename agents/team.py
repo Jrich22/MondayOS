@@ -30,7 +30,9 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import os
 import re
+import stat
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -40,14 +42,23 @@ from typing import Any
 
 from agents.roles import get_role
 from agents.runtime import AgentRuntime
-from agents.types import AgentRun
+from agents.types import AgentRun, sanitize_team_record
 from agents.verdicts import ALL_VERDICTS, BLOCK, INVALID, NEEDS_CHANGES, PASS
-from core.atomic import write_json_atomic
+from brain.providers.base import safe_provider_identifier
 from core.errors import TeamCheckpointError
+from core.secure_io import (
+    ConcurrentRecordChangeError,
+    open_directory_beneath,
+    open_private_lock_file,
+    read_json_with_identity_at,
+    validate_private_lock_file,
+    write_json_atomic_at,
+)
 
 # The collaboration order. Human Approval is the terminal gate, not an agent run.
 TEAM_SEQUENCE: tuple[str, ...] = ("cpo", "lead-engineer", "qa", "security", "reviewer")
 _TEAM_RUN_ID = re.compile(r"^team-[A-Za-z0-9-]{1,80}$")
+_LEGACY_MIGRATION_ATTEMPTS = 3
 
 # Roles that must produce a valid `pass` for the pipeline to advance.
 BLOCKING_ROLES: frozenset[str] = frozenset({"qa", "security", "reviewer"})
@@ -148,8 +159,10 @@ class TeamRun:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TeamRun:
-        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-        return cls(**{k: v for k, v in data.items() if k in known})
+        known = {f for f in cls.__dataclass_fields__}
+        sanitized = sanitize_team_record(data)
+        clean = {k: v for k, v in sanitized.items() if k in known}
+        return cls(**clean)
 
 
 class TeamWorkflow:
@@ -243,8 +256,7 @@ class TeamWorkflow:
         # process is killed, the OS releases the lease automatically; the next
         # worker can then identify and interrupt the stale `running` record.
         # A hash keeps arbitrary task IDs out of filesystem paths.
-        lease_path = _task_lease_path(self._runs_dir, task_id)
-        lease = _TeamRunLease(lease_path)
+        lease = _TeamRunLease(self._root, task_id)
         try:
             lease.acquire()
         except TeamRunBusyError:
@@ -401,7 +413,12 @@ class TeamWorkflow:
                 "role": role,
             })
             stage_provider = provider
-            if role == "reviewer" and provider.strip().lower() not in {
+            requested_provider = (
+                safe_provider_identifier(provider, fallback="custom")
+                if type(provider) is str and provider
+                else ""
+            )
+            if role == "reviewer" and requested_provider not in {
                 "",
                 "openai",
                 "fake",
@@ -411,9 +428,10 @@ class TeamWorkflow:
                 stage_provider = ""
             stage_provider_instance = (stage_providers or {}).get(role)
             if role == "reviewer" and stage_provider_instance is not None:
-                injected_name = str(
-                    getattr(stage_provider_instance, "name", "") or ""
-                ).strip().lower()
+                injected_name = safe_provider_identifier(
+                    stage_provider_instance,
+                    fallback="custom",
+                )
                 if injected_name not in {"openai", "fake"}:
                     # `stage_providers` is public test/advanced-use input, not a
                     # bypass around the mandatory independent OpenAI reviewer.
@@ -533,9 +551,8 @@ class TeamWorkflow:
     def interrupt(self, team_run_id: str, reason: str = "") -> TeamRun:
         """Atomically mark an abandoned running team so recovery is auditable."""
         candidate = self.get_team_run(team_run_id)
-        lease_path = _task_lease_path(self._runs_dir, candidate.task_id)
         try:
-            with _TeamRunLease(lease_path):
+            with _TeamRunLease(self._root, candidate.task_id):
                 # Re-read under the lease. The workflow may have completed
                 # between the initial identity lookup and lease acquisition.
                 team = self.get_team_run(team_run_id)
@@ -547,10 +564,7 @@ class TeamWorkflow:
                     )
                     team.message = team.stopped_reason
                     # Recovery must not begin unless this state change is durable.
-                    write_json_atomic(
-                        self._runs_dir / f"{team.team_run_id}.json",
-                        team.to_dict(),
-                    )
+                    self._persist_required(team)
                 return team
         except TeamRunBusyError as exc:
             raise TeamRunBusyError(
@@ -559,11 +573,29 @@ class TeamWorkflow:
             ) from exc
 
     def history(self, task_id: str | None = None, limit: int = 20) -> list[TeamRun]:
-        if not self._runs_dir.exists():
+        try:
+            directory_fd = open_directory_beneath(
+                self._root,
+                Path("logs") / "agents",
+            )
+        except FileNotFoundError:
             return []
         runs: list[TeamRun] = []
-        for path in sorted(self._runs_dir.glob("team-*.json")):
-            runs.append(_load_team_run_record(path, expected_id=path.stem))
+        try:
+            names = sorted(
+                name
+                for name in os.listdir(directory_fd)
+                if name.startswith("team-") and name.endswith(".json")
+            )
+        finally:
+            os.close(directory_fd)
+        for name in names:
+            runs.append(
+                _load_team_run_record(
+                    self._runs_dir / name,
+                    expected_id=Path(name).stem,
+                )
+            )
         if task_id is not None:
             runs = [r for r in runs if r.task_id == task_id]
         runs.sort(key=lambda r: r.created_at, reverse=True)
@@ -585,7 +617,7 @@ class TeamWorkflow:
         identity lock also protects the same caller-provided ID from being
         claimed concurrently by *different* task IDs.
         """
-        with _TeamIdentityLock(self._runs_dir / ".team-identity.lock"):
+        with _TeamIdentityLock(self._root):
             path = self._runs_dir / f"{team.team_run_id}.json"
             if path.exists() or path.is_symlink():
                 if reconcile_existing:
@@ -652,10 +684,19 @@ class TeamWorkflow:
     def _persist(self, team: TeamRun) -> None:
         checked_id = _validate_team_run_id(team.team_run_id)
         try:
-            write_json_atomic(
-                self._runs_dir / f"{checked_id}.json",
-                team.to_dict(),
+            directory_fd = open_directory_beneath(
+                self._root,
+                Path("logs") / "agents",
+                create=True,
             )
+            try:
+                write_json_atomic_at(
+                    directory_fd,
+                    f"{checked_id}.json",
+                    team.to_dict(),
+                )
+            finally:
+                os.close(directory_fd)
         except Exception as exc:
             raise TeamCheckpointError(
                 "Could not persist the team run checkpoint"
@@ -669,28 +710,46 @@ class TeamWorkflow:
 class _TeamRunLease:
     """Non-blocking kernel lease held for one task's complete workflow."""
 
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._file: Any = None
+    def __init__(self, root: Path, task_id: str) -> None:
+        self._root = root
+        self._name = _task_lease_name(task_id)
+        self._file_fd: int | None = None
+        self._directory_fd: int | None = None
 
     def acquire(self) -> _TeamRunLease:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self._path.open("a+", encoding="utf-8")
+        file_fd, directory_fd = open_private_lock_file(
+            self._root,
+            Path("logs") / "agents" / "locks",
+            self._name,
+        )
         try:
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(file_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            validate_private_lock_file(directory_fd, file_fd, self._name)
         except BlockingIOError as exc:
-            self._file.close()
-            self._file = None
+            os.close(file_fd)
+            os.close(directory_fd)
             raise TeamRunBusyError("A live team run already owns this task") from exc
+        except BaseException:
+            try:
+                fcntl.flock(file_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(file_fd)
+                os.close(directory_fd)
+            raise
+        self._file_fd = file_fd
+        self._directory_fd = directory_fd
         return self
 
     def release(self) -> None:
-        if self._file is not None:
+        if self._file_fd is not None:
             try:
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(self._file_fd, fcntl.LOCK_UN)
             finally:
-                self._file.close()
-                self._file = None
+                os.close(self._file_fd)
+                self._file_fd = None
+                if self._directory_fd is not None:
+                    os.close(self._directory_fd)
+                    self._directory_fd = None
 
     def __enter__(self) -> _TeamRunLease:
         return self.acquire()
@@ -702,23 +761,45 @@ class _TeamRunLease:
 class _TeamIdentityLock:
     """Serialize the short compare-and-create window for team identities."""
 
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._file: Any = None
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._file_fd: int | None = None
+        self._directory_fd: int | None = None
 
     def __enter__(self) -> _TeamIdentityLock:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self._path.open("a+", encoding="utf-8")
-        fcntl.flock(self._file.fileno(), fcntl.LOCK_EX)
+        file_fd, directory_fd = open_private_lock_file(
+            self._root,
+            Path("logs") / "agents",
+            ".team-identity.lock",
+        )
+        try:
+            fcntl.flock(file_fd, fcntl.LOCK_EX)
+            validate_private_lock_file(
+                directory_fd,
+                file_fd,
+                ".team-identity.lock",
+            )
+        except BaseException:
+            try:
+                fcntl.flock(file_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(file_fd)
+                os.close(directory_fd)
+            raise
+        self._file_fd = file_fd
+        self._directory_fd = directory_fd
         return self
 
     def __exit__(self, *_args: Any) -> None:
-        if self._file is not None:
+        if self._file_fd is not None:
             try:
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(self._file_fd, fcntl.LOCK_UN)
             finally:
-                self._file.close()
-                self._file = None
+                os.close(self._file_fd)
+                self._file_fd = None
+                if self._directory_fd is not None:
+                    os.close(self._directory_fd)
+                    self._directory_fd = None
 
 
 def _notify(
@@ -825,34 +906,64 @@ def _context_from(prior: list[tuple[str, str]]) -> str:
 
 def _load_team_run_record(path: Path, *, expected_id: str) -> TeamRun:
     """Load one parent record only when its durable identity matches its path."""
+    directory_fd: int | None = None
     try:
-        if path.is_symlink():
-            raise ValueError(f"Refusing symlinked team run record {expected_id!r}")
         _validate_team_run_id(expected_id)
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise TypeError("team run record must be a JSON object")
-        team = TeamRun.from_dict(payload)
-        _validate_team_run_id(team.team_run_id)
-        if team.team_run_id != expected_id:
-            raise ValueError(
-                f"team_run_id {team.team_run_id!r} does not match filename "
-                f"{expected_id!r}"
-            )
-        return team
+        directory_fd = open_directory_beneath(
+            path.parents[2],
+            Path("logs") / "agents",
+        )
+        entry = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISLNK(entry.st_mode):
+            raise ValueError(f"Refusing symlinked team run record {expected_id!r}")
+        for _attempt in range(_LEGACY_MIGRATION_ATTEMPTS):
+            payload, identity = read_json_with_identity_at(directory_fd, path.name)
+            team = _team_run_from_payload(payload, expected_id)
+            migrated = team.to_dict()
+            if migrated == payload:
+                return team
+            try:
+                write_json_atomic_at(
+                    directory_fd,
+                    path.name,
+                    migrated,
+                    expected_identity=identity,
+                )
+            except ConcurrentRecordChangeError:
+                continue
+            return team
+
+        payload, _identity = read_json_with_identity_at(directory_fd, path.name)
+        return _team_run_from_payload(payload, expected_id)
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise ValueError(
             f"Team run record {path.name!r} is unreadable or malformed: {exc}"
         ) from exc
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _team_run_from_payload(payload: Any, expected_id: str) -> TeamRun:
+    if not isinstance(payload, dict):
+        raise TypeError("team run record must be a JSON object")
+    team = TeamRun.from_dict(payload)
+    _validate_team_run_id(team.team_run_id)
+    if team.team_run_id != expected_id:
+        raise ValueError(
+            f"team_run_id {team.team_run_id!r} does not match filename "
+            f"{expected_id!r}"
+        )
+    return team
 
 
 def _new_team_id() -> str:
     return f"team-{uuid.uuid4().hex[:12]}"
 
 
-def _task_lease_path(runs_dir: Path, task_id: str) -> Path:
+def _task_lease_name(task_id: str) -> str:
     lease_key = hashlib.sha256(task_id.encode("utf-8")).hexdigest()
-    return runs_dir / "locks" / f"{lease_key}.lock"
+    return f"{lease_key}.lock"
 
 
 def _validate_team_run_id(team_run_id: str) -> str:

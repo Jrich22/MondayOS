@@ -22,14 +22,21 @@ impossible to retrofit once ids are allocated.
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from core.atomic import write_atomic
+from core.secure_io import (
+    ConcurrentRecordChangeError,
+    open_directory_beneath,
+    read_text_with_identity_at,
+    write_text_atomic_at,
+)
 from core.sequence import IdentityPolicy, Namespace, SequenceAllocator
 from workspace.errors import ConversationNotFoundError
 from workspace.models import (
@@ -47,6 +54,7 @@ from workspace.models import (
 _SEQUENCES_FILENAME = ".sequences.json"
 _CONVERSATION_PREFIX = "CONV"
 _MESSAGE_PREFIX = "MSG"
+_CONVERSATION_ID = re.compile(r"^CONV-[A-Za-z0-9-]{1,100}$")
 _FRONTMATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 
 # `ConversationStore.list` mirrors `ProjectRegistry.list`, which means the name
@@ -87,7 +95,19 @@ class ConversationStore:
         return self._base / slug
 
     def _path(self, project: str, conversation_id: str) -> Path:
-        return self.project_dir(project) / f"{conversation_id}.md"
+        return self.project_dir(project) / _conversation_filename(conversation_id)
+
+    def _project_fd(self, project: str, *, create: bool = False) -> int:
+        slug = slugify(project)
+        if not slug:
+            raise ValueError("A conversation must belong to a nameable project.")
+        return open_directory_beneath(
+            self._root,
+            Path("workspace") / "conversations" / slug,
+            create=create,
+            private=create,
+            private_from=1,
+        )
 
     # ------------------------------------------------------------------- ids
 
@@ -101,16 +121,20 @@ class ConversationStore:
         uniqueness git cannot.
         """
         directory = self.project_dir(project)
-        directory.mkdir(parents=True, exist_ok=True)
-        return SequenceAllocator(
-            Namespace(
-                prefix=prefix,
-                records=directory,
-                counter=directory / _SEQUENCES_FILENAME,
-                policy=IdentityPolicy.RUNTIME_HYBRID,
-                recursive=False,
-            )
-        ).allocate()
+        directory_fd = self._project_fd(project, create=True)
+        try:
+            return SequenceAllocator(
+                Namespace(
+                    prefix=prefix,
+                    records=directory,
+                    counter=directory / _SEQUENCES_FILENAME,
+                    policy=IdentityPolicy.RUNTIME_HYBRID,
+                    recursive=False,
+                ),
+                directory_fd=directory_fd,
+            ).allocate()
+        finally:
+            os.close(directory_fd)
 
     def next_message_id(self, conversation: Conversation) -> str:
         """
@@ -151,27 +175,69 @@ class ConversationStore:
         explicit constraint recorded in ADR-015 — not an oversight.
         """
         path = self._path(conversation.project, conversation.id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_atomic(path, _serialize(conversation))
+        directory_fd = self._project_fd(conversation.project, create=True)
+        try:
+            write_text_atomic_at(directory_fd, path.name, _serialize(conversation))
+        finally:
+            os.close(directory_fd)
         return path
 
     def delete(self, project: str, conversation_id: str) -> None:
         """Remove a conversation permanently. Archiving is the reversible option."""
-        path = self._path(project, conversation_id)
-        if not path.is_file():
-            raise ConversationNotFoundError(conversation_id, project)
-        path.unlink()
+        name = _conversation_filename(conversation_id)
+        try:
+            directory_fd = self._project_fd(project)
+        except FileNotFoundError as exc:
+            raise ConversationNotFoundError(conversation_id, project) from exc
+        except OSError as exc:
+            raise ValueError("Conversation directory is not safe.") from exc
+        try:
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+                raise ConversationNotFoundError(conversation_id, project)
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError as exc:
+            raise ConversationNotFoundError(conversation_id, project) from exc
+        finally:
+            os.close(directory_fd)
 
     # ----------------------------------------------------------------- reads
 
     def get(self, project: str, conversation_id: str) -> Conversation:
-        path = self._path(project, conversation_id)
-        if not path.is_file():
-            raise ConversationNotFoundError(conversation_id, project)
-        return _parse(path.read_text(encoding="utf-8"), fallback_project=slugify(project))
+        name = _conversation_filename(conversation_id)
+        try:
+            directory_fd = self._project_fd(project)
+        except FileNotFoundError as exc:
+            raise ConversationNotFoundError(conversation_id, project) from exc
+        except OSError as exc:
+            raise ValueError("Conversation directory is not safe.") from exc
+        try:
+            try:
+                conversation = _load_conversation_at(
+                    directory_fd,
+                    name,
+                    project=slugify(project),
+                )
+            except FileNotFoundError as exc:
+                raise ConversationNotFoundError(conversation_id, project) from exc
+            except OSError as exc:
+                raise ValueError("Conversation record is not a safe regular file.") from exc
+            return conversation
+        finally:
+            os.close(directory_fd)
 
     def exists(self, project: str, conversation_id: str) -> bool:
-        return self._path(project, conversation_id).is_file()
+        directory_fd: int | None = None
+        try:
+            name = _conversation_filename(conversation_id)
+            directory_fd = self._project_fd(project)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            return stat.S_ISREG(current.st_mode) and current.st_nlink == 1
+        except (FileNotFoundError, OSError, ValueError):
+            return False
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
 
     def list(self, project: str, include_archived: bool = False) -> list[Conversation]:
         """
@@ -180,36 +246,109 @@ class ConversationStore:
         Reads only this project's directory, so the listing is scoped by the
         filesystem rather than by a filter that could be forgotten.
         """
-        directory = self.project_dir(project)
-        if not directory.is_dir():
+        try:
+            directory_fd = self._project_fd(project)
+        except (FileNotFoundError, OSError, ValueError):
             return []
 
         conversations: list[Conversation] = []
-        for path in sorted(directory.glob(f"{_CONVERSATION_PREFIX}-*.md")):
-            try:
-                conversation = _parse(
-                    path.read_text(encoding="utf-8"), fallback_project=slugify(project)
-                )
-            except (OSError, ValueError):
-                # One malformed file must not make the sidebar unusable.
-                continue
-            if conversation.is_archived and not include_archived:
-                continue
-            conversations.append(conversation)
+        try:
+            names = sorted(
+                name
+                for name in os.listdir(directory_fd)
+                if name.startswith(f"{_CONVERSATION_PREFIX}-") and name.endswith(".md")
+            )
+            for name in names:
+                try:
+                    conversation = _load_conversation_at(
+                        directory_fd,
+                        name,
+                        project=slugify(project),
+                    )
+                except (OSError, ValueError):
+                    # One malformed file must not make the sidebar unusable.
+                    continue
+                if conversation.is_archived and not include_archived:
+                    continue
+                conversations.append(conversation)
+        finally:
+            os.close(directory_fd)
 
         conversations.sort(key=lambda c: (c.updated_at, c.id), reverse=True)
         return conversations
 
     def projects_with_conversations(self) -> _StrList:
         """Project slugs that have at least one conversation on disk."""
-        if not self._base.is_dir():
+        try:
+            directory_fd = open_directory_beneath(
+                self._root,
+                Path("workspace") / "conversations",
+            )
+        except (FileNotFoundError, OSError, ValueError):
             return []
-        return sorted(p.name for p in self._base.iterdir() if p.is_dir())
+
+        projects: list[str] = []
+        try:
+            try:
+                names = os.listdir(directory_fd)
+            except OSError:
+                return []
+            for name in names:
+                try:
+                    current = os.stat(
+                        name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    continue
+                if stat.S_ISDIR(current.st_mode):
+                    projects.append(name)
+        finally:
+            os.close(directory_fd)
+        return sorted(projects)
 
 
 # --------------------------------------------------------------------------- #
 # serialization
 # --------------------------------------------------------------------------- #
+
+
+def _conversation_filename(conversation_id: str) -> str:
+    """Return one bounded conversation leaf or reject it before filesystem use."""
+    if type(conversation_id) is not str or not _CONVERSATION_ID.fullmatch(
+        conversation_id
+    ):
+        raise ValueError("conversation_id must be one valid CONV identifier")
+    return f"{conversation_id}.md"
+
+
+def _load_conversation_at(
+    directory_fd: int,
+    name: str,
+    *,
+    project: str,
+) -> Conversation:
+    """Load and lazily migrate one conversation without overwriting a newer write."""
+    for attempt in range(3):
+        text, identity = read_text_with_identity_at(directory_fd, name)
+        conversation = _parse(text, fallback_project=project)
+        migrated = _serialize(conversation)
+        if migrated == text:
+            return conversation
+        try:
+            write_text_atomic_at(
+                directory_fd,
+                name,
+                migrated,
+                expected_identity=identity,
+            )
+        except ConcurrentRecordChangeError:
+            if attempt < 2:
+                continue
+            raise
+        return conversation
+    raise ConcurrentRecordChangeError("conversation changed during migration")
 
 
 def _serialize(conversation: Conversation) -> str:

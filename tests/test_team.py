@@ -28,6 +28,7 @@ from brain.providers.base import ProviderAvailability
 from monday import Monday, MondayConfig
 from monday.cli import main
 from tasks import TaskStatus
+from telegram_bot.service import _team_result
 
 
 class _UnavailableFake(FakeAgentProvider):
@@ -53,6 +54,15 @@ class _HoldingFake(FakeAgentProvider):
         if not self._release.wait(timeout=5):
             raise TimeoutError("test did not release the holding provider")
         return super().ask(*args, **kwargs)
+
+
+class _LeakingFake(FakeAgentProvider):
+    def __init__(self, secret: str) -> None:
+        super().__init__(name="fake", role="cpo")
+        self._secret = secret
+
+    def ask(self, *args, **kwargs):
+        raise RuntimeError(self._secret)
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +249,55 @@ class TestTeamPipeline(unittest.TestCase):
         r = self._team(progress_callback=broken)
         self.assertTrue(r.success)
         self.assertEqual(r.status, "awaiting-approval")
+
+    def test_provider_exception_is_absent_from_team_state_and_telegram_text(self):
+        secret = "provider copied API key and prompt LEAK-ME-246813579"
+        workflow = TeamWorkflow(self.monday, self.root)
+
+        run = workflow.run(
+            task_id=self.task_id,
+            provider="fake",
+            stage_providers={"cpo": _LeakingFake(secret)},
+        )
+
+        records = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (self.root / "logs").rglob("*.json")
+        )
+        bus = getattr(self.monday, "_Monday__bus")
+        event_payloads = json.dumps([event.payload for event in bus.history()])
+        telegram_text = _team_result(self.task_id, run.to_dict())
+
+        self.assertFalse(run.success)
+        self.assertEqual(run.status, "failed")
+        self.assertNotIn(secret, json.dumps(run.to_dict()))
+        self.assertNotIn(secret, records)
+        self.assertNotIn(secret, event_payloads)
+        self.assertNotIn(secret, telegram_text)
+        self.assertIn("could not complete", telegram_text)
+
+    def test_telegram_team_result_preserves_fixed_terminal_statuses(self):
+        invalid = _team_result(
+            self.task_id,
+            {"status": "invalid-verdict", "stopped_at": "reviewer"},
+        )
+        changes = _team_result(
+            self.task_id,
+            {"status": "changes-requested", "stopped_at": "qa"},
+        )
+
+        self.assertIn("team run: invalid-verdict", invalid)
+        self.assertIn("Stopped at Final product review", invalid)
+        self.assertIn("requested before completion", changes)
+        self.assertNotIn("approval gate", changes)
+
+    def test_telegram_team_result_uses_the_runtime_run_id_validator(self):
+        rendered = _team_result(
+            self.task_id,
+            {"status": "awaiting-approval", "approval_run_id": "run--"},
+        )
+
+        self.assertNotIn("/approve", rendered)
 
     def test_required_checkpoint_failure_stops_before_task_or_provider_work(self):
         provider = FakeAgentProvider(role="cpo")

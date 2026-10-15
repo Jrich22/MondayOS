@@ -1434,3 +1434,86 @@ one-shot work cannot inherit a crashed daemon's still-fresh ready leases.
 - Upgrades from the old heartbeat format require one normal daemon restart.
 - The heartbeat remains ephemeral, strict, bounded, and safe to expose through
   the secret-free health command.
+
+---
+
+## ADR-029: Provider Failures Cross the Runtime as Fixed Diagnostics
+
+**Date:** 2026-10-15
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+Provider and SDK exceptions can contain remote response bodies, request
+fragments, credentials, or model prompts. The orchestrator previously copied
+that free-form text into model-call events, execution reports, API responses,
+agent and team checkpoints, and ultimately Telegram team replies. Environment
+secret pattern replacement is not a sufficient boundary because a private
+prompt fragment may be sensitive without resembling a credential.
+
+### Decision
+
+Provider exceptions are reduced at the provider boundary to one fixed code:
+authentication failure, rate limiting, unavailability, or generic provider
+failure. No exception message or exception class name crosses that boundary.
+Readiness results retain only a strict availability boolean, a fixed cause code,
+a supported provider label, a fixed model-family label, and the provider's
+known credential-variable name. Free-form reasons, response model strings,
+custom provider identifiers, and shell installation hints are discarded before
+higher layers use them. Fixed readiness codes distinguish a missing SDK,
+credential, local service, and local model without exposing vendor prose.
+
+The same boundary applies to the Orchestrator, agent runtime, Workspace
+conversation path, and Growth model writer. Model-generation failures inherit
+the Growth error boundary, so public API and CLI callers receive the fixed
+diagnostic instead of an uncaught provider exception.
+
+Execution reports use a descriptor-bound atomic writer, which replaces complete
+JSON records with private file permissions. Each new write safely tightens and
+sanitizes older single-link regular reports without following linked report
+directories or files. Dashboard JSONL audit writes also use no-follow
+regular-file validation, an append lock, and mode 0600. Legacy Agent, Team, and
+Workspace records are reduced on read and rewritten only through directories
+opened beneath the trusted project root without following project-controlled
+links. Agent and team state may copy only an already-reduced report.
+Approval, team-identity, task-lease, and Workspace sequence locks use the same
+descriptor-bound rule. Lock directories are private, lock leaves must remain
+single-link regular files before and after kernel-lock acquisition, and the
+Workspace allocator keeps its validated project directory open through counter
+read, allocation, and replacement. Workspace record IDs are validated before
+all descriptor-relative operations, project discovery ignores linked children,
+and unsafe counter or destination leaves fail closed without replacing links.
+Telegram team results render an allowlisted status, validated role, fixed
+provider label, and the runtime's canonical approval-run handle with fixed
+explanatory text; they never append the persisted team message.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Redact known token patterns from raw exceptions | Prompt fragments and unknown credential formats can remain sensitive without matching a pattern. |
+| Keep raw diagnostics only in local logs | Local reports are durable and can be copied into later agent output; they remain part of the confidentiality boundary. |
+| Return the exception type but not its message | Provider-defined class names are unnecessary data and fixed semantic codes are more stable for automation. |
+| Remove provider failure records entirely | Fixed codes retain enough audit and retry information without retaining provider-controlled prose. |
+
+### Consequences
+
+- Provider failures remain distinguishable for retry and operator diagnosis
+  without disclosing provider-controlled text.
+- Missing-key guidance can name a fixed, known environment variable selected
+  from MondayOS's provider mapping, but SDK-specific prose and
+  install commands are no longer propagated through the runtime.
+- Exact vendor model IDs are replaced by fixed family labels in cross-layer
+  state; vendor consoles remain the place for low-level diagnostics.
+- Execution and dashboard audit files containing prompts or generated output
+  are private; execution JSON is also crash-safe.
+- Workflow and Workspace allocation locks cannot be redirected through linked
+  project directories or lock leaves, and are mode 0600 inside mode 0700
+  project-controlled directories.
+- Atomic migrations and report writes refuse linked destinations, preserving
+  both the contents and filesystem metadata of outside files.
+- Detailed vendor diagnostics must be investigated at the provider boundary or
+  vendor console rather than copied into MondayOS durable state or chat.

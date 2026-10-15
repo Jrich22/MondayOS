@@ -25,9 +25,11 @@ from brain.providers.base import (
     ProviderError,
     ProviderResponse,
 )
+from core.project import ProjectRegistry
 from growth import GrowthStore
 from growth.campaign import CampaignStatus
 from growth.content import ContentStatus
+from growth.errors import GrowthError
 from growth.generation import (
     AssetKind,
     BrandContext,
@@ -46,7 +48,6 @@ from growth.generation import (
     parse_response,
 )
 from growth.service import GrowthService
-from core.project import ProjectRegistry
 
 T0 = datetime(2026, 9, 7, 9, 0, tzinfo=UTC)
 
@@ -341,6 +342,26 @@ class TestStructuredOutput(unittest.TestCase):
         )
         self.assertNotIn("invented", payload)
 
+    def test_optional_collection_fields_must_be_string_arrays(self):
+        for field, value in (("themes", 123), ("warnings", {"secret": True})):
+            with self.subTest(field=field):
+                with self.assertRaises(ModelOutputInvalidError):
+                    parse_response(json.dumps({
+                        "title": "t",
+                        "body": "body",
+                        "cta": "c",
+                        field: value,
+                    }))
+
+    def test_optional_scalar_fields_must_be_strings(self):
+        with self.assertRaises(ModelOutputInvalidError):
+            parse_response(json.dumps({
+                "title": "t",
+                "body": "body",
+                "cta": "c",
+                "destination": ["not", "a", "string"],
+            }))
+
     def test_a_writer_receiving_prose_fails_closed(self):
         writer = ModelContentWriter(FakeContentProvider(response="Just some prose."))
         with self.assertRaises(ModelOutputInvalidError):
@@ -433,22 +454,63 @@ class TestContextProvenanceAndFallback(unittest.TestCase):
         self.assertEqual(provider.prompts, [])
 
     def test_an_unavailable_provider_surfaces_cleanly(self):
-        writer = ModelContentWriter(FakeContentProvider(available=False))
+        secret = "SECRET-RAW-READINESS-DETAIL"
+        provider = FakeContentProvider(name="openai", available=False)
+
+        def unavailable() -> ProviderAvailability:
+            return ProviderAvailability(
+                available=False,
+                provider="openai",
+                reason=secret,
+                env_var="OPENAI_API_KEY",
+            )
+
+        provider.availability = unavailable  # type: ignore[method-assign]
+        writer = ModelContentWriter(provider)
         with self.assertRaises(ModelGenerationError) as ctx:
             writer.write(_planned(), _brand(), angle="")
-        self.assertIn("FAKE_WRITER_KEY", str(ctx.exception))
+        self.assertIn("OPENAI_API_KEY", str(ctx.exception))
+        self.assertNotIn(secret, str(ctx.exception))
         self.assertIn("No template fallback", str(ctx.exception))
 
     def test_a_provider_error_surfaces_cleanly(self):
-        writer = ModelContentWriter(FakeContentProvider(raises=ProviderError("upstream exploded")))
+        secret = "upstream exploded with SECRET-GROWTH-DIAGNOSTIC"
+        writer = ModelContentWriter(FakeContentProvider(raises=ProviderError(secret)))
         with self.assertRaises(ModelGenerationError) as ctx:
             writer.write(_planned(), _brand(), angle="")
-        self.assertIn("upstream exploded", str(ctx.exception))
+        self.assertIn("Provider request failed", str(ctx.exception))
+        self.assertNotIn(secret, str(ctx.exception))
 
     def test_an_unexpected_provider_exception_still_surfaces(self):
-        writer = ModelContentWriter(FakeContentProvider(raises=RuntimeError("boom")))
-        with self.assertRaises(ModelGenerationError):
+        secret = "boom SECRET-UNEXPECTED-DIAGNOSTIC"
+        writer = ModelContentWriter(FakeContentProvider(raises=RuntimeError(secret)))
+        with self.assertRaises(ModelGenerationError) as ctx:
             writer.write(_planned(), _brand(), angle="")
+        self.assertNotIn(secret, str(ctx.exception))
+
+    def test_an_availability_exception_is_also_contained(self):
+        secret = "SECRET-AVAILABILITY-EXCEPTION"
+
+        class BrokenAvailability(FakeContentProvider):
+            def availability(self) -> ProviderAvailability:
+                raise RuntimeError(secret)
+
+        with self.assertRaises(ModelGenerationError) as ctx:
+            ModelContentWriter(BrokenAvailability()).write(_planned(), _brand(), angle="")
+        self.assertNotIn(secret, str(ctx.exception))
+
+    def test_model_generation_errors_are_caught_by_the_growth_api_boundary(self):
+        self.assertTrue(issubclass(ModelGenerationError, GrowthError))
+
+    def test_provider_and_model_provenance_are_bounded(self):
+        secret = "SECRET PROVIDER PROVENANCE"
+        writer = ModelContentWriter(FakeContentProvider(name=secret, model=secret))
+        writer.write(_planned(), _brand(), angle="")
+        assert writer.last_draft is not None
+        self.assertEqual(writer.provider_name, "custom")
+        self.assertEqual(writer.last_draft.provider, "custom")
+        self.assertEqual(writer.last_draft.model, "")
+        self.assertNotIn(secret, json.dumps(writer.last_draft.to_dict()))
 
     def test_model_mode_never_silently_becomes_template(self):
         """A failed model draft raises; it does not quietly return template copy."""
@@ -462,7 +524,7 @@ class TestContextProvenanceAndFallback(unittest.TestCase):
         )
         template_asset = Copywriter(TemplateContentWriter()).draft(_planned(), _brand())
         self.assertEqual(model_asset.generation_method, "model")
-        self.assertEqual(model_asset.provider, "fake-writer")
+        self.assertEqual(model_asset.provider, "custom")
         self.assertEqual(template_asset.generation_method, "template")
         self.assertEqual(template_asset.provider, "")
 
@@ -470,7 +532,7 @@ class TestContextProvenanceAndFallback(unittest.TestCase):
         asset = Copywriter(ModelContentWriter(FakeContentProvider())).draft(_planned(), _brand())
         payload = asset.to_dict()
         self.assertEqual(payload["generation_method"], "model")
-        self.assertEqual(payload["provider"], "fake-writer")
+        self.assertEqual(payload["provider"], "custom")
         self.assertEqual(payload["recommendation_ids"], ["REC-abc"])
         self.assertEqual(payload["experiment_ids"], ["EXP-xyz"])
         self.assertEqual(payload["campaign"], "CAMPAIGN-0001")
@@ -548,7 +610,7 @@ class TestModelGenerationInThePackage(unittest.TestCase):
             item = self.handle.get_content(post.content_id)
             self.assertIs(item.status, ContentStatus.DRAFT)
             self.assertEqual(item.metadata["generation_method"], "model")
-            self.assertEqual(item.metadata["provider"], "fake-writer")
+            self.assertEqual(item.metadata["provider"], "custom")
 
     def test_variants_remain_independently_approvable(self):
         package = self._build(FakeContentProvider(), ["linkedin", "x"], multi=True)
@@ -620,6 +682,42 @@ class TestServiceWriterSelection(unittest.TestCase):
             package = service.generate_week("acme", week_start=T0, mode="model")
             self.assertTrue(package["posts"])
             self.assertTrue(provider.prompts)
+
+    def test_provider_diagnostics_do_not_cross_the_public_growth_api(self):
+        from monday import Monday, MondayConfig
+
+        secret = "SECRET-PUBLIC-GROWTH-DIAGNOSTIC-731"
+        with TemporaryDirectory() as tmp:
+            root = _root(tmp)
+            monday = Monday(MondayConfig(project_root=root))
+            monday.growth("workspace-init", project="acme")
+            monday.growth("seed-demo", project="acme")
+            monday.growth(
+                "onboard",
+                project="acme",
+                brand_voice="Direct and evidence-led.",
+                objectives=["Generate 50 demos"],
+                audience_personas=["VP Talent"],
+                brand_assets=["assets/logo.svg"],
+                prohibited_content=["Unverified stats"],
+                cadence_per_week=1,
+                platforms=[{"platform": "linkedin", "account_label": "Acme page"}],
+                weekly_review_day="sunday",
+                weekly_review_hour_utc=17,
+            )
+            monday._Monday__provider = FakeContentProvider(  # type: ignore[attr-defined]
+                raises=ProviderError(secret)
+            )
+
+            result = monday.growth(
+                "generate-week",
+                project="acme",
+                week_start=T0,
+                mode="model",
+            )
+            self.assertFalse(result.success)
+            self.assertIn("Provider request failed", result.message)
+            self.assertNotIn(secret, json.dumps({"message": result.message, "data": result.data}))
 
     def test_explicit_template_mode_does_not_call_the_provider(self):
         with TemporaryDirectory() as tmp:

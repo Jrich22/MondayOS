@@ -67,9 +67,11 @@ class ProviderAvailability:
         available:    True if the provider can execute a call right now.
         provider:     Provider name (e.g. "openai").
         model:        The model that would be used.
-        reason:       Human-readable status ("ready" or why it is not).
+        reason:       Legacy status field. Sanitized consumers expose a fixed
+                      readiness code here, never provider-controlled prose.
         env_var:      Env var that must be set ("" if none required).
         install_hint: Shell hint to install a missing SDK ("" if not needed).
+        code:         Fixed readiness code for safe cross-layer diagnostics.
     """
 
     available: bool
@@ -78,27 +80,27 @@ class ProviderAvailability:
     reason: str = ""
     env_var: str = ""
     install_hint: str = ""
+    code: str = ""
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider if type(self) is ProviderAvailability else ""
+        safe = safe_provider_availability(self, provider=provider)
         return {
-            "available": self.available,
-            "provider": self.provider,
-            "model": self.model,
-            "reason": self.reason,
-            "env_var": self.env_var,
-            "install_hint": self.install_hint,
+            "available": safe.available,
+            "provider": safe.provider,
+            "model": safe.model,
+            "reason": safe.reason,
+            "env_var": safe.env_var,
+            "install_hint": "",
+            "code": safe.code,
         }
 
     def instructions(self) -> str:
-        """A single clear line telling the user how to make this provider ready."""
-        if self.available:
-            return f"{self.provider} is ready (model {self.model})."
-        parts = [self.reason or f"{self.provider} is unavailable"]
-        if self.install_hint:
-            parts.append(f"install: {self.install_hint}")
-        if self.env_var:
-            parts.append(f"set {self.env_var}")
-        return "; ".join(parts) + "."
+        """Return fixed, actionable guidance without free-form provider prose."""
+        provider = self.provider if type(self) is ProviderAvailability else ""
+        return provider_availability_message(
+            safe_provider_availability(self, provider=provider)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +121,229 @@ class ProviderRateLimitError(ProviderError):
 
 class ProviderUnavailableError(ProviderError):
     """Raised when the provider service cannot be reached."""
+
+
+_CANONICAL_PROVIDER_NAMES = frozenset({
+    "anthropic",
+    "deepseek",
+    "fake",
+    "ollama",
+    "openai",
+})
+_PROVIDER_ALIASES = {
+    "deep-seek": "deepseek",
+    "deep_seek": "deepseek",
+    "open-ai": "openai",
+    "open_ai": "openai",
+}
+_PROVIDER_ENV_VARS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+_PROVIDER_MODEL_LABELS = {
+    "anthropic": "anthropic-model",
+    "deepseek": "deepseek-model",
+    "fake": "fake-1",
+    "ollama": "ollama-model",
+    "openai": "openai-model",
+}
+_READINESS_CODES = frozenset({
+    "authentication-failed",
+    "missing-credential",
+    "missing-sdk",
+    "model-missing",
+    "provider-error",
+    "provider-not-configured",
+    "provider-status-invalid",
+    "rate-limited",
+    "ready",
+    "service-unreachable",
+    "unavailable",
+})
+_STOP_REASONS = frozenset({
+    "content_filter",
+    "end_turn",
+    "length",
+    "max_tokens",
+    "stop",
+    "stop_sequence",
+    "tool_use",
+})
+
+
+def provider_failure_code(error: BaseException) -> str:
+    """Reduce an untrusted provider exception to one fixed diagnostic code."""
+    if isinstance(error, ProviderAuthError):
+        return "authentication-failed"
+    if isinstance(error, ProviderRateLimitError):
+        return "rate-limited"
+    if isinstance(error, ProviderUnavailableError):
+        return "unavailable"
+    return "provider-error"
+
+
+def provider_failure_message(error: BaseException | str) -> str:
+    """Render a fixed user-facing message for a provider failure."""
+    if type(error) is str:
+        code = error
+    elif isinstance(error, BaseException):
+        code = provider_failure_code(error)
+    else:
+        code = "provider-error"
+    messages = {
+        "authentication-failed": (
+            "Provider authentication failed. Check the configured credential "
+            "and retry."
+        ),
+        "rate-limited": "Provider request was rate-limited. Retry later.",
+        "unavailable": "Provider service is unavailable. Retry later.",
+    }
+    return messages.get(code, "Provider request failed. Retry later.")
+
+
+def safe_provider_identifier(value: Any, *, fallback: str = "unknown") -> str:
+    """Return only a fixed, supported provider identity.
+
+    Provider implementations are extension points, so even a syntactically
+    ordinary ``name`` may contain copied credentials or prompt fragments.  A
+    known provider name is useful provenance; every other value becomes the
+    fixed ``custom`` label instead of crossing the boundary verbatim.
+    """
+    try:
+        candidate = value if type(value) is str else getattr(value, "name", "")
+    except Exception:  # noqa: BLE001 - hostile provider properties are untrusted
+        candidate = ""
+    normalized = candidate.strip().lower() if type(candidate) is str else ""
+    normalized = _PROVIDER_ALIASES.get(normalized, normalized)
+    if normalized in _CANONICAL_PROVIDER_NAMES:
+        return normalized
+    if normalized == "custom":
+        return "custom"
+    return fallback if fallback in {"custom", "unknown"} else "unknown"
+
+
+def safe_provider_model(provider: Any) -> str:
+    """Return a fixed model-family label, never a provider-reported model ID."""
+    return _PROVIDER_MODEL_LABELS.get(
+        safe_provider_identifier(provider),
+        "",
+    )
+
+
+def safe_provider_stop_reason(value: Any) -> str:
+    """Allow only stop reasons whose exact values MondayOS understands."""
+    if type(value) is not str:
+        return ""
+    candidate = value.strip().lower()
+    return candidate if candidate in _STOP_REASONS else ""
+
+
+def safe_provider_token_count(value: Any) -> int:
+    """Return a bounded token count without coercing provider-controlled data."""
+    if type(value) is not int:
+        return 0
+    return value if 0 <= value <= 1_000_000_000 else 0
+
+
+def safe_provider_availability(
+    value: Any,
+    *,
+    provider: str = "",
+    error: BaseException | None = None,
+) -> ProviderAvailability:
+    """Return a bounded readiness record without provider-controlled prose.
+
+    Provider status is copied into API responses, agent checkpoints, and team
+    output.  Reasons and install hints can originate in an SDK or remote error,
+    so only structural booleans and tightly validated identifiers may cross
+    that boundary.
+    """
+    provider_name = safe_provider_identifier(provider, fallback="custom")
+    if error is not None:
+        code = provider_failure_code(error)
+        return ProviderAvailability(
+            available=False,
+            provider=provider_name,
+            reason=code,
+            code=code,
+        )
+    if type(value) is not ProviderAvailability or type(value.available) is not bool:
+        return ProviderAvailability(
+            available=False,
+            provider=provider_name,
+            reason="provider-status-invalid",
+            code="provider-status-invalid",
+        )
+
+    reported_provider = safe_provider_identifier(value.provider, fallback="custom")
+    if (
+        provider_name not in {"custom", "unknown"}
+        and reported_provider not in {"custom", "unknown", provider_name}
+    ):
+        return ProviderAvailability(
+            available=False,
+            provider=provider_name,
+            reason="provider-status-invalid",
+            code="provider-status-invalid",
+        )
+
+    if value.available:
+        code = "ready"
+    else:
+        raw_code = value.code if type(value.code) is str else ""
+        if not raw_code and type(value.reason) is str:
+            raw_code = value.reason
+        code = raw_code if raw_code in _READINESS_CODES else ""
+        if (
+            not code
+            and type(value.install_hint) is str
+            and bool(value.install_hint)
+        ):
+            code = "missing-sdk"
+        elif not code and type(value.env_var) is str and bool(value.env_var):
+            code = "missing-credential"
+        if not code or code == "ready":
+            code = "unavailable"
+
+    env_var = (
+        _PROVIDER_ENV_VARS.get(provider_name, "")
+        if code == "missing-credential"
+        else ""
+    )
+    return ProviderAvailability(
+        available=value.available,
+        provider=provider_name,
+        model=safe_provider_model(provider_name),
+        reason=code,
+        env_var=env_var,
+        install_hint="",
+        code=code,
+    )
+
+
+def provider_availability_message(value: ProviderAvailability) -> str:
+    """Render a fixed readiness message from an already bounded status."""
+    provider = value.provider if type(value) is ProviderAvailability else ""
+    safe = safe_provider_availability(value, provider=provider)
+    provider = safe.provider
+    if safe.available:
+        return f"Provider is ready ({provider})."
+    if safe.code == "missing-sdk":
+        return f"Provider component is not installed ({provider})."
+    if safe.code == "missing-credential" and safe.env_var:
+        return f"Provider credential is missing ({provider}); set {safe.env_var} and retry."
+    if safe.code == "service-unreachable":
+        return f"Provider service is unreachable ({provider}). Retry later."
+    if safe.code == "model-missing":
+        return f"Configured provider model is not installed ({provider})."
+    if safe.code == "provider-status-invalid":
+        return f"Provider readiness response was invalid ({provider})."
+    if safe.code == "provider-not-configured":
+        return "Requested provider is unsupported or not configured."
+    if safe.code in {"authentication-failed", "rate-limited", "provider-error"}:
+        return provider_failure_message(safe.code)
+    return f"Provider is unavailable ({provider}). Check its configuration and retry."
 
 
 # ---------------------------------------------------------------------------

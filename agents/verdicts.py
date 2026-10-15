@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -240,13 +241,13 @@ def _find_verdict_json(text: str) -> dict[str, Any] | None:
 _FENCED = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 
 
-def _candidate_json_blobs(text: str):
+def _candidate_json_blobs(text: str) -> Iterator[str]:
     for m in _FENCED.finditer(text):
         yield m.group(1)
     yield from _balanced_objects(text)
 
 
-def _balanced_objects(text: str):
+def _balanced_objects(text: str) -> Iterator[str]:
     """Yield top-level ``{...}`` substrings by brace-depth scanning.
 
     Good enough for model output; each candidate is validated with json.loads by

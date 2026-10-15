@@ -13,6 +13,7 @@ decided to keep it — and an entry that records only one of them misattributes.
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -110,3 +111,34 @@ class TestKnowledgeCaptureProvenance(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             entry, _, _, _ = self._capture(tmp)
             self.assertIn("Not independently verified", entry.body)
+
+    def test_provider_diagnostics_do_not_cross_the_public_api_or_persistence(self):
+        from monday import Monday, MondayConfig
+
+        secret = "SECRET-UPSTREAM-DIAGNOSTIC-89214"
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            project = _project_tree(root, "alpha")
+
+            monday = Monday(MondayConfig(project_root=root))
+            monday.project("register", name="alpha", path=str(project))
+            monday._Monday__provider = FakeProvider(fail=secret)  # type: ignore[attr-defined]
+
+            conversation = monday.workspace("create-conversation", project="alpha").data
+            sent = monday.workspace(
+                "send-message",
+                project="alpha",
+                conversation_id=conversation["id"],
+                content="keep this turn",
+            )
+            self.assertFalse(sent.success)
+            self.assertEqual(sent.message, "Provider request failed. Retry later.")
+            self.assertNotIn(secret, json.dumps(sent.data))
+
+            loaded = monday.workspace(
+                "get-conversation",
+                project="alpha",
+                conversation_id=conversation["id"],
+            )
+            self.assertNotIn(secret, json.dumps(loaded.data))

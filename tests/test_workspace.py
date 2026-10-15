@@ -10,6 +10,7 @@ the machine, so they are asserted directly rather than assumed from careful code
 from __future__ import annotations
 
 import json
+import os
 import random
 import subprocess
 import unittest
@@ -224,6 +225,19 @@ class TestConversationStore(unittest.TestCase):
             self.assertTrue((base / "alpha").is_dir())
             self.assertTrue((base / "beta").is_dir())
 
+    def test_private_conversations_do_not_change_the_source_workspace_mode(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_workspace = root / "workspace"
+            source_workspace.mkdir(mode=0o755)
+
+            ConversationStore(root).create("alpha", "A", now=T0)
+
+            self.assertEqual(source_workspace.stat().st_mode & 0o777, 0o755)
+            conversations = source_workspace / "conversations"
+            self.assertEqual(conversations.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((conversations / "alpha").stat().st_mode & 0o777, 0o700)
+
     def test_each_project_has_its_own_sequence_counter(self):
         """
         A shared counter would let one project infer another's volume from the
@@ -281,6 +295,50 @@ class TestConversationStore(unittest.TestCase):
             self.assertEqual(len(store.list("beta")), 1)
             self.assertEqual([c.title for c in store.list("beta")], ["b1"])
 
+    def test_project_listing_rejects_a_linked_workspace_ancestor(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "trusted"
+            outside_workspace = base / "outside-workspace"
+            root.mkdir()
+            outside_project = outside_workspace / "conversations" / "linked"
+            outside_project.mkdir(parents=True)
+            sentinel = outside_project / "sentinel.txt"
+            sentinel.write_text("outside\n", encoding="utf-8")
+            before = sentinel.read_bytes()
+            (root / "workspace").symlink_to(
+                outside_workspace,
+                target_is_directory=True,
+            )
+
+            self.assertEqual(
+                ConversationStore(root).projects_with_conversations(),
+                [],
+            )
+            self.assertEqual(sentinel.read_bytes(), before)
+
+    def test_project_listing_ignores_a_linked_child_directory(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "trusted"
+            conversations = root / "workspace" / "conversations"
+            (conversations / "safe").mkdir(parents=True)
+            outside_project = base / "outside-project"
+            outside_project.mkdir()
+            sentinel = outside_project / "sentinel.txt"
+            sentinel.write_text("outside\n", encoding="utf-8")
+            before = sentinel.read_bytes()
+            (conversations / "linked").symlink_to(
+                outside_project,
+                target_is_directory=True,
+            )
+
+            self.assertEqual(
+                ConversationStore(root).projects_with_conversations(),
+                ["safe"],
+            )
+            self.assertEqual(sentinel.read_bytes(), before)
+
     def test_a_traversal_slug_cannot_escape_the_conversations_directory(self):
         """
         A traversal name never reaches the filesystem at all now.
@@ -302,6 +360,35 @@ class TestConversationStore(unittest.TestCase):
             store = ConversationStore(Path(tmp))
             with self.assertRaises(ValueError):
                 store.project_dir("///")
+
+    def test_a_conversation_id_cannot_escape_its_project_on_delete(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ConversationStore(root)
+            store.create("demo", "safe", now=T0)
+            victim = root / "victim.md"
+            victim.write_text("outside\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                store.delete("demo", "../../../victim")
+
+            self.assertEqual(victim.read_text(encoding="utf-8"), "outside\n")
+
+    def test_delete_refuses_a_hardlinked_conversation_leaf(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ConversationStore(root)
+            project = store.project_dir("demo")
+            project.mkdir(parents=True)
+            victim = root / "outside.md"
+            victim.write_text("outside\n", encoding="utf-8")
+            os.link(victim, project / "CONV-0001.md")
+
+            with self.assertRaises(ConversationNotFoundError):
+                store.delete("demo", "CONV-0001")
+
+            self.assertEqual(victim.read_text(encoding="utf-8"), "outside\n")
+            self.assertEqual(victim.stat().st_nlink, 2)
 
     def test_messages_survive_a_write_read_cycle_with_provenance(self):
         with TemporaryDirectory() as tmp:
@@ -616,14 +703,124 @@ class TestResponderSeam(unittest.TestCase):
             WorkspaceRequest(project="a", message="hello")
         )
         self.assertFalse(reply.ok)
-        self.assertIn("no API key", reply.error)
+        self.assertIn("unavailable", reply.error.lower())
+        self.assertNotIn("no API key", reply.error)
+
+    def test_a_validated_credential_hint_survives_without_readiness_prose(self):
+        secret = "credential missing because SECRET-READINESS-DETAIL"
+
+        class MissingCredential(FakeProvider):
+            @property
+            def name(self) -> str:
+                return "openai"
+
+            def availability(self) -> ProviderAvailability:
+                return ProviderAvailability(
+                    available=False,
+                    provider="openai",
+                    reason=secret,
+                    env_var="OPENAI_API_KEY",
+                )
+
+        reply = ProviderWorkspaceResponder(MissingCredential()).respond(
+            WorkspaceRequest(project="a", message="hello")
+        )
+        self.assertIn("OPENAI_API_KEY", reply.error)
+        self.assertNotIn(secret, reply.error)
 
     def test_a_provider_error_becomes_a_recorded_failure(self):
-        reply = ProviderWorkspaceResponder(FakeProvider(fail="rate limited")).respond(
+        secret = "rate limited with SECRET-PROVIDER-DIAGNOSTIC"
+        reply = ProviderWorkspaceResponder(FakeProvider(fail=secret)).respond(
             WorkspaceRequest(project="a", message="hello")
         )
         self.assertFalse(reply.ok)
-        self.assertIn("rate limited", reply.error)
+        self.assertEqual(reply.error, "Provider request failed. Retry later.")
+        self.assertNotIn(secret, reply.error)
+
+    def test_an_availability_exception_becomes_a_fixed_failure(self):
+        secret = "SECRET-WORKSPACE-AVAILABILITY-DIAGNOSTIC"
+
+        class BrokenAvailability(FakeProvider):
+            def availability(self) -> ProviderAvailability:
+                raise RuntimeError(secret)
+
+        reply = ProviderWorkspaceResponder(BrokenAvailability()).respond(
+            WorkspaceRequest(project="a", message="hello")
+        )
+        self.assertFalse(reply.ok)
+        self.assertEqual(reply.error, "Provider request failed. Retry later.")
+        self.assertNotIn(secret, json.dumps(reply.__dict__))
+
+    def test_provider_provenance_fields_are_bounded(self):
+        secret = "SECRET PROVIDER METADATA"
+
+        class HostileMetadata(FakeProvider):
+            def ask(self, *args: Any, **kwargs: Any) -> ProviderResponse:
+                return ProviderResponse(
+                    content="safe answer",
+                    provider=secret,
+                    model=secret,
+                    tokens_used=secret,  # type: ignore[arg-type]
+                    metadata={"stop_reason": secret},
+                )
+
+        reply = ProviderWorkspaceResponder(HostileMetadata()).respond(
+            WorkspaceRequest(project="a", message="hello")
+        )
+        self.assertEqual(reply.provider, "fake")
+        self.assertEqual(reply.model, "fake-1")
+        self.assertEqual(reply.tokens_used, 0)
+        self.assertNotIn("stop_reason", reply.metadata)
+        self.assertNotIn(secret, json.dumps(reply.__dict__))
+
+    def test_invalid_provider_content_types_become_fixed_failures(self):
+        class InvalidSync(FakeProvider):
+            def ask(self, *args: Any, **kwargs: Any) -> ProviderResponse:
+                return ProviderResponse(content=b"not text")  # type: ignore[arg-type]
+
+        class InvalidStream(FakeProvider):
+            @property
+            def supports_streaming(self) -> bool:
+                return True
+
+            def stream(self, *args: Any, **kwargs: Any):
+                from brain.providers.base import ProviderChunk
+
+                yield ProviderChunk(text=b"not text")  # type: ignore[arg-type]
+
+        request = WorkspaceRequest(project="a", message="hello")
+        direct = ProviderWorkspaceResponder(InvalidSync()).respond(request)
+        streamed = list(
+            ProviderWorkspaceResponder(InvalidStream()).respond_stream(request)
+        )[-1].reply
+
+        assert streamed is not None
+        self.assertEqual(direct.error, "Provider returned an invalid response.")
+        self.assertEqual(streamed.error, "Provider returned an invalid response.")
+        self.assertFalse(streamed.incomplete)
+
+    def test_a_stream_that_ends_without_a_terminal_chunk_is_incomplete(self):
+        class EarlyEOF(FakeProvider):
+            @property
+            def supports_streaming(self) -> bool:
+                return True
+
+            def stream(self, *args: Any, **kwargs: Any):
+                from brain.providers.base import ProviderChunk
+
+                yield ProviderChunk(text="partial answer")
+
+        chunks = list(
+            ProviderWorkspaceResponder(EarlyEOF()).respond_stream(
+                WorkspaceRequest(project="a", message="hello")
+            )
+        )
+        reply = chunks[-1].reply
+
+        assert reply is not None
+        self.assertEqual(reply.content, "partial answer")
+        self.assertEqual(reply.error, "Provider returned an invalid response.")
+        self.assertTrue(reply.incomplete)
 
     def test_an_empty_response_is_a_failure_not_an_answer(self):
         """A blank bubble would let the conversation continue as if something was said."""
@@ -725,14 +922,18 @@ class TestWorkspaceService(unittest.TestCase):
 
     def test_a_provider_failure_preserves_the_user_message(self):
         with TemporaryDirectory() as tmp:
-            _, service = self._service(tmp, FakeProvider(fail="upstream down"))
+            secret = "upstream down with SECRET-PERSISTED-DIAGNOSTIC"
+            _, service = self._service(tmp, FakeProvider(fail=secret))
             conversation = service.create_conversation("alpha", "c")
             result = service.send_message("alpha", conversation["id"], "important question")
 
             messages = result["conversation"]["messages"]
             self.assertEqual(messages[0]["content"], "important question")
             self.assertTrue(messages[1]["error"])
-            self.assertIn("upstream down", messages[1]["error"])
+            self.assertEqual(messages[1]["error"], "Provider request failed. Retry later.")
+            self.assertNotIn(secret, json.dumps(result))
+            stored = service.get_conversation("alpha", conversation["id"])
+            self.assertNotIn(secret, json.dumps(stored))
 
     def test_retry_replaces_the_failed_turn_rather_than_appending(self):
         with TemporaryDirectory() as tmp:
@@ -752,6 +953,47 @@ class TestWorkspaceService(unittest.TestCase):
             messages = result["conversation"]["messages"]
             self.assertEqual(len(messages), 2)
             self.assertFalse(messages[1]["error"])
+
+    def test_retry_preserves_a_truncated_replacements_stop_reason(self):
+        class TruncatedRetryProvider(FakeProvider):
+            def ask(
+                self,
+                prompt: str,
+                context: str = "",
+                max_tokens: int = 1024,
+                **kwargs: Any,
+            ) -> ProviderResponse:
+                response = super().ask(
+                    prompt,
+                    context=context,
+                    max_tokens=max_tokens,
+                    **kwargs,
+                )
+                response.metadata = {"stop_reason": "max_tokens", "truncated": True}
+                return response
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alpha = _project_tree(root, "alpha")
+            provider = TruncatedRetryProvider(fail="down")
+            service = WorkspaceService(
+                root=root,
+                engine=_engine(root, {"alpha": alpha}),
+                responder=ProviderWorkspaceResponder(provider),
+            )
+            conversation = service.create_conversation("alpha", "c")
+            service.send_message("alpha", conversation["id"], "q")
+
+            provider._fail = ""
+            result = service.retry_message("alpha", conversation["id"])
+            retried = result["assistant_message"]
+            persisted = service.get_conversation("alpha", conversation["id"])[
+                "messages"
+            ][-1]
+
+            for message in (retried, persisted):
+                self.assertTrue(message["incomplete"])
+                self.assertEqual(message["stop_reason"], "max_tokens")
 
     def test_no_configured_responder_records_a_clear_failure(self):
         with TemporaryDirectory() as tmp:
@@ -1076,7 +1318,8 @@ class TestStreaming(unittest.TestCase):
                 if event["type"] == "done":
                     done = event
             assert done is not None
-            self.assertIn("stream died", done["message"]["error"])
+            self.assertEqual(done["message"]["error"], "Provider request failed. Retry later.")
+            self.assertNotIn("stream died", json.dumps(done))
             self.assertTrue(done["message"]["incomplete"])
             self.assertIn("one", done["message"]["content"])
 
@@ -2836,6 +3079,49 @@ class TestEvidenceCorrectionFlow(unittest.TestCase):
         self.assertTrue(validation["correction_attempted"])
         self.assertTrue(validation["correction_succeeded"])
 
+    def test_a_successful_correction_uses_its_own_termination_metadata(self):
+        class CorrectionMetadata(_ScriptedProvider):
+            def ask(self, prompt, context="", max_tokens=1024, **kwargs):
+                index = len(self.calls)
+                self.calls.append(prompt)
+                if index == 0:
+                    return ProviderResponse(
+                        content=FABRICATED_ANSWER,
+                        model="first-model-must-not-escape",
+                        provider="scripted",
+                        tokens_used=11,
+                        metadata={"stop_reason": "end_turn", "truncated": False},
+                    )
+                return ProviderResponse(
+                    content=CORRECTED_ANSWER,
+                    model="correction-model-must-not-escape",
+                    provider="scripted",
+                    tokens_used=23,
+                    metadata={"stop_reason": "max_tokens", "truncated": True},
+                )
+
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                responder = ProviderWorkspaceResponder(
+                    CorrectionMetadata(FABRICATED_ANSWER, CORRECTED_ANSWER)
+                )
+                if streaming:
+                    chunks = list(responder.respond_stream(self._request()))
+                    reply = chunks[-1].reply
+                    assert reply is not None
+                    self.assertEqual(
+                        "".join(chunk.text for chunk in chunks if chunk.text),
+                        CORRECTED_ANSWER,
+                    )
+                else:
+                    reply = responder.respond(self._request())
+
+                self.assertEqual(reply.content, CORRECTED_ANSWER)
+                self.assertEqual(reply.tokens_used, 23)
+                self.assertEqual(reply.metadata.get("stop_reason"), "max_tokens")
+                self.assertTrue(reply.incomplete)
+                self.assertNotIn("must-not-escape", json.dumps(reply.__dict__))
+
     def test_the_correction_names_the_unsupported_identifiers(self):
         """MondayOS already knows which ones failed; the model is told, not asked."""
         provider = _ScriptedProvider(FABRICATED_ANSWER, CORRECTED_ANSWER)
@@ -2863,6 +3149,70 @@ class TestEvidenceCorrectionFlow(unittest.TestCase):
         self.assertNotIn("6d23456", reply.content)
         self.assertTrue(reply.incomplete)
         self.assertFalse(reply.metadata["evidence_validation"]["correction_succeeded"])
+
+    def test_invalid_correction_responses_fail_closed_in_the_sync_path(self):
+        for label, correction in (
+            ("wrong response type", object()),
+            (
+                "non-text content",
+                ProviderResponse(content=b"not text"),  # type: ignore[arg-type]
+            ),
+        ):
+            with self.subTest(label=label):
+                provider = self._provider_with_invalid_correction(correction)
+                reply = ProviderWorkspaceResponder(provider).respond(self._request())
+
+                self.assertEqual(len(provider.calls), 2, "exactly one correction")
+                self.assertTrue(reply.incomplete)
+                self.assertIn("could not verify", reply.content)
+                self.assertFalse(
+                    reply.metadata["evidence_validation"]["correction_succeeded"]
+                )
+                for sha in FAKE_SHAS:
+                    self.assertNotIn(sha, reply.content)
+
+    def test_invalid_correction_responses_fail_closed_in_the_buffered_stream(self):
+        for label, correction in (
+            ("wrong response type", object()),
+            (
+                "non-text content",
+                ProviderResponse(content=b"not text"),  # type: ignore[arg-type]
+            ),
+        ):
+            with self.subTest(label=label):
+                provider = self._provider_with_invalid_correction(correction)
+                chunks = list(
+                    ProviderWorkspaceResponder(provider).respond_stream(self._request())
+                )
+                reply = chunks[-1].reply
+                deltas = "".join(chunk.text for chunk in chunks if chunk.text)
+
+                assert reply is not None
+                self.assertEqual(len(provider.calls), 2, "exactly one correction")
+                self.assertTrue(reply.incomplete)
+                self.assertIn("could not verify", reply.content)
+                self.assertEqual(deltas, reply.content)
+                self.assertFalse(
+                    reply.metadata["evidence_validation"]["correction_succeeded"]
+                )
+                for sha in FAKE_SHAS:
+                    self.assertNotIn(sha, deltas)
+
+    @staticmethod
+    def _provider_with_invalid_correction(correction: Any) -> _ScriptedProvider:
+        class InvalidCorrection(_ScriptedProvider):
+            def ask(self, prompt, context="", max_tokens=1024, **kwargs):
+                if self.calls:
+                    self.calls.append(prompt)
+                    return correction
+                return super().ask(
+                    prompt,
+                    context=context,
+                    max_tokens=max_tokens,
+                    **kwargs,
+                )
+
+        return InvalidCorrection(FABRICATED_ANSWER)
 
     def test_the_diagnostic_metadata_is_deterministic(self):
         first = ProviderWorkspaceResponder(
@@ -2978,7 +3328,7 @@ class TestStopReasonSurvivesBothPaths(unittest.TestCase):
                 provider="stubthropic",
                 metadata={
                     "stop_reason": self.stop_reason,
-                    "truncated": self.stop_reason == "max_tokens",
+                    "truncated": self.stop_reason in {"length", "max_tokens"},
                 },
             )
 
@@ -3016,6 +3366,10 @@ class TestStopReasonSurvivesBothPaths(unittest.TestCase):
 
     def test_max_tokens_marks_the_reply_incomplete(self):
         self.assertTrue(self._reply("max_tokens").incomplete)
+
+    def test_length_marks_both_generation_paths_incomplete(self):
+        self.assertTrue(self._reply("length").incomplete)
+        self.assertTrue(self._reply("length", streaming=True).incomplete)
 
     def test_no_answer_reports_complete_when_the_provider_says_truncated(self):
         """Gate 4's claim, asserted directly rather than through the harness."""

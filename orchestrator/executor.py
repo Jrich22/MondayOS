@@ -20,8 +20,17 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+from brain.providers.base import (
+    ProviderResponse,
+    provider_failure_code,
+    safe_provider_availability,
+    safe_provider_identifier,
+    safe_provider_model,
+    safe_provider_stop_reason,
+    safe_provider_token_count,
+)
 from events.types import Event, EventType
 from orchestrator.planner import ExecutionPlanner
 from orchestrator.queue import ExecutionQueue, ExecutionUnit
@@ -95,8 +104,11 @@ def select_provider(
 
     # Manual override (explicit name) takes precedence over any policy.
     if manual_name:
+        wanted = safe_provider_identifier(manual_name)
+        if wanted == "unknown":
+            return None
         for p in available:
-            if p.name == manual_name:
+            if safe_provider_identifier(p, fallback="custom") == wanted:
                 return p
         return None
 
@@ -107,15 +119,33 @@ def select_provider(
         return available[0]
 
     if policy is ProviderSelectionPolicy.PREFER_LOCAL:
-        locals_ = [p for p in available if p.is_local]
+        locals_ = [p for p in available if _safe_provider_bool(p, "is_local")]
         pool = locals_ or available
-        return max(pool, key=lambda p: (p.capability_tier, -p.cost_tier))
+        return max(
+            pool,
+            key=lambda p: (
+                _safe_provider_tier(p, "capability_tier", 0),
+                -_safe_provider_tier(p, "cost_tier", 10),
+            ),
+        )
 
     if policy is ProviderSelectionPolicy.LOWEST_COST:
-        return min(available, key=lambda p: (p.cost_tier, -p.capability_tier))
+        return min(
+            available,
+            key=lambda p: (
+                _safe_provider_tier(p, "cost_tier", 10),
+                -_safe_provider_tier(p, "capability_tier", 0),
+            ),
+        )
 
     if policy is ProviderSelectionPolicy.HIGHEST_CAPABILITY:
-        return max(available, key=lambda p: (p.capability_tier, -p.cost_tier))
+        return max(
+            available,
+            key=lambda p: (
+                _safe_provider_tier(p, "capability_tier", 0),
+                -_safe_provider_tier(p, "cost_tier", 10),
+            ),
+        )
 
     return available[0]
 
@@ -128,23 +158,71 @@ def rank_providers(
     """Return providers in execution order so the orchestrator can fail over."""
     available = [p for p in providers if p is not None]
     if manual_name:
-        return [p for p in available if p.name == manual_name]
+        wanted = safe_provider_identifier(manual_name)
+        if wanted == "unknown":
+            return []
+        return [
+            p
+            for p in available
+            if safe_provider_identifier(p, fallback="custom") == wanted
+        ]
     if policy is ProviderSelectionPolicy.MANUAL:
         return available[:1]
     if policy is ProviderSelectionPolicy.ORDERED_FAILOVER:
         return available
     if policy is ProviderSelectionPolicy.PREFER_LOCAL:
         def key(p: AIProvider) -> tuple[int, int]:
-            return (-p.capability_tier, p.cost_tier)
+            return (
+                -_safe_provider_tier(p, "capability_tier", 0),
+                _safe_provider_tier(p, "cost_tier", 10),
+            )
 
-        local = sorted((p for p in available if p.is_local), key=key)
-        remote = sorted((p for p in available if not p.is_local), key=key)
+        local = sorted(
+            (p for p in available if _safe_provider_bool(p, "is_local")),
+            key=key,
+        )
+        remote = sorted(
+            (p for p in available if not _safe_provider_bool(p, "is_local")),
+            key=key,
+        )
         return local + remote
     if policy is ProviderSelectionPolicy.LOWEST_COST:
-        return sorted(available, key=lambda p: (p.cost_tier, -p.capability_tier))
+        return sorted(
+            available,
+            key=lambda p: (
+                _safe_provider_tier(p, "cost_tier", 10),
+                -_safe_provider_tier(p, "capability_tier", 0),
+            ),
+        )
     if policy is ProviderSelectionPolicy.HIGHEST_CAPABILITY:
-        return sorted(available, key=lambda p: (-p.capability_tier, p.cost_tier))
+        return sorted(
+            available,
+            key=lambda p: (
+                -_safe_provider_tier(p, "capability_tier", 0),
+                _safe_provider_tier(p, "cost_tier", 10),
+            ),
+        )
     return available
+
+
+def _safe_provider_bool(provider: Any, attribute: str) -> bool:
+    """Read provider selection metadata without trusting extension properties."""
+    try:
+        value = getattr(provider, attribute)
+    except Exception:  # noqa: BLE001 - provider metadata is an extension boundary
+        return False
+    return value if type(value) is bool else False
+
+
+def _safe_provider_tier(provider: Any, attribute: str, default: int) -> int:
+    """Read a small bounded provider selection tier without leaking failures."""
+    try:
+        value = getattr(provider, attribute)
+    except Exception:  # noqa: BLE001 - provider metadata is an extension boundary
+        return default
+    if type(value) is not int:
+        return default
+    return min(max(value, 0), 10)
 
 
 # ---------------------------------------------------------------------------
@@ -304,43 +382,108 @@ class ExecutionOrchestrator:
 
         # ── 6. Provider executes (through the abstraction only) ──────────
         response = None
-        failures: list[str] = []
         for candidate in candidates:
-            readiness = candidate.availability()
+            candidate_name = safe_provider_identifier(candidate, fallback="custom")
+            try:
+                readiness = safe_provider_availability(
+                    candidate.availability(),
+                    provider=candidate_name,
+                )
+            except Exception as exc:
+                readiness = safe_provider_availability(
+                    None,
+                    provider=candidate_name,
+                    error=exc,
+                )
             if not readiness.available:
-                reason = readiness.reason or "unavailable"
                 report.provider_attempts.append({
-                    "provider": candidate.name,
+                    "provider": readiness.provider,
                     "status": "unavailable",
-                    "reason": reason,
+                    "reason": readiness.reason,
                 })
-                failures.append(f"{candidate.name}: {reason}")
                 continue
 
             self._publish(EventType.MODEL_CALL_STARTED, task_id, execution_id,
-                          {"provider": candidate.name, "policy": self._policy.value})
+                          {"provider": candidate_name, "policy": self._policy.value})
             try:
-                response = candidate.ask(
+                raw_response = candidate.ask(
                     unit.plan.prompt,
                     context=unit.plan.context,
                     max_tokens=self._max_tokens,
                 )
             except Exception as exc:  # a provider failure triggers the next candidate
-                reason = str(exc)
+                reason = provider_failure_code(exc)
                 report.provider_attempts.append({
-                    "provider": candidate.name,
+                    "provider": candidate_name,
                     "status": "failed",
                     "reason": reason,
                 })
-                failures.append(f"{candidate.name}: {reason}")
                 self._publish(EventType.MODEL_CALL_FAILED, task_id, execution_id,
-                              {"provider": candidate.name, "error": reason})
+                              {"provider": candidate_name, "error": reason})
                 continue
 
-            provider = candidate
-            report.provider_used = candidate.name
+            if type(raw_response) is not ProviderResponse:
+                reason = "provider-error"
+                report.provider_attempts.append({
+                    "provider": candidate_name,
+                    "status": "failed",
+                    "reason": reason,
+                })
+                self._publish(
+                    EventType.MODEL_CALL_FAILED,
+                    task_id,
+                    execution_id,
+                    {"provider": candidate_name, "error": reason},
+                )
+                continue
+
+            if type(raw_response.content) is not str:
+                reason = "provider-error"
+                report.provider_attempts.append({
+                    "provider": candidate_name,
+                    "status": "failed",
+                    "reason": reason,
+                })
+                self._publish(
+                    EventType.MODEL_CALL_FAILED,
+                    task_id,
+                    execution_id,
+                    {"provider": candidate_name, "error": reason},
+                )
+                continue
+
+            raw_meta: dict[str, Any] = {}
+            if type(raw_response.metadata) is dict:
+                # Looking up a normal string in a provider-owned dict can call
+                # a hostile key's ``__eq__`` after a hash collision. Copy only
+                # exact string keys while iterating, then use our own mapping.
+                for key, value in raw_response.metadata.items():
+                    if type(key) is str and key in {"stop_reason", "truncated"}:
+                        raw_meta[key] = value
+            tokens_used = safe_provider_token_count(raw_response.tokens_used)
+            stop_reason = safe_provider_stop_reason(raw_meta.get("stop_reason", ""))
+            response = ProviderResponse(
+                content=(
+                    raw_response.content
+                    if type(raw_response.content) is str
+                    else ""
+                ),
+                model=safe_provider_model(candidate_name),
+                provider=candidate_name,
+                tokens_used=tokens_used,
+                cached=raw_response.cached is True,
+                metadata={
+                    "stop_reason": stop_reason,
+                    "truncated": (
+                        raw_meta.get("truncated") is True
+                        or stop_reason in {"length", "max_tokens"}
+                    ),
+                },
+            )
+
+            report.provider_used = candidate_name
             report.provider_attempts.append({
-                "provider": candidate.name,
+                "provider": candidate_name,
                 "status": "completed",
                 "reason": "",
             })
@@ -349,18 +492,21 @@ class ExecutionOrchestrator:
         if response is None:
             return self._finish(
                 report, t0, status="failed",
-                error="All eligible AI providers failed: " + "; ".join(failures),
+                error=(
+                    "All eligible AI providers failed. Check provider "
+                    "configuration or retry later."
+                ),
             )
-        report.model_used = response.model or ""
+        report.model_used = response.model
         self._publish(EventType.MODEL_CALL_COMPLETED, task_id, execution_id,
-                      {"provider": provider.name, "model": report.model_used,
+                      {"provider": report.provider_used, "model": report.model_used,
                        "tokens_used": response.tokens_used})
 
         report.result_excerpt = response.content[:500]
         report.result_full = response.content or ""
-        meta = response.metadata or {}
-        report.stop_reason = str(meta.get("stop_reason", "") or "")
-        report.truncated = bool(meta.get("truncated", False))
+        meta = response.metadata
+        report.stop_reason = safe_provider_stop_reason(meta.get("stop_reason", ""))
+        report.truncated = meta.get("truncated") is True
 
         # ── 7. Result validation ─────────────────────────────────────────
         validation = self._validator.validate(plan, response, task)
@@ -373,7 +519,11 @@ class ExecutionOrchestrator:
             )
 
         # ── 8. Knowledge capture ─────────────────────────────────────────
-        report.knowledge_captured = self._capture_knowledge(task, response, provider)
+        report.knowledge_captured = self._capture_knowledge(
+            task,
+            response,
+            report.provider_used,
+        )
 
         # ── 9. Task update ───────────────────────────────────────────────
         if self._do_task_update:
@@ -394,7 +544,7 @@ class ExecutionOrchestrator:
         try:
             advise_resp = self._monday.advise()
             if advise_resp.success:
-                return advise_resp.data
+                return cast(dict[str, Any], advise_resp.data)
         except Exception:
             pass
         return None
@@ -403,7 +553,7 @@ class ExecutionOrchestrator:
         self,
         task: dict[str, Any],
         response: Any,
-        provider: Any,
+        provider_name: str,
     ) -> list[str]:
         """Persist the execution result as a knowledge entry. Best-effort."""
         content = (response.content or "").strip()
@@ -414,14 +564,14 @@ class ExecutionOrchestrator:
             f"{content}\n\n"
             f"---\n"
             f"_Captured by the Execution Orchestrator for task "
-            f"{task.get('id', '')} via provider '{provider.name}'._"
+            f"{task.get('id', '')} via provider '{provider_name}'._"
         )
         try:
             learn_resp = self._monday.learn(
                 content=body,
                 title=title,
                 entry_type="research",
-                tags=["execution", provider.name],
+                tags=["execution", provider_name],
                 components=[task.get("task_type", "")] if task.get("task_type") else [],
                 # This is model output, not curated knowledge. Saying so routes
                 # it to the gitignored runtime store instead of the

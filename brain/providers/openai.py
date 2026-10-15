@@ -115,15 +115,17 @@ class OpenAIProvider(AIProvider):
                 available=False, provider=self.name, model=self._model,
                 reason="openai SDK not installed",
                 env_var=self.api_key_env, install_hint="pip install openai",
+                code="missing-sdk",
             )
         if not self._api_key:
             return ProviderAvailability(
                 available=False, provider=self.name, model=self._model,
                 reason=f"{self.api_key_env} is not set", env_var=self.api_key_env,
+                code="missing-credential",
             )
         return ProviderAvailability(
             available=True, provider=self.name, model=self._model,
-            reason="ready", env_var=self.api_key_env,
+            reason="ready", env_var=self.api_key_env, code="ready",
         )
 
     def ask(

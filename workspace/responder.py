@@ -29,7 +29,18 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
-from brain.providers.base import AIProvider, ProviderError
+from brain.providers.base import (
+    AIProvider,
+    ProviderAvailability,
+    ProviderChunk,
+    ProviderResponse,
+    provider_availability_message,
+    provider_failure_message,
+    safe_provider_availability,
+    safe_provider_identifier,
+    safe_provider_stop_reason,
+    safe_provider_token_count,
+)
 from reasoning.models import Assessment, Mode
 from workspace.authority import EvidenceAuthority, NullAuthority, Resolution
 from workspace.context.snapshot import ContextSnapshot
@@ -57,6 +68,22 @@ EXECUTIVE_MAX_TOKENS = 6000
 # How many prior turns to replay. Recent dialogue is high-value context and cheap;
 # the whole history is neither. Increment 2 replaces this with summarised history.
 DEFAULT_HISTORY_TURNS = 12
+
+
+def _safe_response_metadata(value: Any) -> tuple[str, bool]:
+    """Read the two supported response flags without hostile-key lookup."""
+    if type(value) is not dict:
+        return "", False
+    stop_reason = ""
+    truncated = False
+    for key, item in value.items():
+        if type(key) is not str:
+            continue
+        if key == "stop_reason":
+            stop_reason = safe_provider_stop_reason(item)
+        elif key == "truncated":
+            truncated = item is True
+    return stop_reason, truncated
 
 # The standing instruction, in two registers.
 #
@@ -1480,12 +1507,29 @@ class ProviderWorkspaceResponder:
 
     @property
     def name(self) -> str:
-        return self._provider.name
+        try:
+            name = self._provider.name
+        except Exception:  # noqa: BLE001 - provider metadata is untrusted input
+            name = ""
+        return safe_provider_identifier(name, fallback="custom")
 
     @property
     def streams(self) -> bool:
         """Whether the configured provider genuinely emits incremental chunks."""
-        return self._provider.supports_streaming
+        try:
+            value = self._provider.supports_streaming
+        except Exception:  # noqa: BLE001 - provider metadata is untrusted input
+            return False
+        return value if type(value) is bool else False
+
+    def _availability(self) -> ProviderAvailability:
+        """Read provider readiness without allowing diagnostics to escape."""
+        provider_name = self.name
+        try:
+            availability = self._provider.availability()
+        except Exception as exc:  # noqa: BLE001 - readiness is a provider boundary
+            return safe_provider_availability(None, provider=provider_name, error=exc)
+        return safe_provider_availability(availability, provider=provider_name)
 
     def respond_stream(self, request: WorkspaceRequest) -> Iterator[ReplyChunk]:
         """
@@ -1506,12 +1550,14 @@ class ProviderWorkspaceResponder:
         **Empty stream.** A stream that yields nothing is a failed turn, not an
         empty answer, for the same reason a blank `ask` response is.
         """
-        availability = self._provider.availability()
+        availability = self._availability()
         if not availability.available:
             yield ReplyChunk(
                 done=True,
                 reply=WorkspaceReply(
-                    content="", provider=self._provider.name, error=availability.instructions()
+                    content="",
+                    provider=availability.provider,
+                    error=provider_availability_message(availability),
                 ),
             )
             return
@@ -1527,22 +1573,36 @@ class ProviderWorkspaceResponder:
         buffered = request.validates
 
         parts: list[str] = []
-        model = ""
-        provider_name = self._provider.name
+        model = availability.model
+        provider_name = availability.provider
         stop_reason = ""
         tokens = 0
         error = ""
+        saw_done = False
 
         try:
             for chunk in self._provider.stream(
                 prompt, context=context, max_tokens=request.token_budget(self._max_tokens)
             ):
+                if type(chunk) is not ProviderChunk or type(chunk.done) is not bool:
+                    error = "Provider returned an invalid response."
+                    break
                 if chunk.done:
-                    model = chunk.model or model
-                    provider_name = chunk.provider or provider_name
-                    tokens = chunk.tokens_used or tokens
-                    stop_reason = chunk.stop_reason or stop_reason
+                    if saw_done:
+                        error = "Provider returned an invalid response."
+                        break
+                    saw_done = True
+                    chunk_tokens = safe_provider_token_count(chunk.tokens_used)
+                    tokens = chunk_tokens or tokens
+                    safe_stop_reason = safe_provider_stop_reason(chunk.stop_reason)
+                    stop_reason = safe_stop_reason or stop_reason
                     continue
+                if saw_done:
+                    error = "Provider returned an invalid response."
+                    break
+                if type(chunk.text) is not str:
+                    error = "Provider returned an invalid response."
+                    break
                 if chunk.text:
                     parts.append(chunk.text)
                     # An evidence-bearing turn is buffered until validation has
@@ -1556,12 +1616,12 @@ class ProviderWorkspaceResponder:
             # The caller stopped us. Preserve what arrived and re-raise so the
             # generator closes cleanly; the caller already holds the text it saw.
             raise
-        except ProviderError as exc:
-            error = str(exc)
         except Exception as exc:  # noqa: BLE001 — a provider bug must surface, not vanish
-            error = f"{type(exc).__name__}: {exc}"
+            error = provider_failure_message(exc)
 
         content = "".join(parts).strip()
+        if not saw_done and not error:
+            error = "Provider returned an invalid response."
         if not content and not error:
             error = "The provider returned an empty response."
 
@@ -1587,7 +1647,7 @@ class ProviderWorkspaceResponder:
         # finished one. Without this the flag says complete while the text stops
         # mid-sentence — the precise failure `incomplete` exists to prevent, and
         # the reason ProviderChunk carries stop_reason at all.
-        truncated = stop_reason == "max_tokens"
+        truncated = stop_reason in {"length", "max_tokens"}
 
         yield ReplyChunk(
             done=True,
@@ -1611,12 +1671,12 @@ class ProviderWorkspaceResponder:
         is a normal thing that happens mid-conversation, and the turn should be
         recorded and retryable rather than lost to an exception.
         """
-        availability = self._provider.availability()
+        availability = self._availability()
         if not availability.available:
             return WorkspaceReply(
                 content="",
-                provider=self._provider.name,
-                error=availability.instructions(),
+                provider=availability.provider,
+                error=provider_availability_message(availability),
             )
 
         context = request.render_context(self._history_turns)
@@ -1628,40 +1688,49 @@ class ProviderWorkspaceResponder:
                 context=context,
                 max_tokens=request.token_budget(self._max_tokens),
             )
-        except ProviderError as exc:
-            return WorkspaceReply(content="", provider=self._provider.name, error=str(exc))
+            if type(response) is not ProviderResponse or type(response.content) is not str:
+                return WorkspaceReply(
+                    content="",
+                    provider=availability.provider,
+                    model=availability.model,
+                    error="Provider returned an invalid response.",
+                )
+            content = response.content.strip()
+            model = availability.model
+            stop_reason, truncated = _safe_response_metadata(response.metadata)
+            tokens = safe_provider_token_count(response.tokens_used)
         except Exception as exc:  # noqa: BLE001 — a provider bug must surface, not vanish
             return WorkspaceReply(
                 content="",
-                provider=self._provider.name,
-                error=f"{type(exc).__name__}: {exc}",
+                provider=availability.provider,
+                error=provider_failure_message(exc),
             )
 
-        content = (response.content or "").strip()
         if not content:
             # An empty body is a failed turn, not an answer. Recording it as an
             # assistant message would put a blank bubble in the transcript and
             # let the conversation continue as though something was said.
             return WorkspaceReply(
                 content="",
-                provider=response.provider or self._provider.name,
-                model=response.model,
+                provider=availability.provider,
+                model=model,
                 error="The provider returned an empty response.",
             )
 
         return self._verified(
             request,
             content,
-            provider=response.provider or self._provider.name,
-            model=response.model,
-            tokens=response.tokens_used,
+            provider=availability.provider,
+            model=model,
+            tokens=tokens,
             # The provider reported how generation ended; the streaming path
             # threaded it and this one dropped it on the floor. `send_message`
             # uses *this* path, so a hosted run against a provider that reports a
             # stop reason recorded none on all fifty-two turns -- and the gate
             # that exists to catch a truncated answer being shown as finished
             # could never be exercised at all.
-            stop_reason=str(response.metadata.get("stop_reason", "") or ""),
+            stop_reason=stop_reason,
+            truncated=truncated,
         )
 
     def _verified(
@@ -1673,6 +1742,7 @@ class ProviderWorkspaceResponder:
         model: str,
         tokens: int,
         stop_reason: str = "",
+        truncated: bool = False,
     ) -> WorkspaceReply:
         """
         An answer, checked against the evidence its own turn received *and* the
@@ -1737,6 +1807,9 @@ class ProviderWorkspaceResponder:
             incomplete: bool = False,
             attempted: bool,
             succeeded: bool,
+            response_tokens: int = tokens,
+            response_stop_reason: str = stop_reason,
+            response_truncated: bool = truncated,
         ) -> WorkspaceReply:
             # Validation is additive to truncation, never a replacement for it.
             # A verified answer that stopped at max_tokens is still a partial one.
@@ -1747,15 +1820,19 @@ class ProviderWorkspaceResponder:
                 metadata["score_validation"] = scores.to_metadata(
                     attempted=attempted, succeeded=succeeded
                 )
-            if stop_reason:
-                metadata["stop_reason"] = stop_reason
+            if response_stop_reason:
+                metadata["stop_reason"] = response_stop_reason
             return WorkspaceReply(
                 content=body,
                 provider=provider,
                 model=model,
-                tokens_used=tokens,
+                tokens_used=response_tokens,
                 error=error,
-                incomplete=incomplete or stop_reason == "max_tokens",
+                incomplete=(
+                    incomplete
+                    or response_truncated
+                    or response_stop_reason in {"length", "max_tokens"}
+                ),
                 metadata=metadata,
             )
 
@@ -1769,15 +1846,33 @@ class ProviderWorkspaceResponder:
                 context=request.render_context(self._history_turns),
                 max_tokens=request.token_budget(self._max_tokens),
             )
-            retry = (corrected.content or "").strip()
+            if type(corrected) is ProviderResponse and type(corrected.content) is str:
+                retry = corrected.content.strip()
+                retry_stop_reason, retry_truncated = _safe_response_metadata(
+                    corrected.metadata
+                )
+                retry_tokens = safe_provider_token_count(corrected.tokens_used)
+            else:
+                retry = ""
+                retry_stop_reason, retry_truncated, retry_tokens = "", False, 0
         except Exception:  # noqa: BLE001 — a failed correction must not rescue the original
             retry = ""
+            retry_stop_reason, retry_truncated, retry_tokens = "", False, 0
 
         report, score_report = first, first_scores
         if retry:
             shown_again, second, second_scores = assess(retry)
             if not second.blocking and not second_scores.unsupported:
-                return reply(shown_again, second, second_scores, attempted=True, succeeded=True)
+                return reply(
+                    shown_again,
+                    second,
+                    second_scores,
+                    attempted=True,
+                    succeeded=True,
+                    response_tokens=retry_tokens,
+                    response_stop_reason=retry_stop_reason,
+                    response_truncated=retry_truncated,
+                )
             report, score_report = second, second_scores
 
         # Fail closed. The unproven identifiers are reported in metadata for

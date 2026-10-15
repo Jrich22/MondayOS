@@ -17,7 +17,13 @@ import os
 from collections.abc import Iterable
 from typing import Any
 
-from brain.providers.base import AIProvider, ProviderAvailability, ProviderResponse
+from brain.providers.base import (
+    AIProvider,
+    ProviderAvailability,
+    ProviderResponse,
+    safe_provider_availability,
+    safe_provider_identifier,
+)
 from brain.providers.factory import ProviderConfig, create_provider
 
 __all__ = [
@@ -203,11 +209,18 @@ def build_provider_for(
     in which case the orchestrator reports the run as "skipped" rather than
     crashing.
     """
-    provider_name = getattr(agent, "provider", agent)
-    role_slug = getattr(agent, "role", role)
-    name = str(provider_name or "").strip().lower()
+    try:
+        provider_name = getattr(agent, "provider", agent)
+    except Exception:  # noqa: BLE001 - agent metadata is an extension boundary
+        provider_name = agent if type(agent) is str else ""
+    try:
+        role_value = getattr(agent, "role", role)
+    except Exception:  # noqa: BLE001 - agent metadata is an extension boundary
+        role_value = role
+    role_slug = role_value if type(role_value) is str else role
+    name = safe_provider_identifier(provider_name)
 
-    if not name:
+    if name == "unknown":
         return None
     if name == FAKE_PROVIDER:
         return FakeAgentProvider(role=role_slug)
@@ -252,8 +265,16 @@ def build_provider_pool(
     offline ``fake`` provider always remains a single-provider pool so tests are
     deterministic.
     """
-    role_slug = str(getattr(agent, "role", role) or role)
-    primary_name = str(getattr(agent, "provider", agent) or "").strip().lower()
+    try:
+        role_value = getattr(agent, "role", role)
+    except Exception:  # noqa: BLE001 - agent metadata is an extension boundary
+        role_value = role
+    role_slug = role_value if type(role_value) is str and role_value else role
+    try:
+        provider_value = getattr(agent, "provider", agent)
+    except Exception:  # noqa: BLE001 - agent metadata is an extension boundary
+        provider_value = agent if type(agent) is str else ""
+    primary_name = safe_provider_identifier(provider_value)
     if role_slug == "reviewer":
         # Product invariant: the terminal independent review is ChatGPT/OpenAI.
         # Registry customization and automatic failover may not weaken it.
@@ -283,12 +304,12 @@ def build_provider_pool(
     # The terminal reviewer is the mandatory ChatGPT/OpenAI quality gate. A
     # different model may not silently stand in for it during an outage.
     if primary is not None and (
-        primary.name == FAKE_PROVIDER or role_slug == "reviewer"
+        safe_provider_identifier(primary) == FAKE_PROVIDER or role_slug == "reviewer"
     ):
         return [primary]
 
     providers = [primary] if primary is not None else []
-    seen = {primary.name} if primary is not None else set()
+    seen = {safe_provider_identifier(primary)} if primary is not None else set()
     for name in _FALLBACK_PROVIDER_ORDER:
         if name in seen:
             continue
@@ -301,7 +322,7 @@ def build_provider_pool(
             candidate = build_provider_for(name, role=role_slug)
         if candidate is not None:
             providers.append(candidate)
-            seen.add(candidate.name)
+            seen.add(safe_provider_identifier(candidate))
     return providers
 
 
@@ -315,11 +336,19 @@ def availability_for(
     Report provider availability for an agent (or a bare provider name).
 
     Never raises: an unknown/unconstructable provider is reported unavailable
-    with a clear reason. Used by `monday agent list` and by the runtime's
-    pre-run gate so missing keys fail gracefully.
+    with a fixed reason code. Used by `monday agent list` and by the runtime's
+    pre-run gate so missing keys fail gracefully without exposing SDK prose.
     """
-    role_slug = str(getattr(agent, "role", role) or role)
-    name = str(getattr(agent, "provider", agent) or "").strip().lower()
+    try:
+        role_value = getattr(agent, "role", role)
+    except Exception:  # noqa: BLE001 - agent metadata is an extension boundary
+        role_value = role
+    role_slug = role_value if type(role_value) is str and role_value else role
+    try:
+        provider_value = getattr(agent, "provider", agent)
+    except Exception:  # noqa: BLE001 - agent metadata is an extension boundary
+        provider_value = agent if type(agent) is str else ""
+    name = safe_provider_identifier(provider_value, fallback="custom")
     if role_slug == "reviewer":
         name = "openai"
     pool = build_provider_pool(
@@ -328,9 +357,13 @@ def availability_for(
         configured_providers=configured_providers,
     )
     if not pool:
-        return ProviderAvailability(
-            available=False, provider=name or "(none)",
-            reason=f"unknown or unconstructable provider {name!r}",
+        return safe_provider_availability(
+            ProviderAvailability(
+                available=False,
+                provider=safe_provider_identifier(name, fallback="custom"),
+                code="provider-not-configured",
+            ),
+            provider=name or "unknown",
         )
 
     # Match execution semantics: the runtime tries the ordered pool until one
@@ -339,25 +372,25 @@ def availability_for(
     # run on a healthy fallback.
     first_failure: ProviderAvailability | None = None
     for provider in pool:
+        provider_name = safe_provider_identifier(provider, fallback="custom")
         try:
-            availability = provider.availability()
+            availability = safe_provider_availability(
+                provider.availability(),
+                provider=provider_name,
+            )
         except Exception as exc:
-            availability = ProviderAvailability(
-                available=False,
-                provider=provider.name,
-                reason=(
-                    "availability check failed: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
+            availability = safe_provider_availability(
+                None,
+                provider=provider_name,
+                error=exc,
             )
         if availability.available:
             return availability
         if first_failure is None:
             first_failure = availability
 
-    # Preserve the primary provider's diagnostic when every candidate is down;
-    # it is the provider the registry asked for and therefore the most useful
-    # setup error to show.
+    # Preserve the primary provider's bounded status when every candidate is
+    # down; it is the provider the registry asked for.
     assert first_failure is not None
     return first_failure
 
@@ -368,8 +401,10 @@ def _provider_named(
 ) -> AIProvider | None:
     if providers is None:
         return None
-    wanted = name.strip().lower()
+    wanted = safe_provider_identifier(name)
+    if wanted == "unknown":
+        return None
     for provider in providers:
-        if provider.name.strip().lower() == wanted:
+        if safe_provider_identifier(provider) == wanted:
             return provider
     return None

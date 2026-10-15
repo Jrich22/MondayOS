@@ -115,7 +115,7 @@ class Brain:
         """
         raise NotImplementedError("TODO: delegate to TaskManager.create()")
 
-    def query_knowledge(self, query: str) -> list:
+    def query_knowledge(self, query: str) -> list[object]:
         """
         Search the knowledge base for entries relevant to a query.
 

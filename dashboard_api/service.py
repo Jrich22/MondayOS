@@ -18,7 +18,10 @@ here), and never returns provider keys.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,6 +40,71 @@ _STATUS_ACTION = {
     "review": "review",
     "completed": "complete",
 }
+
+
+def _append_private_line(path: Path, payload: bytes) -> None:
+    """Append one complete log entry without following links.
+
+    The descriptor is validated both against its file type and the directory
+    entry before anything is written. ``fchmod`` also migrates logs created by
+    older versions with permissive modes. The advisory lock keeps concurrent
+    dashboard requests from interleaving entries.
+    """
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(path.parent, directory_flags)
+    try:
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+        locked = False
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise OSError("dashboard write log is not a private regular file")
+
+            current = os.stat(
+                path.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+                raise OSError("dashboard write log path is not a private regular file")
+            if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+                raise OSError("dashboard write log changed while it was opened")
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+            opened = os.fstat(fd)
+            current = os.stat(
+                path.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            ):
+                raise OSError("dashboard write log changed while its lock was acquired")
+            os.fchmod(fd, 0o600)
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("dashboard write log append made no progress")
+                view = view[written:]
+        finally:
+            try:
+                if locked:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+    finally:
+        os.close(directory_fd)
 
 
 class DashboardService:
@@ -63,8 +131,8 @@ class DashboardService:
                 "message": message,
                 "revision": self.revision,
             }
-            with self._write_log.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(entry) + "\n")
+            payload = (json.dumps(entry) + "\n").encode("utf-8")
+            _append_private_line(self._write_log, payload)
         except OSError:
             pass  # logging must never break a request
 
