@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import Any
 
-from telegram_bot.client import TelegramAPIError, TelegramClient, TelegramRateLimitError
+from telegram_bot.client import TelegramAPIError, TelegramClient
 from telegram_bot.config import TelegramConfig
 from telegram_bot.state import TelegramState, job_id, parse_job_id
 
@@ -29,6 +29,12 @@ _DELIVERY_RETRY_RECONCILE_SECONDS = 60
 _DELIVERY_RETRY_WINDOW_SECONDS = 24 * 60 * 60
 _MAX_DELIVERY_RUNS = 1 + len(_DELIVERY_RETRY_DELAYS_SECONDS)
 _TERMINAL_PR_STATES = frozenset({"merged", "closed", "diverged"})
+_DELIVERY_NOTICE_FOLLOW_UP_PHASES = frozenset({
+    "", "pending", "polling", "retrying", "not-started-capacity",
+})
+_DELIVERY_NOTICE_UNAVAILABLE_PHASES = frozenset({
+    "", "not-started-capacity", "not-started-deadline",
+})
 _ROLE_NAMES = {
     "cpo": "Product strategy",
     "lead-engineer": "Technical design",
@@ -203,6 +209,76 @@ class TelegramBotService:
             "Monday's inbox is full, so this request was not saved. "
             + guidance,
         )
+        return True
+
+    def deliver_delivery_notice(self, notice: dict[str, Any]) -> bool:
+        """Reauthorize and send one request-free terminal delivery notice."""
+        user_id = notice.get("user_id")
+        chat_id = notice.get("chat_id")
+        chat_type = str(notice.get("chat_type") or "")
+        task_id = str(notice.get("task_id") or "").upper()
+        delivery_id = str(notice.get("delivery_id") or "")
+        notice_kind = str(notice.get("notice_kind") or "")
+        follow_up_phase = notice.get("follow_up_phase", "")
+        retry_unavailable_phase = notice.get("retry_unavailable_phase", "")
+        if (
+            isinstance(user_id, bool)
+            or not isinstance(user_id, int)
+            or user_id <= 0
+            or isinstance(chat_id, bool)
+            or not isinstance(chat_id, int)
+            or chat_id != user_id
+            or chat_type != "private"
+            or not _TASK_ID.fullmatch(task_id)
+            or not _DELIVERY_ID.fullmatch(delivery_id)
+            or notice_kind not in {"retry-scheduled", "terminal-result"}
+            or not isinstance(follow_up_phase, str)
+            or follow_up_phase not in _DELIVERY_NOTICE_FOLLOW_UP_PHASES
+            or not isinstance(retry_unavailable_phase, str)
+            or retry_unavailable_phase not in _DELIVERY_NOTICE_UNAVAILABLE_PHASES
+            or (
+                notice_kind == "retry-scheduled"
+                and (follow_up_phase or retry_unavailable_phase)
+            )
+        ):
+            raise ValueError("Invalid Telegram delivery notice")
+        if user_id not in self._config.allowed_user_ids:
+            return False
+
+        if notice_kind == "retry-scheduled":
+            attempt = _integer(notice.get("attempt"), 0)
+            maximum = _integer(notice.get("max_attempts"), 0)
+            next_attempt_at = _finite_timestamp(notice.get("next_attempt_at"))
+            if not 2 <= attempt <= maximum <= _MAX_DELIVERY_RUNS:
+                raise ValueError("Invalid Telegram delivery retry notice")
+            delay = max(1, min(
+                86_400,
+                int(max(0.0, next_attempt_at - time.time())),
+            ))
+            text = _delivery_retry_notice(task_id, attempt, maximum, delay)
+        else:
+            result = notice.get("result")
+            if (
+                not isinstance(result, dict)
+                or str(result.get("delivery_id") or "") != delivery_id
+                or not _delivery_terminal(str(result.get("status") or ""))
+            ):
+                raise ValueError("Invalid Telegram terminal delivery notice")
+            # Provider/CLI diagnostics are not part of this durable semantic
+            # notification channel. Render only the structured bounded fields.
+            safe_result = dict(result)
+            safe_result["message"] = ""
+            text = _delivery_result(
+                task_id,
+                safe_result,
+                follow_up_phase=str(follow_up_phase),
+            )
+            unavailable = _delivery_retry_unavailable_notice(
+                {"phase": retry_unavailable_phase}
+            )
+            if unavailable:
+                text = f"{text}\n{unavailable}"
+        self._client.send_message(chat_id, text)
         return True
 
     def handle_intake_control(self, update: dict[str, Any]) -> bool:
@@ -618,21 +694,6 @@ class TelegramBotService:
                     ),
                 )
                 if rescheduled.get("phase") != "deadline-exceeded":
-                    try:
-                        self._client.send_message(
-                            chat_id,
-                            _delivery_retry_notice(
-                                task_id,
-                                next_attempt,
-                                maximum,
-                                delay,
-                            ),
-                        )
-                    except TelegramRateLimitError:
-                        raise
-                    except TelegramAPIError as exc:
-                        if not exc.retryable:
-                            raise
                     return
 
         follow_up_phase = self._ensure_lifecycle_follow_up(
@@ -886,7 +947,6 @@ class TelegramBotService:
             if str(saved_result.get("delivery_id") or "") != stable_id:
                 raise RuntimeError("The saved Telegram delivery result changed identity")
             retry = self._state.delivery_retry(update_id)
-            retry_unavailable = ""
             if (
                 not retry
                 and not isinstance(job.get("delivery_retry"), dict)
@@ -895,7 +955,7 @@ class TelegramBotService:
                 # The terminal result and scheduler checkpoint are separate
                 # durable writes. Reconstruct the deterministic first retry if
                 # a crash or power loss landed between them.
-                retry, retry_unavailable = self._schedule_initial_delivery_retry(
+                retry, _retry_unavailable = self._schedule_initial_delivery_retry(
                     update_id,
                     chat_id,
                     task_id,
@@ -907,46 +967,14 @@ class TelegramBotService:
                     ),
                 )
             if retry:
-                now = time.time()
-                expires_at = _finite_timestamp(retry.get("expires_at"))
-                if expires_at > now:
-                    delay = max(
-                        1,
-                        int(_finite_timestamp(retry.get("next_attempt_at")) - now),
-                    )
-                    self._client.send_message(
-                        chat_id,
-                        _delivery_retry_notice(
-                            task_id,
-                            _integer(retry.get("attempt"), 0),
-                            _integer(retry.get("max_attempts"), 0),
-                            delay,
-                        ),
-                    )
-                self._state.set_job(update_id, delivery_final_sent=True)
                 return
-            follow_up_phase = self._ensure_lifecycle_follow_up(
+            self._ensure_lifecycle_follow_up(
                 update_id,
                 chat_id,
                 task_id,
                 saved_result,
                 project_name,
             )
-            text = _delivery_result(
-                task_id,
-                saved_result,
-                follow_up_phase=follow_up_phase,
-            )
-            unavailable = retry_unavailable or _delivery_retry_unavailable_notice(
-                job.get("delivery_retry")
-            )
-            if unavailable:
-                text = f"{text}\n{unavailable}"
-            self._client.send_message(
-                chat_id,
-                text,
-            )
-            self._state.set_job(update_id, delivery_final_sent=True)
             return
 
         self._state.set_job(
@@ -987,9 +1015,8 @@ class TelegramBotService:
             delivery_retry_expires_at=retry_expires_at,
         )
         if terminal:
-            retry_unavailable = ""
             if _safe_transient_delivery_failure(result):
-                retry, retry_unavailable = self._schedule_initial_delivery_retry(
+                retry, _retry_unavailable = self._schedule_initial_delivery_retry(
                     update_id,
                     chat_id,
                     task_id,
@@ -999,33 +1026,14 @@ class TelegramBotService:
                     expires_at=retry_expires_at,
                 )
                 if retry:
-                    self._client.send_message(
-                        chat_id,
-                        _delivery_retry_notice(
-                            task_id,
-                            _integer(retry.get("attempt"), 0),
-                            _integer(retry.get("max_attempts"), 0),
-                            _delivery_retry_remaining_delay(retry),
-                        ),
-                    )
-                    self._state.set_job(update_id, delivery_final_sent=True)
                     return
-            follow_up_phase = self._ensure_lifecycle_follow_up(
+            self._ensure_lifecycle_follow_up(
                 update_id,
                 chat_id,
                 task_id,
                 result,
                 project_name,
             )
-            text = _delivery_result(
-                task_id,
-                result,
-                follow_up_phase=follow_up_phase,
-            )
-            if retry_unavailable:
-                text = f"{text}\n{retry_unavailable}"
-            self._client.send_message(chat_id, text)
-            self._state.set_job(update_id, delivery_final_sent=True)
             return
 
         # A lease-owning worker may still be building this exact delivery.
@@ -1515,11 +1523,9 @@ def _delivery_snapshot(response: Any, *, fallback_id: str) -> dict[str, Any]:
         "failure_code": _safe_failure_code(value("failure_code", "")),
         "failure_class": failure_class,
         "retry_after_seconds": retry_after,
-        "message": (
-            ""
-            if failure_class == "transient"
-            else _bounded_text(value("message", ""), 300)
-        ),
+        # Provider, CLI, and repository diagnostics never enter Telegram's
+        # durable state. Notices render only bounded semantic fields.
+        "message": "",
     }
 
 

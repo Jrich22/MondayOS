@@ -11,6 +11,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A bounded, request-free Telegram delivery-notice outbox for terminal
+  live-build results and retry-scheduled messages. The notice is durable before
+  its source job is acknowledged, so completed request text is scrubbed and the
+  FIFO advances even during Telegram outages. Restart-safe retries use bound
+  minimal private routing, recheck current allowlists, exclude request and
+  provider-diagnostic text, and fail closed on malformed, redirected, revoked,
+  or permanently failed destinations. Health now reports unresolved delivery
+  notices and remains unhealthy until they resolve.
 - A bounded Telegram inbox with a 25-pending-job admission limit, stable
   `JOB-ID` receipts, private ownership-bound `/queue`, and queued-only
   `/cancel JOB-ID`. Capacity refusals and cancellations are durable,

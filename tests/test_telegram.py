@@ -615,9 +615,11 @@ class TestTelegramService(TelegramFixture):
             live_build=True,
         )
         service = TelegramBotService(self.monday, self.client, self.state, config)
-        TelegramRunner(self.client, service, self.state).start()
+        runner = TelegramRunner(self.client, service, self.state)
+        runner.start()
 
-        service.handle_update(_update(text="/build Ship a health endpoint"))
+        self.client.updates = [_update(text="/build Ship a health endpoint")]
+        self.assertEqual(runner.run_once(), 1)
 
         self.assertEqual(len(self.monday.tasks), 1)
         self.assertEqual(self.monday.team_calls, 0)
@@ -626,7 +628,7 @@ class TestTelegramService(TelegramFixture):
         self.assertEqual(action, "run")
         self.assertEqual(request["task_id"], "TASK-0001")
         self.assertRegex(request["delivery_id"], r"^delivery-telegram-[0-9a-f]{20}$")
-        job = self.state.job(10)
+        job = self.state.completed_job(10)
         self.assertEqual(job["workflow"], "live-build")
         self.assertEqual(job["delivery_id"], request["delivery_id"])
         self.assertEqual(job["delivery_status"], "pr-open")
@@ -750,8 +752,18 @@ class TestTelegramService(TelegramFixture):
         }
         update = _update(update_id=20, text=f"/deliver {created.task_id}")
 
+        normalized = service.normalize_update(update)
+        self.assertIsNotNone(normalized)
+        self.state.enqueue(20, normalized)
+        self.state.complete_acceptance_receipt(20, delivered=True)
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
         with self.assertRaises(TelegramUpdatePendingError):
-            service.handle_update(update)
+            worker.run_once()
 
         pending = self.state.job(20)
         self.assertFalse(pending["delivery_terminal"])
@@ -764,9 +776,10 @@ class TestTelegramService(TelegramFixture):
             "phase": "interrupted",
             "message": "Start a new build request with a new delivery identity.",
         })
-        service.handle_update(update)
+        self.assertTrue(worker.run_once())
+        self.assertTrue(worker.run_delivery_notice_once())
 
-        settled = self.state.job(20)
+        settled = self.state.completed_job(20)
         self.assertTrue(settled["delivery_terminal"])
         self.assertTrue(settled["delivery_final_sent"])
         self.assertEqual(len(self.monday.build_calls), 2)
@@ -956,6 +969,35 @@ class TestTelegramService(TelegramFixture):
         self.assertEqual(self.client.sent[-1][0], -100)
         self.assertIn("request was not saved", self.client.sent[-1][1])
         self.assertIn("Open Monday's private chat", self.client.sent[-1][1])
+
+    def test_delivery_notice_rejects_unknown_semantic_display_phases(self):
+        base = {
+            "notice_kind": "terminal-result",
+            "user_id": 7,
+            "chat_id": 7,
+            "chat_type": "private",
+            "task_id": "TASK-0001",
+            "delivery_id": "delivery-test-notice",
+            "follow_up_phase": "",
+            "retry_unavailable_phase": "",
+            "result": {
+                "delivery_id": "delivery-test-notice",
+                "success": False,
+                "status": "failed",
+                "phase": "failed",
+                "message": "must not be rendered",
+            },
+        }
+
+        for field in ("follow_up_phase", "retry_unavailable_phase"):
+            for malformed in ("unknown-phase", []):
+                with self.subTest(field=field, malformed=malformed):
+                    notice = dict(base)
+                    notice[field] = malformed
+                    with self.assertRaisesRegex(ValueError, "Invalid Telegram"):
+                        self.service.deliver_delivery_notice(notice)
+
+        self.assertEqual(self.client.sent, [])
 
     def test_acceptance_receipt_is_fixed_request_free_and_reauthorized(self):
         group_config = TelegramConfig(
@@ -1357,9 +1399,11 @@ class TestTelegramStateAndRunner(TelegramFixture):
             update_id,
             task_id="TASK-0001",
             chat_id=7,
+            workflow="live-build",
             project_name="",
             delivery_id=root_delivery_id,
             delivery_terminal=True,
+            delivery_final_sent=False,
             delivery_result={
                 "delivery_id": root_delivery_id,
                 "success": False,
@@ -1394,6 +1438,46 @@ class TestTelegramStateAndRunner(TelegramFixture):
             now=now,
         )
         return root_delivery_id
+
+    def _stage_terminal_notice(
+        self,
+        update_id: int,
+        *,
+        retry_unavailable_phase: str = "",
+        follow_up_phase: str = "",
+    ) -> tuple[TelegramConfig, str]:
+        config, delivery_id = self._seed_terminal_live_build_checkpoint(
+            update_id,
+            failure_class="permanent",
+        )
+        fields: dict[str, object] = {}
+        if retry_unavailable_phase:
+            fields["delivery_retry"] = {
+                "phase": retry_unavailable_phase,
+                "root_delivery_id": delivery_id,
+                "delivery_id": delivery_id,
+                "attempt": 1,
+                "max_attempts": 6,
+                "failure_code": "provider-timeout",
+            }
+        if follow_up_phase:
+            fields["follow_up"] = {
+                "kind": "pr-lifecycle",
+                "phase": follow_up_phase,
+                "delivery_id": delivery_id,
+                "task_id": "TASK-0001",
+                "project_name": "",
+                "chat_id": 7,
+                "pr_url": "https://github.com/example/mondayos/pull/55",
+                "failure_count": 0,
+                "next_poll_at": 0.0,
+                "created_at": 1.0,
+                "expires_at": 86_401.0,
+            }
+        if fields:
+            self.state.set_job(update_id, **fields)
+        self.state.acknowledge(update_id)
+        return config, delivery_id
 
     def test_state_survives_restart(self):
         self.state.set_job(10, task_id="TASK-0001")
@@ -1454,7 +1538,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         loaded.bind_bot_identity(99, "monday_test_bot")
         self.assertEqual(
             json.loads(self.config.state_path.read_text(encoding="utf-8"))["version"],
-            7,
+            8,
         )
 
     def test_transient_live_build_retries_after_restart_without_request_text(self):
@@ -1504,6 +1588,10 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertNotIn("private provider diagnostic", "\n".join(
             text for _chat, text in self.client.sent
         ))
+        self.assertNotIn(
+            "private provider diagnostic",
+            config.state_path.read_text(encoding="utf-8"),
+        )
 
         restarted_state = TelegramState(config.state_path)
         restarted_service = TelegramBotService(
@@ -1562,17 +1650,19 @@ class TestTelegramStateAndRunner(TelegramFixture):
             wake_event=threading.Event(),
         )
 
-        with (
-            patch("telegram_bot.state.time.time", return_value=100.0),
-            self.assertRaises(TelegramAPIError),
-        ):
-            worker.run_once()
+        with patch("telegram_bot.state.time.time", return_value=100.0):
+            self.assertTrue(worker.run_once())
+            self.assertTrue(worker.run_delivery_notice_once())
 
         retry = restarted_state.delivery_retry(83)
         self.assertEqual(retry["root_delivery_id"], delivery_id)
         self.assertEqual(retry["delivery_id"], f"{delivery_id}-r2")
         self.assertEqual(retry["attempt"], 2)
         self.assertEqual(self.monday.build_calls, [])
+        self.assertEqual(restarted_state.job(83), {})
+        self.assertTrue(restarted_state.is_terminal(83))
+        self.assertEqual(restarted_state.pending_delivery_notice_count, 1)
+        self.assertEqual(restarted_state.due_delivery_notice_ids(now=129.0), [])
 
         client.fail_notice = False
         resumed_state = TelegramState(config.state_path)
@@ -1590,12 +1680,17 @@ class TestTelegramStateAndRunner(TelegramFixture):
             wake_event=threading.Event(),
         )
 
-        self.assertTrue(resumed_worker.run_once())
+        with (
+            patch("telegram_bot.state.time.time", return_value=131.0),
+            patch("telegram_bot.service.time.time", return_value=131.0),
+        ):
+            self.assertTrue(resumed_worker.run_delivery_notice_once())
         self.assertFalse(resumed_worker.run_once())
         self.assertEqual(resumed_state.delivery_retry(83), retry)
         self.assertEqual(self.monday.build_calls, [])
         state_payload = json.loads(config.state_path.read_text(encoding="utf-8"))
         self.assertEqual(set(state_payload["delivery_retries"]), {"83"})
+        self.assertEqual(state_payload["delivery_notices"], {})
         self.assertTrue(resumed_state.is_terminal(83))
 
     def test_restart_does_not_recover_unsafe_or_nontransient_terminal_results(self):
@@ -1664,6 +1759,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
         with patch("telegram_bot.state.time.time", return_value=100.0):
             self.assertTrue(worker.run_once())
+            self.assertTrue(worker.run_delivery_notice_once())
 
         terminal = restarted_state.completed_job(95)
         self.assertEqual(restarted_state.delivery_retry(95), {})
@@ -1776,6 +1872,621 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(claimed[0], 89)
         self.assertEqual(claimed[1]["delivery_id"], f"{root_delivery_id}-r2")
 
+    def test_due_retry_supersedes_equally_due_scheduled_notice(self):
+        root_delivery_id = self._seed_delivery_retry(
+            189,
+            now=100.0,
+            delay_seconds=60.0,
+        )
+        self.state.acknowledge(189)
+        notice = self.state.delivery_notice(189)
+        self.assertEqual(notice["notice_kind"], "retry-scheduled")
+        self.state.defer_delivery_notice(
+            189,
+            source_binding=str(notice["source_binding"]),
+            delay_seconds=60.0,
+            now=100.0,
+        )
+        self.assertEqual(self.state.due_delivery_notice_ids(now=160.0), [])
+
+        worker = TelegramJobWorker(
+            self.service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        with (
+            patch("telegram_bot.state.time.time", return_value=160.0),
+            patch("telegram_bot.service.time.time", return_value=160.0),
+        ):
+            self.assertTrue(worker.run_delivery_retry_once())
+            self.assertFalse(worker.run_delivery_notice_once())
+
+        self.assertEqual(self.state.pending_delivery_notice_count, 0)
+        self.assertEqual(self.state.delivery_retry(189), {})
+        completed = self.state.completed_job(189)
+        self.assertEqual(
+            completed["delivery_notice"],
+            {"phase": "superseded", "notice_kind": "retry-scheduled"},
+        )
+        self.assertEqual(completed["delivery_id"], f"{root_delivery_id}-r2")
+        self.assertFalse(any(
+            "will try automatically" in text
+            for _chat_id, text in self.client.sent
+        ))
+
+    def test_one_shot_does_not_send_an_overdue_retry_schedule_notice(self):
+        self._seed_delivery_retry(187, now=100.0, delay_seconds=60.0)
+        self.state.acknowledge(187)
+        runner = TelegramRunner(
+            self.client,
+            self.service,
+            self.state,
+            poll_timeout=1,
+        )
+
+        with patch("telegram_bot.state.time.time", return_value=160.0):
+            self.assertEqual(runner.run_once(), 0)
+
+        self.assertEqual(self.state.pending_delivery_notice_count, 1)
+        self.assertTrue(self.state.delivery_retry(187))
+        self.assertFalse(any(
+            "will try automatically" in text
+            for _chat_id, text in self.client.sent
+        ))
+
+    def test_reschedule_retry_atomically_stages_next_semantic_notice(self):
+        root_delivery_id = self._seed_delivery_retry(188, now=100.0)
+        self.state.acknowledge(188)
+        worker = TelegramJobWorker(
+            self.service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        with patch("telegram_bot.state.time.time", return_value=100.0):
+            self.assertTrue(worker.run_delivery_notice_once())
+        self.assertTrue(self.state.completed_job(188)["delivery_final_sent"])
+        claimed = self.state.claim_due_delivery_retry(now=161.0)
+        self.assertIsNotNone(claimed)
+
+        with patch.object(
+            self.state,
+            "_write",
+            wraps=self.state._write,
+        ) as writer:
+            retry = self.state.reschedule_delivery_retry(
+                188,
+                delivery_id=f"{root_delivery_id}-r3",
+                attempt=3,
+                delay_seconds=300,
+                failure_code="provider-timeout",
+                now=161.0,
+            )
+            self.assertEqual(writer.call_count, 1)
+
+        self.assertEqual(retry["next_attempt_at"], 461.0)
+        self.assertFalse(self.state.completed_job(188)["delivery_final_sent"])
+        notice = self.state.delivery_notice(188)
+        self.assertEqual(notice["notice_kind"], "retry-scheduled")
+        self.assertEqual(notice["attempt"], 3)
+        self.assertEqual(notice["next_attempt_at"], 461.0)
+        self.assertNotIn(
+            "request",
+            json.loads(
+                self.config.state_path.read_text(encoding="utf-8")
+            )["completed_jobs"]["188"],
+        )
+        restarted = TelegramState(self.config.state_path)
+        self.assertEqual(restarted.delivery_notice(188)["attempt"], 3)
+
+    def test_terminal_notice_is_request_free_and_tampering_fails_closed(self):
+        config, _delivery_id = self._stage_terminal_notice(
+            190,
+            retry_unavailable_phase="not-started-deadline",
+        )
+        payload = json.loads(config.state_path.read_text(encoding="utf-8"))
+        source = payload["completed_jobs"]["190"]
+        notice = payload["delivery_notices"]["190"]
+        self.assertNotIn("request", source)
+        self.assertEqual(notice["retry_unavailable_phase"], "not-started-deadline")
+        self.assertNotIn(
+            "Recover the saved transient result",
+            config.state_path.read_text(encoding="utf-8"),
+        )
+        baseline = json.loads(json.dumps(payload))
+
+        def changed_binding(candidate):
+            candidate["delivery_notices"]["190"]["source_binding"] = "0" * 64
+
+        def changed_route(candidate):
+            current = candidate["delivery_notices"]["190"]
+            current["origin_user_id"] = 8
+            current["origin_chat_id"] = 8
+
+        def changed_source(candidate):
+            candidate["completed_jobs"]["190"]["project_name"] = "other-project"
+
+        def changed_semantics(candidate):
+            candidate["delivery_notices"]["190"][
+                "retry_unavailable_phase"
+            ] = "not-started-capacity"
+
+        def changed_result_shape(candidate):
+            candidate["completed_jobs"]["190"]["delivery_result"][
+                "provider_diagnostic"
+            ] = "must not survive"
+
+        for label, mutate in (
+            ("binding", changed_binding),
+            ("route", changed_route),
+            ("source", changed_source),
+            ("semantic-display", changed_semantics),
+            ("non-canonical-result", changed_result_shape),
+        ):
+            with self.subTest(label=label):
+                candidate = json.loads(json.dumps(baseline))
+                mutate(candidate)
+                config.state_path.write_text(json.dumps(candidate), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    TelegramStateError,
+                    "Invalid Telegram state",
+                ):
+                    TelegramState(config.state_path)
+
+    def test_permanent_root_diagnostic_never_enters_state_notice_or_send(self):
+        secret = "provider stack trace with private customer context"
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+
+        class RetryableFinalClient(FakeTelegramClient):
+            fail_final = True
+
+            def send_message(self, chat_id, text):
+                if self.fail_final and "live build: failed" in text:
+                    raise TelegramAPIError("temporary outage", retryable=True)
+                return super().send_message(chat_id, text)
+
+        client = RetryableFinalClient([
+            _update(update_id=205, text="/build Keep diagnostics private"),
+        ])
+        self.state.bind_bot_identity(99, "monday_test_bot")
+        service = TelegramBotService(self.monday, client, self.state, config)
+        service.bind_bot_identity(client.get_me())
+        delivery_id = service._delivery_id(205)
+        self.monday.delivery_runs[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "status": "failed",
+            "phase": "failed",
+            "success": False,
+            "branch": "",
+            "commit_sha": "",
+            "pr_url": "",
+            "pushed": False,
+            "changed_files": [],
+            "attempts": [],
+            "failure_code": "provider-invalid-response",
+            "failure_class": "permanent",
+            "retry_after_seconds": 0,
+            "message": secret,
+        }
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+
+        self.assertEqual(runner.run_once(), 1)
+
+        serialized = config.state_path.read_text(encoding="utf-8")
+        self.assertNotIn(secret, serialized)
+        self.assertEqual(self.state.pending_delivery_notice_count, 1)
+        notice = self.state.delivery_notice(205)
+        result = notice["result"]
+        self.assertEqual(result["message"], "")
+        self.assertEqual(set(result), {
+            "delivery_id", "success", "status", "phase", "branch",
+            "commit_sha", "pr_url", "publication_uncertain", "pushed",
+            "changed_files", "attempts", "failure_code", "failure_class",
+            "retry_after_seconds", "message",
+        })
+
+        baseline = json.loads(serialized)
+        tampered = json.loads(serialized)
+        tampered["completed_jobs"]["205"]["delivery_result"]["message"] = secret
+        config.state_path.write_text(json.dumps(tampered), encoding="utf-8")
+        with self.assertRaisesRegex(TelegramStateError, "Invalid Telegram state"):
+            TelegramState(config.state_path)
+        config.state_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+        client.fail_final = False
+        restarted = TelegramState(config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday,
+            client,
+            restarted,
+            config,
+        )
+        restarted_worker = TelegramJobWorker(
+            restarted_service,
+            restarted,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        due_at = baseline["delivery_notices"]["205"]["next_attempt_at"]
+        with patch("telegram_bot.state.time.time", return_value=due_at):
+            self.assertTrue(restarted_worker.run_delivery_notice_once())
+
+        final_messages = [
+            text for _chat_id, text in client.sent if "live build: failed" in text
+        ]
+        self.assertEqual(len(final_messages), 1)
+        self.assertNotIn(secret, final_messages[0])
+        self.assertEqual(restarted.pending_delivery_notice_count, 0)
+        self.assertNotIn(secret, config.state_path.read_text(encoding="utf-8"))
+
+    def test_v7_migration_does_not_synthesize_historical_delivery_notice(self):
+        config, _delivery_id = self._stage_terminal_notice(191)
+        payload = json.loads(config.state_path.read_text(encoding="utf-8"))
+        payload["version"] = 7
+        payload.pop("delivery_notices")
+        payload.pop("delivery_notice_pause_until")
+        config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        migrated = TelegramState(config.state_path)
+
+        self.assertEqual(migrated.pending_delivery_notice_count, 0)
+        self.assertFalse(migrated.completed_job(191)["delivery_final_sent"])
+        self.assertEqual(
+            json.loads(config.state_path.read_text(encoding="utf-8"))["version"],
+            7,
+        )
+        migrated.bind_bot_identity(99, "monday_test_bot")
+        persisted = json.loads(config.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["version"], 8)
+        self.assertEqual(persisted["delivery_notices"], {})
+        self.assertEqual(persisted["delivery_notice_pause_until"], 0.0)
+
+    def test_legacy_migration_scrubs_delivery_results_in_every_job_bucket(self):
+        config, _delivery_id = self._seed_terminal_live_build_checkpoint(
+            209,
+            failure_class="permanent",
+        )
+        payload = json.loads(config.state_path.read_text(encoding="utf-8"))
+        template = payload["jobs"]["209"]["delivery_result"]
+        bucket_keys = {
+            "jobs": "209",
+            "completed_jobs": "207",
+            "failed_jobs": "208",
+        }
+        for index, (bucket_name, key) in enumerate(bucket_keys.items(), start=1):
+            if bucket_name != "jobs":
+                payload[bucket_name][key] = {
+                    "phase": "completed" if bucket_name == "completed_jobs" else "dead-letter",
+                    "delivery_terminal": True,
+                    "delivery_result": json.loads(json.dumps(template)),
+                }
+            result = payload[bucket_name][key]["delivery_result"]
+            result["message"] = f"legacy private diagnostic {index}"
+            result[f"provider_extra_{index}"] = f"private-extra-{index}"
+        expected_fields = {
+            "delivery_id", "success", "status", "phase", "branch",
+            "commit_sha", "pr_url", "publication_uncertain", "pushed",
+            "changed_files", "attempts", "failure_code", "failure_class",
+            "retry_after_seconds", "message",
+        }
+        for legacy_version in (0, 7):
+            with self.subTest(legacy_version=legacy_version):
+                candidate = json.loads(json.dumps(payload))
+                candidate["version"] = legacy_version
+                candidate.pop("delivery_notices", None)
+                candidate.pop("delivery_notice_pause_until", None)
+                config.state_path.write_text(json.dumps(candidate), encoding="utf-8")
+
+                migrated = TelegramState(config.state_path)
+                self.assertEqual(
+                    migrated.job(209)["delivery_result"]["message"],
+                    "",
+                )
+                untouched = config.state_path.read_text(encoding="utf-8")
+                self.assertIn("legacy private diagnostic", untouched)
+                migrated.bind_bot_identity(99, "monday_test_bot")
+
+                persisted = json.loads(
+                    config.state_path.read_text(encoding="utf-8")
+                )
+                for bucket_name, key in bucket_keys.items():
+                    result = persisted[bucket_name][key]["delivery_result"]
+                    self.assertEqual(set(result), expected_fields)
+                    self.assertEqual(result["message"], "")
+                serialized = config.state_path.read_text(encoding="utf-8")
+                self.assertNotIn("legacy private diagnostic", serialized)
+                self.assertNotIn("private-extra", serialized)
+
+    def test_rate_limited_terminal_notice_defers_due_cohort_atomically(self):
+        config, _first_delivery = self._stage_terminal_notice(192)
+        self._stage_terminal_notice(193)
+        worker = TelegramJobWorker(
+            self.service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        with (
+            patch.object(
+                self.service,
+                "deliver_delivery_notice",
+                side_effect=TelegramRateLimitError(9),
+            ),
+            patch("telegram_bot.state.time.time", return_value=100.0),
+            patch.object(self.state, "_write", wraps=self.state._write) as writer,
+        ):
+            self.assertTrue(worker.run_delivery_notice_once())
+            self.assertEqual(writer.call_count, 1)
+
+        self.assertEqual(self.state.pending_delivery_notice_count, 2)
+        self.assertEqual(self.state.due_delivery_notice_ids(now=108.0), [])
+        restarted = TelegramState(config.state_path)
+        self.assertEqual(restarted.due_delivery_notice_ids(now=109.0), [192, 193])
+        persisted = json.loads(config.state_path.read_text(encoding="utf-8"))
+        for update_id in ("192", "193"):
+            notice = persisted["delivery_notices"][update_id]
+            self.assertEqual(notice["phase"], "retrying")
+            self.assertEqual(notice["failure_count"], 1)
+            self.assertEqual(notice["next_attempt_at"], 109.0)
+
+    def test_delivery_notice_pause_covers_future_and_new_notice_after_restart(self):
+        config, _first_delivery = self._stage_terminal_notice(201)
+        self._stage_terminal_notice(202)
+        future = self.state.delivery_notice(202)
+        self.state.defer_delivery_notice(
+            202,
+            source_binding=str(future["source_binding"]),
+            delay_seconds=5,
+            now=100.0,
+        )
+        worker = TelegramJobWorker(
+            self.service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        with (
+            patch.object(
+                self.service,
+                "deliver_delivery_notice",
+                side_effect=TelegramRateLimitError(9),
+            ),
+            patch("telegram_bot.state.time.time", return_value=100.0),
+        ):
+            self.assertTrue(worker.run_delivery_notice_once())
+
+        with patch("telegram_bot.state.time.time", return_value=101.0):
+            self._stage_terminal_notice(203)
+            restarted = TelegramState(config.state_path)
+
+        payload = json.loads(config.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["delivery_notice_pause_until"], 109.0)
+        self.assertEqual(restarted.due_delivery_notice_ids(now=108.0), [])
+        self.assertEqual(restarted.next_follow_up_delay(now=101.0), 8.0)
+        self.assertEqual(
+            restarted.due_delivery_notice_ids(now=109.0),
+            [201, 202, 203],
+        )
+
+        restarted.bind_bot_identity(100, "replacement_bot")
+        reset = json.loads(config.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(reset["delivery_notice_pause_until"], 0.0)
+        self.assertEqual(reset["delivery_notices"], {})
+
+    def test_current_delivery_notice_pause_is_bounded_and_validated(self):
+        config, _delivery_id = self._stage_terminal_notice(204)
+        payload = json.loads(config.state_path.read_text(encoding="utf-8"))
+
+        for malformed in (True, 86_502.0):
+            with self.subTest(malformed=malformed):
+                candidate = json.loads(json.dumps(payload))
+                candidate["delivery_notice_pause_until"] = malformed
+                config.state_path.write_text(json.dumps(candidate), encoding="utf-8")
+                with (
+                    patch("telegram_bot.state.time.time", return_value=100.0),
+                    self.assertRaisesRegex(
+                        TelegramStateError,
+                        "Invalid Telegram state",
+                    ),
+                ):
+                    TelegramState(config.state_path)
+
+        config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_revoked_and_permanent_terminal_notice_routes_do_not_hot_loop(self):
+        config, _delivery_id = self._stage_terminal_notice(194)
+        revoked = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({999}),
+            project_root=self.root,
+        )
+        revoked_service = TelegramBotService(
+            self.monday,
+            self.client,
+            self.state,
+            revoked,
+        )
+        revoked_worker = TelegramJobWorker(
+            revoked_service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        self.assertTrue(revoked_worker.run_delivery_notice_once())
+        self.assertEqual(self.state.pending_delivery_notice_count, 0)
+        self.assertEqual(
+            self.state.completed_job(194)["delivery_notice"]["phase"],
+            "notification-failed",
+        )
+
+        self._stage_terminal_notice(195)
+        worker = TelegramJobWorker(
+            self.service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        with patch.object(
+            self.service,
+            "deliver_delivery_notice",
+            side_effect=TelegramAPIError(
+                "chat unavailable",
+                retryable=False,
+                status_code=403,
+            ),
+        ):
+            self.assertTrue(worker.run_delivery_notice_once())
+        self.assertEqual(self.state.pending_delivery_notice_count, 0)
+        self.assertEqual(
+            self.state.completed_job(195)["delivery_notice"]["phase"],
+            "notification-failed",
+        )
+        self.assertEqual(TelegramState(config.state_path).due_delivery_notice_ids(), [])
+
+    def test_deferred_notice_keeps_bound_follow_up_snapshot_as_source_advances(self):
+        config, _delivery_id = self._stage_terminal_notice(
+            196,
+            follow_up_phase="pending",
+        )
+        notice = self.state.delivery_notice(196)
+        self.assertEqual(notice["follow_up_phase"], "pending")
+        self.state.defer_delivery_notice(
+            196,
+            source_binding=str(notice["source_binding"]),
+            delay_seconds=60,
+            now=100.0,
+        )
+        self.state.update_follow_up(196, phase="polling")
+
+        restarted = TelegramState(config.state_path)
+        durable = restarted.delivery_notice(196)
+        self.assertEqual(durable["follow_up_phase"], "pending")
+        self.assertEqual(
+            restarted.completed_job(196)["follow_up"]["phase"],
+            "polling",
+        )
+
+    def test_invalid_terminal_notice_ack_does_not_partially_mutate_memory(self):
+        config, _delivery_id = self._seed_terminal_live_build_checkpoint(
+            197,
+            failure_class="permanent",
+        )
+        self.state.set_job(197, chat_id=999)
+        persisted_before = config.state_path.read_text(encoding="utf-8")
+
+        with self.assertRaisesRegex(TelegramStateError, "notice route"):
+            self.state.acknowledge(197)
+
+        self.assertTrue(self.state.job(197).get("request"))
+        self.assertEqual(self.state.completed_job(197), {})
+        self.assertEqual(config.state_path.read_text(encoding="utf-8"), persisted_before)
+
+    def test_full_delivery_notice_outbox_still_scrubs_and_advances_fifo(self):
+        with patch("telegram_bot.state._MAX_ACTIVE_DELIVERY_NOTICES", 1):
+            config, _first_delivery = self._stage_terminal_notice(198)
+            _config, _overflow_delivery = self._seed_terminal_live_build_checkpoint(
+                199,
+                failure_class="permanent",
+            )
+            unsafe_result = self.state.job(199)["delivery_result"]
+            unsafe_result["message"] = "overflow private diagnostic 199"
+            unsafe_result["provider_context"] = "overflow-extra-199"
+            self.state.set_job(199, delivery_result=unsafe_result)
+            self.state.enqueue(200, _update(update_id=200, text="/help"))
+            self._complete_acceptance_receipt(200)
+
+            self.state.acknowledge(199)
+
+        overflow = self.state.completed_job(199)
+        self.assertNotIn("request", overflow)
+        self.assertTrue(_ORIGIN_KEYS.isdisjoint(overflow))
+        self.assertEqual(
+            overflow["delivery_notice"],
+            {"phase": "not-started-capacity", "notice_kind": "terminal-result"},
+        )
+        self.assertEqual(self.state.next_offset, 201)
+        self.assertEqual(self.state.pending_delivery_notice_count, 1)
+        self.assertEqual(overflow["delivery_result"]["message"], "")
+        self.assertNotIn("provider_context", overflow["delivery_result"])
+        serialized = config.state_path.read_text(encoding="utf-8")
+        self.assertNotIn("overflow private diagnostic 199", serialized)
+        self.assertNotIn("overflow-extra-199", serialized)
+        before_eviction = TelegramState(config.state_path)
+        self.assertEqual(
+            before_eviction.completed_job(199)["delivery_result"]["message"],
+            "",
+        )
+
+        claimed = self.state.claim_next()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed[0], 200)
+        with patch("telegram_bot.state._MAX_COMPLETED_JOBS", 1):
+            self.state.acknowledge(200)
+
+        self.assertTrue(self.state.completed_job(198))
+        self.assertTrue(self.state.delivery_notice(198))
+        self.assertEqual(self.state.completed_job(199), {})
+        restarted = TelegramState(config.state_path)
+        self.assertTrue(restarted.completed_job(198))
+        self.assertEqual(restarted.pending_delivery_notice_count, 1)
+
+    def test_full_outbox_reschedule_scrubs_legacy_completed_source(self):
+        self.state.bind_bot_identity(99, "monday_test_bot")
+        root_delivery_id = self._seed_delivery_retry(207, now=100.0)
+        self.state.acknowledge(207)
+        scheduled = self.state.delivery_notice(207)
+        self.state.complete_delivery_notice(
+            207,
+            source_binding=str(scheduled["source_binding"]),
+            delivered=True,
+        )
+        self.assertTrue(self.state.completed_job(207)["delivery_final_sent"])
+        with patch("telegram_bot.state._MAX_ACTIVE_DELIVERY_NOTICES", 1):
+            config, _blocker_delivery = self._stage_terminal_notice(208)
+
+        payload = json.loads(config.state_path.read_text(encoding="utf-8"))
+        unsafe_result = payload["completed_jobs"]["207"]["delivery_result"]
+        unsafe_result["message"] = "reschedule private diagnostic 207"
+        unsafe_result["provider_context"] = "reschedule-extra-207"
+        config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+        legacy = TelegramState(config.state_path)
+        claimed = legacy.claim_due_delivery_retry(now=161.0)
+        self.assertIsNotNone(claimed)
+
+        with patch("telegram_bot.state._MAX_ACTIVE_DELIVERY_NOTICES", 1):
+            retry = legacy.reschedule_delivery_retry(
+                207,
+                delivery_id=f"{root_delivery_id}-r3",
+                attempt=3,
+                delay_seconds=300,
+                failure_code="provider-timeout",
+                now=161.0,
+            )
+
+        self.assertEqual(retry["attempt"], 3)
+        self.assertEqual(legacy.pending_delivery_notice_count, 1)
+        self.assertEqual(legacy.delivery_notice(207), {})
+        source = legacy.completed_job(207)
+        self.assertEqual(source["delivery_result"]["message"], "")
+        self.assertNotIn("provider_context", source["delivery_result"])
+        self.assertEqual(
+            source["delivery_notice"],
+            {"phase": "not-started-capacity", "notice_kind": "retry-scheduled"},
+        )
+        serialized = config.state_path.read_text(encoding="utf-8")
+        self.assertNotIn("reschedule private diagnostic 207", serialized)
+        self.assertNotIn("reschedule-extra-207", serialized)
+        restarted = TelegramState(config.state_path)
+        self.assertEqual(restarted.delivery_retry(207)["attempt"], 3)
+
     def test_retry_notice_failure_replays_checkpoint_without_rerunning_root(self):
         config = TelegramConfig(
             token=_fake_token(),
@@ -1817,12 +2528,26 @@ class TestTelegramStateAndRunner(TelegramFixture):
         }
         runner = TelegramRunner(client, service, self.state, poll_timeout=1)
 
-        with self.assertRaises(TelegramAPIError):
-            runner.run_once()
+        self.assertEqual(runner.run_once(), 1)
 
-        self.assertEqual(self.state.job(90)["phase"], "waiting")
+        self.assertEqual(self.state.job(90), {})
+        self.assertTrue(self.state.is_terminal(90))
+        self.assertEqual(self.state.pending_delivery_notice_count, 1)
         self.assertTrue(self.state.delivery_retry(90))
         self.assertEqual(len(self.monday.build_calls), 1)
+
+        later = service.normalize_update(_update(update_id=91, text="/help"))
+        self.assertIsNotNone(later)
+        self.state.enqueue(91, later)
+        self._complete_acceptance_receipt(91)
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        self.assertTrue(worker.run_once())
+        self.assertTrue(self.state.is_terminal(91))
 
         client.fail_notice = False
         restarted_state = TelegramState(config.state_path)
@@ -1839,10 +2564,20 @@ class TestTelegramStateAndRunner(TelegramFixture):
             restarted_state,
             poll_timeout=1,
         )
+        persisted = json.loads(config.state_path.read_text(encoding="utf-8"))
+        notice_due = persisted["delivery_notices"]["90"]["next_attempt_at"]
+        retry_due = persisted["delivery_retries"]["90"]["next_attempt_at"]
+        self.assertLess(notice_due, retry_due)
+        resume_at = notice_due + ((retry_due - notice_due) / 2)
 
-        self.assertEqual(restarted_runner.run_once(), 0)
+        with (
+            patch("telegram_bot.state.time.time", return_value=resume_at),
+            patch("telegram_bot.service.time.time", return_value=resume_at),
+        ):
+            self.assertEqual(restarted_runner.run_once(), 0)
         self.assertTrue(restarted_state.is_terminal(90))
         self.assertTrue(restarted_state.delivery_retry(90))
+        self.assertEqual(restarted_state.pending_delivery_notice_count, 0)
         self.assertEqual(len(self.monday.build_calls), 1)
         self.assertIn("will try automatically", client.sent[-1][1])
 
@@ -1917,7 +2652,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(self.state.delivery_retry(91), {})
         self.assertEqual(self.monday.build_executions, 1)
 
-    def test_retryable_intermediate_notice_preserves_next_build_deadline(self):
+    def test_retryable_later_schedule_notice_survives_restart_without_rerun(self):
         config = TelegramConfig(
             token=_fake_token(),
             allowed_user_ids=frozenset({7}),
@@ -1926,8 +2661,10 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
 
         class FailingThirdRunNoticeClient(FakeTelegramClient):
+            fail_notice = True
+
             def send_message(self, chat_id, text):
-                if "delivery run 3/6" in text:
+                if self.fail_notice and "delivery run 3/6" in text:
                     raise TelegramAPIError("temporary outage", retryable=True)
                 return super().send_message(chat_id, text)
 
@@ -1960,6 +2697,8 @@ class TestTelegramStateAndRunner(TelegramFixture):
         runner = TelegramRunner(client, service, self.state, poll_timeout=1)
         with patch("telegram_bot.state.time.time", return_value=started):
             self.assertEqual(runner.run_once(), 1)
+        self.assertTrue(self.state.completed_job(92)["delivery_final_sent"])
+        self.assertEqual(self.state.pending_delivery_notice_count, 0)
 
         retry_two = f"{delivery_id}-r2"
         self.monday.delivery_runs[retry_two] = {
@@ -1979,8 +2718,47 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(retry["delivery_id"], f"{delivery_id}-r3")
         self.assertEqual(retry["failure_count"], 0)
         self.assertEqual(retry["next_attempt_at"], started + 361)
+        self.assertFalse(self.state.completed_job(92)["delivery_final_sent"])
+        self.assertEqual(self.state.pending_delivery_notice_count, 1)
+        self.assertFalse(any(
+            "delivery run 3/6" in text for _chat_id, text in client.sent
+        ))
+
+        with patch("telegram_bot.state.time.time", return_value=started + 62):
+            self.assertTrue(worker.run_delivery_notice_once())
+
+        durable_retry = self.state.delivery_retry(92)
+        self.assertEqual(durable_retry["failure_count"], 0)
+        self.assertEqual(durable_retry["next_attempt_at"], started + 361)
+        payload = json.loads(config.state_path.read_text(encoding="utf-8"))
+        notice = payload["delivery_notices"]["92"]
+        self.assertEqual(notice["phase"], "retrying")
+        self.assertEqual(notice["failure_count"], 1)
+        self.assertEqual(notice["next_attempt_at"], started + 92)
+
+        restarted_state = TelegramState(config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday,
+            client,
+            restarted_state,
+            config,
+        )
+        restarted_worker = TelegramJobWorker(
+            restarted_service,
+            restarted_state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        client.fail_notice = False
+        with patch("telegram_bot.state.time.time", return_value=started + 92):
+            self.assertTrue(restarted_worker.run_delivery_notice_once())
+        self.assertEqual(restarted_state.pending_delivery_notice_count, 0)
+        self.assertEqual(
+            sum("delivery run 3/6" in text for _chat_id, text in client.sent),
+            1,
+        )
         with patch("telegram_bot.state.time.time", return_value=started + 122):
-            self.assertFalse(worker.run_delivery_retry_once())
+            self.assertFalse(restarted_worker.run_delivery_retry_once())
         self.assertEqual(
             [call[1]["delivery_id"] for call in self.monday.build_calls],
             [delivery_id, retry_two],
@@ -2052,7 +2830,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
             for call in self.monday.build_calls
         ))
 
-    def test_intermediate_rate_limit_extends_next_build_deadline(self):
+    def test_intermediate_rate_limit_pauses_notice_not_next_build(self):
         root_delivery_id = self._seed_delivery_retry(101, now=100.0)
         self.state.acknowledge(101)
 
@@ -2097,8 +2875,19 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
         retry = self.state.delivery_retry(101)
         self.assertEqual(retry["delivery_id"], f"{root_delivery_id}-r3")
-        self.assertEqual(retry["failure_count"], 1)
-        self.assertEqual(retry["next_attempt_at"], 3_761.0)
+        self.assertEqual(retry["failure_count"], 0)
+        self.assertEqual(retry["next_attempt_at"], 461.0)
+
+        with patch("telegram_bot.state.time.time", return_value=161.0):
+            self.assertTrue(worker.run_delivery_notice_once())
+
+        unchanged = self.state.delivery_retry(101)
+        self.assertEqual(unchanged["failure_count"], 0)
+        self.assertEqual(unchanged["next_attempt_at"], 461.0)
+        notice = json.loads(
+            self.config.state_path.read_text(encoding="utf-8")
+        )["delivery_notices"]["101"]
+        self.assertEqual(notice["next_attempt_at"], 3_761.0)
 
     def test_expired_notification_retry_uses_notification_due_not_old_deadline(self):
         started = 1_000.0
@@ -2448,55 +3237,25 @@ class TestTelegramStateAndRunner(TelegramFixture):
         with self.assertRaisesRegex(TelegramStateError, "Invalid Telegram state"):
             TelegramState(self.config.state_path)
 
-    def test_retry_route_must_still_be_an_allowed_private_user(self):
+    def test_retry_route_change_cannot_bypass_bound_private_notice(self):
         self._seed_delivery_retry(95, now=100.0)
         self.state.acknowledge(95)
         payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
         payload["delivery_retries"]["95"]["chat_id"] = 999
         payload["completed_jobs"]["95"]["chat_id"] = 999
         self.config.state_path.write_text(json.dumps(payload), encoding="utf-8")
-        reloaded = TelegramState(self.config.state_path)
-        service = TelegramBotService(self.monday, self.client, reloaded, self.config)
-        worker = TelegramJobWorker(
-            service,
-            reloaded,
-            stop_event=threading.Event(),
-            wake_event=threading.Event(),
-        )
+        with self.assertRaisesRegex(TelegramStateError, "Invalid Telegram state"):
+            TelegramState(self.config.state_path)
 
-        with patch("telegram_bot.state.time.time", return_value=200.0):
-            self.assertTrue(worker.run_delivery_retry_once())
-
-        self.assertEqual(self.monday.build_calls, [])
-        self.assertEqual(self.client.sent, [])
-        self.assertEqual(reloaded.delivery_retry(95), {})
-        self.assertEqual(
-            reloaded.completed_job(95)["delivery_retry"]["phase"],
-            "notification-failed",
-        )
-
-    def test_revoked_retry_destination_after_expiry_stops_without_hot_loop(self):
+    def test_expired_retry_route_change_cannot_bypass_bound_private_notice(self):
         self._seed_delivery_retry(99, now=100.0)
         self.state.acknowledge(99)
         payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
         payload["delivery_retries"]["99"]["chat_id"] = 999
         payload["completed_jobs"]["99"]["chat_id"] = 999
         self.config.state_path.write_text(json.dumps(payload), encoding="utf-8")
-        reloaded = TelegramState(self.config.state_path)
-        service = TelegramBotService(self.monday, self.client, reloaded, self.config)
-        worker = TelegramJobWorker(
-            service,
-            reloaded,
-            stop_event=threading.Event(),
-            wake_event=threading.Event(),
-        )
-
-        with patch("telegram_bot.state.time.time", return_value=90_000.0):
-            self.assertTrue(worker.run_delivery_retry_once())
-
-        self.assertEqual(reloaded.delivery_retry(99), {})
-        self.assertIsNone(reloaded.claim_due_delivery_retry(now=90_001.0))
-        self.assertEqual(self.monday.build_calls, [])
+        with self.assertRaisesRegex(TelegramStateError, "Invalid Telegram state"):
+            TelegramState(self.config.state_path)
 
     def test_pending_fifo_delivery_does_not_starve_due_retry_lane(self):
         self._seed_delivery_retry(96, now=1.0, delay_seconds=1.0)
@@ -2622,7 +3381,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
         payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
         receipt = payload["acceptance_receipts"]["15"]
-        self.assertEqual(payload["version"], 7)
+        self.assertEqual(payload["version"], 8)
         self.assertEqual(payload["last_update_id"], 15)
         self.assertEqual(receipt["kind"], "acceptance-receipt")
         self.assertEqual(receipt["phase"], "pending")
@@ -2690,7 +3449,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertIsNone(migrated.claim_next())
         migrated.bind_bot_identity(99, "monday_test_bot")
         persisted = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["version"], 7)
+        self.assertEqual(persisted["version"], 8)
         self.assertIn("19", persisted["acceptance_receipts"])
 
     def test_legacy_replay_atomically_attaches_bound_receipt(self):
@@ -2717,7 +3476,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
         payload = json.loads(path.read_text(encoding="utf-8"))
         receipt = payload["acceptance_receipts"]["21"]
-        self.assertEqual(payload["version"], 7)
+        self.assertEqual(payload["version"], 8)
         self.assertEqual(receipt["phase"], "sent")
         self.assertEqual(
             receipt["request_digest"],
@@ -2991,7 +3750,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
         migrated.bind_bot_identity(99, "monday_test_bot")
         persisted = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["version"], 7)
+        self.assertEqual(persisted["version"], 8)
         self.assertEqual(persisted["last_update_id"], 19)
         self.assertEqual(
             persisted["completed_jobs"]["19"]["notice_status"],
@@ -5478,6 +6237,7 @@ class TestTelegramIdentify(unittest.TestCase):
         self.assertTrue(payload["service"]["accepting_work"])
         self.assertEqual(payload["service"]["pending_capacity_notices"], 0)
         self.assertEqual(payload["service"]["pending_acceptance_receipts"], 0)
+        self.assertEqual(payload["service"]["pending_delivery_notices"], 0)
         self.assertIsNone(payload["build"]["ready"])
         self.assertNotIn("super-secret-token", output.getvalue())
 
@@ -5741,6 +6501,51 @@ class TestTelegramIdentify(unittest.TestCase):
         self.assertNotIn(token, output.getvalue())
         self.assertNotIn(provider_key, output.getvalue())
         self.assertIn("***REDACTED***", output.getvalue())
+
+    def test_health_is_unhealthy_for_unresolved_delivery_notice(self):
+        secret = "completed request must stay out of delivery health"
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "123:super-secret-token",
+            "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+        }, clear=True), patch(
+            "telegram_bot.state.instance_lock_is_held",
+            return_value=True,
+        ), patch.object(
+            TelegramState,
+            "pending_delivery_notice_count",
+            1,
+            create=True,
+        ):
+            root = Path(tmp)
+            state = TelegramState(root / "logs" / "telegram" / "state.json")
+            state.bind_bot_identity(99, "monday_bot")
+            state.mark_worker_started()
+            args = SimpleNamespace(
+                project_root=tmp,
+                health=True,
+                json=True,
+                identify=False,
+                provider="",
+                once=False,
+            )
+            json_output = StringIO()
+            with redirect_stdout(json_output):
+                json_result = _cmd_telegram(args)
+
+            args.json = False
+            human_output = StringIO()
+            with redirect_stdout(human_output):
+                human_result = _cmd_telegram(args)
+
+        payload = json.loads(json_output.getvalue())
+        self.assertEqual(json_result, 1)
+        self.assertEqual(human_result, 1)
+        self.assertFalse(payload["healthy"])
+        self.assertEqual(payload["service"]["pending_delivery_notices"], 1)
+        self.assertIn("Deliveries   : 1 pending", human_output.getvalue())
+        self.assertNotIn(secret, json_output.getvalue())
+        self.assertNotIn(secret, human_output.getvalue())
+        self.assertNotIn("super-secret-token", json_output.getvalue())
 
     @patch("telegram_bot.client.HttpTelegramClient")
     def test_identify_holds_worker_lock_and_does_not_confirm_updates(self, client_type):

@@ -1297,3 +1297,71 @@ confidentiality boundary, not builder routing or publication authority.
   invalid selection fails or falls back without granting broader access.
 - The controller, not either model CLI, remains the sole reader of the target
   worktree and the sole owner of all Git and GitHub mutations.
+
+---
+
+## ADR-027: Completed Live Builds Use a Request-Free Notification Outbox
+
+**Date:** 2026-10-14
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+Live-build terminal and retry-scheduled messages were sent before the Telegram
+source job could be acknowledged. A transient send failure therefore kept a
+finished job in the active FIFO, retained its original request text, and could
+delay later work. Replaying the source handler merely to recover a notification
+also couples messaging availability to build and retry-scheduling idempotency.
+
+### Decision
+
+Terminal live-build results and retry-scheduled messages use a bounded durable
+outbox. The worker stages a request-free notice before acknowledging its source
+job; normal acknowledgment then terminalizes the job, scrubs its request, and
+releases the FIFO regardless of Telegram availability. Only the outbox retries
+the message. It cannot rerun a build, allocate another delivery identity, or
+create another retry checkpoint.
+
+An active notice contains only a fixed notice kind, safe structured delivery
+fields, minimal private destination, bounded retry metadata, and a
+deterministic binding to its source update, request digest, origin, task, and
+delivery identity. It contains no original request, provider diagnostics,
+credentials, or arbitrary rendered error text. Every send revalidates the
+binding and the current private destination and allowlists. Malformed,
+redirected, revoked, or permanently failed notices become scrubbed terminal
+tombstones without contacting a different destination. Legacy records without
+the complete binding do not acquire messaging authority during migration.
+
+Delivery is at-least-once. A crash after Telegram accepts a message but before
+the local checkpoint may produce the same fixed message twice, but it cannot
+duplicate the build or retry scheduling. The outbox has an explicit active
+capacity bound; exhaustion fails closed without retaining request text or
+blocking source-job terminalization. Local health reports the unresolved count
+and remains unhealthy while any delivery notice is pending.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Keep sending inside the source-job handler | Telegram availability would continue to retain completed requests and block the FIFO. |
+| Retry only in memory | A restart could silently lose a terminal or retry-scheduled notification. |
+| Retain the source request until delivery succeeds | The notification does not need the objective, and retaining it expands privacy exposure. |
+| Allow an unbounded notice list | A sustained Telegram outage could turn recovery into local state exhaustion. |
+| Claim exactly-once Telegram delivery | Telegram provides no atomic transaction with the local checkpoint, so that guarantee would be false. |
+
+### Consequences
+
+- Finished source jobs release the FIFO and discard request text independently
+  of Telegram availability.
+- Notification recovery survives restart without replaying build or scheduling
+  side effects.
+- Current authorization and deterministic binding prevent persisted route
+  changes from redirecting a notice.
+- Monitoring distinguishes a healthy worker from an unresolved notification
+  backlog.
+- Rare duplicate fixed messages remain possible at the remote/local checkpoint
+  boundary, and an exhausted or permanently invalid outbox may drop a notice
+  to preserve privacy and control-plane availability.

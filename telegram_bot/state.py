@@ -27,6 +27,8 @@ _MAX_DELIVERY_RETRY_NOTIFICATION_FAILURES = 3
 _MAX_ACCEPTANCE_RECEIPT_RETRY_SECONDS = 86_400.0
 _MAX_QUEUE_FULL_NOTICE_RETRY_SECONDS = 86_400.0
 _MAX_ACTIVE_QUEUE_FULL_NOTICES = 500
+_MAX_DELIVERY_NOTICE_RETRY_SECONDS = 86_400.0
+_MAX_ACTIVE_DELIVERY_NOTICES = 500
 _DELIVERY_ID = re.compile(r"^delivery-[A-Za-z0-9-]{1,80}$")
 _TASK_ID = re.compile(r"^TASK-\d{1,64}(?:-[a-z0-9]{1,12})?$", re.IGNORECASE)
 _PROJECT_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -54,6 +56,20 @@ _QUEUE_FULL_NOTICE_ACTIVE_FIELDS = frozenset({
     "notice_failure_count",
     "notice_deferred_at",
     "notice_next_attempt_at",
+})
+_DELIVERY_NOTICE_PHASES = frozenset({"pending", "retrying"})
+_DELIVERY_NOTICE_KINDS = frozenset({"retry-scheduled", "terminal-result"})
+_DELIVERY_NOTICE_FIELDS = frozenset({
+    "kind", "phase", "notice_kind", "task_id", "delivery_id",
+    *_ORIGIN_FIELDS,
+    "follow_up_phase", "retry_unavailable_phase",
+    "source_binding", "failure_count", "deferred_at", "next_attempt_at",
+})
+_DELIVERY_NOTICE_FOLLOW_UP_PHASES = frozenset({
+    "", "pending", "polling", "retrying", "not-started-capacity",
+})
+_DELIVERY_NOTICE_UNAVAILABLE_PHASES = frozenset({
+    "", "not-started-capacity", "not-started-deadline",
 })
 _TERMINAL_DELIVERY_STATUSES = frozenset({
     "blocked", "cancelled", "completed", "failed", "interrupted", "pr-open",
@@ -119,6 +135,8 @@ class TelegramState:
                     "failed_jobs": {},
                     "delivery_retries": {},
                     "acceptance_receipts": {},
+                    "delivery_notices": {},
+                    "delivery_notice_pause_until": 0.0,
                 })
 
             needs_write = (
@@ -126,10 +144,10 @@ class TelegramState:
                 or legacy_with_state
                 or current_id != normalized_id
                 or self._data.get("bot_username") != normalized_username
-                or self._data.get("version") != 7
+                or self._data.get("version") != 8
             )
             self._data.update({
-                "version": 7,
+                "version": 8,
                 "bot_id": normalized_id,
                 "bot_username": normalized_username,
             })
@@ -521,6 +539,7 @@ class TelegramState:
                 _MAX_COMPLETED_JOBS,
                 protected={
                     *self._data.setdefault("delivery_retries", {}),
+                    *self._data.setdefault("delivery_notices", {}),
                     key,
                 },
             )
@@ -736,7 +755,10 @@ class TelegramState:
                 _bound_completed(
                     completed,
                     _MAX_COMPLETED_JOBS,
-                    protected=set(self._data.setdefault("delivery_retries", {})),
+                    protected={
+                        *self._data.setdefault("delivery_retries", {}),
+                        *self._data.setdefault("delivery_notices", {}),
+                    },
                 )
                 self._write()
                 return False, 0
@@ -824,6 +846,236 @@ class TelegramState:
                     f"Telegram update {normalized_id} is not queued"
                 )
             record["phase"] = "waiting"
+            self._write()
+
+    @property
+    def pending_delivery_notice_count(self) -> int:
+        """Return terminal delivery notices whose send is unresolved."""
+        with self._lock:
+            return sum(
+                1
+                for value in self._data.setdefault("delivery_notices", {}).values()
+                if _delivery_notice_pending(value)
+            )
+
+    def due_delivery_notice_ids(
+        self,
+        *,
+        now: float | None = None,
+    ) -> list[int]:
+        """Return source-bound terminal notices whose retry is due."""
+        current = time.time() if now is None else _finite_nonnegative(now, time.time())
+        with self._lock:
+            pause_until = _finite_nonnegative(
+                self._data.get("delivery_notice_pause_until"),
+                0.0,
+            )
+            if current < pause_until:
+                return []
+            due: list[int] = []
+            notices = self._data.setdefault("delivery_notices", {})
+            completed = self._data.setdefault("completed_jobs", {})
+            retries = self._data.setdefault("delivery_retries", {})
+            for key, value in notices.items():
+                update_id = _delivery_notice_key(key)
+                notice = _normalized_delivery_notice(value)
+                source = completed.get(key)
+                _require_delivery_notice_binding(
+                    notice,
+                    source,
+                    update_id,
+                    retry=retries.get(key),
+                )
+                retry = retries.get(key)
+                if (
+                    notice["notice_kind"] == "retry-scheduled"
+                    and _delivery_retry_active(retry)
+                    and _delivery_retry_due(retry, current) <= current
+                ):
+                    # The build retry now supersedes this schedule notice. A
+                    # daemon claims it before this lane; one-shot mode leaves
+                    # both durable rather than sending already-stale timing.
+                    continue
+                if notice["next_attempt_at"] <= current:
+                    due.append(update_id)
+            return sorted(due)
+
+    def delivery_notice(self, update_id: int) -> dict[str, object]:
+        """Return one safe semantic notice without rehydrating request text."""
+        normalized_id = _update_id(update_id)
+        key = str(normalized_id)
+        with self._lock:
+            value = self._data.setdefault("delivery_notices", {}).get(key)
+            source = self._data.setdefault("completed_jobs", {}).get(key)
+            if not isinstance(value, dict) or not isinstance(source, dict):
+                return {}
+            notice = _normalized_delivery_notice(value)
+            retry = self._data.setdefault("delivery_retries", {}).get(key)
+            _require_delivery_notice_binding(
+                notice,
+                source,
+                normalized_id,
+                retry=retry,
+            )
+            payload: dict[str, object] = {
+                "update_id": normalized_id,
+                "notice_kind": notice["notice_kind"],
+                "user_id": notice["origin_user_id"],
+                "chat_id": notice["origin_chat_id"],
+                "chat_type": notice["origin_chat_type"],
+                "task_id": notice["task_id"],
+                "delivery_id": notice["delivery_id"],
+                "source_binding": notice["source_binding"],
+            }
+            if notice["notice_kind"] == "retry-scheduled":
+                if not isinstance(retry, dict):  # guarded by the binding check
+                    raise TelegramStateError(
+                        f"Telegram update {normalized_id} lost its delivery retry"
+                    )
+                payload.update({
+                    "attempt": retry["attempt"],
+                    "max_attempts": retry["max_attempts"],
+                    "next_attempt_at": retry["next_attempt_at"],
+                })
+            else:
+                safe_result = _normalize_delivery_outcome(
+                    source.get("delivery_result")
+                )
+                payload.update({
+                    "result": safe_result,
+                    "follow_up_phase": notice["follow_up_phase"],
+                    "retry_unavailable_phase": notice[
+                        "retry_unavailable_phase"
+                    ],
+                })
+            return payload
+
+    def defer_delivery_notice(
+        self,
+        update_id: int,
+        *,
+        source_binding: str,
+        delay_seconds: float,
+        now: float | None = None,
+    ) -> None:
+        """Persist bounded terminal-notice backoff without diagnostics."""
+        normalized_id = _update_id(update_id)
+        with self._lock:
+            value = self._data.setdefault("delivery_notices", {}).get(
+                str(normalized_id)
+            )
+            notice = _normalized_delivery_notice(value)
+            if notice["source_binding"] != source_binding:
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} delivery notice changed"
+                )
+        self.defer_delivery_notices(
+            [normalized_id],
+            delay_seconds=delay_seconds,
+            now=now,
+            pause_all=False,
+        )
+
+    def defer_delivery_notices(
+        self,
+        update_ids: list[int],
+        *,
+        delay_seconds: float,
+        now: float | None = None,
+        pause_all: bool = True,
+    ) -> None:
+        """Atomically defer a cohort of terminal notices after Telegram 429."""
+        if not isinstance(pause_all, bool):
+            raise TelegramStateError("Invalid Telegram delivery notice pause")
+        normalized_ids = sorted({_update_id(value) for value in update_ids})
+        current = time.time() if now is None else _finite_nonnegative(now, time.time())
+        delay = _bounded_delay(
+            delay_seconds,
+            _MAX_DELIVERY_NOTICE_RETRY_SECONDS,
+        )
+        with self._lock:
+            pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            notices = self._data.setdefault("delivery_notices", {})
+            completed = self._data.setdefault("completed_jobs", {})
+            retries = self._data.setdefault("delivery_retries", {})
+            for normalized_id in normalized_ids:
+                key = str(normalized_id)
+                value = notices.get(key)
+                source = completed.get(key)
+                if not isinstance(value, dict) or not isinstance(source, dict):
+                    continue
+                notice = _normalized_delivery_notice(value)
+                _require_delivery_notice_binding(
+                    notice,
+                    source,
+                    normalized_id,
+                    retry=retries.get(key),
+                )
+                pending.append((value, notice))
+            for value, notice in pending:
+                value.update({
+                    "phase": "retrying",
+                    "failure_count": int(notice["failure_count"]) + 1,
+                    "deferred_at": current,
+                    "next_attempt_at": current + delay,
+                })
+            if pause_all:
+                prior_pause = _finite_nonnegative(
+                    self._data.get("delivery_notice_pause_until"),
+                    0.0,
+                )
+                self._data["delivery_notice_pause_until"] = min(
+                    max(prior_pause, current + delay),
+                    current + _MAX_DELIVERY_NOTICE_RETRY_SECONDS,
+                )
+            if pending or pause_all:
+                self._write()
+
+    def complete_delivery_notice(
+        self,
+        update_id: int,
+        *,
+        source_binding: str,
+        delivered: bool,
+    ) -> None:
+        """Finish one terminal notice and scrub its private route."""
+        normalized_id = _update_id(update_id)
+        key = str(normalized_id)
+        with self._lock:
+            notices = self._data.setdefault("delivery_notices", {})
+            value = notices.get(key)
+            source = self._data.setdefault("completed_jobs", {}).get(key)
+            if not isinstance(value, dict):
+                return
+            notice = _normalized_delivery_notice(value)
+            if notice["source_binding"] != source_binding:
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} delivery notice changed"
+                )
+            _require_delivery_notice_binding(
+                notice,
+                source,
+                normalized_id,
+                retry=self._data.setdefault("delivery_retries", {}).get(key),
+            )
+            if not isinstance(source, dict):  # guarded by the binding check
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} lost its completed source"
+                )
+            notices.pop(key)
+            source["delivery_final_sent"] = bool(delivered)
+            source["delivery_notice"] = {
+                "phase": "sent" if delivered else "notification-failed",
+                "notice_kind": notice["notice_kind"],
+            }
+            _bound_completed(
+                self._data.setdefault("completed_jobs", {}),
+                _MAX_COMPLETED_JOBS,
+                protected={
+                    *self._data.setdefault("delivery_retries", {}),
+                    *notices,
+                },
+            )
             self._write()
 
     def job(self, update_id: int) -> dict[str, Any]:
@@ -995,6 +1247,25 @@ class TelegramState:
                 return None
             _due, update_id = min(candidates)
             retry = self._delivery_retry_record(update_id)
+            key = str(update_id)
+            notices = self._data.setdefault("delivery_notices", {})
+            notice_value = notices.get(key)
+            if isinstance(notice_value, dict):
+                notice = _normalized_delivery_notice(notice_value)
+                source = self._data.setdefault("completed_jobs", {}).get(key)
+                _require_delivery_notice_binding(
+                    notice,
+                    source,
+                    update_id,
+                    retry=retry,
+                )
+                if notice["notice_kind"] == "retry-scheduled":
+                    notices.pop(key)
+                    if isinstance(source, dict):
+                        source["delivery_notice"] = {
+                            "phase": "superseded",
+                            "notice_kind": "retry-scheduled",
+                        }
             retry["phase"] = "running"
             self._write()
             return update_id, copy.deepcopy(retry)
@@ -1009,11 +1280,31 @@ class TelegramState:
         failure_code: str,
         now: float | None = None,
     ) -> dict[str, Any]:
-        """Advance a claimed transient failure to its next immutable identity."""
+        """Atomically advance a retry and replace its semantic schedule notice."""
         normalized_id = _update_id(update_id)
         current = time.time() if now is None else _finite_nonnegative(now, time.time())
         with self._lock:
             retry = self._delivery_retry_record(normalized_id)
+            key = str(normalized_id)
+            source = self._data.setdefault("completed_jobs", {}).get(key)
+            if not isinstance(source, dict) or "request" in source:
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has no safe retry source"
+                )
+            prospective_source = copy.deepcopy(source)
+            prospective_source["delivery_final_sent"] = False
+            prospective_source.pop("delivery_notice", None)
+            try:
+                canonical_result = _normalize_delivery_outcome(
+                    prospective_source.get("delivery_result")
+                )
+            except (TelegramStateError, TypeError, ValueError) as exc:
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has an invalid terminal result"
+                ) from exc
+            prospective_source["delivery_result"] = canonical_result
+            prospective_source["delivery_status"] = canonical_result["status"]
+            prospective_source["delivery_phase"] = canonical_result["phase"]
             maximum = _retry_integer(retry.get("max_attempts"), "max_attempts")
             prior_attempt = _retry_integer(retry.get("attempt"), "attempt")
             if attempt != prior_attempt + 1 or attempt > maximum:
@@ -1029,7 +1320,8 @@ class TelegramState:
                 rejected = copy.deepcopy(retry)
                 rejected["phase"] = "deadline-exceeded"
                 return rejected
-            retry.update({
+            candidate = copy.deepcopy(retry)
+            candidate.update({
                 "phase": "pending",
                 "delivery_id": delivery_id,
                 "attempt": attempt,
@@ -1039,8 +1331,54 @@ class TelegramState:
                 "failure_count": 0,
                 "next_attempt_at": due_at,
             })
+            notices = self._data.setdefault("delivery_notices", {})
+            existing_notice = notices.get(key)
+            if isinstance(existing_notice, dict):
+                normalized_notice = _normalized_delivery_notice(existing_notice)
+                _require_delivery_notice_binding(
+                    normalized_notice,
+                    source,
+                    normalized_id,
+                    retry=retry,
+                )
+            chat_id = candidate.get("chat_id")
+            if (
+                isinstance(chat_id, bool)
+                or not isinstance(chat_id, int)
+                or chat_id <= 0
+            ):
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} lost its retry destination"
+                )
+            candidate_notice = _new_delivery_notice(
+                normalized_id,
+                prospective_source,
+                (chat_id, chat_id, "private"),
+                retry=candidate,
+            )
+            active = sum(
+                1 for notice_key, value in notices.items()
+                if notice_key != key and _delivery_notice_pending(value)
+            )
+            new_notice: dict[str, Any] | None = None
+            if existing_notice is not None or active < _MAX_ACTIVE_DELIVERY_NOTICES:
+                new_notice = candidate_notice
+            self._data.setdefault("delivery_retries", {})[key] = candidate
+            source["delivery_final_sent"] = False
+            source["delivery_result"] = canonical_result
+            source["delivery_status"] = canonical_result["status"]
+            source["delivery_phase"] = canonical_result["phase"]
+            if new_notice is None:
+                notices.pop(key, None)
+                source["delivery_notice"] = {
+                    "phase": "not-started-capacity",
+                    "notice_kind": "retry-scheduled",
+                }
+            else:
+                notices[key] = new_notice
+                source.pop("delivery_notice", None)
             self._write()
-            return copy.deepcopy(retry)
+            return copy.deepcopy(candidate)
 
     def start_delivery_retry_attempt(
         self,
@@ -1274,7 +1612,10 @@ class TelegramState:
         _bound_completed(
             completed,
             _MAX_COMPLETED_JOBS,
-            protected=set(self._data.setdefault("delivery_retries", {})),
+            protected={
+                *self._data.setdefault("delivery_retries", {}),
+                *self._data.setdefault("delivery_notices", {}),
+            },
         )
         self._write()
         return copy.deepcopy(summary)
@@ -1534,6 +1875,17 @@ class TelegramState:
                     source = completed.get(key)
                     if isinstance(source, dict) and "request" not in source:
                         due_times.append(_delivery_retry_due(retry, current))
+            for notice in self._data.setdefault("delivery_notices", {}).values():
+                if _delivery_notice_pending(notice):
+                    normalized = _normalized_delivery_notice(notice)
+                    pause_until = _finite_nonnegative(
+                        self._data.get("delivery_notice_pause_until"),
+                        0.0,
+                    )
+                    due_times.append(max(
+                        normalized["next_attempt_at"],
+                        pause_until,
+                    ))
             if expired:
                 self._write()
             if not due_times:
@@ -1595,7 +1947,10 @@ class TelegramState:
             _bound_completed(
                 completed,
                 _MAX_COMPLETED_JOBS,
-                protected=set(self._data.setdefault("delivery_retries", {})),
+                protected={
+                    *self._data.setdefault("delivery_retries", {}),
+                    *self._data.setdefault("delivery_notices", {}),
+                },
             )
             self._write()
 
@@ -1612,21 +1967,68 @@ class TelegramState:
 
     def acknowledge(self, update_id: int) -> None:
         with self._lock:
-            key = str(update_id)
+            normalized_id = _update_id(update_id)
+            key = str(normalized_id)
             jobs = self._data.setdefault("jobs", {})
-            record = copy.deepcopy(jobs.pop(key, {}))
-            self._data.setdefault("acceptance_receipts", {}).pop(key, None)
+            record = copy.deepcopy(jobs.get(key, {}))
+            origin = _saved_origin(record)
             record.pop("request", None)
             for name in _ORIGIN_FIELDS:
                 record.pop(name, None)
             record["phase"] = "completed"
+            notices = self._data.setdefault("delivery_notices", {})
+            new_notice: dict[str, Any] | None = None
+            if (
+                record.get("delivery_terminal") is True
+                and record.get("delivery_final_sent") is False
+            ):
+                if origin is None:
+                    raise TelegramStateError(
+                        f"Telegram update {normalized_id} lost its notice destination"
+                    )
+                try:
+                    canonical_result = _normalize_delivery_outcome(
+                        record.get("delivery_result")
+                    )
+                except (TelegramStateError, TypeError, ValueError) as exc:
+                    raise TelegramStateError(
+                        f"Telegram update {normalized_id} has an invalid terminal result"
+                    ) from exc
+                record["delivery_result"] = canonical_result
+                record["delivery_status"] = canonical_result["status"]
+                record["delivery_phase"] = canonical_result["phase"]
+                retry = self._data.setdefault("delivery_retries", {}).get(key)
+                candidate_notice = _new_delivery_notice(
+                    normalized_id,
+                    record,
+                    origin,
+                    retry=retry,
+                )
+                active = sum(
+                    1 for value in notices.values()
+                    if _delivery_notice_pending(value)
+                )
+                if active >= _MAX_ACTIVE_DELIVERY_NOTICES:
+                    record["delivery_notice"] = {
+                        "phase": "not-started-capacity",
+                        "notice_kind": _delivery_notice_kind(retry),
+                    }
+                else:
+                    new_notice = candidate_notice
+            jobs.pop(key, None)
+            self._data.setdefault("acceptance_receipts", {}).pop(key, None)
             completed = self._data.setdefault("completed_jobs", {})
             completed[key] = record
-            self._advance(update_id)
+            if new_notice is not None:
+                notices[key] = new_notice
+            self._advance(normalized_id)
             _bound_completed(
                 completed,
                 _MAX_COMPLETED_JOBS,
-                protected=set(self._data.setdefault("delivery_retries", {})),
+                protected={
+                    *self._data.setdefault("delivery_retries", {}),
+                    *notices,
+                },
             )
             self._write()
 
@@ -1682,7 +2084,7 @@ class TelegramState:
         with self._lock:
             if not self.path.exists():
                 return {
-                    "version": 7,
+                    "version": 8,
                     "bot_id": None,
                     "bot_username": "",
                     "last_update_id": -1,
@@ -1692,6 +2094,8 @@ class TelegramState:
                     "failed_jobs": {},
                     "delivery_retries": {},
                     "acceptance_receipts": {},
+                    "delivery_notices": {},
+                    "delivery_notice_pause_until": 0.0,
                 }
             try:
                 payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -1703,7 +2107,7 @@ class TelegramState:
                 not isinstance(payload.get(name, {}), dict)
                 for name in (
                     "jobs", "completed_jobs", "failed_jobs", "delivery_retries",
-                    "acceptance_receipts",
+                    "acceptance_receipts", "delivery_notices",
                 )
             ):
                 raise TelegramStateError(f"Invalid Telegram state at {self.path}")
@@ -1718,9 +2122,11 @@ class TelegramState:
             if not isinstance(payload.get("bot_username", ""), str):
                 raise TelegramStateError(f"Invalid Telegram state at {self.path}")
             try:
+                _migrate_legacy_delivery_results(payload)
                 _validate_loaded_queue_full_notices(payload)
                 _validate_loaded_acceptance_receipts(payload)
                 _validate_loaded_delivery_retries(payload)
+                _validate_loaded_delivery_notices(payload)
             except (TelegramStateError, TypeError, ValueError) as exc:
                 raise TelegramStateError(
                     f"Invalid Telegram state at {self.path}"
@@ -1729,7 +2135,8 @@ class TelegramState:
 
     def _write(self) -> None:
         with self._lock:
-            self._data["version"] = 7
+            self._data["version"] = 8
+            self._data.setdefault("delivery_notice_pause_until", 0.0)
             write_json_atomic(self.path, self._data)
 
 
@@ -1915,7 +2322,7 @@ def _validate_loaded_queue_full_notices(payload: dict[str, Any]) -> None:
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
-        or not 0 <= version <= 7
+        or not 0 <= version <= 8
     ):
         raise TelegramStateError("Invalid Telegram state version")
     last_update_id = payload.get("last_update_id", -1)
@@ -1980,6 +2387,367 @@ def _validate_loaded_queue_full_notices(payload: dict[str, Any]) -> None:
             _MAX_COMPLETED_JOBS,
             protected=set(payload.setdefault("delivery_retries", {})),
         )
+
+
+def _delivery_notice_pending(value: Any) -> TypeGuard[dict[str, Any]]:
+    return (
+        isinstance(value, dict)
+        and value.get("kind") == "delivery-notice"
+        and value.get("phase") in _DELIVERY_NOTICE_PHASES
+    )
+
+
+def _delivery_notice_key(value: Any) -> int:
+    try:
+        update_id = _update_id(int(value))
+    except (TelegramStateError, TypeError, ValueError) as exc:
+        raise TelegramStateError("Invalid Telegram delivery notice key") from exc
+    if value != str(update_id):
+        raise TelegramStateError("Invalid Telegram delivery notice key")
+    return update_id
+
+
+def _delivery_notice_kind(retry: Any) -> str:
+    return "retry-scheduled" if _delivery_retry_active(retry) else "terminal-result"
+
+
+def _delivery_notice_source_payload(
+    source: Any,
+    update_id: int,
+    *,
+    retry: Any,
+) -> dict[str, Any]:
+    if (
+        not isinstance(source, dict)
+        or "request" in source
+        or source.get("phase") != "completed"
+        or source.get("delivery_terminal") is not True
+        or source.get("delivery_final_sent") is not False
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} has no safe terminal notice source"
+        )
+    task_id = str(source.get("task_id") or "").upper()
+    delivery_id = str(source.get("delivery_id") or "")
+    chat_id = source.get("chat_id")
+    request_digest = source.get("request_digest")
+    workflow = source.get("workflow")
+    project_name = source.get("project_name", "")
+    result = source.get("delivery_result")
+    if (
+        not _TASK_ID.fullmatch(task_id)
+        or not _DELIVERY_ID.fullmatch(delivery_id)
+        or not isinstance(request_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", request_digest) is None
+        or workflow != "live-build"
+        or not isinstance(project_name, str)
+        or len(project_name) > 160
+        or any(not character.isprintable() for character in project_name)
+        or isinstance(chat_id, bool)
+        or not isinstance(chat_id, int)
+        or chat_id == 0
+        or not isinstance(result, dict)
+        or str(result.get("delivery_id") or "") != delivery_id
+        or str(result.get("status") or "").lower()
+        not in _TERMINAL_DELIVERY_STATUSES
+        or result.get("message") not in (None, "")
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} has an invalid terminal notice source"
+        )
+    try:
+        normalized_result = _normalize_delivery_outcome(result)
+        serialized_result = json.dumps(
+            result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        serialized_normalized = json.dumps(
+            normalized_result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TelegramStateError, TypeError, ValueError) as exc:
+        raise TelegramStateError(
+            f"Telegram update {update_id} has an invalid terminal result"
+        ) from exc
+    if serialized_result != serialized_normalized:
+        raise TelegramStateError(
+            f"Telegram update {update_id} has a non-canonical terminal result"
+        )
+    notice_kind = _delivery_notice_kind(retry)
+    retry_identity: dict[str, Any] = {}
+    if notice_kind == "retry-scheduled":
+        if not isinstance(retry, dict):  # guarded by notice_kind
+            raise TelegramStateError("Invalid Telegram delivery notice retry")
+        normalized_retry = _normalize_delivery_retry(retry)
+        _require_retry_source_binding(normalized_retry, source, update_id)
+        retry_identity = {
+            "root_delivery_id": normalized_retry["root_delivery_id"],
+            "delivery_id": normalized_retry["delivery_id"],
+            "attempt": normalized_retry["attempt"],
+            "max_attempts": normalized_retry["max_attempts"],
+            "next_attempt_at": _strict_timestamp(retry.get("next_attempt_at")),
+        }
+    try:
+        result_digest = hashlib.sha256(
+            serialized_result.encode("utf-8")
+        ).hexdigest()
+    except (TypeError, ValueError) as exc:
+        raise TelegramStateError(
+            f"Telegram update {update_id} has an invalid terminal result"
+        ) from exc
+    return {
+        "notice_kind": notice_kind,
+        "task_id": task_id,
+        "delivery_id": delivery_id,
+        "chat_id": chat_id,
+        "request_digest": request_digest,
+        "workflow": workflow,
+        "project_name": project_name,
+        "result_digest": result_digest,
+        "retry": retry_identity,
+    }
+
+
+def _delivery_notice_binding(
+    update_id: int,
+    source: dict[str, Any],
+    origin: tuple[int, int, str],
+    *,
+    retry: Any,
+    follow_up_phase: str,
+    retry_unavailable_phase: str,
+) -> str:
+    payload = {
+        "kind": "delivery-notice-binding-v1",
+        "update_id": _update_id(update_id),
+        **_delivery_notice_source_payload(source, update_id, retry=retry),
+        "origin_user_id": origin[0],
+        "origin_chat_id": origin[1],
+        "origin_chat_type": origin[2],
+        "follow_up_phase": follow_up_phase,
+        "retry_unavailable_phase": retry_unavailable_phase,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _new_delivery_notice(
+    update_id: int,
+    source: dict[str, Any],
+    origin: tuple[int, int, str],
+    *,
+    retry: Any,
+) -> dict[str, Any]:
+    source_payload = _delivery_notice_source_payload(
+        source,
+        update_id,
+        retry=retry,
+    )
+    if (
+        origin[2] != "private"
+        or origin[0] != origin[1]
+        or source_payload["chat_id"] != origin[1]
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} changed its terminal notice route"
+        )
+    follow_up = source.get("follow_up")
+    follow_up_phase = (
+        str(follow_up.get("phase") or "")
+        if isinstance(follow_up, dict)
+        else ""
+    )
+    if follow_up_phase not in _DELIVERY_NOTICE_FOLLOW_UP_PHASES:
+        follow_up_phase = ""
+    retry_summary = source.get("delivery_retry")
+    retry_unavailable_phase = (
+        str(retry_summary.get("phase") or "")
+        if isinstance(retry_summary, dict)
+        else ""
+    )
+    if retry_unavailable_phase not in _DELIVERY_NOTICE_UNAVAILABLE_PHASES:
+        retry_unavailable_phase = ""
+    return {
+        "kind": "delivery-notice",
+        "phase": "pending",
+        "notice_kind": source_payload["notice_kind"],
+        "task_id": source_payload["task_id"],
+        "delivery_id": source_payload["delivery_id"],
+        "origin_user_id": origin[0],
+        "origin_chat_id": origin[1],
+        "origin_chat_type": origin[2],
+        "follow_up_phase": follow_up_phase,
+        "retry_unavailable_phase": retry_unavailable_phase,
+        "source_binding": _delivery_notice_binding(
+            update_id,
+            source,
+            origin,
+            retry=retry,
+            follow_up_phase=follow_up_phase,
+            retry_unavailable_phase=retry_unavailable_phase,
+        ),
+        "failure_count": 0,
+        "deferred_at": 0.0,
+        "next_attempt_at": 0.0,
+    }
+
+
+def _normalized_delivery_notice(value: Any) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != _DELIVERY_NOTICE_FIELDS
+        or value.get("kind") != "delivery-notice"
+        or value.get("phase") not in _DELIVERY_NOTICE_PHASES
+        or value.get("notice_kind") not in _DELIVERY_NOTICE_KINDS
+    ):
+        raise TelegramStateError("Invalid Telegram delivery notice")
+    task_id = str(value.get("task_id") or "").upper()
+    delivery_id = str(value.get("delivery_id") or "")
+    binding = value.get("source_binding")
+    follow_up_phase = value.get("follow_up_phase")
+    retry_unavailable_phase = value.get("retry_unavailable_phase")
+    failure_count = value.get("failure_count")
+    if (
+        not _TASK_ID.fullmatch(task_id)
+        or not _DELIVERY_ID.fullmatch(delivery_id)
+        or not isinstance(binding, str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding) is None
+        or follow_up_phase not in _DELIVERY_NOTICE_FOLLOW_UP_PHASES
+        or retry_unavailable_phase not in _DELIVERY_NOTICE_UNAVAILABLE_PHASES
+        or isinstance(failure_count, bool)
+        or not isinstance(failure_count, int)
+        or failure_count < 0
+    ):
+        raise TelegramStateError("Invalid Telegram delivery notice")
+    origin = _validated_origin(
+        value.get("origin_user_id"),
+        value.get("origin_chat_id"),
+        value.get("origin_chat_type"),
+    )
+    deferred_at = _strict_timestamp(value.get("deferred_at"), allow_zero=True)
+    next_attempt_at = _strict_timestamp(
+        value.get("next_attempt_at"),
+        allow_zero=True,
+    )
+    phase = str(value.get("phase"))
+    if (
+        next_attempt_at < deferred_at
+        or next_attempt_at - deferred_at > _MAX_DELIVERY_NOTICE_RETRY_SECONDS + 1
+        or (phase == "pending" and (failure_count or deferred_at or next_attempt_at))
+        or (phase == "retrying" and (
+            failure_count < 1 or deferred_at <= 0 or next_attempt_at <= deferred_at
+        ))
+    ):
+        raise TelegramStateError("Invalid Telegram delivery notice retry state")
+    return {
+        "kind": "delivery-notice",
+        "phase": phase,
+        "notice_kind": value["notice_kind"],
+        "task_id": task_id,
+        "delivery_id": delivery_id,
+        "origin_user_id": origin[0],
+        "origin_chat_id": origin[1],
+        "origin_chat_type": origin[2],
+        "follow_up_phase": follow_up_phase,
+        "retry_unavailable_phase": retry_unavailable_phase,
+        "source_binding": binding,
+        "failure_count": failure_count,
+        "deferred_at": deferred_at,
+        "next_attempt_at": next_attempt_at,
+    }
+
+
+def _require_delivery_notice_binding(
+    notice: dict[str, Any],
+    source: Any,
+    update_id: int,
+    *,
+    retry: Any,
+) -> None:
+    source_payload = _delivery_notice_source_payload(
+        source,
+        update_id,
+        retry=retry,
+    )
+    origin = _validated_origin(
+        notice.get("origin_user_id"),
+        notice.get("origin_chat_id"),
+        notice.get("origin_chat_type"),
+    )
+    if origin[2] != "private" or origin[0] != origin[1]:
+        raise TelegramStateError(
+            f"Telegram update {update_id} has a non-private delivery notice route"
+        )
+    expected = {
+        "notice_kind": source_payload["notice_kind"],
+        "task_id": source_payload["task_id"],
+        "delivery_id": source_payload["delivery_id"],
+        "origin_chat_id": source_payload["chat_id"],
+        "source_binding": _delivery_notice_binding(
+            update_id,
+            source,
+            origin,
+            retry=retry,
+            follow_up_phase=str(notice.get("follow_up_phase") or ""),
+            retry_unavailable_phase=str(
+                notice.get("retry_unavailable_phase") or ""
+            ),
+        ),
+    }
+    if any(notice.get(name) != value for name, value in expected.items()):
+        raise TelegramStateError(
+            f"Telegram update {update_id} delivery notice changed source binding"
+        )
+
+
+def _validate_loaded_delivery_notices(payload: dict[str, Any]) -> None:
+    version = payload.get("version", 0)
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or not 0 <= version <= 8
+    ):
+        raise TelegramStateError("Invalid Telegram state version")
+    notices = payload.setdefault("delivery_notices", {})
+    if version < 8:
+        # Older state has no route-bound outbox. Never infer permission to send
+        # from historical `delivery_final_sent=False` tombstones.
+        notices.clear()
+        payload["delivery_notice_pause_until"] = 0.0
+        return
+    pause_until = _strict_timestamp(
+        payload.setdefault("delivery_notice_pause_until", 0.0),
+        allow_zero=True,
+    )
+    if pause_until > time.time() + _MAX_DELIVERY_NOTICE_RETRY_SECONDS + 1:
+        raise TelegramStateError("Invalid Telegram delivery notice pause")
+    payload["delivery_notice_pause_until"] = pause_until
+    completed = payload.setdefault("completed_jobs", {})
+    retries = payload.setdefault("delivery_retries", {})
+    if len(notices) > _MAX_ACTIVE_DELIVERY_NOTICES:
+        raise TelegramStateError("Too many pending Telegram delivery notices")
+    for key, value in notices.items():
+        update_id = _delivery_notice_key(key)
+        notice = _normalized_delivery_notice(value)
+        _require_delivery_notice_binding(
+            notice,
+            completed.get(key),
+            update_id,
+            retry=retries.get(key),
+        )
+        notices[key] = notice
 
 
 def _acceptance_receipt_pending(value: Any) -> TypeGuard[dict[str, Any]]:
@@ -2087,7 +2855,7 @@ def _validate_loaded_acceptance_receipts(payload: dict[str, Any]) -> None:
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
-        or not 0 <= version <= 7
+        or not 0 <= version <= 8
     ):
         raise TelegramStateError("Invalid Telegram state version")
 
@@ -2228,7 +2996,11 @@ def _normalize_delivery_retry(value: Any) -> dict[str, Any]:
     }
 
 
-def _normalize_delivery_outcome(value: Any) -> dict[str, Any]:
+def _normalize_delivery_result(
+    value: Any,
+    *,
+    require_terminal: bool,
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TelegramStateError("Invalid Telegram delivery retry outcome")
     delivery_id = str(value.get("delivery_id") or "")
@@ -2243,9 +3015,13 @@ def _normalize_delivery_outcome(value: Any) -> dict[str, Any]:
     publication_uncertain = value.get("publication_uncertain", False)
     if (
         not _DELIVERY_ID.fullmatch(delivery_id)
-        or status not in _TERMINAL_DELIVERY_STATUSES
+        or not status
+        or len(status) > 80
+        or any(not character.isprintable() for character in status)
+        or (require_terminal and status not in _TERMINAL_DELIVERY_STATUSES)
         or not phase
         or len(phase) > 80
+        or any(not character.isprintable() for character in phase)
         or bool(commit_sha and not _COMMIT_SHA.fullmatch(commit_sha))
         or bool(pr_url and not _GITHUB_PR_URL.fullmatch(pr_url))
         or not isinstance(success, bool)
@@ -2282,6 +3058,32 @@ def _normalize_delivery_outcome(value: Any) -> dict[str, Any]:
         # request-free notification checkpoint.
         "message": "",
     }
+
+
+def _normalize_delivery_outcome(value: Any) -> dict[str, Any]:
+    return _normalize_delivery_result(value, require_terminal=True)
+
+
+def _migrate_legacy_delivery_results(payload: dict[str, Any]) -> None:
+    """Canonicalize legacy result snapshots before v8 can route notices."""
+    version = payload.get("version", 0)
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or not 0 <= version < 8
+    ):
+        return
+    for bucket_name in ("jobs", "completed_jobs", "failed_jobs"):
+        bucket = payload.setdefault(bucket_name, {})
+        for record in bucket.values():
+            if not isinstance(record, dict):
+                raise TelegramStateError("Invalid legacy Telegram job")
+            if "delivery_result" not in record:
+                continue
+            record["delivery_result"] = _normalize_delivery_result(
+                record.get("delivery_result"),
+                require_terminal=record.get("delivery_terminal") is True,
+            )
 
 
 def _require_retry_binding(
@@ -2814,9 +3616,14 @@ def _has_update_state(data: dict[str, Any]) -> bool:
             return True
     except (TypeError, ValueError):
         return True
+    try:
+        if float(data.get("delivery_notice_pause_until", 0.0)) > 0:
+            return True
+    except (TypeError, ValueError):
+        return True
     return any(bool(data.get(name)) for name in (
         "jobs", "completed_jobs", "failed_jobs", "delivery_retries",
-        "acceptance_receipts",
+        "acceptance_receipts", "delivery_notices",
     ))
 
 
