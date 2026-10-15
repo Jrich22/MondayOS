@@ -416,6 +416,8 @@ class BuildResponse:
         task_reconciliation: Result of applying a terminal PR state to the task.
         failure_class: Machine-readable empty/transient/permanent/policy outcome.
         retry_after_seconds: Bounded retry delay for transient failures only.
+        review_reconciliation: Durable result of moving an open-PR task to REVIEW.
+        review_reconciled_at: UTC timestamp when REVIEW reconciliation was settled.
     """
 
     action: str
@@ -441,6 +443,9 @@ class BuildResponse:
     task_reconciliation: str = ""
     failure_class: str = ""
     retry_after_seconds: int = 0
+    # Appended so existing positional BuildResponse construction remains valid.
+    review_reconciliation: str = ""
+    review_reconciled_at: str = ""
 
 
 @dataclass

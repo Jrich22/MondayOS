@@ -33,6 +33,8 @@ class _Job:
             "observation_success": True,
             "observation_message": "The pull request is open; checks are pending.",
             "task_reconciliation": "",
+            "review_reconciliation": "reviewed",
+            "review_reconciled_at": "2026-10-13T00:00:01+00:00",
             "message": "Pull request opened.",
         }
         self.payload.update(overrides)
@@ -100,8 +102,43 @@ def test_build_response_is_part_of_the_public_package() -> None:
     assert response.merge_commit_sha == ""
     assert response.pr_observed_at == ""
     assert response.task_reconciliation == ""
+    assert response.review_reconciliation == ""
+    assert response.review_reconciled_at == ""
     assert response.failure_class == ""
     assert response.retry_after_seconds == 0
+
+
+def test_build_response_keeps_legacy_positional_field_order() -> None:
+    response = BuildResponse(
+        "run",
+        False,
+        "retry",
+        "delivery-test-1",
+        "TASK-0001",
+        "failed",
+        "review",
+        "codex/task-0001",
+        "a" * 40,
+        "https://github.com/acme/repo/pull/1",
+        ["app.py"],
+        [{"number": 1}],
+        {"status": "failed"},
+        "project",
+        "acme/repo",
+        "/repo",
+        "open",
+        "pending",
+        "",
+        "2026-10-13T00:00:00+00:00",
+        "",
+        "transient",
+        90,
+    )
+
+    assert response.failure_class == "transient"
+    assert response.retry_after_seconds == 90
+    assert response.review_reconciliation == ""
+    assert response.review_reconciled_at == ""
 
 
 def test_build_run_passes_identity_and_callbacks_without_invoking_real_tools(
@@ -127,6 +164,8 @@ def test_build_run_passes_identity_and_callbacks_without_invoking_real_tools(
     assert response.pr_url.endswith("/pull/7")
     assert response.changed_files == ["monday/api.py"]
     assert response.attempts == [{"number": 1, "status": "passed"}]
+    assert response.review_reconciliation == "reviewed"
+    assert response.review_reconciled_at == "2026-10-13T00:00:01+00:00"
     assert workflow.calls == [(
         "run",
         {

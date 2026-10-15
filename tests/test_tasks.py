@@ -533,6 +533,19 @@ class TestTaskManager:
         assert retrieved.id == created.id
         assert retrieved.title == created.title
 
+    def test_revision_changes_for_same_second_persisted_edit(self) -> None:
+        task = self._create()
+        before = self.mgr.get(task.id)
+        before_revision = self.mgr.revision(task.id)
+
+        with mock.patch.object(task_manager_module, "datetime") as clock:
+            clock.now.return_value = before.updated
+            self.mgr.append_work_log(task.id, "Human edit", "human:test")
+
+        after = self.mgr.get(task.id)
+        assert after.updated == before.updated
+        assert self.mgr.revision(task.id) != before_revision
+
     def test_get_raises_for_unknown_id(self) -> None:
         with pytest.raises(TaskNotFoundError):
             self.mgr.get("TASK-9999")

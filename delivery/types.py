@@ -6,6 +6,19 @@ from typing import Any
 
 DELIVERY_FAILURE_CLASSES = frozenset({"transient", "permanent", "policy"})
 MAX_DELIVERY_RETRY_AFTER_SECONDS = 86_400
+REVIEW_RECONCILIATION_STATES = frozenset(
+    {
+        "",
+        "review-pending",
+        "reviewed",
+        "terminal-unchanged",
+        "state-unchanged",
+        "state-changed",
+        "target-changed",
+        "superseded",
+        "legacy-unverifiable",
+    }
+)
 
 
 @dataclass
@@ -100,6 +113,12 @@ class DeliveryJob:
     # not retryable; retry hints are honored only for classified transients.
     failure_class: str = ""
     retry_after_seconds: int = 0
+    # Opening the exact reviewed PR and moving its task to REVIEW are separate
+    # durable effects.  A task-store outage after publication must therefore be
+    # visible and repairable without replaying any GitHub or repository action.
+    review_reconciliation: str = ""
+    review_reconciled_at: str = ""
+    review_expected_task_revision: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -112,6 +131,12 @@ class DeliveryJob:
         payload["retry_after_seconds"] = bounded_delivery_retry_after_seconds(
             self.retry_after_seconds,
             failure_class=failure_class,
+        )
+        payload["review_reconciliation"] = normalize_review_reconciliation(
+            self.review_reconciliation
+        )
+        payload["review_expected_task_revision"] = normalize_task_revision(
+            self.review_expected_task_revision
         )
         if not include_private:
             payload.pop("worktree_owner_token", None)
@@ -169,6 +194,13 @@ class DeliveryJob:
                 data.get("retry_after_seconds"),
                 failure_class=failure_class,
             ),
+            review_reconciliation=normalize_review_reconciliation(
+                data.get("review_reconciliation")
+            ),
+            review_reconciled_at=str(data.get("review_reconciled_at", "")),
+            review_expected_task_revision=normalize_task_revision(
+                data.get("review_expected_task_revision")
+            ),
         )
 
 
@@ -176,6 +208,22 @@ def normalize_delivery_failure_class(value: object) -> str:
     """Accept only the exact durable taxonomy; prose can never enable retries."""
     if isinstance(value, str) and value in DELIVERY_FAILURE_CLASSES:
         return value
+    return ""
+
+
+def normalize_review_reconciliation(value: object) -> str:
+    """Accept only controller-owned open-PR task reconciliation states."""
+    if isinstance(value, str) and value in REVIEW_RECONCILIATION_STATES:
+        return value
+    return ""
+
+
+def normalize_task_revision(value: object) -> str:
+    """Return one canonical SHA-256 task revision, or no mutation authority."""
+    if isinstance(value, str) and len(value) == 64:
+        lowered = value.lower()
+        if all(character in "0123456789abcdef" for character in lowered):
+            return lowered
     return ""
 
 

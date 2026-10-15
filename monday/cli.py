@@ -1980,7 +1980,7 @@ def _register_build(subparsers: Any) -> None:
 
     p_observe = build_sub.add_parser(
         "observe",
-        help="Read the exact PR/check state and reconcile a merge or closure.",
+        help="Read exact PR/check state and reconcile its pending task transition.",
     )
     p_observe.add_argument(
         "delivery_id", metavar="DELIVERY-ID", help="PR-backed delivery to observe."

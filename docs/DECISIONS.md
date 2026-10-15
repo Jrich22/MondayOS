@@ -1052,13 +1052,16 @@ descriptions, annotations, and logs are neither exposed nor persisted. The
 observer may persist this bounded local record, but it cannot mutate GitHub: it
 does not push, edit, close, merge, or deploy.
 
-Task reconciliation occurs only after a verified terminal PR state. A newer open
-delivery remains authoritative over every outcome from an older PR, including a
-merge. Otherwise, an exact reviewed merge completes an eligible task
-idempotently, while a closed or SHA-diverged PR returns a task still in `REVIEW`
-to `IN_PROGRESS`. Open check states, including `failed`, never change task
-status. Completed, cancelled, blocked, retargeted, or otherwise human-managed
-states are not overridden.
+Open check states, including `failed`, never drive task status. Observation may
+repair a distinct initial task-to-`REVIEW` transition only when the durable
+delivery explicitly says `review-pending`, the same exact reviewed PR is still
+open, and a SHA-256 revision of the complete persisted task record is unchanged
+since publication. Legacy records do not acquire this mutation authority. A
+newer open delivery remains authoritative over every outcome from an older PR,
+including a merge. Otherwise, terminal reconciliation lets an exact reviewed
+merge complete an eligible task idempotently, while a closed or SHA-diverged PR
+returns a task still in `REVIEW` to `IN_PROGRESS`. Completed, cancelled,
+blocked, retargeted, or otherwise human-managed states are not overridden.
 
 Observation is serialized with publication finalization by the repository
 workflow lease. Any terminal task transition is then performed under the same

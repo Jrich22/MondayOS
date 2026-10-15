@@ -315,6 +315,19 @@ class TaskManager:
             )
         raise TaskNotFoundError(task_id)
 
+    def revision(self, task_id: EntityId) -> str:
+        """Return a collision-resistant digest of the complete persisted task.
+
+        Callers that use the digest as an optimistic mutation guard must hold
+        ``lock(task_id)`` across both ``get``/``revision`` and the guarded
+        action.  Canonical serialization covers status history, work log,
+        metadata, targeting, and every other persisted task field, so two
+        same-second edits cannot share authority merely because display
+        timestamps are second-granularity.
+        """
+        canonical = self._parser.serialize(self.get(task_id)).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
     def update_status(
         self,
         task_id: EntityId,

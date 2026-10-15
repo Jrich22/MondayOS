@@ -1806,9 +1806,10 @@ class Monday:
                            ``checkpoint_callback``.
             get          — retrieve one durable delivery. Requires ``delivery_id``.
                            Optional: ``project`` identity assertion.
-            observe      — read the exact pull request and checks, then reconcile a
-                           verified merge/closure. Requires ``delivery_id`` and the
-                           registered ``project`` for external deliveries.
+            observe      — read the exact pull request and checks, repair an explicitly
+                           pending initial REVIEW transition, or reconcile a verified
+                           merge/closure. Requires ``delivery_id`` and the registered
+                           ``project`` for external deliveries.
             history      — list deliveries. Optional: ``task_id``, ``project``, and ``limit``.
             capabilities — report builder, reviewer, target, and GitHub readiness.
                            Optional: registered ``project``.
@@ -3611,6 +3612,7 @@ def _delivery_job_payload(value: Any) -> dict[str, Any]:
     from delivery.types import (
         bounded_delivery_retry_after_seconds,
         normalize_delivery_failure_class,
+        normalize_review_reconciliation,
     )
 
     data = _delivery_payload(value)
@@ -3619,6 +3621,9 @@ def _delivery_job_payload(value: Any) -> dict[str, Any]:
     data["retry_after_seconds"] = bounded_delivery_retry_after_seconds(
         data.get("retry_after_seconds"),
         failure_class=failure_class,
+    )
+    data["review_reconciliation"] = normalize_review_reconciliation(
+        data.get("review_reconciliation")
     )
     return data
 
@@ -3676,6 +3681,8 @@ def _build_response_from_job(
         merge_commit_sha=str(data.get("merge_commit_sha", "")),
         pr_observed_at=str(data.get("pr_observed_at", "")),
         task_reconciliation=str(data.get("task_reconciliation", "")),
+        review_reconciliation=str(data.get("review_reconciliation", "")),
+        review_reconciled_at=str(data.get("review_reconciled_at", "")),
         failure_class=failure_class,
         retry_after_seconds=retry_after_seconds,
     )

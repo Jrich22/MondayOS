@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import subprocess
 import sys
@@ -10,9 +11,11 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import pytest
 
+import tasks.manager as task_manager_module
 from delivery.backends import PatchProposal, ReviewDecision, ToolAvailability
 from delivery.github import PullRequestResult
 from delivery.security import ArtifactSecurityError
@@ -83,6 +86,12 @@ class _Monday:
         self.project_delivery_repository = project_delivery_repository
         self.project_source_device = project_source_device
         self.project_source_inode = project_source_inode
+        self.updated_sequence = 0
+        self.updated = "2026-10-13T00:00:00+00:00"
+
+    def _touch(self) -> None:
+        self.updated_sequence += 1
+        self.updated = f"2026-10-13T00:00:{self.updated_sequence:02d}+00:00"
 
     def task(self, action: str, **kwargs: Any) -> SimpleNamespace:
         self.calls.append(action)
@@ -100,20 +109,32 @@ class _Monday:
                     "project_source_device": self.project_source_device,
                     "project_source_inode": self.project_source_inode,
                     "status": self.status,
+                    "updated": self.updated,
                 },
             )
         if action == "start":
             self.status = "in-progress"
+            self._touch()
             return SimpleNamespace(
-                success=True, message="started", data={"status": self.status}
+                success=True,
+                message="started",
+                data={"status": self.status, "updated": self.updated},
             )
         if action == "review":
             self.status = "review"
-            return SimpleNamespace(success=True, message="review", data={})
+            self._touch()
+            return SimpleNamespace(
+                success=True,
+                message="review",
+                data={"status": self.status, "updated": self.updated},
+            )
         if action == "complete":
             self.status = "completed"
+            self._touch()
             return SimpleNamespace(
-                success=True, message="completed", data={"status": self.status}
+                success=True,
+                message="completed",
+                data={"status": self.status, "updated": self.updated},
             )
         raise AssertionError(action)
 
@@ -352,6 +373,10 @@ def _workflow(
     )
 
 
+def _task_revision(root: Path, task_id: str = "TASK-0001") -> str:
+    return TaskManager(root).revision(task_id)
+
+
 def _persist_delivery(
     workflow: DeliveryWorkflow,
     *,
@@ -446,6 +471,48 @@ def test_observe_records_exact_open_pr_and_bounded_check_summary(
     }]
 
 
+def test_observe_open_pr_repairs_pending_review_without_github_mutation(
+    tmp_path: Path,
+) -> None:
+    class _ObserveOnlyGitHub(_ObserverGitHub):
+        def ensure_pull_request(self, **_: Any) -> PullRequestResult:
+            raise AssertionError("observation must not publish or update a pull request")
+
+    root, _ = _repository(tmp_path)
+    monday = _Monday()
+    monday.status = "in-progress"
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _ObserveOnlyGitHub(lifecycle="open", checks="pending")
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    job.review_reconciliation = "review-pending"
+    job.review_expected_task_revision = _task_revision(root)
+    workflow.store.persist(job)
+
+    observed = workflow.observe(job.delivery_id)
+
+    assert observed.observation_success is True
+    assert observed.pr_state == "open"
+    assert observed.review_reconciliation == "reviewed"
+    assert observed.review_reconciled_at
+    assert monday.status == "review"
+    assert monday.calls.count("review") == 1
+    assert github.calls == 1
+    assert builder.calls == reviewer.calls == validator.calls == 0
+    durable = workflow.get(job.delivery_id)
+    assert durable.review_reconciliation == "reviewed"
+    assert durable.review_reconciled_at == observed.review_reconciled_at
+
+
 def test_observe_verified_merge_completes_task_exactly_once(tmp_path: Path) -> None:
     root, _ = _repository(tmp_path)
     github = _ObserverGitHub(
@@ -474,6 +541,135 @@ def test_observe_verified_merge_completes_task_exactly_once(tmp_path: Path) -> N
     assert second.task_reconciliation == "already-completed"
     assert monday.status == "completed"
     assert monday.calls.count("complete") == 1
+
+
+@pytest.mark.parametrize("lifecycle", ["merged", "closed"])
+def test_terminal_truth_crash_retires_pending_review_before_task_reconciliation(
+    tmp_path: Path,
+    lifecycle: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(
+        lifecycle=lifecycle,
+        checks="passed" if lifecycle == "merged" else "failed",
+        merge_commit_sha="4" * 40 if lifecycle == "merged" else "",
+    )
+    monday = _Monday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    job.review_reconciliation = "review-pending"
+    job.review_expected_task_revision = _task_revision(root)
+    workflow.store.persist(job)
+    original_persist = workflow.store.persist
+    crash_armed = True
+
+    def crash_after_terminal_truth(job_to_persist: DeliveryJob) -> None:
+        nonlocal crash_armed
+        if (
+            crash_armed
+            and job_to_persist.pr_state == lifecycle
+            and not job_to_persist.task_reconciliation
+        ):
+            crash_armed = False
+            original_persist(job_to_persist)
+            raise SystemExit("simulated death after terminal PR truth")
+        original_persist(job_to_persist)
+
+    workflow.store.persist = crash_after_terminal_truth  # type: ignore[method-assign]
+    with pytest.raises(SystemExit, match="after terminal PR truth"):
+        workflow.observe(job.delivery_id)
+    workflow.store.persist = original_persist  # type: ignore[method-assign]
+
+    durable = workflow.get(job.delivery_id)
+    assert durable.pr_state == lifecycle
+    assert durable.review_reconciliation == "review-pending"
+    assert monday.calls.count("review") == 0
+    assert monday.calls.count("complete") == 0
+    assert monday.calls.count("start") == 0
+
+    same_id = workflow.run(task_id=job.task_id, delivery_id=job.delivery_id)
+
+    assert same_id.review_reconciliation == "terminal-unchanged"
+    assert monday.status == "review"
+    assert monday.calls.count("review") == 0
+
+    first = workflow.observe(job.delivery_id)
+    second = workflow.observe(job.delivery_id)
+
+    expected_first = "completed" if lifecycle == "merged" else "reopened"
+    expected_second = (
+        "already-completed" if lifecycle == "merged" else "already-in-progress"
+    )
+    assert first.task_reconciliation == expected_first
+    assert second.task_reconciliation == expected_second
+    assert monday.calls.count("complete") == (1 if lifecycle == "merged" else 0)
+    assert monday.calls.count("start") == (1 if lifecycle == "closed" else 0)
+    assert monday.calls.count("review") == 0
+
+
+@pytest.mark.parametrize("lifecycle", ["merged", "closed"])
+def test_terminal_task_mutation_crash_replays_without_second_mutation(
+    tmp_path: Path,
+    lifecycle: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(
+        lifecycle=lifecycle,
+        checks="passed" if lifecycle == "merged" else "failed",
+        merge_commit_sha="4" * 40 if lifecycle == "merged" else "",
+    )
+    monday = _Monday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    job.review_reconciliation = "reviewed"
+    job.review_reconciled_at = "2026-10-13T00:00:01+00:00"
+    workflow.store.persist(job)
+    original_persist = workflow.store.persist
+    expected_mutation = "completed" if lifecycle == "merged" else "reopened"
+    crash_armed = True
+
+    def crash_before_terminal_settlement(job_to_persist: DeliveryJob) -> None:
+        nonlocal crash_armed
+        if crash_armed and job_to_persist.task_reconciliation == expected_mutation:
+            crash_armed = False
+            raise SystemExit("simulated death before terminal task settlement")
+        original_persist(job_to_persist)
+
+    workflow.store.persist = crash_before_terminal_settlement  # type: ignore[method-assign]
+    with pytest.raises(SystemExit, match="before terminal task settlement"):
+        workflow.observe(job.delivery_id)
+    workflow.store.persist = original_persist  # type: ignore[method-assign]
+
+    assert monday.status == ("completed" if lifecycle == "merged" else "in-progress")
+    assert monday.calls.count("complete") == (1 if lifecycle == "merged" else 0)
+    assert monday.calls.count("start") == (1 if lifecycle == "closed" else 0)
+    durable = workflow.get(job.delivery_id)
+    assert durable.pr_state == lifecycle
+    assert durable.task_reconciliation == ""
+
+    replayed = workflow.observe(job.delivery_id)
+
+    assert replayed.task_reconciliation == (
+        "already-completed" if lifecycle == "merged" else "already-in-progress"
+    )
+    assert monday.calls.count("complete") == (1 if lifecycle == "merged" else 0)
+    assert monday.calls.count("start") == (1 if lifecycle == "closed" else 0)
 
 
 @pytest.mark.parametrize("lifecycle", ["closed", "diverged"])
@@ -1136,6 +1332,9 @@ def test_success_reviews_exact_artifact_pushes_branch_and_opens_pr(tmp_path: Pat
     assert job.pr_url.endswith("/pull/12")
     assert job.artifact_sha256 == job.reviewed_artifact_sha256
     assert len(job.artifact_sha256) == 64
+    assert job.review_reconciliation == "reviewed"
+    assert job.review_reconciled_at
+    assert job.task_reconciliation == ""
     assert monday.status == "review"
     assert (root / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
     assert _git(remote, "show", f"{job.branch}:app.py") == "VALUE = 2"
@@ -1282,7 +1481,7 @@ def test_controller_death_after_pr_creation_is_reconciled_exactly(
 ) -> None:
     root, remote = _repository(tmp_path)
     github = _GitHub()
-    workflow, _ = _workflow(
+    workflow, monday = _workflow(
         root,
         builder=_Builder([_patch(1, 2)]),
         reviewer=_Reviewer([_pass()]),
@@ -1354,6 +1553,10 @@ def test_controller_death_after_pr_creation_is_reconciled_exactly(
 
     assert recovered.success is True
     assert recovered.pr_url.endswith("/pull/12")
+    assert recovered.review_reconciliation == "reviewed"
+    assert recovered.review_reconciled_at
+    assert monday.status == "review"
+    assert monday.calls.count("review") == 1
     assert "pull-request" in recovery_phases
     assert push_calls == 1
     # The second idempotent ensure call represents the exact PR lookup that a
@@ -1515,9 +1718,436 @@ def test_task_store_failure_after_pr_keeps_published_delivery_successful(
     assert job.failure_code == ""
     assert job.pr_url.endswith("/pull/12")
     assert "task status could not be moved to REVIEW" in job.message
-    assert workflow.get(job.delivery_id).status == "pr-open"
+    assert job.review_reconciliation == "review-pending"
+    assert job.review_reconciled_at == ""
+    assert job.task_reconciliation == ""
+    durable = workflow.get(job.delivery_id)
+    assert durable.status == "pr-open"
+    assert durable.review_reconciliation == "review-pending"
+    assert durable.review_reconciled_at == ""
     assert _git(remote, "show", f"{job.branch}:app.py") == "VALUE = 2"
     assert github.calls == 1
+
+
+@pytest.mark.parametrize(
+    "write_before_crash",
+    [False, True],
+    ids=["before-settlement-write", "after-settlement-write"],
+)
+def test_controller_death_during_review_settlement_recovers_at_most_once(
+    tmp_path: Path,
+    write_before_crash: bool,
+) -> None:
+    root, _ = _repository(tmp_path)
+    monday = _Monday()
+    original, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+        monday=monday,
+    )
+    original_persist = original.store.persist
+    crash_armed = True
+
+    def crash_around_review_settlement(job: DeliveryJob) -> None:
+        nonlocal crash_armed
+        if crash_armed and job.review_reconciliation == "reviewed":
+            crash_armed = False
+            if write_before_crash:
+                original_persist(job)
+            raise SystemExit("simulated controller death during REVIEW settlement")
+        original_persist(job)
+
+    original.store.persist = crash_around_review_settlement  # type: ignore[method-assign]
+    delivery_id = (
+        "delivery-review-settlement-after-write"
+        if write_before_crash
+        else "delivery-review-settlement-before-write"
+    )
+    with pytest.raises(SystemExit, match="during REVIEW settlement"):
+        original.run(task_id="TASK-0001", delivery_id=delivery_id)
+    original.store.persist = original_persist  # type: ignore[method-assign]
+
+    durable = original.get(delivery_id)
+    assert durable.status == "pr-open"
+    assert durable.review_reconciliation == (
+        "reviewed" if write_before_crash else "review-pending"
+    )
+    assert monday.status == "review"
+    assert monday.calls.count("review") == 1
+
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _GitHub()
+    restarted, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+        monday=monday,
+    )
+
+    repaired = restarted.run(task_id="TASK-0001", delivery_id=delivery_id)
+
+    assert repaired.status == "pr-open"
+    assert repaired.review_reconciliation == "reviewed"
+    assert repaired.review_reconciled_at
+    assert monday.calls.count("review") == 1
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+    assert restarted.get(delivery_id).review_reconciliation == "reviewed"
+
+
+def test_terminal_pr_retry_after_restart_repairs_review_without_republishing(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    monday = _Monday()
+    monday.status = "in-progress"
+    original_builder = _Builder([_patch(1, 2)])
+    original_reviewer = _Reviewer([_pass()])
+    original_validator = _Validator([True])
+    original_github = _GitHub()
+    original, _ = _workflow(
+        root,
+        builder=original_builder,
+        reviewer=original_reviewer,
+        validator=original_validator,
+        github=original_github,
+        monday=monday,
+    )
+    job = _observable_delivery(original, root)
+    job.review_reconciliation = "review-pending"
+    job.review_expected_task_revision = _task_revision(root)
+    job.message = (
+        "ChatGPT approved the exact artifact and PR #12 is open; "
+        "task status could not be moved to REVIEW; "
+        "the local worktree was retained for cleanup"
+    )
+    original.store.persist(job)
+
+    retry_builder = _Builder([_patch(1, 9)])
+    retry_reviewer = _Reviewer([_pass("must not run")])
+    retry_validator = _Validator([True])
+    retry_github = _GitHub()
+    restarted, _ = _workflow(
+        root,
+        builder=retry_builder,
+        reviewer=retry_reviewer,
+        validator=retry_validator,
+        github=retry_github,
+        monday=monday,
+    )
+
+    repaired = restarted.run(
+        task_id=job.task_id,
+        delivery_id=job.delivery_id,
+    )
+
+    assert repaired.status == "pr-open"
+    assert repaired.review_reconciliation == "reviewed"
+    assert repaired.review_reconciled_at
+    assert repaired.task_reconciliation == ""
+    assert "task status could not be moved to REVIEW" not in repaired.message
+    assert "the local worktree was retained for cleanup" in repaired.message
+    assert monday.status == "review"
+    assert monday.calls.count("review") == 1
+    assert retry_builder.calls == 0
+    assert retry_reviewer.calls == 0
+    assert retry_validator.calls == 0
+    assert retry_github.calls == 0
+    assert restarted.get(job.delivery_id).review_reconciliation == "reviewed"
+
+    reviewed_at = repaired.review_reconciled_at
+    replayed = restarted.run(task_id=job.task_id, delivery_id=job.delivery_id)
+
+    assert replayed.review_reconciliation == "reviewed"
+    assert replayed.review_reconciled_at == reviewed_at
+    assert monday.calls.count("review") == 1
+    assert retry_builder.calls == retry_reviewer.calls == retry_validator.calls == 0
+    assert retry_github.calls == 0
+
+
+def test_pending_review_repair_accepts_already_review_without_second_transition(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    monday = _Monday()
+    monday.status = "review"
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    job.review_reconciliation = "review-pending"
+    job.review_expected_task_revision = _task_revision(root)
+    workflow.store.persist(job)
+
+    settled = workflow.run(task_id=job.task_id, delivery_id=job.delivery_id)
+
+    assert settled.review_reconciliation == "reviewed"
+    assert settled.review_reconciled_at
+    assert monday.status == "review"
+    assert monday.calls.count("review") == 0
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+    reconciled_at = settled.review_reconciled_at
+    replayed = workflow.run(task_id=job.task_id, delivery_id=job.delivery_id)
+
+    assert replayed.review_reconciliation == "reviewed"
+    assert replayed.review_reconciled_at == reconciled_at
+    assert monday.calls.count("review") == 0
+
+
+@pytest.mark.parametrize("lifecycle", ["merged", "closed", "diverged"])
+def test_terminal_pr_observation_wins_over_pending_initial_review(
+    tmp_path: Path,
+    lifecycle: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    monday = _Monday()
+    monday.status = "in-progress"
+    github = _ObserverGitHub(
+        lifecycle=lifecycle,
+        checks="passed" if lifecycle == "merged" else "failed",
+        merge_commit_sha="4" * 40 if lifecycle == "merged" else "",
+    )
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 9)]),
+        reviewer=_Reviewer([_pass("must not run")]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    job.review_reconciliation = "review-pending"
+    job.review_expected_task_revision = _task_revision(root)
+    workflow.store.persist(job)
+
+    observed = workflow.observe(job.delivery_id)
+
+    assert observed.pr_state == lifecycle
+    assert observed.task_reconciliation == (
+        "completed" if lifecycle == "merged" else "already-in-progress"
+    )
+    assert observed.review_reconciliation == "terminal-unchanged"
+    assert observed.review_reconciled_at
+    assert monday.status == ("completed" if lifecycle == "merged" else "in-progress")
+    assert monday.calls.count("review") == 0
+    assert monday.calls.count("complete") == (1 if lifecycle == "merged" else 0)
+
+    replayed = workflow.run(task_id=job.task_id, delivery_id=job.delivery_id)
+
+    assert replayed.review_reconciliation == "terminal-unchanged"
+    assert monday.status == ("completed" if lifecycle == "merged" else "in-progress")
+    assert monday.calls.count("review") == 0
+    assert monday.calls.count("complete") == (1 if lifecycle == "merged" else 0)
+
+
+@pytest.mark.parametrize("raw_reconciliation", ["", "invalid-legacy-state"])
+def test_legacy_or_invalid_pr_open_record_does_not_authorize_review_transition(
+    tmp_path: Path,
+    raw_reconciliation: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    monday = _Monday()
+    monday.status = "in-progress"
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    payload = job.to_dict(include_private=True)
+    payload["review_reconciliation"] = raw_reconciliation
+    payload["review_expected_task_revision"] = _task_revision(root)
+    record_path = workflow.store.records / f"{job.delivery_id}.json"
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert workflow.get(job.delivery_id).review_reconciliation == ""
+
+    unchanged = workflow.run(task_id=job.task_id, delivery_id=job.delivery_id)
+
+    assert unchanged.review_reconciliation == ""
+    assert monday.status == "in-progress"
+    assert monday.calls.count("review") == 0
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+def test_pending_review_repair_refuses_changed_task_revision(tmp_path: Path) -> None:
+    root, _ = _repository(tmp_path)
+    monday = _Monday()
+    monday.status = "in-progress"
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    task_manager = TaskManager(root)
+    expected_revision = task_manager.revision(job.task_id)
+    unchanged_updated_at = task_manager.get(job.task_id).updated
+    job.review_reconciliation = "review-pending"
+    job.review_expected_task_revision = expected_revision
+    workflow.store.persist(job)
+    with mock.patch.object(task_manager_module, "datetime") as clock:
+        clock.now.return_value = unchanged_updated_at
+        task_manager.append_work_log(
+            job.task_id,
+            "A human changed the task after publication.",
+            "human:test",
+        )
+
+    assert task_manager.get(job.task_id).updated == unchanged_updated_at
+    assert task_manager.revision(job.task_id) != expected_revision
+
+    settled = workflow.run(task_id=job.task_id, delivery_id=job.delivery_id)
+
+    assert monday.status == "in-progress"
+    assert monday.calls.count("review") == 0
+    assert settled.review_reconciliation == "state-changed"
+    assert settled.review_reconciled_at
+    assert settled.review_expected_task_revision == expected_revision
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+def test_newer_open_delivery_supersedes_old_pending_review(tmp_path: Path) -> None:
+    root, _ = _repository(tmp_path)
+    monday = _Monday()
+    monday.status = "in-progress"
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+        monday=monday,
+    )
+    old = _observable_delivery(workflow, root)
+    old.review_reconciliation = "review-pending"
+    old.review_expected_task_revision = _task_revision(root)
+    workflow.store.persist(old)
+    newer = DeliveryJob.from_dict(old.to_dict(include_private=True))
+    newer.delivery_id = "delivery-observe-newer"
+    newer.created_at = "2026-10-13T00:01:00+00:00"
+    newer.updated_at = newer.created_at
+    newer.branch = "codex/task-0001-delivery-observe-newer"
+    newer.repository = "OWNER/PROJECT"
+    newer.pr_number = 13
+    newer.pr_url = "https://github.com/owner/project/pull/13"
+    assert workflow.store.reserve(newer) is None
+
+    settled = workflow.run(task_id=old.task_id, delivery_id=old.delivery_id)
+
+    assert settled.review_reconciliation == "superseded"
+    assert settled.review_reconciled_at
+    assert monday.status == "in-progress"
+    assert monday.calls.count("review") == 0
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+    assert workflow.get(newer.delivery_id).review_reconciliation == "review-pending"
+
+
+@pytest.mark.parametrize(
+    ("task_status", "expected_reconciliation"),
+    [
+        ("completed", "terminal-unchanged"),
+        ("cancelled", "terminal-unchanged"),
+        ("blocked", "state-unchanged"),
+    ],
+)
+def test_pending_review_repair_never_overrides_human_managed_task_state(
+    tmp_path: Path,
+    task_status: str,
+    expected_reconciliation: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    monday = _Monday()
+    monday.status = task_status
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    job.review_reconciliation = "review-pending"
+    workflow.store.persist(job)
+
+    settled = workflow.run(task_id=job.task_id, delivery_id=job.delivery_id)
+
+    assert monday.status == task_status
+    assert monday.calls.count("review") == 0
+    assert settled.review_reconciliation == expected_reconciliation
+    assert settled.review_reconciled_at
+    assert settled.task_reconciliation == ""
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+def test_pending_review_repair_refuses_a_retargeted_task(tmp_path: Path) -> None:
+    root, _ = _repository(tmp_path)
+    monday = _Monday()
+    monday.status = "in-progress"
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    job.review_reconciliation = "review-pending"
+    workflow.store.persist(job)
+    monday.project = "another-project"
+
+    settled = workflow.run(task_id=job.task_id, delivery_id=job.delivery_id)
+
+    assert monday.status == "in-progress"
+    assert monday.calls.count("review") == 0
+    assert settled.review_reconciliation == "target-changed"
+    assert settled.review_reconciled_at
+    assert settled.task_reconciliation == ""
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
 
 
 def test_task_becoming_terminal_after_review_stops_before_push_or_pr(
