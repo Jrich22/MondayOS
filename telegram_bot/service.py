@@ -19,9 +19,9 @@ _TASK_ID = re.compile(
     re.IGNORECASE,
 )
 _DELIVERY_ID = re.compile(r"^delivery-[A-Za-z0-9-]{1,80}$")
-_PROJECT_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _FULL_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
+_SOURCE_BINDING = re.compile(r"^[0-9a-f]{64}$")
 _PROJECT_BUILD_DELIMITER = "::"
 _FOLLOW_UP_POLL_SECONDS = 30.0
 _FOLLOW_UP_SLOW_POLL_SECONDS = 300.0
@@ -305,6 +305,71 @@ class TelegramBotService:
         self._client.send_message(chat_id, text)
         return True
 
+    def deliver_lifecycle_notice(self, notice: dict[str, Any]) -> bool:
+        """Reauthorize and send one source-bound PR lifecycle notice.
+
+        The durable outbox contains only the bounded semantic observation. Its
+        source binding is checked again by state when the worker acknowledges
+        delivery, so a crash after this send is safely at-least-once.
+        """
+        update_id = notice.get("update_id")
+        user_id = notice.get("user_id")
+        chat_id = notice.get("chat_id")
+        chat_type = str(notice.get("chat_type") or "")
+        task_id = str(notice.get("task_id") or "").upper()
+        delivery_id = str(notice.get("delivery_id") or "")
+        project_name = str(notice.get("project_name") or "")
+        raw_pr_url = str(notice.get("pr_url") or "")
+        pr_url = _github_pr_url(raw_pr_url)
+        pr_state = str(notice.get("pr_state") or "")
+        checks_status = str(notice.get("checks_status") or "")
+        merge_commit_sha = str(notice.get("merge_commit_sha") or "")
+        notice_key = str(notice.get("notice_key") or "")
+        source_binding = str(notice.get("source_binding") or "")
+        if (
+            isinstance(update_id, bool)
+            or not isinstance(update_id, int)
+            or update_id < 0
+            or isinstance(user_id, bool)
+            or not isinstance(user_id, int)
+            or user_id <= 0
+            or isinstance(chat_id, bool)
+            or not isinstance(chat_id, int)
+            or chat_id != user_id
+            or chat_type != "private"
+            or not _TASK_ID.fullmatch(task_id)
+            or not _DELIVERY_ID.fullmatch(delivery_id)
+            or not _valid_project_selector(project_name)
+            or not pr_url
+            or raw_pr_url != pr_url
+            or pr_state not in {"open", *_TERMINAL_PR_STATES}
+            or checks_status not in {
+                "pending", "passed", "failed", "no-checks", "timed-out", "unknown",
+            }
+            or (pr_state == "open" and checks_status == "unknown")
+            or notice_key != _lifecycle_notice_key(pr_state, checks_status)
+            or not _SOURCE_BINDING.fullmatch(source_binding)
+            or (
+                pr_state == "merged"
+                and not _FULL_COMMIT_SHA.fullmatch(merge_commit_sha)
+            )
+            or (pr_state != "merged" and bool(merge_commit_sha))
+        ):
+            raise ValueError("Invalid Telegram lifecycle notice")
+        if user_id not in self._config.allowed_user_ids:
+            return False
+
+        observation = {
+            "pr_state": pr_state,
+            "checks_status": checks_status,
+            "merge_commit_sha": merge_commit_sha.lower(),
+        }
+        text = _lifecycle_notice(task_id, pr_url, observation)
+        if not text:
+            raise ValueError("Invalid Telegram lifecycle notice")
+        self._client.send_message(chat_id, text)
+        return True
+
     def handle_intake_control(self, update: dict[str, Any]) -> bool:
         """Handle private state-only controls while model/build work is busy."""
         message = update.get("message")
@@ -495,11 +560,13 @@ class TelegramBotService:
             self._client.send_message(context[0], text)
 
     def poll_follow_up(self, update_id: int, claimed: dict[str, Any]) -> None:
-        """Observe one exact PR lifecycle without exposing check output.
+        """Observe and checkpoint one exact PR lifecycle without Telegram I/O.
 
         The public build API owns GitHub identity verification and task
         reconciliation. Telegram consumes only its small structured outcome;
         it never requests or retains check logs, annotations, or descriptions.
+        State checkpoints the observation and coalesced notice in one write so
+        notification availability cannot delay GitHub reconciliation.
         """
         delivery_id = str(claimed.get("delivery_id") or "")
         task_id = str(claimed.get("task_id") or "")
@@ -509,14 +576,11 @@ class TelegramBotService:
         if (
             not _DELIVERY_ID.fullmatch(delivery_id)
             or not _TASK_ID.fullmatch(task_id)
+            or not _valid_project_selector(project_name)
             or not pr_url
+            or chat_id <= 0
         ):
             raise RuntimeError("Saved Telegram lifecycle follow-up is invalid")
-        if chat_id <= 0 or chat_id not in self._config.allowed_user_ids:
-            raise TelegramAPIError(
-                "Saved Telegram destination is no longer allowed",
-                retryable=False,
-            )
 
         kwargs: dict[str, Any] = {"delivery_id": delivery_id}
         if project_name:
@@ -539,28 +603,16 @@ class TelegramBotService:
 
         pr_state = observation["pr_state"]
         checks_status = observation["checks_status"]
-        notice_key = _lifecycle_notice_key(pr_state, checks_status)
-        prior_notice = str(claimed.get("last_notified_key") or "")
-        text = _lifecycle_notice(task_id, pr_url, observation)
-        if text and notice_key != prior_notice:
-            self._client.send_message(chat_id, text)
-            prior_notice = notice_key
-
         terminal = pr_state in _TERMINAL_PR_STATES
-        self._state.update_follow_up(
+        self._state.settle_follow_up_observation(
             update_id,
-            phase="completed" if terminal else "pending",
-            failure_count=0,
+            claimed=claimed,
+            observation=observation,
             next_poll_at=(
                 0.0
                 if terminal
                 else time.time() + _follow_up_poll_interval(checks_status)
             ),
-            pr_state=pr_state,
-            checks_status=checks_status,
-            merge_commit_sha=observation["merge_commit_sha"],
-            last_observation_key=notice_key,
-            last_notified_key=prior_notice,
         )
 
     def retry_delivery(self, update_id: int, claimed: dict[str, Any]) -> None:
@@ -581,7 +633,7 @@ class TelegramBotService:
             not _DELIVERY_ID.fullmatch(delivery_id)
             or not _DELIVERY_ID.fullmatch(root_delivery_id)
             or not _TASK_ID.fullmatch(task_id)
-            or bool(project_name and not _PROJECT_ID.fullmatch(project_name))
+            or not _valid_project_selector(project_name)
             or not 2 <= attempt <= maximum <= _MAX_DELIVERY_RUNS
             or not isinstance(attempt_started, bool)
             or not isinstance(post_expiry_reconciliation_started, bool)
@@ -589,7 +641,7 @@ class TelegramBotService:
             or delivery_id != _retry_delivery_id(root_delivery_id, attempt)
         ):
             raise RuntimeError("Saved Telegram delivery retry is invalid")
-        if chat_id <= 0 or chat_id not in self._config.allowed_user_ids:
+        if chat_id <= 0:
             raise TelegramAPIError(
                 "Saved Telegram destination is no longer allowed",
                 retryable=False,
@@ -598,13 +650,18 @@ class TelegramBotService:
         staged = claimed.get("outcome")
         if isinstance(staged, dict):
             outcome_phase = str(claimed.get("outcome_phase") or "")
-            completed = self._state.completed_job(update_id)
-            follow_up = completed.get("follow_up")
-            follow_up_phase = (
-                str(follow_up.get("phase") or "")
-                if isinstance(follow_up, dict)
-                else ""
+            follow_up_phase = self._ensure_lifecycle_follow_up(
+                update_id,
+                chat_id,
+                task_id,
+                staged,
+                project_name,
             )
+            if chat_id not in self._config.allowed_user_ids:
+                raise TelegramAPIError(
+                    "Saved Telegram destination is no longer allowed",
+                    retryable=False,
+                )
             self._client.send_message(
                 chat_id,
                 _delivery_retry_outcome_notice(
@@ -617,6 +674,12 @@ class TelegramBotService:
             )
             self._state.finish_delivery_retry(update_id)
             return
+
+        if chat_id not in self._config.allowed_user_ids:
+            raise TelegramAPIError(
+                "Saved Telegram destination is no longer allowed",
+                retryable=False,
+            )
 
         now = time.time()
         if expires_at <= now and not attempt_started:
@@ -721,13 +784,6 @@ class TelegramBotService:
                 if rescheduled.get("phase") != "deadline-exceeded":
                     return
 
-        follow_up_phase = self._ensure_lifecycle_follow_up(
-            update_id,
-            chat_id,
-            task_id,
-            result,
-            project_name,
-        )
         outcome_phase = (
             "completed"
             if bool(result.get("success"))
@@ -741,6 +797,13 @@ class TelegramBotService:
             update_id,
             phase=outcome_phase,
             result=result,
+        )
+        follow_up_phase = self._ensure_lifecycle_follow_up(
+            update_id,
+            chat_id,
+            task_id,
+            result,
+            project_name,
         )
         self._client.send_message(
             chat_id,
@@ -1154,10 +1217,6 @@ class TelegramBotService:
         pr_url = _github_pr_url(result.get("pr_url", ""))
         if not bool(result.get("success")) or not _DELIVERY_ID.fullmatch(delivery_id) or not pr_url:
             return ""
-        durable = self._state.job(update_id) or self._state.completed_job(update_id)
-        current = durable.get("follow_up")
-        if isinstance(current, dict):
-            return str(current.get("phase") or "")
         follow_up = self._state.start_follow_up(
             update_id,
             {
@@ -1516,6 +1575,15 @@ def _project_build_request(argument: str) -> tuple[str, str]:
     return project_name.strip(), objective.strip()
 
 
+def _valid_project_selector(value: str) -> bool:
+    """Accept the bounded project names supported by Telegram build syntax."""
+    return (
+        isinstance(value, str)
+        and len(value) <= 160
+        and all(character.isprintable() for character in value)
+    )
+
+
 def _external_project(task_data: Any) -> str:
     """Return a task's external target; MondayOS itself needs no selector."""
     if not isinstance(task_data, dict):
@@ -1819,8 +1887,26 @@ def _delivery_result(
                 "Monday did not start automatic PR monitoring because the "
                 "500-watcher limit is full. The pull request is unaffected."
             )
+        elif follow_up_phase in {"pending", "polling", "retrying"}:
+            # Delivery notices can be delayed while the independently durable
+            # watcher advances. Describe the saved fact in the past tense so a
+            # later merge/close notice cannot be contradicted by this message.
+            lines.append(
+                "Monday started automatic monitoring for GitHub checks and "
+                "pull-request changes."
+            )
+        elif follow_up_phase == "completed":
+            lines.append("Monday has already finished monitoring this pull request.")
+        elif follow_up_phase == "expired":
+            lines.append("Monday's 30-day automatic PR monitoring window has ended.")
+        elif follow_up_phase == "notification-failed":
+            lines.append(
+                "Automatic PR monitoring is no longer active for this pull request."
+            )
         else:
-            lines.append("Monday will keep watching GitHub checks and the pull request.")
+            lines.append(
+                "Monday did not start automatic PR monitoring for this pull request."
+            )
     else:
         lines = [f"{task_id} live build: {status}."]
         if pr_url:
@@ -1977,7 +2063,7 @@ def _lifecycle_snapshot(
         value("checks_status", "check_status", "ci_status")
     )
     if not pr_state or checks_status not in {
-        "pending", "passed", "failed", "no-checks",
+        "pending", "passed", "failed", "no-checks", "timed-out", "unknown",
     }:
         return {}
     merge_commit = str(value("merge_commit_sha") or "")

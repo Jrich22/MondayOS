@@ -31,6 +31,8 @@ _MAX_QUEUE_FULL_NOTICE_RETRY_SECONDS = 86_400.0
 _MAX_ACTIVE_QUEUE_FULL_NOTICES = 500
 _MAX_DELIVERY_NOTICE_RETRY_SECONDS = 86_400.0
 _MAX_ACTIVE_DELIVERY_NOTICES = 500
+_MAX_LIFECYCLE_NOTICE_RETRY_SECONDS = 86_400.0
+_MAX_ACTIVE_LIFECYCLE_NOTICES = 500
 _RUNTIME_HEARTBEAT_VERSION = 2
 _MAX_RUNTIME_HEARTBEAT_BYTES = 16_384
 _MAX_RUNTIME_BACKOFF_SECONDS = 86_400.0
@@ -67,7 +69,6 @@ _RUNTIME_ACTIVE_LEASES: dict[str, dict[str, float]] = {
 _RUNTIME_BACKOFF_OPERATIONS = frozenset({"rate-limit", "retry"})
 _DELIVERY_ID = re.compile(r"^delivery-[A-Za-z0-9-]{1,80}$")
 _TASK_ID = re.compile(r"^TASK-\d{1,64}(?:-[a-z0-9]{1,12})?$", re.IGNORECASE)
-_PROJECT_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _FAILURE_CODE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _GITHUB_PR_URL = re.compile(r"^https://github\.com/[^\s/]+/[^\s/]+/pull/\d+$")
@@ -106,6 +107,19 @@ _DELIVERY_NOTICE_FOLLOW_UP_PHASES = frozenset({
 })
 _DELIVERY_NOTICE_UNAVAILABLE_PHASES = frozenset({
     "", "not-started-capacity", "not-started-deadline",
+})
+_LIFECYCLE_NOTICE_PHASES = frozenset({"pending", "retrying"})
+_LIFECYCLE_NOTICE_PR_STATES = frozenset({
+    "open", "merged", "closed", "diverged",
+})
+_LIFECYCLE_NOTICE_CHECK_STATUSES = frozenset({
+    "pending", "passed", "failed", "no-checks", "timed-out", "unknown",
+})
+_LIFECYCLE_NOTICE_FIELDS = frozenset({
+    "kind", "phase", "delivery_id", "task_id", "project_name", "pr_url",
+    *_ORIGIN_FIELDS,
+    "pr_state", "checks_status", "merge_commit_sha", "notice_key",
+    "source_binding", "failure_count", "deferred_at", "next_attempt_at",
 })
 _TERMINAL_DELIVERY_STATUSES = frozenset({
     "blocked", "cancelled", "completed", "failed", "interrupted", "pr-open",
@@ -173,6 +187,8 @@ class TelegramState:
                     "acceptance_receipts": {},
                     "delivery_notices": {},
                     "delivery_notice_pause_until": 0.0,
+                    "lifecycle_notices": {},
+                    "lifecycle_notice_pause_until": 0.0,
                 })
 
             needs_write = (
@@ -180,10 +196,10 @@ class TelegramState:
                 or legacy_with_state
                 or current_id != normalized_id
                 or self._data.get("bot_username") != normalized_username
-                or self._data.get("version") != 8
+                or self._data.get("version") != 9
             )
             self._data.update({
-                "version": 8,
+                "version": 9,
                 "bot_id": normalized_id,
                 "bot_username": normalized_username,
             })
@@ -576,6 +592,7 @@ class TelegramState:
                 protected={
                     *self._data.setdefault("delivery_retries", {}),
                     *self._data.setdefault("delivery_notices", {}),
+                    *self._data.setdefault("lifecycle_notices", {}),
                     key,
                 },
             )
@@ -880,6 +897,7 @@ class TelegramState:
                     protected={
                         *self._data.setdefault("delivery_retries", {}),
                         *self._data.setdefault("delivery_notices", {}),
+                        *self._data.setdefault("lifecycle_notices", {}),
                     },
                 )
                 self._write()
@@ -1196,6 +1214,217 @@ class TelegramState:
                 protected={
                     *self._data.setdefault("delivery_retries", {}),
                     *notices,
+                    *self._data.setdefault("lifecycle_notices", {}),
+                },
+            )
+            self._write()
+
+    @property
+    def pending_lifecycle_notice_count(self) -> int:
+        """Return PR lifecycle notices whose send is unresolved."""
+        with self._lock:
+            return sum(
+                1
+                for value in self._data.setdefault(
+                    "lifecycle_notices", {}
+                ).values()
+                if _lifecycle_notice_pending(value)
+            )
+
+    def due_lifecycle_notice_ids(
+        self,
+        *,
+        now: float | None = None,
+    ) -> list[int]:
+        """Return source-bound lifecycle notices whose retry is due."""
+        current = time.time() if now is None else _finite_nonnegative(now, time.time())
+        with self._lock:
+            pause_until = _finite_nonnegative(
+                self._data.get("lifecycle_notice_pause_until"),
+                0.0,
+            )
+            if current < pause_until:
+                return []
+            due: list[int] = []
+            notices = self._data.setdefault("lifecycle_notices", {})
+            completed = self._data.setdefault("completed_jobs", {})
+            retries = self._data.setdefault("delivery_retries", {})
+            for key, value in notices.items():
+                update_id = _lifecycle_notice_update_id(key)
+                notice = _normalized_lifecycle_notice(value)
+                _require_lifecycle_notice_binding(
+                    notice,
+                    completed.get(key),
+                    update_id,
+                    retry=retries.get(key),
+                )
+                if notice["next_attempt_at"] <= current:
+                    due.append(update_id)
+            return sorted(due)
+
+    def lifecycle_notice(self, update_id: int) -> dict[str, object]:
+        """Return one bounded lifecycle notice without request or diagnostics."""
+        normalized_id = _update_id(update_id)
+        key = str(normalized_id)
+        with self._lock:
+            value = self._data.setdefault("lifecycle_notices", {}).get(key)
+            source = self._data.setdefault("completed_jobs", {}).get(key)
+            if not isinstance(value, dict) or not isinstance(source, dict):
+                return {}
+            notice = _normalized_lifecycle_notice(value)
+            _require_lifecycle_notice_binding(
+                notice,
+                source,
+                normalized_id,
+                retry=self._data.setdefault("delivery_retries", {}).get(key),
+            )
+            return {
+                "update_id": normalized_id,
+                "user_id": notice["origin_user_id"],
+                "chat_id": notice["origin_chat_id"],
+                "chat_type": notice["origin_chat_type"],
+                "task_id": notice["task_id"],
+                "delivery_id": notice["delivery_id"],
+                "project_name": notice["project_name"],
+                "pr_url": notice["pr_url"],
+                "pr_state": notice["pr_state"],
+                "checks_status": notice["checks_status"],
+                "merge_commit_sha": notice["merge_commit_sha"],
+                "notice_key": notice["notice_key"],
+                "source_binding": notice["source_binding"],
+            }
+
+    def defer_lifecycle_notice(
+        self,
+        update_id: int,
+        *,
+        source_binding: str,
+        delay_seconds: float,
+        now: float | None = None,
+    ) -> None:
+        """Persist bounded lifecycle-notice backoff without diagnostics."""
+        normalized_id = _update_id(update_id)
+        with self._lock:
+            value = self._data.setdefault("lifecycle_notices", {}).get(
+                str(normalized_id)
+            )
+            notice = _normalized_lifecycle_notice(value)
+            if notice["source_binding"] != source_binding:
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} lifecycle notice changed"
+                )
+        self.defer_lifecycle_notices(
+            [normalized_id],
+            delay_seconds=delay_seconds,
+            now=now,
+            pause_all=False,
+        )
+
+    def defer_lifecycle_notices(
+        self,
+        update_ids: list[int],
+        *,
+        delay_seconds: float,
+        now: float | None = None,
+        pause_all: bool = True,
+    ) -> None:
+        """Atomically defer a cohort of lifecycle notices after send failure."""
+        if not isinstance(pause_all, bool):
+            raise TelegramStateError("Invalid Telegram lifecycle notice pause")
+        normalized_ids = sorted({_update_id(value) for value in update_ids})
+        current = time.time() if now is None else _finite_nonnegative(now, time.time())
+        delay = _bounded_delay(
+            delay_seconds,
+            _MAX_LIFECYCLE_NOTICE_RETRY_SECONDS,
+        )
+        with self._lock:
+            pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            notices = self._data.setdefault("lifecycle_notices", {})
+            completed = self._data.setdefault("completed_jobs", {})
+            retries = self._data.setdefault("delivery_retries", {})
+            for normalized_id in normalized_ids:
+                key = str(normalized_id)
+                value = notices.get(key)
+                source = completed.get(key)
+                if not isinstance(value, dict) or not isinstance(source, dict):
+                    continue
+                notice = _normalized_lifecycle_notice(value)
+                _require_lifecycle_notice_binding(
+                    notice,
+                    source,
+                    normalized_id,
+                    retry=retries.get(key),
+                )
+                pending.append((value, notice))
+            for value, notice in pending:
+                value.update({
+                    "phase": "retrying",
+                    "failure_count": int(notice["failure_count"]) + 1,
+                    "deferred_at": current,
+                    "next_attempt_at": current + delay,
+                })
+            if pause_all:
+                prior_pause = _finite_nonnegative(
+                    self._data.get("lifecycle_notice_pause_until"),
+                    0.0,
+                )
+                self._data["lifecycle_notice_pause_until"] = min(
+                    max(prior_pause, current + delay),
+                    current + _MAX_LIFECYCLE_NOTICE_RETRY_SECONDS,
+                )
+            if pending or pause_all:
+                self._write()
+
+    def complete_lifecycle_notice(
+        self,
+        update_id: int,
+        *,
+        source_binding: str,
+        delivered: bool,
+    ) -> None:
+        """Finish one lifecycle notice while preserving watcher progress."""
+        normalized_id = _update_id(update_id)
+        key = str(normalized_id)
+        with self._lock:
+            notices = self._data.setdefault("lifecycle_notices", {})
+            value = notices.get(key)
+            source = self._data.setdefault("completed_jobs", {}).get(key)
+            if not isinstance(value, dict):
+                return
+            notice = _normalized_lifecycle_notice(value)
+            if notice["source_binding"] != source_binding:
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} lifecycle notice changed"
+                )
+            _require_lifecycle_notice_binding(
+                notice,
+                source,
+                normalized_id,
+                retry=self._data.setdefault("delivery_retries", {}).get(key),
+            )
+            if not isinstance(source, dict):  # guarded by binding validation
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} lost its lifecycle source"
+                )
+            follow_up = source.get("follow_up")
+            if not isinstance(follow_up, dict):  # guarded by binding validation
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} lost its lifecycle follow-up"
+                )
+            notices.pop(key)
+            if delivered:
+                follow_up["last_notified_key"] = notice["notice_key"]
+            follow_up["last_resolved_notice_key"] = notice["notice_key"]
+            follow_up["last_notice_status"] = (
+                "sent" if delivered else "notification-failed"
+            )
+            _bound_completed(
+                self._data.setdefault("completed_jobs", {}),
+                _MAX_COMPLETED_JOBS,
+                protected={
+                    *self._data.setdefault("delivery_retries", {}),
+                    *self._data.setdefault("delivery_notices", {}),
+                    *notices,
                 },
             )
             self._write()
@@ -1207,10 +1436,36 @@ class TelegramState:
             return copy.deepcopy(value) if isinstance(value, dict) else {}
 
     def set_job(self, update_id: int, **fields: Any) -> None:
+        normalized_id = _update_id(update_id)
+        key = str(normalized_id)
         with self._lock:
             jobs = self._data.setdefault("jobs", {})
-            record = jobs.setdefault(str(update_id), {})
-            record.update(copy.deepcopy(fields))
+            current = jobs.get(key)
+            if current is not None and not isinstance(current, dict):
+                raise TelegramStateError(
+                    f"Invalid Telegram job state for update {normalized_id}"
+                )
+            candidate = copy.deepcopy(current) if isinstance(current, dict) else {}
+            candidate.update(copy.deepcopy(fields))
+            follow_up = candidate.get("follow_up")
+            retry = self._data.setdefault("delivery_retries", {}).get(key)
+            if _follow_up_active(follow_up):
+                _require_lifecycle_follow_up_binding(
+                    follow_up,
+                    candidate,
+                    normalized_id,
+                    retry=retry,
+                )
+            notice_value = self._data.setdefault("lifecycle_notices", {}).get(key)
+            if notice_value is not None:
+                notice = _normalized_lifecycle_notice(notice_value)
+                _require_lifecycle_notice_binding(
+                    notice,
+                    candidate,
+                    normalized_id,
+                    retry=retry,
+                )
+            jobs[key] = candidate
             self._write()
 
     def record_failure(self, update_id: int) -> int:
@@ -1614,13 +1869,40 @@ class TelegramState:
             existing_phase = str(retry.get("outcome_phase") or "")
             if existing is not None and (existing != outcome or existing_phase != phase):
                 raise TelegramStateError("Telegram delivery retry outcome changed")
-            retry.update({
+            candidate_retry = copy.deepcopy(retry)
+            candidate_retry.update({
                 "outcome_phase": phase,
                 "outcome": outcome,
                 "phase": "running",
                 "failure_count": 0,
                 "next_attempt_at": time.time(),
             })
+            _staged_delivery_outcome(candidate_retry)
+            key = str(normalized_id)
+            completed = self._data.setdefault("completed_jobs", {})
+            source = completed.get(key)
+            if not isinstance(source, dict) or "request" in source:
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has no safe completed tombstone"
+                )
+            candidate_source = copy.deepcopy(source)
+            _ensure_authorized_lifecycle_follow_up(
+                candidate_source,
+                normalized_id,
+                retry=candidate_retry,
+                now=time.time(),
+                active_count=_active_follow_up_count(self._data, exclude=key),
+            )
+            notice_value = self._data.setdefault("lifecycle_notices", {}).get(key)
+            if notice_value is not None:
+                _require_lifecycle_notice_binding(
+                    _normalized_lifecycle_notice(notice_value),
+                    candidate_source,
+                    normalized_id,
+                    retry=candidate_retry,
+                )
+            self._data.setdefault("delivery_retries", {})[key] = candidate_retry
+            completed[key] = candidate_source
             self._write()
             return copy.deepcopy(outcome)
 
@@ -1649,14 +1931,6 @@ class TelegramState:
             retry = self._delivery_retry_record(normalized_id)
             if isinstance(retry.get("outcome"), dict):
                 outcome, outcome_phase = _staged_delivery_outcome(retry)
-                completed = self._data.setdefault("completed_jobs", {})
-                record = completed.get(key)
-                follow_up = record.get("follow_up") if isinstance(record, dict) else None
-                if _follow_up_active(follow_up):
-                    follow_up.update({
-                        "phase": "notification-failed",
-                        "next_poll_at": 0.0,
-                    })
                 return self._complete_delivery_retry(
                     normalized_id,
                     retry,
@@ -1712,6 +1986,41 @@ class TelegramState:
             raise TelegramStateError(
                 f"Telegram update {update_id} has no safe completed tombstone"
             )
+        candidate_retry = copy.deepcopy(retry)
+        staged_outcome, staged_phase = _staged_delivery_outcome(candidate_retry)
+        if staged_outcome != outcome or staged_phase != outcome_phase:
+            raise TelegramStateError(
+                f"Telegram update {update_id} delivery retry outcome changed"
+            )
+        candidate_source = copy.deepcopy(record)
+        _ensure_authorized_lifecycle_follow_up(
+            candidate_source,
+            update_id,
+            retry=candidate_retry,
+            now=time.time(),
+            active_count=_active_follow_up_count(self._data, exclude=key),
+        )
+        follow_up = candidate_source.get("follow_up")
+        if _follow_up_active(follow_up):
+            _require_lifecycle_follow_up_binding(
+                follow_up,
+                candidate_source,
+                update_id,
+                retry=candidate_retry,
+            )
+        notice_value = self._data.setdefault("lifecycle_notices", {}).get(key)
+        notice = (
+            _normalized_lifecycle_notice(notice_value)
+            if notice_value is not None
+            else None
+        )
+        if notice is not None:
+            _require_lifecycle_notice_binding(
+                notice,
+                candidate_source,
+                update_id,
+                retry=candidate_retry,
+            )
         summary = {
             "phase": summary_phase,
             "outcome_phase": outcome_phase,
@@ -1721,7 +2030,7 @@ class TelegramState:
             "max_attempts": retry.get("max_attempts", 0),
             "failure_code": outcome.get("failure_code", ""),
         }
-        record.update({
+        candidate_source.update({
             "delivery_id": outcome["delivery_id"],
             "delivery_terminal": True,
             "delivery_final_sent": notification_sent,
@@ -1730,6 +2039,25 @@ class TelegramState:
             "delivery_result": outcome,
             "delivery_retry": summary,
         })
+        promoted_follow_up = candidate_source.get("follow_up")
+        if _follow_up_active(promoted_follow_up) or (
+            isinstance(promoted_follow_up, dict)
+            and bool(promoted_follow_up.get("source_binding"))
+        ):
+            _require_lifecycle_follow_up_binding(
+                promoted_follow_up,
+                candidate_source,
+                update_id,
+                retry=None,
+            )
+        if notice is not None:
+            _require_lifecycle_notice_binding(
+                notice,
+                candidate_source,
+                update_id,
+                retry=None,
+            )
+        completed[key] = candidate_source
         self._data.setdefault("delivery_retries", {}).pop(key, None)
         _bound_completed(
             completed,
@@ -1737,6 +2065,7 @@ class TelegramState:
             protected={
                 *self._data.setdefault("delivery_retries", {}),
                 *self._data.setdefault("delivery_notices", {}),
+                *self._data.setdefault("lifecycle_notices", {}),
             },
         )
         self._write()
@@ -1785,13 +2114,21 @@ class TelegramState:
             for key, record in completed.items():
                 if not isinstance(record, dict):
                     continue
-                if _delivery_retry_active(
-                    self._data.setdefault("delivery_retries", {}).get(key)
+                retry = self._data.setdefault("delivery_retries", {}).get(key)
+                if (
+                    _delivery_retry_active(retry)
+                    and not isinstance(retry.get("outcome"), dict)
                 ):
                     continue
                 follow_up = record.get("follow_up")
                 if not _follow_up_active(follow_up):
                     continue
+                _require_lifecycle_follow_up_binding(
+                    follow_up,
+                    record,
+                    _lifecycle_notice_update_id(key),
+                    retry=retry,
+                )
                 due = _finite_nonnegative(follow_up.get("next_poll_at"), 0.0)
                 if due <= current:
                     candidates.append((due, int(key)))
@@ -1823,12 +2160,15 @@ class TelegramState:
         ):
             raise TelegramStateError("Invalid Telegram lifecycle follow-up")
         with self._lock:
+            expired = self._expire_follow_ups(current)
             key = str(normalized_id)
             record = self._data.setdefault("jobs", {}).get(key)
             from_completed = not isinstance(record, dict)
             if not isinstance(record, dict):
                 record = self._data.setdefault("completed_jobs", {}).get(key)
             if not isinstance(record, dict):
+                if expired:
+                    self._write()
                 raise TelegramStateError(
                     f"Telegram update {normalized_id} has no durable record"
                 )
@@ -1838,20 +2178,44 @@ class TelegramState:
                 )
             existing = record.get("follow_up")
             if isinstance(existing, dict):
-                return copy.deepcopy(existing)
-            self._expire_follow_ups(current)
-            active = sum(
-                1
-                for bucket in ("jobs", "completed_jobs")
-                for value in self._data.setdefault(bucket, {}).values()
-                if isinstance(value, dict)
-                and _follow_up_active(value.get("follow_up"))
-            )
+                if existing.get("phase") not in {"migration-invalid"}:
+                    if _follow_up_active(existing) or existing.get("source_binding"):
+                        retry = self._data.setdefault("delivery_retries", {}).get(key)
+                        _require_lifecycle_follow_up_binding(
+                            existing,
+                            record,
+                            normalized_id,
+                            retry=retry,
+                        )
+                        _require_same_lifecycle_route(
+                            existing,
+                            candidate,
+                            normalized_id,
+                        )
+                    if expired:
+                        self._write()
+                    return copy.deepcopy(existing)
             candidate.update({
                 "created_at": current,
                 "expires_at": current + _FOLLOW_UP_MAX_AGE_SECONDS,
             })
-            if active >= _MAX_ACTIVE_FOLLOW_UPS:
+            retry = self._data.setdefault("delivery_retries", {}).get(key)
+            source_payload = _lifecycle_source_payload(
+                record,
+                normalized_id,
+                retry=retry,
+            )
+            candidate["source_binding"] = _lifecycle_source_binding(
+                normalized_id,
+                source_payload,
+            )
+            _require_lifecycle_follow_up_binding(
+                candidate,
+                record,
+                normalized_id,
+                retry=retry,
+            )
+            if _active_follow_up_count(self._data, exclude=key) >= _MAX_ACTIVE_FOLLOW_UPS:
                 candidate.update({
                     "phase": "not-started-capacity",
                     "next_poll_at": 0.0,
@@ -1878,16 +2242,164 @@ class TelegramState:
                 )
             immutable = {
                 "kind", "delivery_id", "task_id", "project_name", "chat_id", "pr_url",
-                "created_at", "expires_at",
+                "created_at", "expires_at", "source_binding",
             }
             for name in immutable.intersection(fields):
-                if fields[name] != follow_up.get(name):
+                if (
+                    type(fields[name]) is not type(follow_up.get(name))
+                    or fields[name] != follow_up.get(name)
+                ):
                     raise TelegramStateError(
                         f"Telegram update {normalized_id} follow-up cannot change {name}"
                     )
-            follow_up.update(copy.deepcopy(fields))
+            candidate = copy.deepcopy(follow_up)
+            candidate.update(copy.deepcopy(fields))
+            candidate_source = copy.deepcopy(record)
+            candidate_source["follow_up"] = candidate
+            key = str(normalized_id)
+            retry = self._data.setdefault("delivery_retries", {}).get(key)
+            if _follow_up_active(candidate):
+                _require_lifecycle_follow_up_binding(
+                    candidate,
+                    candidate_source,
+                    normalized_id,
+                    retry=retry,
+                )
+            notice_value = self._data.setdefault("lifecycle_notices", {}).get(key)
+            if notice_value is not None:
+                _require_lifecycle_notice_binding(
+                    _normalized_lifecycle_notice(notice_value),
+                    candidate_source,
+                    normalized_id,
+                    retry=retry,
+                )
+            record["follow_up"] = candidate
             self._write()
-            return copy.deepcopy(follow_up)
+            return copy.deepcopy(candidate)
+
+    def settle_follow_up_observation(
+        self,
+        update_id: int,
+        *,
+        claimed: dict[str, Any],
+        observation: dict[str, Any],
+        next_poll_at: float,
+    ) -> dict[str, Any]:
+        """Atomically checkpoint one PR observation and coalesce its notice.
+
+        The GitHub watcher clock and Telegram delivery clock are deliberately
+        independent. A semantic transition replaces an older unsent notice;
+        an unchanged observation preserves any existing notice backoff.
+        """
+        normalized_id = _update_id(update_id)
+        normalized_observation = _normalized_lifecycle_observation(observation)
+        terminal = normalized_observation["pr_state"] != "open"
+        normalized_next_poll = _strict_timestamp(
+            next_poll_at,
+            allow_zero=terminal,
+        )
+        if terminal and normalized_next_poll != 0:
+            raise TelegramStateError(
+                "Terminal Telegram lifecycle observations cannot be repolled"
+            )
+        if not terminal and normalized_next_poll <= 0:
+            raise TelegramStateError(
+                "Open Telegram lifecycle observations need a future poll"
+            )
+        key = str(normalized_id)
+        with self._lock:
+            completed = self._data.setdefault("completed_jobs", {})
+            source = completed.get(key)
+            if not isinstance(source, dict) or "request" in source:
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has no safe lifecycle source"
+                )
+            current = source.get("follow_up")
+            retry = self._data.setdefault("delivery_retries", {}).get(key)
+            if _follow_up_active(current):
+                _require_lifecycle_follow_up_binding(
+                    current,
+                    source,
+                    normalized_id,
+                    retry=retry,
+                )
+            _require_claimed_follow_up(current, claimed, normalized_id)
+            if not isinstance(current, dict):  # guarded above
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} lost its lifecycle follow-up"
+                )
+
+            notices = self._data.setdefault("lifecycle_notices", {})
+            existing_value = notices.get(key)
+            existing: dict[str, Any] | None = None
+            if existing_value is not None:
+                existing = _normalized_lifecycle_notice(existing_value)
+                _require_lifecycle_notice_binding(
+                    existing,
+                    source,
+                    normalized_id,
+                    retry=retry,
+                )
+
+            notice_key = _lifecycle_semantic_key(normalized_observation)
+            prior_observation_key = str(current.get("last_observation_key") or "")
+            candidate = copy.deepcopy(current)
+            candidate.update({
+                "phase": "completed" if terminal else "pending",
+                "failure_count": 0,
+                "next_poll_at": normalized_next_poll,
+                "pr_state": normalized_observation["pr_state"],
+                "checks_status": normalized_observation["checks_status"],
+                "merge_commit_sha": normalized_observation["merge_commit_sha"],
+                "last_observation_key": notice_key,
+            })
+            candidate.pop("error", None)
+
+            replacement: dict[str, Any] | None = None
+            semantic_transition = notice_key != prior_observation_key
+            should_notify = terminal or (
+                normalized_observation["checks_status"] != "unknown"
+            )
+            if semantic_transition and should_notify:
+                candidate_notice = _new_lifecycle_notice(
+                    normalized_id,
+                    candidate,
+                    normalized_observation,
+                    source=source,
+                    retry=retry,
+                )
+                if existing is not None:
+                    # A newer semantic state supersedes the payload, not
+                    # Telegram's persisted retry window. In particular, a
+                    # terminal GitHub transition must never bypass a 429.
+                    candidate_notice.update({
+                        "phase": existing["phase"],
+                        "failure_count": existing["failure_count"],
+                        "deferred_at": existing["deferred_at"],
+                        "next_attempt_at": existing["next_attempt_at"],
+                    })
+                active = sum(
+                    1
+                    for notice_id, value in notices.items()
+                    if notice_id != key and _lifecycle_notice_pending(value)
+                )
+                if existing is not None or active < _MAX_ACTIVE_LIFECYCLE_NOTICES:
+                    replacement = candidate_notice
+                else:
+                    candidate["last_resolved_notice_key"] = notice_key
+                    candidate["last_notice_status"] = "not-started-capacity"
+            elif semantic_transition:
+                candidate["last_resolved_notice_key"] = notice_key
+                candidate["last_notice_status"] = "suppressed"
+
+            source["follow_up"] = candidate
+            if semantic_transition:
+                if replacement is None:
+                    notices.pop(key, None)
+                else:
+                    notices[key] = replacement
+            self._write()
+            return copy.deepcopy(candidate)
 
     def defer_follow_up(
         self,
@@ -1923,7 +2435,8 @@ class TelegramState:
         """Stop a watcher after Telegram permanently rejects its destination."""
         normalized_id = _update_id(update_id)
         with self._lock:
-            record = self._data.setdefault("completed_jobs", {}).get(str(normalized_id))
+            key = str(normalized_id)
+            record = self._data.setdefault("completed_jobs", {}).get(key)
             follow_up = record.get("follow_up") if isinstance(record, dict) else None
             if not isinstance(follow_up, dict):
                 raise TelegramStateError(
@@ -1931,17 +2444,39 @@ class TelegramState:
                 )
             if not _follow_up_active(follow_up):
                 return copy.deepcopy(follow_up)
+            retry = self._data.setdefault("delivery_retries", {}).get(key)
+            _require_lifecycle_follow_up_binding(
+                follow_up,
+                record,
+                normalized_id,
+                retry=retry,
+            )
             failures = max(0, int(follow_up.get("failure_count", 0))) + 1
-            follow_up.update({
+            candidate = copy.deepcopy(follow_up)
+            candidate.update({
                 "phase": "notification-failed",
                 "failure_count": failures,
                 "next_poll_at": 0.0,
             })
+            notices = self._data.setdefault("lifecycle_notices", {})
+            notice_value = notices.get(key)
+            if notice_value is not None:
+                notice = _normalized_lifecycle_notice(notice_value)
+                _require_lifecycle_notice_binding(
+                    notice,
+                    record,
+                    normalized_id,
+                    retry=retry,
+                )
+                notices.pop(key)
+                candidate["last_resolved_notice_key"] = notice["notice_key"]
+                candidate["last_notice_status"] = "notification-failed"
             # The Telegram diagnostic can contain destination-specific data.
             # The terminal phase is sufficient for operators and eviction.
-            follow_up.pop("error", None)
+            candidate.pop("error", None)
+            record["follow_up"] = candidate
             self._write()
-            return copy.deepcopy(follow_up)
+            return copy.deepcopy(candidate)
 
     def _defer_follow_up(
         self,
@@ -1955,7 +2490,8 @@ class TelegramState:
         current = time.time() if now is None else _finite_nonnegative(now, time.time())
         delay = _bounded_delay(delay_seconds, maximum_delay)
         with self._lock:
-            record = self._data.setdefault("completed_jobs", {}).get(str(normalized_id))
+            key = str(normalized_id)
+            record = self._data.setdefault("completed_jobs", {}).get(key)
             follow_up = record.get("follow_up") if isinstance(record, dict) else None
             if not isinstance(follow_up, dict):
                 raise TelegramStateError(
@@ -1963,17 +2499,26 @@ class TelegramState:
                 )
             if not _follow_up_active(follow_up):
                 return copy.deepcopy(follow_up)
+            retry = self._data.setdefault("delivery_retries", {}).get(key)
+            _require_lifecycle_follow_up_binding(
+                follow_up,
+                record,
+                normalized_id,
+                retry=retry,
+            )
             failures = max(0, int(follow_up.get("failure_count", 0))) + 1
-            follow_up.update({
+            candidate = copy.deepcopy(follow_up)
+            candidate.update({
                 "phase": "retrying",
                 "failure_count": failures,
                 "next_poll_at": current + delay,
             })
             # Raw GitHub/CLI/Telegram errors are intentionally not persisted or
             # sent. The failure counter is enough to drive bounded backoff.
-            follow_up.pop("error", None)
+            candidate.pop("error", None)
+            record["follow_up"] = candidate
             self._write()
-            return copy.deepcopy(follow_up)
+            return copy.deepcopy(candidate)
 
     def next_follow_up_delay(self, *, now: float | None = None) -> float | None:
         """Return the bounded wait until the next background action."""
@@ -1984,10 +2529,20 @@ class TelegramState:
             completed = self._data.setdefault("completed_jobs", {})
             retries = self._data.setdefault("delivery_retries", {})
             for key, record in completed.items():
-                if _delivery_retry_active(retries.get(key)):
+                retry = retries.get(key)
+                if (
+                    _delivery_retry_active(retry)
+                    and not isinstance(retry.get("outcome"), dict)
+                ):
                     continue
                 follow_up = record.get("follow_up") if isinstance(record, dict) else None
                 if _follow_up_active(follow_up):
+                    _require_lifecycle_follow_up_binding(
+                        follow_up,
+                        record,
+                        _lifecycle_notice_update_id(key),
+                        retry=retry,
+                    )
                     due_times.append(min(
                         _finite_nonnegative(follow_up.get("next_poll_at"), current),
                         _finite_nonnegative(follow_up.get("expires_at"), current),
@@ -2002,6 +2557,17 @@ class TelegramState:
                     normalized = _normalized_delivery_notice(notice)
                     pause_until = _finite_nonnegative(
                         self._data.get("delivery_notice_pause_until"),
+                        0.0,
+                    )
+                    due_times.append(max(
+                        normalized["next_attempt_at"],
+                        pause_until,
+                    ))
+            for notice in self._data.setdefault("lifecycle_notices", {}).values():
+                if _lifecycle_notice_pending(notice):
+                    normalized = _normalized_lifecycle_notice(notice)
+                    pause_until = _finite_nonnegative(
+                        self._data.get("lifecycle_notice_pause_until"),
                         0.0,
                     )
                     due_times.append(max(
@@ -2072,6 +2638,7 @@ class TelegramState:
                 protected={
                     *self._data.setdefault("delivery_retries", {}),
                     *self._data.setdefault("delivery_notices", {}),
+                    *self._data.setdefault("lifecycle_notices", {}),
                 },
             )
             self._write()
@@ -2137,6 +2704,18 @@ class TelegramState:
                     }
                 else:
                     new_notice = candidate_notice
+            retry = self._data.setdefault("delivery_retries", {}).get(key)
+            follow_up = record.get("follow_up")
+            if _follow_up_active(follow_up) or (
+                isinstance(follow_up, dict)
+                and bool(follow_up.get("source_binding"))
+            ):
+                _require_lifecycle_follow_up_binding(
+                    follow_up,
+                    record,
+                    normalized_id,
+                    retry=retry,
+                )
             jobs.pop(key, None)
             self._data.setdefault("acceptance_receipts", {}).pop(key, None)
             completed = self._data.setdefault("completed_jobs", {})
@@ -2150,14 +2729,17 @@ class TelegramState:
                 protected={
                     *self._data.setdefault("delivery_retries", {}),
                     *notices,
+                    *self._data.setdefault("lifecycle_notices", {}),
                 },
             )
             self._write()
 
     def _expire_follow_ups(self, now: float) -> bool:
         changed = False
+        notices = self._data.setdefault("lifecycle_notices", {})
+        retries = self._data.setdefault("delivery_retries", {})
         for bucket in ("jobs", "completed_jobs"):
-            for record in self._data.setdefault(bucket, {}).values():
+            for key, record in self._data.setdefault(bucket, {}).items():
                 follow_up = record.get("follow_up") if isinstance(record, dict) else None
                 if not _follow_up_active(follow_up):
                     continue
@@ -2174,9 +2756,34 @@ class TelegramState:
                     expires_at = created_at + _FOLLOW_UP_MAX_AGE_SECONDS
                     changed = True
                 if expires_at <= now:
+                    notice = notices.get(key)
+                    if notice is not None:
+                        normalized_id = _lifecycle_notice_update_id(key)
+                        normalized_notice = _normalized_lifecycle_notice(notice)
+                        _require_lifecycle_notice_binding(
+                            normalized_notice,
+                            record,
+                            normalized_id,
+                            retry=retries.get(key),
+                        )
+                        notices.pop(key)
+                        follow_up["last_resolved_notice_key"] = (
+                            normalized_notice["notice_key"]
+                        )
+                        follow_up["last_notice_status"] = "expired"
                     follow_up.update({"phase": "expired", "next_poll_at": 0.0})
                     follow_up.pop("error", None)
                     changed = True
+        if changed:
+            _bound_completed(
+                self._data.setdefault("completed_jobs", {}),
+                _MAX_COMPLETED_JOBS,
+                protected={
+                    *retries,
+                    *self._data.setdefault("delivery_notices", {}),
+                    *notices,
+                },
+            )
         return changed
 
     def _advance(self, update_id: int) -> None:
@@ -2206,7 +2813,7 @@ class TelegramState:
         with self._lock:
             if not self.path.exists():
                 return {
-                    "version": 8,
+                    "version": 9,
                     "bot_id": None,
                     "bot_username": "",
                     "last_update_id": -1,
@@ -2218,6 +2825,8 @@ class TelegramState:
                     "acceptance_receipts": {},
                     "delivery_notices": {},
                     "delivery_notice_pause_until": 0.0,
+                    "lifecycle_notices": {},
+                    "lifecycle_notice_pause_until": 0.0,
                 }
             try:
                 payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -2230,6 +2839,7 @@ class TelegramState:
                 for name in (
                     "jobs", "completed_jobs", "failed_jobs", "delivery_retries",
                     "acceptance_receipts", "delivery_notices",
+                    "lifecycle_notices",
                 )
             ):
                 raise TelegramStateError(f"Invalid Telegram state at {self.path}")
@@ -2249,6 +2859,8 @@ class TelegramState:
                 _validate_loaded_acceptance_receipts(payload)
                 _validate_loaded_delivery_retries(payload)
                 _validate_loaded_delivery_notices(payload)
+                _validate_loaded_follow_ups(payload)
+                _validate_loaded_lifecycle_notices(payload)
             except (TelegramStateError, TypeError, ValueError) as exc:
                 raise TelegramStateError(
                     f"Invalid Telegram state at {self.path}"
@@ -2257,8 +2869,10 @@ class TelegramState:
 
     def _write(self) -> None:
         with self._lock:
-            self._data["version"] = 8
+            self._data["version"] = 9
             self._data.setdefault("delivery_notice_pause_until", 0.0)
+            self._data.setdefault("lifecycle_notices", {})
+            self._data.setdefault("lifecycle_notice_pause_until", 0.0)
             write_json_atomic(self.path, self._data)
 
 
@@ -2444,7 +3058,7 @@ def _validate_loaded_queue_full_notices(payload: dict[str, Any]) -> None:
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
-        or not 0 <= version <= 8
+        or not 0 <= version <= 9
     ):
         raise TelegramStateError("Invalid Telegram state version")
     last_update_id = payload.get("last_update_id", -1)
@@ -2839,7 +3453,7 @@ def _validate_loaded_delivery_notices(payload: dict[str, Any]) -> None:
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
-        or not 0 <= version <= 8
+        or not 0 <= version <= 9
     ):
         raise TelegramStateError("Invalid Telegram state version")
     notices = payload.setdefault("delivery_notices", {})
@@ -2864,6 +3478,800 @@ def _validate_loaded_delivery_notices(payload: dict[str, Any]) -> None:
         update_id = _delivery_notice_key(key)
         notice = _normalized_delivery_notice(value)
         _require_delivery_notice_binding(
+            notice,
+            completed.get(key),
+            update_id,
+            retry=retries.get(key),
+        )
+        notices[key] = notice
+
+
+def _lifecycle_notice_pending(value: Any) -> TypeGuard[dict[str, Any]]:
+    return (
+        isinstance(value, dict)
+        and value.get("kind") == "lifecycle-notice"
+        and value.get("phase") in _LIFECYCLE_NOTICE_PHASES
+    )
+
+
+def _lifecycle_notice_update_id(value: Any) -> int:
+    try:
+        update_id = _update_id(int(value))
+    except (TelegramStateError, TypeError, ValueError) as exc:
+        raise TelegramStateError("Invalid Telegram lifecycle notice key") from exc
+    if value != str(update_id):
+        raise TelegramStateError("Invalid Telegram lifecycle notice key")
+    return update_id
+
+
+def _lifecycle_follow_up_identity(
+    follow_up: Any,
+    update_id: int,
+    *,
+    require_source_binding: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(follow_up, dict) or follow_up.get("kind") != "pr-lifecycle":
+        raise TelegramStateError(
+            f"Telegram update {update_id} has no lifecycle follow-up"
+        )
+    delivery_id = str(follow_up.get("delivery_id") or "")
+    task_id = str(follow_up.get("task_id") or "").upper()
+    project_name = follow_up.get("project_name", "")
+    chat_id = follow_up.get("chat_id")
+    pr_url = str(follow_up.get("pr_url") or "")
+    source_binding = follow_up.get("source_binding")
+    created_at = _strict_timestamp(follow_up.get("created_at"))
+    expires_at = _strict_timestamp(follow_up.get("expires_at"))
+    if (
+        not _DELIVERY_ID.fullmatch(delivery_id)
+        or not _TASK_ID.fullmatch(task_id)
+        or follow_up.get("task_id") != task_id
+        or not isinstance(project_name, str)
+        or len(project_name) > 160
+        or any(not character.isprintable() for character in project_name)
+        or isinstance(chat_id, bool)
+        or not isinstance(chat_id, int)
+        or chat_id <= 0
+        or not _GITHUB_PR_URL.fullmatch(pr_url)
+        or (
+            require_source_binding
+            and (
+                not isinstance(source_binding, str)
+                or re.fullmatch(r"[0-9a-f]{64}", source_binding) is None
+            )
+        )
+        or expires_at <= created_at
+        or expires_at - created_at > _FOLLOW_UP_MAX_AGE_SECONDS + 1
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} has an invalid lifecycle identity"
+        )
+    return {
+        "delivery_id": delivery_id,
+        "task_id": task_id,
+        "project_name": project_name,
+        "chat_id": chat_id,
+        "pr_url": pr_url,
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "source_binding": source_binding if require_source_binding else "",
+    }
+
+
+def _canonical_lifecycle_result(value: Any, update_id: int) -> dict[str, Any]:
+    try:
+        normalized = _normalize_delivery_outcome(value)
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        canonical = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TelegramStateError, TypeError, ValueError) as exc:
+        raise TelegramStateError(
+            f"Telegram update {update_id} has an invalid lifecycle result"
+        ) from exc
+    if serialized != canonical:
+        raise TelegramStateError(
+            f"Telegram update {update_id} has a non-canonical lifecycle result"
+        )
+    return normalized
+
+
+def _lifecycle_source_payload(
+    source: Any,
+    update_id: int,
+    *,
+    retry: Any,
+) -> dict[str, Any]:
+    if not isinstance(source, dict) or source.get("delivery_terminal") is not True:
+        raise TelegramStateError(
+            f"Telegram update {update_id} has no authoritative lifecycle source"
+        )
+    if "request" in source:
+        if not isinstance(source.get("request"), dict):
+            raise TelegramStateError(
+                f"Telegram update {update_id} has no authoritative lifecycle source"
+            )
+    elif source.get("phase") != "completed":
+        raise TelegramStateError(
+            f"Telegram update {update_id} has no authoritative lifecycle source"
+        )
+    request_digest = source.get("request_digest")
+    workflow = source.get("workflow")
+    task_id = str(source.get("task_id") or "").upper()
+    project_name = source.get("project_name", "")
+    chat_id = source.get("chat_id")
+    root_delivery_id = str(source.get("delivery_id") or "")
+    if (
+        not isinstance(request_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", request_digest) is None
+        or workflow != "live-build"
+        or not _TASK_ID.fullmatch(task_id)
+        or source.get("task_id") != task_id
+        or not isinstance(project_name, str)
+        or len(project_name) > 160
+        or any(not character.isprintable() for character in project_name)
+        or isinstance(chat_id, bool)
+        or not isinstance(chat_id, int)
+        or chat_id <= 0
+        or not _DELIVERY_ID.fullmatch(root_delivery_id)
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} has an invalid lifecycle source"
+        )
+    if "request" in source:
+        origin = _saved_origin(source)
+        if origin != (chat_id, chat_id, "private"):
+            raise TelegramStateError(
+                f"Telegram update {update_id} lifecycle route changed origin"
+            )
+    root_result = _canonical_lifecycle_result(
+        source.get("delivery_result"),
+        update_id,
+    )
+    if (
+        root_result["delivery_id"] != root_delivery_id
+        or source.get("delivery_status") != root_result["status"]
+        or source.get("delivery_phase") != root_result["phase"]
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} lifecycle result changed identity"
+        )
+
+    effective_result = root_result
+    if retry is not None:
+        if not _delivery_retry_active(retry):
+            raise TelegramStateError(
+                f"Telegram update {update_id} has an invalid lifecycle retry"
+            )
+        normalized_retry = _normalize_delivery_retry(retry)
+        _require_retry_source_binding(normalized_retry, source, update_id)
+        effective_result, outcome_phase = _staged_delivery_outcome(retry)
+        if outcome_phase != "completed":
+            raise TelegramStateError(
+                f"Telegram update {update_id} retry did not authorize a lifecycle watcher"
+            )
+        effective_result = _canonical_lifecycle_result(
+            retry.get("outcome"),
+            update_id,
+        )
+        if effective_result["delivery_id"] != normalized_retry["delivery_id"]:
+            raise TelegramStateError(
+                f"Telegram update {update_id} retry changed lifecycle identity"
+            )
+
+    delivery_id = effective_result["delivery_id"]
+    pr_url = effective_result["pr_url"]
+    if (
+        effective_result["success"] is not True
+        or effective_result["status"] != "pr-open"
+        or not _GITHUB_PR_URL.fullmatch(pr_url)
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} has no successful PR lifecycle source"
+        )
+    serialized_result = json.dumps(
+        effective_result,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return {
+        "request_digest": request_digest,
+        "workflow": workflow,
+        "task_id": task_id,
+        "project_name": project_name,
+        "chat_id": chat_id,
+        "delivery_id": delivery_id,
+        "pr_url": pr_url,
+        "result_digest": hashlib.sha256(
+            serialized_result.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _lifecycle_source_binding(
+    update_id: int,
+    source_payload: dict[str, Any],
+) -> str:
+    payload = {
+        "kind": "lifecycle-follow-up-source-binding-v1",
+        "update_id": _update_id(update_id),
+        **source_payload,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _require_lifecycle_follow_up_binding(
+    follow_up: Any,
+    source: Any,
+    update_id: int,
+    *,
+    retry: Any,
+) -> dict[str, Any]:
+    identity = _lifecycle_follow_up_identity(follow_up, update_id)
+    source_payload = _lifecycle_source_payload(source, update_id, retry=retry)
+    expected_binding = _lifecycle_source_binding(update_id, source_payload)
+    expected = {
+        "delivery_id": source_payload["delivery_id"],
+        "task_id": source_payload["task_id"],
+        "project_name": source_payload["project_name"],
+        "chat_id": source_payload["chat_id"],
+        "pr_url": source_payload["pr_url"],
+        "source_binding": expected_binding,
+    }
+    if any(
+        type(identity.get(name)) is not type(value)
+        or identity.get(name) != value
+        for name, value in expected.items()
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} lifecycle follow-up changed source binding"
+        )
+    return source_payload
+
+
+def _require_same_lifecycle_route(
+    existing: dict[str, Any],
+    candidate: dict[str, Any],
+    update_id: int,
+) -> None:
+    for name in (
+        "kind", "delivery_id", "task_id", "project_name", "chat_id", "pr_url",
+    ):
+        if (
+            type(existing.get(name)) is not type(candidate.get(name))
+            or existing.get(name) != candidate.get(name)
+        ):
+            raise TelegramStateError(
+                f"Telegram update {update_id} lifecycle follow-up changed {name}"
+            )
+
+
+def _active_follow_up_count(
+    payload: dict[str, Any],
+    *,
+    exclude: str | None = None,
+) -> int:
+    return sum(
+        1
+        for bucket in ("jobs", "completed_jobs")
+        for key, value in payload.setdefault(bucket, {}).items()
+        if key != exclude
+        and isinstance(value, dict)
+        and _follow_up_active(value.get("follow_up"))
+    )
+
+
+def _ensure_authorized_lifecycle_follow_up(
+    source: dict[str, Any],
+    update_id: int,
+    *,
+    retry: Any,
+    now: float,
+    active_count: int,
+) -> None:
+    existing = source.get("follow_up")
+    expects_watcher = False
+    if retry is not None and _delivery_retry_active(retry):
+        try:
+            staged, staged_phase = _staged_delivery_outcome(retry)
+        except TelegramStateError:
+            staged = {}
+            staged_phase = ""
+        expects_watcher = (
+            staged_phase == "completed"
+            and staged.get("success") is True
+            and staged.get("status") == "pr-open"
+            and bool(staged.get("pr_url"))
+        )
+    if not expects_watcher:
+        if _follow_up_active(existing):
+            raise TelegramStateError(
+                f"Telegram update {update_id} has an unauthorized lifecycle follow-up"
+            )
+        return
+    source_payload = _lifecycle_source_payload(
+        source,
+        update_id,
+        retry=retry,
+    )
+    if isinstance(existing, dict) and existing.get("phase") != "migration-invalid":
+        if _follow_up_active(existing) or existing.get("source_binding"):
+            _require_lifecycle_follow_up_binding(
+                existing,
+                source,
+                update_id,
+                retry=retry,
+            )
+        return
+    candidate = {
+        "kind": "pr-lifecycle",
+        "phase": "pending",
+        "delivery_id": source_payload["delivery_id"],
+        "task_id": source_payload["task_id"],
+        "project_name": source_payload["project_name"],
+        "chat_id": source_payload["chat_id"],
+        "pr_url": source_payload["pr_url"],
+        "source_binding": _lifecycle_source_binding(update_id, source_payload),
+        "failure_count": 0,
+        "next_poll_at": 0.0,
+        "created_at": now,
+        "expires_at": now + _FOLLOW_UP_MAX_AGE_SECONDS,
+        "pr_state": "open",
+        "checks_status": "unknown",
+        "merge_commit_sha": "",
+        "last_observation_key": "",
+        "last_notified_key": "",
+    }
+    if active_count >= _MAX_ACTIVE_FOLLOW_UPS:
+        candidate.update({
+            "phase": "not-started-capacity",
+            "next_poll_at": 0.0,
+        })
+    _require_lifecycle_follow_up_binding(
+        candidate,
+        source,
+        update_id,
+        retry=retry,
+    )
+    source["follow_up"] = candidate
+
+
+def _require_claimed_follow_up(
+    current: Any,
+    claimed: Any,
+    update_id: int,
+) -> None:
+    if (
+        not isinstance(current, dict)
+        or not isinstance(claimed, dict)
+        or current.get("phase") != "polling"
+        or claimed.get("phase") != "polling"
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} lifecycle follow-up is not claimed"
+        )
+    current_identity = _lifecycle_follow_up_identity(current, update_id)
+    claimed_identity = _lifecycle_follow_up_identity(claimed, update_id)
+    if current_identity != claimed_identity or current != claimed:
+        raise TelegramStateError(
+            f"Telegram update {update_id} lifecycle claim changed identity"
+        )
+
+
+def _normalized_lifecycle_observation(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise TelegramStateError("Invalid Telegram lifecycle observation")
+    pr_state = str(value.get("pr_state") or "")
+    checks_status = str(value.get("checks_status") or "")
+    merge_commit_sha = str(value.get("merge_commit_sha") or "").lower()
+    if (
+        pr_state not in _LIFECYCLE_NOTICE_PR_STATES
+        or checks_status not in _LIFECYCLE_NOTICE_CHECK_STATUSES
+        or (
+            pr_state == "merged"
+            and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", merge_commit_sha)
+            is None
+        )
+        or (pr_state != "merged" and merge_commit_sha)
+    ):
+        raise TelegramStateError("Invalid Telegram lifecycle observation")
+    return {
+        "pr_state": pr_state,
+        "checks_status": checks_status,
+        "merge_commit_sha": merge_commit_sha,
+    }
+
+
+def _lifecycle_semantic_key(observation: dict[str, str]) -> str:
+    pr_state = observation["pr_state"]
+    return (
+        pr_state
+        if pr_state != "open"
+        else f"open:{observation['checks_status']}"
+    )
+
+
+def _lifecycle_notice_binding(
+    update_id: int,
+    follow_up: dict[str, Any],
+    observation: dict[str, str],
+    *,
+    source: Any,
+    retry: Any,
+) -> str:
+    identity = _lifecycle_follow_up_identity(follow_up, update_id)
+    source_payload = _require_lifecycle_follow_up_binding(
+        follow_up,
+        source,
+        update_id,
+        retry=retry,
+    )
+    payload = {
+        "kind": "lifecycle-notice-binding-v2",
+        "update_id": _update_id(update_id),
+        "source": source_payload,
+        **identity,
+        **observation,
+        "notice_key": _lifecycle_semantic_key(observation),
+        "origin_user_id": identity["chat_id"],
+        "origin_chat_id": identity["chat_id"],
+        "origin_chat_type": "private",
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _new_lifecycle_notice(
+    update_id: int,
+    follow_up: dict[str, Any],
+    observation: dict[str, str],
+    *,
+    source: Any,
+    retry: Any,
+) -> dict[str, Any]:
+    identity = _lifecycle_follow_up_identity(follow_up, update_id)
+    return {
+        "kind": "lifecycle-notice",
+        "phase": "pending",
+        "delivery_id": identity["delivery_id"],
+        "task_id": identity["task_id"],
+        "project_name": identity["project_name"],
+        "pr_url": identity["pr_url"],
+        "origin_user_id": identity["chat_id"],
+        "origin_chat_id": identity["chat_id"],
+        "origin_chat_type": "private",
+        **observation,
+        "notice_key": _lifecycle_semantic_key(observation),
+        "source_binding": _lifecycle_notice_binding(
+            update_id,
+            follow_up,
+            observation,
+            source=source,
+            retry=retry,
+        ),
+        "failure_count": 0,
+        "deferred_at": 0.0,
+        "next_attempt_at": 0.0,
+    }
+
+
+def _normalized_lifecycle_notice(value: Any) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != _LIFECYCLE_NOTICE_FIELDS
+        or value.get("kind") != "lifecycle-notice"
+        or value.get("phase") not in _LIFECYCLE_NOTICE_PHASES
+    ):
+        raise TelegramStateError("Invalid Telegram lifecycle notice")
+    delivery_id = str(value.get("delivery_id") or "")
+    task_id = str(value.get("task_id") or "").upper()
+    project_name = value.get("project_name", "")
+    pr_url = str(value.get("pr_url") or "")
+    observation = _normalized_lifecycle_observation(value)
+    notice_key = str(value.get("notice_key") or "")
+    source_binding = value.get("source_binding")
+    failure_count = value.get("failure_count")
+    origin = _validated_origin(
+        value.get("origin_user_id"),
+        value.get("origin_chat_id"),
+        value.get("origin_chat_type"),
+    )
+    if (
+        not _DELIVERY_ID.fullmatch(delivery_id)
+        or not _TASK_ID.fullmatch(task_id)
+        or not isinstance(project_name, str)
+        or len(project_name) > 160
+        or any(not character.isprintable() for character in project_name)
+        or not _GITHUB_PR_URL.fullmatch(pr_url)
+        or origin[2] != "private"
+        or origin[0] != origin[1]
+        or notice_key != _lifecycle_semantic_key(observation)
+        or not isinstance(source_binding, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_binding) is None
+        or isinstance(failure_count, bool)
+        or not isinstance(failure_count, int)
+        or failure_count < 0
+    ):
+        raise TelegramStateError("Invalid Telegram lifecycle notice")
+    deferred_at = _strict_timestamp(value.get("deferred_at"), allow_zero=True)
+    next_attempt_at = _strict_timestamp(
+        value.get("next_attempt_at"),
+        allow_zero=True,
+    )
+    phase = str(value.get("phase"))
+    if (
+        next_attempt_at < deferred_at
+        or next_attempt_at - deferred_at
+        > _MAX_LIFECYCLE_NOTICE_RETRY_SECONDS + 1
+        or (phase == "pending" and (failure_count or deferred_at or next_attempt_at))
+        or (
+            phase == "retrying"
+            and (
+                failure_count < 1
+                or deferred_at <= 0
+                or next_attempt_at <= deferred_at
+            )
+        )
+    ):
+        raise TelegramStateError("Invalid Telegram lifecycle notice retry state")
+    return {
+        "kind": "lifecycle-notice",
+        "phase": phase,
+        "delivery_id": delivery_id,
+        "task_id": task_id,
+        "project_name": project_name,
+        "pr_url": pr_url,
+        "origin_user_id": origin[0],
+        "origin_chat_id": origin[1],
+        "origin_chat_type": origin[2],
+        **observation,
+        "notice_key": notice_key,
+        "source_binding": source_binding,
+        "failure_count": failure_count,
+        "deferred_at": deferred_at,
+        "next_attempt_at": next_attempt_at,
+    }
+
+
+def _require_lifecycle_notice_binding(
+    notice: dict[str, Any],
+    source: Any,
+    update_id: int,
+    *,
+    retry: Any,
+) -> None:
+    if (
+        not isinstance(source, dict)
+        or "request" in source
+        or source.get("phase") != "completed"
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} has no safe lifecycle notice source"
+        )
+    follow_up = source.get("follow_up")
+    if not isinstance(follow_up, dict):
+        raise TelegramStateError(
+            f"Telegram update {update_id} lost its lifecycle follow-up"
+        )
+    identity = _lifecycle_follow_up_identity(follow_up, update_id)
+    _require_lifecycle_follow_up_binding(
+        follow_up,
+        source,
+        update_id,
+        retry=retry,
+    )
+    observation = _normalized_lifecycle_observation(notice)
+    expected = {
+        "delivery_id": identity["delivery_id"],
+        "task_id": identity["task_id"],
+        "project_name": identity["project_name"],
+        "pr_url": identity["pr_url"],
+        "origin_user_id": identity["chat_id"],
+        "origin_chat_id": identity["chat_id"],
+        "origin_chat_type": "private",
+        "pr_state": str(follow_up.get("pr_state") or ""),
+        "checks_status": str(follow_up.get("checks_status") or ""),
+        "merge_commit_sha": str(
+            follow_up.get("merge_commit_sha") or ""
+        ).lower(),
+        "notice_key": str(follow_up.get("last_observation_key") or ""),
+        "source_binding": _lifecycle_notice_binding(
+            update_id,
+            follow_up,
+            observation,
+            source=source,
+            retry=retry,
+        ),
+    }
+    compatible_phase = (
+        (_follow_up_active(follow_up) and observation["pr_state"] == "open")
+        or (
+            follow_up.get("phase") == "completed"
+            and observation["pr_state"] != "open"
+        )
+    )
+    if (
+        not compatible_phase
+        or any(notice.get(name) != value for name, value in expected.items())
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} lifecycle notice changed source binding"
+        )
+
+
+def _validate_loaded_follow_ups(payload: dict[str, Any]) -> None:
+    """Migrate legacy watchers and reject unbound actionable v9 state."""
+    version = payload.get("version", 0)
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or not 0 <= version <= 9
+    ):
+        raise TelegramStateError("Invalid Telegram state version")
+    current = time.time()
+    active: list[tuple[int, str, str, dict[str, Any], dict[str, Any]]] = []
+    for bucket_name in ("jobs", "completed_jobs"):
+        bucket = payload.setdefault(bucket_name, {})
+        for key, source in bucket.items():
+            if not isinstance(source, dict):
+                continue
+            follow_up = source.get("follow_up")
+            if not _follow_up_active(follow_up):
+                continue
+            try:
+                update_id = _lifecycle_notice_update_id(key)
+            except TelegramStateError:
+                if version >= 9:
+                    raise
+                source["follow_up"] = _legacy_terminal_follow_up(
+                    "migration-invalid"
+                )
+                continue
+            active.append((update_id, bucket_name, key, source, follow_up))
+
+    if version >= 9 and len(active) > _MAX_ACTIVE_FOLLOW_UPS:
+        raise TelegramStateError("Too many active Telegram lifecycle follow-ups")
+
+    preserved = 0
+    retries = payload.setdefault("delivery_retries", {})
+    for update_id, _bucket_name, key, source, follow_up in sorted(
+        active,
+        key=lambda item: (item[0], item[1]),
+    ):
+        if version < 9:
+            try:
+                candidate = copy.deepcopy(follow_up)
+                identity = _lifecycle_follow_up_identity(
+                    candidate,
+                    update_id,
+                    require_source_binding=False,
+                )
+                source_payload = _lifecycle_source_payload(
+                    source,
+                    update_id,
+                    retry=retries.get(key),
+                )
+                expected = {
+                    "delivery_id": source_payload["delivery_id"],
+                    "task_id": source_payload["task_id"],
+                    "project_name": source_payload["project_name"],
+                    "chat_id": source_payload["chat_id"],
+                    "pr_url": source_payload["pr_url"],
+                }
+                if any(
+                    type(identity.get(name)) is not type(value)
+                    or identity.get(name) != value
+                    for name, value in expected.items()
+                ):
+                    raise TelegramStateError(
+                        f"Telegram update {update_id} lifecycle route changed"
+                    )
+                candidate["source_binding"] = _lifecycle_source_binding(
+                    update_id,
+                    source_payload,
+                )
+                _require_lifecycle_follow_up_binding(
+                    candidate,
+                    source,
+                    update_id,
+                    retry=retries.get(key),
+                )
+            except (TelegramStateError, TypeError, ValueError):
+                source["follow_up"] = _legacy_terminal_follow_up(
+                    "migration-invalid"
+                )
+                continue
+            if candidate["expires_at"] <= current:
+                source["follow_up"] = _legacy_terminal_follow_up("expired")
+                continue
+            if preserved >= _MAX_ACTIVE_FOLLOW_UPS:
+                source["follow_up"] = _legacy_terminal_follow_up(
+                    "migration-invalid-capacity"
+                )
+                continue
+            source["follow_up"] = candidate
+            preserved += 1
+            continue
+
+        expires_at = _finite_nonnegative(
+            follow_up.get("expires_at"),
+            0.0,
+        )
+        if expires_at and expires_at <= current:
+            # Expired compatibility placeholders cannot perform remote work;
+            # the normal expiry pass will make them terminal on first use.
+            continue
+        _require_lifecycle_follow_up_binding(
+            follow_up,
+            source,
+            update_id,
+            retry=retries.get(key),
+        )
+
+
+def _legacy_terminal_follow_up(phase: str) -> dict[str, Any]:
+    return {
+        "kind": "pr-lifecycle",
+        "phase": phase,
+        "next_poll_at": 0.0,
+    }
+
+
+def _validate_loaded_lifecycle_notices(payload: dict[str, Any]) -> None:
+    version = payload.get("version", 0)
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or not 0 <= version <= 9
+    ):
+        raise TelegramStateError("Invalid Telegram state version")
+    notices = payload.setdefault("lifecycle_notices", {})
+    if version < 9:
+        # Earlier state has no source-bound lifecycle outbox. Never infer a
+        # notification route from a historical watcher during migration.
+        notices.clear()
+        payload["lifecycle_notice_pause_until"] = 0.0
+        return
+    pause_until = _strict_timestamp(
+        payload.setdefault("lifecycle_notice_pause_until", 0.0),
+        allow_zero=True,
+    )
+    if pause_until > time.time() + _MAX_LIFECYCLE_NOTICE_RETRY_SECONDS + 1:
+        raise TelegramStateError("Invalid Telegram lifecycle notice pause")
+    payload["lifecycle_notice_pause_until"] = pause_until
+    if len(notices) > _MAX_ACTIVE_LIFECYCLE_NOTICES:
+        raise TelegramStateError("Too many pending Telegram lifecycle notices")
+    completed = payload.setdefault("completed_jobs", {})
+    retries = payload.setdefault("delivery_retries", {})
+    for key, value in notices.items():
+        update_id = _lifecycle_notice_update_id(key)
+        notice = _normalized_lifecycle_notice(value)
+        _require_lifecycle_notice_binding(
             notice,
             completed.get(key),
             update_id,
@@ -2977,7 +4385,7 @@ def _validate_loaded_acceptance_receipts(payload: dict[str, Any]) -> None:
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
-        or not 0 <= version <= 8
+        or not 0 <= version <= 9
     ):
         raise TelegramStateError("Invalid Telegram state version")
 
@@ -3077,7 +4485,7 @@ def _normalize_delivery_retry(value: Any) -> dict[str, Any]:
     root_delivery_id = str(value.get("root_delivery_id") or "")
     delivery_id = str(value.get("delivery_id") or "")
     task_id = str(value.get("task_id") or "")
-    project_name = str(value.get("project_name") or "")
+    project_name = value.get("project_name", "")
     chat_id = value.get("chat_id")
     attempt_started = value.get("attempt_started", False)
     post_expiry_reconciliation_started = value.get(
@@ -3090,7 +4498,9 @@ def _normalize_delivery_retry(value: Any) -> dict[str, Any]:
         not _DELIVERY_ID.fullmatch(root_delivery_id)
         or not _DELIVERY_ID.fullmatch(delivery_id)
         or not _TASK_ID.fullmatch(task_id)
-        or project_name and not _PROJECT_ID.fullmatch(project_name)
+        or not isinstance(project_name, str)
+        or len(project_name) > 160
+        or any(not character.isprintable() for character in project_name)
         or isinstance(chat_id, bool)
         or not isinstance(chat_id, int)
         or chat_id <= 0
@@ -3743,9 +5153,14 @@ def _has_update_state(data: dict[str, Any]) -> bool:
             return True
     except (TypeError, ValueError):
         return True
+    try:
+        if float(data.get("lifecycle_notice_pause_until", 0.0)) > 0:
+            return True
+    except (TypeError, ValueError):
+        return True
     return any(bool(data.get(name)) for name in (
         "jobs", "completed_jobs", "failed_jobs", "delivery_retries",
-        "acceptance_receipts", "delivery_notices",
+        "acceptance_receipts", "delivery_notices", "lifecycle_notices",
     ))
 
 

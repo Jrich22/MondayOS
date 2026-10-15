@@ -11,6 +11,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A bounded, request-free Telegram lifecycle-notice outbox that separates
+  exact pull-request observation and task reconciliation from message delivery.
+  Each verified observation atomically advances or completes its watcher and
+  enqueues or supersedes one semantic notice. Telegram rate limits, revoked
+  allowlists, blocked bots, and deleted chats now affect only that notice;
+  GitHub polling continues on its own schedule and verified terminal PR state
+  still reconciles the task, including when a delivery-recovery run opened the
+  PR. A persisted lane-wide rate-limit pause covers notices created during the
+  retry window. Restart recovery never re-observes merely to send a saved
+  notice, terminal transitions replace stale open-state notices, and the
+  remote/local send boundary is explicitly at-least-once. Watcher expiry
+  atomically scrubs its stale unsent notice, and one-shot setup mode leaves
+  lifecycle observation and delivery to the normally ordered daemon.
 - A provider-error confidentiality boundary that reduces provider and SDK
   failures to fixed diagnostic codes before they enter events, execution
   reports, agent/team checkpoints, Workspace and Growth responses, API output,
@@ -88,8 +101,10 @@ Versions follow [Semantic Versioning](https://semver.org/).
   the saved repository, base, head, PR number/URL, and reviewed commit before
   recording lifecycle state. Checks are reduced to `pending`, `passed`,
   `failed`, or `no-checks` plus bounded counts; names, annotations, and logs are
-  not exposed or persisted. Only verified merged, closed, or SHA-diverged states
-  reconcile the task. Observation cannot merge or deploy.
+  not exposed or persisted. An exact open PR may repair only an explicitly
+  pending initial transition to `REVIEW`; verified merged, closed, or
+  SHA-diverged states perform the separate terminal reconciliation.
+  Observation cannot merge or deploy.
 - Explicit external-project delivery enrollment through
   `monday project register --delivery-repository OWNER/REPO`, project-bound
   tasks, and `monday build --project` selectors. MondayOS keeps controller state
@@ -109,10 +124,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
   and last meaningful transition; duplicate states stay silent, transient
   observation failures back off, and terminal merged, closed, or diverged states
   stop the watcher. Watchers are also bounded to 500 active records and 30 days;
-  capacity refusal is explicit, and permanent Telegram destination failures stop
-  without retaining diagnostics. No check names, logs, or raw remote diagnostics
-  are retained or sent. The normal daemon provides this monitoring; `--once`
-  only ingests and drains queued requests and does not keep watching afterward.
+  capacity refusal is explicit. Notification delivery is independently durable,
+  so a permanent Telegram destination failure drops only that notice and never
+  stops PR observation or task reconciliation. No check names, logs, or raw
+  remote diagnostics are retained or sent. The normal daemon provides this
+  monitoring; `--once` only ingests and drains queued requests and does not keep
+  watching afterward.
 - Durable Telegram intake and a single background execution worker. Authorized
   minimal requests are atomically queued with the advanced offset and a
   request-free acceptance-receipt outbox in `logs/telegram/state.json`;

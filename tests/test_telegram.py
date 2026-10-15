@@ -391,6 +391,21 @@ class TelegramFixture(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def _handle_accepted_update(
+        self,
+        service: TelegramBotService,
+        update: dict,
+    ) -> None:
+        """Exercise the service with the durable intake envelope it expects."""
+        normalized = service.normalize_update(update)
+        self.assertIsNotNone(normalized)
+        self.state.enqueue(int(update["update_id"]), normalized)
+        self.state.complete_acceptance_receipt(
+            int(update["update_id"]),
+            delivered=True,
+        )
+        service.handle_update(update)
+
 
 class TestTelegramConfig(unittest.TestCase):
     def test_requires_token(self):
@@ -509,12 +524,19 @@ class TestTelegramParsing(unittest.TestCase):
             )
 
         self.assertEqual(snapshot()["pr_state"], "open")
+        self.assertEqual(
+            snapshot(checks_status="unknown")["checks_status"],
+            "unknown",
+        )
+        self.assertEqual(
+            snapshot(checks_status="timed-out")["checks_status"],
+            "timed-out",
+        )
         for malformed in (
             {"delivery_id": ""},
             {"task_id": ""},
             {"project_name": ""},
             {"pr_url": ""},
-            {"checks_status": "unknown"},
             {"pr_state": "merged", "merge_commit_sha": ""},
             {"pr_state": "open", "merge_commit_sha": "b" * 40},
             {"pr_state": "merged", "merge_commit_sha": "b" * 7},
@@ -655,8 +677,9 @@ class TestTelegramService(TelegramFixture):
         service.bind_bot_identity(self.client.get_me())
         service.bind_runtime_progress(operations.append)
 
-        service.handle_update(
-            _update(update_id=41, text="/build Exercise every live phase")
+        self._handle_accepted_update(
+            service,
+            _update(update_id=41, text="/build Exercise every live phase"),
         )
 
         self.assertEqual(
@@ -709,8 +732,9 @@ class TestTelegramService(TelegramFixture):
         )
         service = TelegramBotService(self.monday, self.client, self.state, config)
 
-        service.handle_update(
-            _update(text="/build weatherbot :: Ship a forecast endpoint")
+        self._handle_accepted_update(
+            service,
+            _update(text="/build weatherbot :: Ship a forecast endpoint"),
         )
 
         create = next(call for call in self.monday.task_calls if call[0] == "create")
@@ -737,7 +761,10 @@ class TestTelegramService(TelegramFixture):
 
         for update_id, text, expected_project in cases:
             with self.subTest(text=text):
-                service.handle_update(_update(update_id=update_id, text=text))
+                self._handle_accepted_update(
+                    service,
+                    _update(update_id=update_id, text=text),
+                )
                 create = [call for call in self.monday.task_calls if call[0] == "create"][-1]
                 self.assertEqual(create[1]["project"], expected_project)
                 self.assertEqual(create[1]["objective"], "Ship it")
@@ -855,8 +882,9 @@ class TestTelegramService(TelegramFixture):
         )
         service = TelegramBotService(self.monday, self.client, self.state, config)
 
-        service.handle_update(
-            _update(update_id=18, text=f"/deliver {created.task_id}")
+        self._handle_accepted_update(
+            service,
+            _update(update_id=18, text=f"/deliver {created.task_id}"),
         )
 
         self.assertEqual(len(self.monday.tasks), 1)
@@ -884,8 +912,9 @@ class TestTelegramService(TelegramFixture):
         )
         service = TelegramBotService(self.monday, self.client, self.state, config)
 
-        service.handle_update(
-            _update(update_id=21, text=f"/deliver {created.task_id}")
+        self._handle_accepted_update(
+            service,
+            _update(update_id=21, text=f"/deliver {created.task_id}"),
         )
 
         self.assertEqual(self.monday.build_calls[-1][1]["project"], "weatherbot")
@@ -907,8 +936,9 @@ class TestTelegramService(TelegramFixture):
         )
         service = TelegramBotService(self.monday, self.client, self.state, config)
 
-        service.handle_update(
-            _update(update_id=23, text=f"/deliver {created.task_id}")
+        self._handle_accepted_update(
+            service,
+            _update(update_id=23, text=f"/deliver {created.task_id}"),
         )
 
         self.assertNotIn("project", self.monday.build_calls[-1][1])
@@ -955,7 +985,7 @@ class TestTelegramService(TelegramFixture):
         identity = self.client.get_me()
         service.bind_bot_identity(identity)
 
-        service.handle_update(update)
+        self._handle_accepted_update(service, update)
         first_id = self.state.job(19)["delivery_id"]
         restarted = TelegramBotService(
             self.monday,
@@ -1120,7 +1150,10 @@ class TestTelegramService(TelegramFixture):
         )
         service = TelegramBotService(self.monday, self.client, self.state, config)
 
-        service.handle_update(_update(text="Build this from an ordinary message"))
+        self._handle_accepted_update(
+            service,
+            _update(text="Build this from an ordinary message"),
+        )
 
         self.assertEqual(self.monday.team_calls, 0)
         self.assertEqual(self.monday.build_executions, 1)
@@ -1375,6 +1408,77 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(notice.get("job_id"), f"JOB-{update_id}")
         self.state.complete_acceptance_receipt(update_id, delivered=True)
 
+    def _seed_pr_lifecycle_source(
+        self,
+        update_id: int,
+        *,
+        delivery_id: str | None = None,
+        project_name: str = "",
+        pr_url: str = "https://github.com/example/mondayos/pull/55",
+    ) -> tuple[str, str]:
+        """Seed the canonical accepted PR result that authorizes a watcher."""
+        stable_id = delivery_id or f"delivery-test-{update_id}"
+        self.state.enqueue(
+            update_id,
+            _update(update_id=update_id, text="/build Observe this PR"),
+        )
+        self.state.set_job(
+            update_id,
+            task_id="TASK-0001",
+            chat_id=7,
+            workflow="live-build",
+            project_name=project_name,
+            delivery_id=stable_id,
+            delivery_terminal=True,
+            delivery_final_sent=True,
+            delivery_status="pr-open",
+            delivery_phase="completed",
+            delivery_result={
+                "delivery_id": stable_id,
+                "success": True,
+                "status": "pr-open",
+                "phase": "completed",
+                "branch": "codex/task-0001-lifecycle",
+                "commit_sha": "a" * 40,
+                "pr_url": pr_url,
+                "publication_uncertain": False,
+                "pushed": True,
+                "changed_files": [],
+                "attempts": 1,
+                "failure_code": "",
+                "failure_class": "",
+                "retry_after_seconds": 0,
+                "message": "",
+            },
+        )
+        return stable_id, pr_url
+
+    def _pr_follow_up_candidate(
+        self,
+        delivery_id: str,
+        *,
+        project_name: str = "",
+        chat_id: int | float = 7,
+        pr_url: str = "https://github.com/example/mondayos/pull/55",
+        next_poll_at: float = 0.0,
+    ) -> dict[str, object]:
+        return {
+            "kind": "pr-lifecycle",
+            "phase": "pending",
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "project_name": project_name,
+            "chat_id": chat_id,
+            "pr_url": pr_url,
+            "failure_count": 0,
+            "next_poll_at": next_poll_at,
+            "pr_state": "open",
+            "checks_status": "unknown",
+            "merge_commit_sha": "",
+            "last_observation_key": "",
+            "last_notified_key": "",
+        }
+
     def _seed_terminal_live_build_checkpoint(
         self,
         update_id: int,
@@ -1449,6 +1553,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         *,
         now: float = 100.0,
         delay_seconds: float = 60.0,
+        project_name: str = "",
     ) -> str:
         root_delivery_id = f"delivery-test-{update_id}"
         self.state.enqueue(update_id, _update(update_id=update_id, text="/help"))
@@ -1457,7 +1562,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
             task_id="TASK-0001",
             chat_id=7,
             workflow="live-build",
-            project_name="",
+            project_name=project_name,
             delivery_id=root_delivery_id,
             delivery_terminal=True,
             delivery_final_sent=False,
@@ -1485,7 +1590,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
                 "root_delivery_id": root_delivery_id,
                 "delivery_id": f"{root_delivery_id}-r2",
                 "task_id": "TASK-0001",
-                "project_name": "",
+                "project_name": project_name,
                 "chat_id": 7,
                 "attempt": 2,
                 "max_attempts": 6,
@@ -1530,6 +1635,48 @@ class TestTelegramStateAndRunner(TelegramFixture):
             f"{root_delivery_id}-r2",
         )
 
+    def test_delivery_retry_supports_registered_project_display_name(self):
+        root_delivery_id = self._seed_delivery_retry(
+            43,
+            now=100.0,
+            project_name="Weather Portal",
+        )
+        self.state.acknowledge(43)
+        service = TelegramBotService(
+            self.monday,
+            self.client,
+            self.state,
+            self.config,
+        )
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        with (
+            patch("telegram_bot.state.time.time", return_value=161.0),
+            patch("telegram_bot.service.time.time", return_value=161.0),
+        ):
+            self.assertTrue(worker.run_delivery_retry_once())
+
+        retry_delivery_id = f"{root_delivery_id}-r2"
+        run_calls = [
+            kwargs for action, kwargs in self.monday.build_calls
+            if action == "run"
+        ]
+        self.assertEqual(run_calls[-1]["delivery_id"], retry_delivery_id)
+        self.assertEqual(run_calls[-1]["project"], "Weather Portal")
+        completed = self.state.completed_job(43)
+        self.assertEqual(completed["delivery_status"], "pr-open")
+        self.assertEqual(completed["follow_up"]["phase"], "pending")
+        self.assertEqual(
+            completed["follow_up"]["project_name"],
+            "Weather Portal",
+        )
+        self.assertEqual(self.state.delivery_retry(43), {})
+
     def _stage_terminal_notice(
         self,
         update_id: int,
@@ -1552,23 +1699,102 @@ class TestTelegramStateAndRunner(TelegramFixture):
                 "failure_code": "provider-timeout",
             }
         if follow_up_phase:
-            fields["follow_up"] = {
+            pr_url = "https://github.com/example/mondayos/pull/55"
+            fields.update({
+                "delivery_status": "pr-open",
+                "delivery_phase": "completed",
+                "delivery_result": {
+                    "delivery_id": delivery_id,
+                    "success": True,
+                    "status": "pr-open",
+                    "phase": "completed",
+                    "branch": "codex/task-0001-lifecycle",
+                    "commit_sha": "a" * 40,
+                    "pr_url": pr_url,
+                    "publication_uncertain": False,
+                    "pushed": True,
+                    "changed_files": [],
+                    "attempts": 1,
+                    "failure_code": "",
+                    "failure_class": "",
+                    "retry_after_seconds": 0,
+                    "message": "",
+                },
+            })
+        if fields:
+            self.state.set_job(update_id, **fields)
+        if follow_up_phase:
+            started = self.state.start_follow_up(update_id, {
                 "kind": "pr-lifecycle",
-                "phase": follow_up_phase,
+                "phase": "pending",
                 "delivery_id": delivery_id,
                 "task_id": "TASK-0001",
                 "project_name": "",
                 "chat_id": 7,
-                "pr_url": "https://github.com/example/mondayos/pull/55",
+                "pr_url": pr_url,
                 "failure_count": 0,
                 "next_poll_at": 0.0,
-                "created_at": 1.0,
-                "expires_at": 86_401.0,
-            }
-        if fields:
-            self.state.set_job(update_id, **fields)
+                "pr_state": "open",
+                "checks_status": "unknown",
+                "merge_commit_sha": "",
+                "last_observation_key": "",
+                "last_notified_key": "",
+            })
         self.state.acknowledge(update_id)
+        if follow_up_phase and follow_up_phase != started["phase"]:
+            self.state.update_follow_up(update_id, phase=follow_up_phase)
         return config, delivery_id
+
+    def _stage_lifecycle_observation(
+        self,
+        update_id: int,
+        *,
+        pr_state: str = "open",
+        checks_status: str = "pending",
+        merge_commit_sha: str = "",
+        now: float = 100.0,
+    ) -> tuple[str, str]:
+        """Create one claimed watcher and atomically settle its observation."""
+        delivery_id, pr_url = self._seed_pr_lifecycle_source(update_id)
+        self.state.start_follow_up(
+            update_id,
+            {
+                "kind": "pr-lifecycle",
+                "phase": "pending",
+                "delivery_id": delivery_id,
+                "task_id": "TASK-0001",
+                "project_name": "",
+                "chat_id": 7,
+                "pr_url": pr_url,
+                "failure_count": 0,
+                "next_poll_at": now,
+                "pr_state": "open",
+                "checks_status": "unknown",
+                "merge_commit_sha": "",
+                "last_observation_key": "",
+                "last_notified_key": "",
+            },
+            now=now,
+        )
+        self.state.acknowledge(update_id)
+        claimed = self.state.claim_due_follow_up(now=now)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed[0], update_id)
+        self.state.settle_follow_up_observation(
+            update_id,
+            claimed=claimed[1],
+            observation={
+                "delivery_id": delivery_id,
+                "task_id": "TASK-0001",
+                "project_name": "",
+                "pr_url": pr_url,
+                "pr_state": pr_state,
+                "checks_status": checks_status,
+                "merge_commit_sha": merge_commit_sha,
+            },
+            next_poll_at=0.0 if pr_state != "open" else now + 30.0,
+        )
+        return delivery_id, pr_url
 
     def test_state_survives_restart(self):
         self.state.set_job(10, task_id="TASK-0001")
@@ -2071,7 +2297,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         loaded.bind_bot_identity(99, "monday_test_bot")
         self.assertEqual(
             json.loads(self.config.state_path.read_text(encoding="utf-8"))["version"],
-            8,
+            9,
         )
 
     def test_transient_live_build_retries_after_restart_without_request_text(self):
@@ -2677,9 +2903,29 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
         migrated.bind_bot_identity(99, "monday_test_bot")
         persisted = json.loads(config.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["version"], 8)
+        self.assertEqual(persisted["version"], 9)
         self.assertEqual(persisted["delivery_notices"], {})
         self.assertEqual(persisted["delivery_notice_pause_until"], 0.0)
+        self.assertEqual(persisted["lifecycle_notices"], {})
+
+    def test_v8_migration_does_not_synthesize_historical_lifecycle_notice(self):
+        self._stage_lifecycle_observation(206, now=100.0)
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        payload["version"] = 8
+        payload.pop("lifecycle_notices")
+        self.config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        migrated = TelegramState(self.config.state_path)
+
+        self.assertEqual(migrated.pending_lifecycle_notice_count, 0)
+        self.assertEqual(
+            json.loads(self.config.state_path.read_text(encoding="utf-8"))["version"],
+            8,
+        )
+        migrated.bind_bot_identity(99, "monday_test_bot")
+        persisted = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["version"], 9)
+        self.assertEqual(persisted["lifecycle_notices"], {})
 
     def test_legacy_migration_scrubs_delivery_results_in_every_job_bucket(self):
         config, _delivery_id = self._seed_terminal_live_build_checkpoint(
@@ -3114,6 +3360,105 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(len(self.monday.build_calls), 1)
         self.assertIn("will try automatically", client.sent[-1][1])
 
+    def test_retry_outcome_rate_limit_does_not_delay_pr_observation(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+
+        class RateLimitedFinalClient(FakeTelegramClient):
+            fail_final = False
+
+            def send_message(self, chat_id, text):
+                if self.fail_final and "recovered automatically" in text:
+                    raise TelegramRateLimitError(86_400)
+                return super().send_message(chat_id, text)
+
+        client = RateLimitedFinalClient([
+            _update(update_id=89, text="/build Observe the recovered PR"),
+        ])
+        self.state.bind_bot_identity(99, "monday_test_bot")
+        service = TelegramBotService(self.monday, client, self.state, config)
+        service.bind_bot_identity(client.get_me())
+        delivery_id = service._delivery_id(89)
+        self.monday.delivery_runs[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "status": "failed",
+            "phase": "failed",
+            "success": False,
+            "branch": "",
+            "commit_sha": "",
+            "pr_url": "",
+            "pushed": False,
+            "changed_files": [],
+            "attempts": [],
+            "failure_code": "provider-timeout",
+            "failure_class": "transient",
+            "retry_after_seconds": 0,
+            "message": "temporary outage",
+        }
+        started = time.time()
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+        with patch("telegram_bot.state.time.time", return_value=started):
+            self.assertEqual(runner.run_once(), 1)
+
+        client.fail_final = True
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        with (
+            patch("telegram_bot.state.time.time", return_value=started + 61),
+            patch("telegram_bot.service.time.time", return_value=started + 61),
+        ):
+            self.assertTrue(worker.run_delivery_retry_once())
+
+        retry_id = f"{delivery_id}-r2"
+        retry = self.state.delivery_retry(89)
+        self.assertEqual(retry["phase"], "retrying")
+        self.assertGreaterEqual(retry["next_attempt_at"], started + 86_460)
+        follow_up = self.state.completed_job(89)["follow_up"]
+        self.assertEqual(follow_up["phase"], "pending")
+        self.assertEqual(follow_up["delivery_id"], retry_id)
+
+        self.monday.observe_results[retry_id] = {
+            "delivery_id": retry_id,
+            "task_id": "TASK-0001",
+            "project_name": "",
+            "pr_url": "https://github.com/example/mondayos/pull/55",
+            "pr_state": "merged",
+            "checks_status": "passed",
+            "merge_commit_sha": "b" * 40,
+        }
+        with (
+            patch("telegram_bot.state.time.time", return_value=started + 91),
+            patch("telegram_bot.service.time.time", return_value=started + 91),
+        ):
+            self.assertTrue(worker.run_follow_up_once())
+
+        terminal = self.state.completed_job(89)["follow_up"]
+        self.assertEqual(terminal["phase"], "completed")
+        self.assertEqual(terminal["pr_state"], "merged")
+        self.assertTrue(self.state.delivery_retry(89))
+
+        client.fail_final = False
+        retry_due = self.state.delivery_retry(89)["next_attempt_at"]
+        with (
+            patch("telegram_bot.state.time.time", return_value=retry_due),
+            patch("telegram_bot.service.time.time", return_value=retry_due),
+        ):
+            self.assertTrue(worker.run_delivery_retry_once())
+
+        recovered_notice = client.sent[-1][1]
+        self.assertIn("already finished monitoring", recovered_notice)
+        self.assertNotIn("will keep watching", recovered_notice)
+        self.assertEqual(self.state.delivery_retry(89), {})
+
     def test_permanent_final_notice_failure_keeps_recovered_pr_outcome(self):
         config = TelegramConfig(
             token=_fake_token(),
@@ -3181,9 +3526,29 @@ class TestTelegramStateAndRunner(TelegramFixture):
             completed["delivery_retry"]["phase"],
             "notification-failed",
         )
-        self.assertEqual(completed["follow_up"]["phase"], "notification-failed")
+        self.assertEqual(completed["follow_up"]["phase"], "pending")
         self.assertEqual(self.state.delivery_retry(91), {})
         self.assertEqual(self.monday.build_executions, 1)
+
+        retry_id = f"{delivery_id}-r2"
+        self.monday.observe_results[retry_id] = {
+            "delivery_id": retry_id,
+            "task_id": "TASK-0001",
+            "project_name": "",
+            "pr_url": "https://github.com/example/mondayos/pull/55",
+            "pr_state": "merged",
+            "checks_status": "passed",
+            "merge_commit_sha": "c" * 40,
+        }
+        with (
+            patch("telegram_bot.state.time.time", return_value=started + 91),
+            patch("telegram_bot.service.time.time", return_value=started + 91),
+        ):
+            self.assertTrue(worker.run_follow_up_once())
+
+        observed = self.state.completed_job(91)["follow_up"]
+        self.assertEqual(observed["phase"], "completed")
+        self.assertEqual(observed["pr_state"], "merged")
 
     def test_retryable_later_schedule_notice_survives_restart_without_rerun(self):
         config = TelegramConfig(
@@ -3914,7 +4279,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
         payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
         receipt = payload["acceptance_receipts"]["15"]
-        self.assertEqual(payload["version"], 8)
+        self.assertEqual(payload["version"], 9)
         self.assertEqual(payload["last_update_id"], 15)
         self.assertEqual(receipt["kind"], "acceptance-receipt")
         self.assertEqual(receipt["phase"], "pending")
@@ -3982,7 +4347,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertIsNone(migrated.claim_next())
         migrated.bind_bot_identity(99, "monday_test_bot")
         persisted = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["version"], 8)
+        self.assertEqual(persisted["version"], 9)
         self.assertIn("19", persisted["acceptance_receipts"])
 
     def test_legacy_replay_atomically_attaches_bound_receipt(self):
@@ -4009,7 +4374,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
         payload = json.loads(path.read_text(encoding="utf-8"))
         receipt = payload["acceptance_receipts"]["21"]
-        self.assertEqual(payload["version"], 8)
+        self.assertEqual(payload["version"], 9)
         self.assertEqual(receipt["phase"], "sent")
         self.assertEqual(
             receipt["request_digest"],
@@ -4283,7 +4648,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
         migrated.bind_bot_identity(99, "monday_test_bot")
         persisted = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["version"], 8)
+        self.assertEqual(persisted["version"], 9)
         self.assertEqual(persisted["last_update_id"], 19)
         self.assertEqual(
             persisted["completed_jobs"]["19"]["notice_status"],
@@ -5973,12 +6338,17 @@ class TestTelegramStateAndRunner(TelegramFixture):
         service = TelegramBotService(self.monday, self.client, self.state, config)
         runner = TelegramRunner(self.client, service, self.state, poll_timeout=1)
         runner.start()
-        self.state.set_job(720)
+        self._seed_pr_lifecycle_source(720)
         self.state.start_follow_up(
             720,
             {
                 "kind": "pr-lifecycle",
                 "phase": "pending",
+                "delivery_id": "delivery-test-720",
+                "task_id": "TASK-0001",
+                "project_name": "",
+                "chat_id": 7,
+                "pr_url": "https://github.com/example/mondayos/pull/55",
                 "next_poll_at": time.time() + 3_600,
             },
         )
@@ -6044,25 +6414,37 @@ class TestTelegramStateAndRunner(TelegramFixture):
         baseline = len(self.client.sent)
 
         self.assertTrue(worker.run_follow_up_once())
+        self.assertEqual(len(self.client.sent), baseline)
+        self.assertEqual(self.state.pending_lifecycle_notice_count, 1)
+        self.assertTrue(worker.run_lifecycle_notice_once())
         self.assertIn("checks are running", self.client.sent[-1][1])
         first_notice_count = len(self.client.sent)
 
         self.state.update_follow_up(73, phase="pending", next_poll_at=0.0)
         self.assertTrue(worker.run_follow_up_once())
+        self.assertEqual(self.state.pending_lifecycle_notice_count, 0)
+        self.assertFalse(worker.run_lifecycle_notice_once())
         self.assertEqual(len(self.client.sent), first_notice_count)
 
         self.state.update_follow_up(73, phase="pending", next_poll_at=0.0)
         self.assertTrue(worker.run_follow_up_once())
+        self.assertEqual(len(self.client.sent), first_notice_count)
+        self.assertTrue(worker.run_lifecycle_notice_once())
         self.assertIn("checks passed", self.client.sent[-1][1])
 
         self.state.update_follow_up(73, phase="pending", next_poll_at=0.0)
         self.assertTrue(worker.run_follow_up_once())
-        self.assertIn("was merged", self.client.sent[-1][1])
-        self.assertIn("bbbbbbbbbbbb", self.client.sent[-1][1])
+        terminal_notice = self.state.lifecycle_notice(73)
+        self.assertEqual(terminal_notice["notice_key"], "merged")
+        self.assertEqual(len(self.client.sent), first_notice_count + 1)
         follow_up = self.state.completed_job(73)["follow_up"]
         self.assertEqual(follow_up["phase"], "completed")
         self.assertEqual(follow_up["pr_state"], "merged")
+        self.assertTrue(worker.run_lifecycle_notice_once())
+        self.assertIn("was merged", self.client.sent[-1][1])
+        self.assertIn("bbbbbbbbbbbb", self.client.sent[-1][1])
         self.assertFalse(worker.run_follow_up_once())
+        self.assertFalse(worker.run_lifecycle_notice_once())
         self.assertGreater(len(self.client.sent), baseline)
         observe_calls = [
             kwargs for action, kwargs in self.monday.build_calls
@@ -6106,14 +6488,31 @@ class TestTelegramStateAndRunner(TelegramFixture):
             stop_event=threading.Event(),
             wake_event=threading.Event(),
         )
+        baseline = len(self.client.sent)
 
         self.assertTrue(worker.run_follow_up_once())
 
         follow_up = restarted_state.completed_job(74)["follow_up"]
         self.assertEqual(follow_up["phase"], "completed")
         self.assertEqual(follow_up["pr_state"], "closed")
+        self.assertEqual(len(self.client.sent), baseline)
+        self.assertEqual(restarted_state.pending_lifecycle_notice_count, 1)
+
+        second_restart = TelegramState(config.state_path)
+        second_service = TelegramBotService(
+            self.monday, self.client, second_restart, config,
+        )
+        second_service.bind_bot_identity(self.client.get_me())
+        second_worker = TelegramJobWorker(
+            second_service,
+            second_restart,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        self.assertTrue(second_worker.run_lifecycle_notice_once())
         self.assertIn("closed without merging", self.client.sent[-1][1])
-        self.assertNotIn("request", restarted_state.completed_job(74))
+        self.assertEqual(second_restart.pending_lifecycle_notice_count, 0)
+        self.assertNotIn("request", second_restart.completed_job(74))
 
     def test_pr_follow_up_outages_back_off_without_persisting_diagnostics(self):
         config = TelegramConfig(
@@ -6160,52 +6559,61 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertNotIn("raw remote log", persisted)
         self.assertNotIn("private diagnostic", persisted)
 
-    def test_pr_follow_up_honors_telegram_rate_limit_beyond_observer_cap(self):
-        self.state.set_job(
-            76,
-            follow_up={
-                "kind": "pr-lifecycle",
-                "phase": "pending",
-                "next_poll_at": 0.0,
-                "failure_count": 0,
-            },
+    def test_lifecycle_notice_rate_limit_does_not_delay_merge_observation(self):
+        delivery_id, pr_url = self._stage_lifecycle_observation(76, now=100.0)
+        service = TelegramBotService(
+            self.monday, self.client, self.state, self.config,
         )
-        self.state.acknowledge(76)
-        service = MagicMock()
-        service.poll_follow_up.side_effect = TelegramRateLimitError(3_600)
         worker = TelegramJobWorker(
             service,
             self.state,
             stop_event=threading.Event(),
             wake_event=threading.Event(),
         )
-        before = time.time()
+        with (
+            patch.object(
+                service,
+                "deliver_lifecycle_notice",
+                side_effect=TelegramRateLimitError(3_600),
+            ),
+            patch("telegram_bot.state.time.time", return_value=100.0),
+        ):
+            self.assertTrue(worker.run_lifecycle_notice_once())
 
-        self.assertTrue(worker.run_follow_up_once())
-
+        notice = self.state.lifecycle_notice(76)
+        self.assertEqual(notice["notice_key"], "open:pending")
+        self.assertEqual(self.state.due_lifecycle_notice_ids(now=3_699.0), [])
         follow_up = self.state.completed_job(76)["follow_up"]
-        self.assertEqual(follow_up["phase"], "retrying")
-        self.assertEqual(follow_up["failure_count"], 1)
-        self.assertGreaterEqual(follow_up["next_poll_at"], before + 3_599)
-        self.assertLessEqual(follow_up["next_poll_at"], before + 3_602)
-        self.assertFalse(worker.run_follow_up_once())
+        self.assertEqual(follow_up["phase"], "pending")
+        self.assertEqual(follow_up["next_poll_at"], 130.0)
 
-    def test_permanent_telegram_failure_stops_pr_follow_up_without_diagnostic(self):
-        self.state.set_job(
-            77,
-            follow_up={
-                "kind": "pr-lifecycle",
-                "phase": "pending",
-                "next_poll_at": 0.0,
-                "failure_count": 0,
-            },
-        )
-        self.state.acknowledge(77)
-        service = MagicMock()
-        service.poll_follow_up.side_effect = TelegramAPIError(
-            "private destination diagnostic",
-            retryable=False,
-            status_code=403,
+        self.monday.observe_results[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "project_name": "",
+            "pr_url": pr_url,
+            "pr_state": "merged",
+            "checks_status": "passed",
+            "merge_commit_sha": "b" * 40,
+        }
+        with (
+            patch("telegram_bot.state.time.time", return_value=130.0),
+            patch("telegram_bot.service.time.time", return_value=130.0),
+        ):
+            self.assertTrue(worker.run_follow_up_once())
+
+        terminal = self.state.completed_job(76)["follow_up"]
+        self.assertEqual(terminal["phase"], "completed")
+        self.assertEqual(terminal["pr_state"], "merged")
+        replacement = self.state.lifecycle_notice(76)
+        self.assertEqual(replacement["notice_key"], "merged")
+        self.assertEqual(replacement["merge_commit_sha"], "b" * 40)
+        self.assertEqual(self.state.due_lifecycle_notice_ids(now=3_699.0), [])
+
+    def test_lifecycle_notice_rate_limit_covers_future_notice(self):
+        self._stage_lifecycle_observation(76, now=100.0)
+        service = TelegramBotService(
+            self.monday, self.client, self.state, self.config,
         )
         worker = TelegramJobWorker(
             service,
@@ -6213,25 +6621,509 @@ class TestTelegramStateAndRunner(TelegramFixture):
             stop_event=threading.Event(),
             wake_event=threading.Event(),
         )
+        with (
+            patch.object(
+                service,
+                "deliver_lifecycle_notice",
+                side_effect=TelegramRateLimitError(3_600),
+            ),
+            patch("telegram_bot.state.time.time", return_value=100.0),
+        ):
+            self.assertTrue(worker.run_lifecycle_notice_once())
 
-        self.assertTrue(worker.run_follow_up_once())
+        self._stage_lifecycle_observation(86, now=101.0)
 
+        restarted = TelegramState(self.config.state_path)
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["lifecycle_notice_pause_until"], 3_700.0)
+        self.assertEqual(restarted.due_lifecycle_notice_ids(now=3_699.0), [])
+        self.assertEqual(
+            restarted.due_lifecycle_notice_ids(now=3_700.0),
+            [76, 86],
+        )
+
+    def test_permanent_notice_failure_and_allowlist_removal_do_not_stop_watcher(self):
+        delivery_id, pr_url = self._stage_lifecycle_observation(77, now=100.0)
+        service = TelegramBotService(
+            self.monday, self.client, self.state, self.config,
+        )
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        with patch.object(
+            service,
+            "deliver_lifecycle_notice",
+            side_effect=TelegramAPIError(
+                "private destination diagnostic",
+                retryable=False,
+                status_code=403,
+            ),
+        ):
+            self.assertTrue(worker.run_lifecycle_notice_once())
+
+        self.assertEqual(self.state.pending_lifecycle_notice_count, 0)
         follow_up = self.state.completed_job(77)["follow_up"]
-        self.assertEqual(follow_up["phase"], "notification-failed")
-        self.assertEqual(follow_up["failure_count"], 1)
-        self.assertEqual(follow_up["next_poll_at"], 0.0)
-        self.assertFalse(worker.run_follow_up_once())
+        self.assertEqual(follow_up["phase"], "pending")
+        self.assertEqual(follow_up["next_poll_at"], 130.0)
+
+        blocked_config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({8}),
+            project_root=self.root,
+        )
+        blocked_service = TelegramBotService(
+            self.monday, self.client, self.state, blocked_config,
+        )
+        blocked_worker = TelegramJobWorker(
+            blocked_service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        self.monday.observe_results[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "project_name": "",
+            "pr_url": pr_url,
+            "pr_state": "merged",
+            "checks_status": "passed",
+            "merge_commit_sha": "c" * 40,
+        }
+        with (
+            patch("telegram_bot.state.time.time", return_value=130.0),
+            patch("telegram_bot.service.time.time", return_value=130.0),
+        ):
+            self.assertTrue(blocked_worker.run_follow_up_once())
+
+        terminal = self.state.completed_job(77)["follow_up"]
+        self.assertEqual(terminal["phase"], "completed")
+        self.assertEqual(terminal["pr_state"], "merged")
+        self.assertEqual(self.state.pending_lifecycle_notice_count, 1)
+        self.assertTrue(blocked_worker.run_lifecycle_notice_once())
+        self.assertEqual(self.state.pending_lifecycle_notice_count, 0)
+        self.assertEqual(
+            self.state.completed_job(77)["follow_up"]["phase"],
+            "completed",
+        )
         persisted = self.config.state_path.read_text(encoding="utf-8")
         self.assertNotIn("private destination diagnostic", persisted)
+
+    def test_unsent_lifecycle_notice_coalesces_to_latest_terminal_state(self):
+        delivery_id, pr_url = self._stage_lifecycle_observation(80, now=100.0)
+        self.monday.observe_results[delivery_id] = [
+            {
+                "delivery_id": delivery_id,
+                "task_id": "TASK-0001",
+                "project_name": "",
+                "pr_url": pr_url,
+                "pr_state": "open",
+                "checks_status": "passed",
+                "merge_commit_sha": "",
+            },
+            {
+                "delivery_id": delivery_id,
+                "task_id": "TASK-0001",
+                "project_name": "",
+                "pr_url": pr_url,
+                "pr_state": "merged",
+                "checks_status": "passed",
+                "merge_commit_sha": "d" * 40,
+            },
+        ]
+        service = TelegramBotService(
+            self.monday, self.client, self.state, self.config,
+        )
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        self.state.update_follow_up(80, phase="pending", next_poll_at=0.0)
+        with (
+            patch("telegram_bot.state.time.time", return_value=130.0),
+            patch("telegram_bot.service.time.time", return_value=130.0),
+        ):
+            self.assertTrue(worker.run_follow_up_once())
+        self.assertEqual(self.state.pending_lifecycle_notice_count, 1)
+        self.assertEqual(
+            self.state.lifecycle_notice(80)["notice_key"],
+            "open:passed",
+        )
+
+        self.state.update_follow_up(80, phase="pending", next_poll_at=0.0)
+        with (
+            patch("telegram_bot.state.time.time", return_value=160.0),
+            patch("telegram_bot.service.time.time", return_value=160.0),
+        ):
+            self.assertTrue(worker.run_follow_up_once())
+        self.assertEqual(self.state.pending_lifecycle_notice_count, 1)
+        self.assertEqual(self.state.lifecycle_notice(80)["notice_key"], "merged")
+        self.assertEqual(
+            self.state.completed_job(80)["follow_up"]["phase"],
+            "completed",
+        )
+
+        self.assertTrue(worker.run_lifecycle_notice_once())
+        lifecycle_messages = [
+            text for _chat_id, text in self.client.sent
+            if "TASK-0001" in text and "Pull request:" in text
+        ]
+        self.assertEqual(len(lifecycle_messages), 1)
+        self.assertIn("was merged", lifecycle_messages[0])
+        self.assertNotIn("checks are running", lifecycle_messages[0])
+        self.assertNotIn("checks passed", lifecycle_messages[0])
+
+    def test_lifecycle_settlement_survives_write_then_exit_as_one_checkpoint(self):
+        delivery_id, pr_url = self._stage_lifecycle_observation(81, now=100.0)
+        self.monday.observe_results[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "project_name": "",
+            "pr_url": pr_url,
+            "pr_state": "merged",
+            "checks_status": "passed",
+            "merge_commit_sha": "e" * 40,
+        }
+        self.state.update_follow_up(81, phase="pending", next_poll_at=0.0)
+        claimed = self.state.claim_due_follow_up(now=130.0)
+        self.assertIsNotNone(claimed)
+        service = TelegramBotService(
+            self.monday, self.client, self.state, self.config,
+        )
+        original_write = self.state._write
+
+        def persist_then_exit() -> None:
+            original_write()
+            raise SystemExit("simulated process exit")
+
+        with (
+            patch.object(self.state, "_write", side_effect=persist_then_exit),
+            self.assertRaisesRegex(SystemExit, "simulated process exit"),
+        ):
+            service.poll_follow_up(81, claimed[1])
+
+        restarted = TelegramState(self.config.state_path)
+        follow_up = restarted.completed_job(81)["follow_up"]
+        notice = restarted.lifecycle_notice(81)
+        self.assertEqual(follow_up["phase"], "completed")
+        self.assertEqual(follow_up["last_observation_key"], "merged")
+        self.assertEqual(notice["notice_key"], "merged")
+        self.assertEqual(notice["merge_commit_sha"], "e" * 40)
+
+    def test_lifecycle_notice_is_at_least_once_after_send_before_ack_exit(self):
+        self._stage_lifecycle_observation(
+            82,
+            pr_state="merged",
+            checks_status="passed",
+            merge_commit_sha="f" * 40,
+            now=100.0,
+        )
+        service = TelegramBotService(
+            self.monday, self.client, self.state, self.config,
+        )
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        with (
+            patch.object(
+                self.state,
+                "complete_lifecycle_notice",
+                side_effect=SystemExit("simulated process exit"),
+            ),
+            self.assertRaisesRegex(SystemExit, "simulated process exit"),
+        ):
+            worker.run_lifecycle_notice_once()
+
+        restarted = TelegramState(self.config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday, self.client, restarted, self.config,
+        )
+        restarted_worker = TelegramJobWorker(
+            restarted_service,
+            restarted,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        self.assertTrue(restarted_worker.run_lifecycle_notice_once())
+
+        lifecycle_messages = [
+            text for _chat_id, text in self.client.sent if "was merged" in text
+        ]
+        self.assertEqual(len(lifecycle_messages), 2)
+        self.assertEqual(lifecycle_messages[0], lifecycle_messages[1])
+        self.assertEqual(restarted.pending_lifecycle_notice_count, 0)
+
+    def test_lifecycle_notice_binding_tampering_fails_closed(self):
+        self._stage_lifecycle_observation(83, now=100.0)
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        payload["lifecycle_notices"]["83"]["checks_status"] = "passed"
+        self.config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with self.assertRaisesRegex(TelegramStateError, "Invalid Telegram state"):
+            TelegramState(self.config.state_path)
+
+    def test_unknown_lifecycle_observation_is_checkpointed_without_notice(self):
+        delivery_id, pr_url = self._seed_pr_lifecycle_source(84)
+        self.state.start_follow_up(
+            84,
+            {
+                "kind": "pr-lifecycle",
+                "phase": "pending",
+                "delivery_id": delivery_id,
+                "task_id": "TASK-0001",
+                "project_name": "",
+                "chat_id": 7,
+                "pr_url": pr_url,
+                "failure_count": 0,
+                "next_poll_at": 100.0,
+                "pr_state": "open",
+                "checks_status": "unknown",
+                "merge_commit_sha": "",
+                "last_observation_key": "",
+                "last_notified_key": "",
+            },
+            now=100.0,
+        )
+        self.state.acknowledge(84)
+        self.monday.observe_results[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "project_name": "",
+            "pr_url": pr_url,
+            "pr_state": "open",
+            "checks_status": "unknown",
+            "merge_commit_sha": "",
+        }
+        service = TelegramBotService(
+            self.monday, self.client, self.state, self.config,
+        )
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        with (
+            patch("telegram_bot.state.time.time", return_value=100.0),
+            patch("telegram_bot.service.time.time", return_value=100.0),
+        ):
+            self.assertTrue(worker.run_follow_up_once())
+
+        follow_up = self.state.completed_job(84)["follow_up"]
+        self.assertEqual(follow_up["phase"], "pending")
+        self.assertEqual(follow_up["checks_status"], "unknown")
+        self.assertEqual(follow_up["last_observation_key"], "open:unknown")
+        self.assertEqual(follow_up["next_poll_at"], 130.0)
+        self.assertEqual(self.state.pending_lifecycle_notice_count, 0)
+
+    def test_timed_out_lifecycle_notice_is_delivered(self):
+        self._stage_lifecycle_observation(
+            85,
+            checks_status="timed-out",
+            now=100.0,
+        )
+        service = TelegramBotService(
+            self.monday, self.client, self.state, self.config,
+        )
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        self.assertTrue(worker.run_lifecycle_notice_once())
+
+        self.assertIn("have not completed", self.client.sent[-1][1])
+        self.assertEqual(self.state.pending_lifecycle_notice_count, 0)
+
+    def test_display_name_project_observes_and_delivers_after_restart(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        runner = TelegramRunner(self.client, service, self.state, poll_timeout=1)
+        runner.start()
+        self.client.updates = [
+            _update(
+                update_id=87,
+                text="/build Weather Portal :: Ship the dashboard",
+            ),
+        ]
+        self.assertEqual(runner.run_once(), 1)
+        delivery_id = self.state.completed_job(87)["delivery_id"]
+        self.monday.observe_results[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "project_name": "Weather Portal",
+            "pr_url": "https://github.com/example/mondayos/pull/55",
+            "pr_state": "merged",
+            "checks_status": "passed",
+            "merge_commit_sha": "a" * 40,
+        }
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        self.assertTrue(worker.run_follow_up_once())
+
+        notice = self.state.lifecycle_notice(87)
+        self.assertEqual(notice["project_name"], "Weather Portal")
+        self.assertEqual(notice["notice_key"], "merged")
+        restarted = TelegramState(config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday, self.client, restarted, config,
+        )
+        restarted_worker = TelegramJobWorker(
+            restarted_service,
+            restarted,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        self.assertTrue(restarted_worker.run_lifecycle_notice_once())
+
+        self.assertIn("was merged", self.client.sent[-1][1])
+        observe_calls = [
+            kwargs for action, kwargs in self.monday.build_calls
+            if action == "observe"
+        ]
+        self.assertEqual(observe_calls[-1]["project"], "Weather Portal")
+        self.assertEqual(restarted.pending_lifecycle_notice_count, 0)
+
+    def test_daemon_observes_new_state_before_sending_stale_due_notice(self):
+        delivery_id, pr_url = self._stage_lifecycle_observation(88, now=100.0)
+        self.state.update_follow_up(88, phase="pending", next_poll_at=0.0)
+        self.monday.observe_results[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "project_name": "",
+            "pr_url": pr_url,
+            "pr_state": "merged",
+            "checks_status": "passed",
+            "merge_commit_sha": "b" * 40,
+        }
+        stop = threading.Event()
+
+        class StopAfterNoticeClient(FakeTelegramClient):
+            def send_message(self, chat_id, text):
+                result = super().send_message(chat_id, text)
+                stop.set()
+                return result
+
+        client = StopAfterNoticeClient()
+        service = TelegramBotService(
+            self.monday, client, self.state, self.config,
+        )
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=stop,
+            wake_event=threading.Event(),
+        )
+
+        with (
+            patch("telegram_bot.state.time.time", return_value=130.0),
+            patch("telegram_bot.service.time.time", return_value=130.0),
+        ):
+            worker.run_forever()
+
+        self.assertEqual(len(client.sent), 1)
+        self.assertIn("was merged", client.sent[0][1])
+        self.assertNotIn("checks are running", client.sent[0][1])
+        self.assertEqual(
+            self.state.completed_job(88)["follow_up"]["phase"],
+            "completed",
+        )
+
+    def test_one_shot_leaves_stale_lifecycle_notice_for_daemon_observation(self):
+        delivery_id, pr_url = self._stage_lifecycle_observation(890, now=100.0)
+        self.monday.observe_results[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "project_name": "",
+            "pr_url": pr_url,
+            "pr_state": "merged",
+            "checks_status": "passed",
+            "merge_commit_sha": "c" * 40,
+        }
+        service = TelegramBotService(
+            self.monday, self.client, self.state, self.config,
+        )
+        runner = TelegramRunner(
+            self.client,
+            service,
+            self.state,
+            poll_timeout=1,
+        )
+        baseline = len(self.client.sent)
+
+        with (
+            patch("telegram_bot.state.time.time", return_value=130.0),
+            patch("telegram_bot.service.time.time", return_value=130.0),
+        ):
+            self.assertEqual(runner.run_once(), 0)
+
+        self.assertEqual(len(self.client.sent), baseline)
+        self.assertEqual(self.state.pending_lifecycle_notice_count, 1)
+        self.assertEqual(
+            self.state.lifecycle_notice(890)["notice_key"],
+            "open:pending",
+        )
+        self.assertFalse(any(
+            action == "observe" for action, _kwargs in self.monday.build_calls
+        ))
+
+    def test_watcher_expiry_scrubs_stale_notice_across_restart(self):
+        with patch("telegram_bot.state._FOLLOW_UP_MAX_AGE_SECONDS", 10):
+            self._stage_lifecycle_observation(891, now=100.0)
+
+        restarted = TelegramState(self.config.state_path)
+        self.assertEqual(restarted.pending_lifecycle_notice_count, 1)
+        self.assertIsNone(restarted.claim_due_follow_up(now=111.0))
+
+        follow_up = restarted.completed_job(891)["follow_up"]
+        self.assertEqual(follow_up["phase"], "expired")
+        self.assertEqual(follow_up["last_resolved_notice_key"], "open:pending")
+        self.assertEqual(follow_up["last_notice_status"], "expired")
+        self.assertEqual(restarted.pending_lifecycle_notice_count, 0)
+        self.assertEqual(restarted.lifecycle_notice(891), {})
+
+        second_restart = TelegramState(self.config.state_path)
+        self.assertEqual(second_restart.pending_lifecycle_notice_count, 0)
+        self.assertEqual(
+            second_restart.completed_job(891)["follow_up"]["phase"],
+            "expired",
+        )
 
     def test_pr_follow_up_expiry_survives_restart_and_frees_capacity(self):
         first = {
             "kind": "pr-lifecycle",
             "phase": "pending",
+            "delivery_id": "delivery-test-78",
+            "task_id": "TASK-0001",
+            "project_name": "",
+            "chat_id": 7,
+            "pr_url": "https://github.com/example/mondayos/pull/55",
             "next_poll_at": 1_000.0,
             "failure_count": 0,
         }
-        self.state.set_job(78)
+        self._seed_pr_lifecycle_source(78)
         with (
             patch("telegram_bot.state._MAX_ACTIVE_FOLLOW_UPS", 1),
             patch("telegram_bot.state._FOLLOW_UP_MAX_AGE_SECONDS", 10),
@@ -6247,11 +7139,418 @@ class TestTelegramStateAndRunner(TelegramFixture):
                 "expired",
             )
 
-            restarted.set_job(79)
-            second = restarted.start_follow_up(79, first, now=111.0)
+            self.state = restarted
+            self._seed_pr_lifecycle_source(79)
+            second_candidate = dict(first)
+            second_candidate["delivery_id"] = "delivery-test-79"
+            second = restarted.start_follow_up(
+                79,
+                second_candidate,
+                now=111.0,
+            )
 
         self.assertEqual(second["phase"], "pending")
         self.assertEqual(second["expires_at"], 121.0)
+
+    def test_active_pr_follow_up_round_trips_through_v9_restart(self):
+        now = time.time()
+        self._seed_pr_lifecycle_source(780, project_name="Weather Portal")
+        started = self.state.start_follow_up(
+            780,
+            {
+                "kind": "pr-lifecycle",
+                "phase": "pending",
+                "delivery_id": "delivery-test-780",
+                "task_id": "TASK-0001",
+                "project_name": "Weather Portal",
+                "chat_id": 7,
+                "pr_url": "https://github.com/example/mondayos/pull/55",
+                "next_poll_at": now + 3_600,
+                "failure_count": 0,
+            },
+            now=now,
+        )
+        self.state.acknowledge(780)
+
+        restarted = TelegramState(self.config.state_path)
+
+        self.assertEqual(restarted.completed_job(780)["follow_up"], started)
+
+    def test_expired_v9_legacy_follow_up_without_route_still_loads(self):
+        now = time.time()
+        self._seed_pr_lifecycle_source(781)
+        self.state.start_follow_up(
+            781,
+            {
+                "kind": "pr-lifecycle",
+                "phase": "pending",
+                "delivery_id": "delivery-test-781",
+                "task_id": "TASK-0001",
+                "project_name": "",
+                "chat_id": 7,
+                "pr_url": "https://github.com/example/mondayos/pull/55",
+                "next_poll_at": now + 3_600,
+            },
+            now=now,
+        )
+        self.state.acknowledge(781)
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        follow_up = payload["completed_jobs"]["781"]["follow_up"]
+        for field in (
+            "delivery_id", "task_id", "project_name", "chat_id", "pr_url",
+        ):
+            follow_up.pop(field)
+        follow_up["created_at"] = 1.0
+        follow_up["expires_at"] = 2.0
+        self.config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        restarted = TelegramState(self.config.state_path)
+        self.assertIsNone(restarted.claim_due_follow_up(now=now))
+        self.assertEqual(
+            restarted.completed_job(781)["follow_up"]["phase"],
+            "expired",
+        )
+
+    def test_v8_migration_terminalizes_unbound_watcher_before_v9_write(self):
+        self.state.bind_bot_identity(99, "monday_test_bot")
+        delivery_id, _pr_url = self._seed_pr_lifecycle_source(782)
+        self.state.start_follow_up(
+            782,
+            self._pr_follow_up_candidate(delivery_id),
+            now=time.time(),
+        )
+        self.state.acknowledge(782)
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        payload["version"] = 8
+        follow_up = payload["completed_jobs"]["782"]["follow_up"]
+        follow_up.pop("source_binding")
+        follow_up["task_id"] = "TASK-9999"
+        self.config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        migrated = TelegramState(self.config.state_path)
+        self.assertEqual(
+            migrated.completed_job(782)["follow_up"]["phase"],
+            "migration-invalid",
+        )
+        migrated.bind_bot_identity(99, "monday_test_bot")
+
+        restarted = TelegramState(self.config.state_path)
+        self.assertEqual(
+            restarted.completed_job(782)["follow_up"]["phase"],
+            "migration-invalid",
+        )
+
+    def test_v8_migration_preserves_authoritative_watcher(self):
+        self.state.bind_bot_identity(99, "monday_test_bot")
+        delivery_id, _pr_url = self._seed_pr_lifecycle_source(783)
+        self.state.start_follow_up(
+            783,
+            self._pr_follow_up_candidate(delivery_id),
+            now=time.time(),
+        )
+        self.state.acknowledge(783)
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        payload["version"] = 8
+        payload["completed_jobs"]["783"]["follow_up"].pop("source_binding")
+        self.config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        migrated = TelegramState(self.config.state_path)
+        follow_up = migrated.completed_job(783)["follow_up"]
+        self.assertEqual(follow_up["phase"], "pending")
+        self.assertRegex(follow_up["source_binding"], r"^[0-9a-f]{64}$")
+        migrated.bind_bot_identity(99, "monday_test_bot")
+
+        restarted = TelegramState(self.config.state_path)
+        self.assertEqual(
+            restarted.completed_job(783)["follow_up"],
+            follow_up,
+        )
+
+    def test_v8_migration_neutralizes_pre_outcome_retry_watcher(self):
+        self.state.bind_bot_identity(99, "monday_test_bot")
+        root_delivery_id = self._seed_delivery_retry(785, now=100.0)
+        self.state.acknowledge(785)
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        payload["version"] = 8
+        payload["completed_jobs"]["785"]["follow_up"] = {
+            **self._pr_follow_up_candidate(f"{root_delivery_id}-r2"),
+            "created_at": time.time(),
+            "expires_at": time.time() + 3_600,
+        }
+        self.config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        migrated = TelegramState(self.config.state_path)
+
+        self.assertEqual(
+            migrated.completed_job(785)["follow_up"]["phase"],
+            "migration-invalid",
+        )
+
+    def test_v8_migration_bounds_legacy_watchers_before_v9_restart(self):
+        self.state.bind_bot_identity(99, "monday_test_bot")
+        delivery_id, _pr_url = self._seed_pr_lifecycle_source(784)
+        self.state.start_follow_up(
+            784,
+            self._pr_follow_up_candidate(delivery_id),
+            now=time.time(),
+        )
+        self.state.acknowledge(784)
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        template = payload["completed_jobs"]["784"]
+        template["follow_up"].pop("source_binding")
+        payload["version"] = 8
+        payload["completed_jobs"] = {
+            str(1_000 + index): json.loads(json.dumps(template))
+            for index in range(501)
+        }
+        self.config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        migrated = TelegramState(self.config.state_path)
+        migrated.bind_bot_identity(99, "monday_test_bot")
+        written = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        active = [
+            value
+            for value in written["completed_jobs"].values()
+            if value["follow_up"]["phase"] in {"pending", "polling", "retrying"}
+        ]
+        self.assertEqual(len(active), 500)
+        self.assertEqual(
+            written["completed_jobs"]["1500"]["follow_up"]["phase"],
+            "migration-invalid-capacity",
+        )
+        TelegramState(self.config.state_path)
+
+        written["completed_jobs"]["1500"]["follow_up"] = json.loads(
+            json.dumps(written["completed_jobs"]["1000"]["follow_up"])
+        )
+        self.config.state_path.write_text(json.dumps(written), encoding="utf-8")
+        with self.assertRaisesRegex(TelegramStateError, "Invalid Telegram state"):
+            TelegramState(self.config.state_path)
+
+    def test_start_follow_up_rejects_every_source_route_mismatch(self):
+        mismatches = {
+            "delivery_id": "delivery-other",
+            "task_id": "TASK-9999",
+            "project_name": "Another Project",
+            "chat_id": 8,
+            "pr_url": "https://github.com/example/mondayos/pull/99",
+        }
+        for index, (field, value) in enumerate(mismatches.items(), start=790):
+            with self.subTest(field=field):
+                delivery_id, _pr_url = self._seed_pr_lifecycle_source(index)
+                candidate = self._pr_follow_up_candidate(delivery_id)
+                candidate[field] = value
+                before = self.config.state_path.read_text(encoding="utf-8")
+                with self.assertRaisesRegex(
+                    TelegramStateError,
+                    "source binding",
+                ):
+                    self.state.start_follow_up(index, candidate)
+                self.assertEqual(
+                    self.config.state_path.read_text(encoding="utf-8"),
+                    before,
+                )
+
+    def test_lifecycle_source_tampering_fails_closed_on_restart(self):
+        self._stage_lifecycle_observation(795, now=100.0)
+        original = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        mutations = {
+            "task": lambda source: source.update(task_id="TASK-9999"),
+            "delivery": lambda source: source.update(delivery_id="delivery-other"),
+            "project": lambda source: source.update(project_name="Other"),
+            "chat": lambda source: source.update(chat_id=8),
+            "digest": lambda source: source.update(request_digest="b" * 64),
+            "pr_url": lambda source: source["delivery_result"].update(
+                pr_url="https://github.com/example/mondayos/pull/99"
+            ),
+        }
+        try:
+            for name, mutate in mutations.items():
+                with self.subTest(field=name):
+                    payload = json.loads(json.dumps(original))
+                    mutate(payload["completed_jobs"]["795"])
+                    self.config.state_path.write_text(
+                        json.dumps(payload),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        TelegramStateError,
+                        "Invalid Telegram state",
+                    ):
+                        TelegramState(self.config.state_path)
+        finally:
+            self.config.state_path.write_text(
+                json.dumps(original),
+                encoding="utf-8",
+            )
+
+    def test_follow_up_mutators_reject_loader_invalid_state_before_write(self):
+        delivery_id, _pr_url = self._seed_pr_lifecycle_source(796)
+        before = self.config.state_path.read_text(encoding="utf-8")
+        with self.assertRaises(TelegramStateError):
+            self.state.set_job(
+                796,
+                follow_up={
+                    "kind": "pr-lifecycle",
+                    "phase": "pending",
+                    "delivery_id": delivery_id,
+                },
+            )
+        self.assertEqual(
+            self.config.state_path.read_text(encoding="utf-8"),
+            before,
+        )
+
+        self.state.start_follow_up(
+            796,
+            self._pr_follow_up_candidate(delivery_id),
+            now=time.time(),
+        )
+        before = self.config.state_path.read_text(encoding="utf-8")
+        with self.assertRaisesRegex(TelegramStateError, "source binding|origin"):
+            self.state.set_job(796, chat_id=8)
+        self.assertEqual(
+            self.config.state_path.read_text(encoding="utf-8"),
+            before,
+        )
+        self.state.acknowledge(796)
+        before = self.config.state_path.read_text(encoding="utf-8")
+        with self.assertRaisesRegex(TelegramStateError, "cannot change chat_id"):
+            self.state.update_follow_up(796, chat_id=7.0)
+        self.assertEqual(
+            self.config.state_path.read_text(encoding="utf-8"),
+            before,
+        )
+        TelegramState(self.config.state_path)
+
+    def test_expiry_rebounds_history_and_preserves_active_notice_source(self):
+        self._stage_lifecycle_observation(797, now=100.0)
+        delivery_id, _pr_url = self._seed_pr_lifecycle_source(798)
+        with patch("telegram_bot.state._FOLLOW_UP_MAX_AGE_SECONDS", 10):
+            self.state.start_follow_up(
+                798,
+                self._pr_follow_up_candidate(delivery_id),
+                now=100.0,
+            )
+        self.state.acknowledge(798)
+
+        with patch("telegram_bot.state._MAX_COMPLETED_JOBS", 1):
+            self.state.next_follow_up_delay(now=111.0)
+
+        self.assertEqual(self.state.lifecycle_notice(797)["notice_key"], "open:pending")
+        self.assertTrue(self.state.completed_job(797))
+        self.assertEqual(self.state.completed_job(798), {})
+
+    def test_staged_successful_retry_watcher_survives_crash_and_restart(self):
+        root_delivery_id = self._seed_delivery_retry(799, now=100.0)
+        self.state.acknowledge(799)
+        claimed = self.state.claim_due_delivery_retry(now=161.0)
+        self.assertIsNotNone(claimed)
+        retry_delivery_id = f"{root_delivery_id}-r2"
+        outcome = {
+            "delivery_id": retry_delivery_id,
+            "success": True,
+            "status": "pr-open",
+            "phase": "completed",
+            "branch": "codex/task-0001-retry",
+            "commit_sha": "b" * 40,
+            "pr_url": "https://github.com/example/mondayos/pull/77",
+            "publication_uncertain": False,
+            "pushed": True,
+            "changed_files": [],
+            "attempts": 1,
+            "failure_code": "",
+            "failure_class": "",
+            "retry_after_seconds": 0,
+            "message": "",
+        }
+        with patch("telegram_bot.state.time.time", return_value=162.0):
+            self.state.stage_delivery_retry_outcome(
+                799,
+                phase="completed",
+                result=outcome,
+            )
+        staged_binding = self.state.completed_job(799)["follow_up"][
+            "source_binding"
+        ]
+
+        restarted = TelegramState(self.config.state_path)
+        service = TelegramBotService(
+            self.monday,
+            self.client,
+            restarted,
+            self.config,
+        )
+        worker = TelegramJobWorker(
+            service,
+            restarted,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        build_calls = len(self.monday.build_calls)
+        self.assertTrue(worker.run_delivery_retry_once())
+
+        self.assertEqual(len(self.monday.build_calls), build_calls)
+        self.assertEqual(restarted.delivery_retry(799), {})
+        self.assertEqual(
+            restarted.completed_job(799)["follow_up"]["source_binding"],
+            staged_binding,
+        )
+        TelegramState(self.config.state_path)
+
+    def test_retry_promotion_preserves_pending_lifecycle_notice_binding(self):
+        root_delivery_id = self._seed_delivery_retry(800, now=100.0)
+        self.state.acknowledge(800)
+        self.assertIsNotNone(self.state.claim_due_delivery_retry(now=161.0))
+        retry_delivery_id = f"{root_delivery_id}-r2"
+        outcome = {
+            "delivery_id": retry_delivery_id,
+            "success": True,
+            "status": "pr-open",
+            "phase": "completed",
+            "branch": "codex/task-0001-retry",
+            "commit_sha": "c" * 40,
+            "pr_url": "https://github.com/example/mondayos/pull/78",
+            "publication_uncertain": False,
+            "pushed": True,
+            "changed_files": [],
+            "attempts": 1,
+            "failure_code": "",
+            "failure_class": "",
+            "retry_after_seconds": 0,
+            "message": "",
+        }
+        with patch("telegram_bot.state.time.time", return_value=162.0):
+            self.state.stage_delivery_retry_outcome(
+                800,
+                phase="completed",
+                result=outcome,
+            )
+        claimed = self.state.claim_due_follow_up(now=163.0)
+        self.assertIsNotNone(claimed)
+        self.state.settle_follow_up_observation(
+            800,
+            claimed=claimed[1],
+            observation={
+                "pr_state": "open",
+                "checks_status": "pending",
+                "merge_commit_sha": "",
+            },
+            next_poll_at=193.0,
+        )
+        notice_binding = self.state.lifecycle_notice(800)["source_binding"]
+
+        self.state.finish_delivery_retry(800)
+        restarted = TelegramState(self.config.state_path)
+
+        self.assertEqual(
+            restarted.lifecycle_notice(800)["source_binding"],
+            notice_binding,
+        )
+        self.assertEqual(
+            restarted.completed_job(800)["follow_up"]["delivery_id"],
+            retry_delivery_id,
+        )
 
     def test_completed_telegram_tombstones_remain_bounded(self):
         with patch("telegram_bot.state._MAX_COMPLETED_JOBS", 3):
@@ -6301,9 +7600,10 @@ class TestTelegramStateAndRunner(TelegramFixture):
         }
         client = SequencedClient()
         self.state.bind_bot_identity(99, "monday_test_bot")
-        self.state.set_job(
+        self._seed_pr_lifecycle_source(76, delivery_id=delivery_id)
+        self.state.start_follow_up(
             76,
-            follow_up={
+            {
                 "kind": "pr-lifecycle",
                 "phase": "pending",
                 "delivery_id": delivery_id,
@@ -6954,6 +8254,7 @@ class TestTelegramIdentify(unittest.TestCase):
         self.assertEqual(payload["service"]["pending_capacity_notices"], 0)
         self.assertEqual(payload["service"]["pending_acceptance_receipts"], 0)
         self.assertEqual(payload["service"]["pending_delivery_notices"], 0)
+        self.assertEqual(payload["service"]["pending_lifecycle_notices"], 0)
         self.assertIsNone(payload["build"]["ready"])
         self.assertNotIn("super-secret-token", output.getvalue())
 
@@ -7352,6 +8653,42 @@ class TestTelegramIdentify(unittest.TestCase):
         self.assertNotIn(secret, json_output.getvalue())
         self.assertNotIn(secret, human_output.getvalue())
         self.assertNotIn("super-secret-token", json_output.getvalue())
+
+    def test_health_is_unhealthy_for_unresolved_lifecycle_notice(self):
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "123:super-secret-token",
+            "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+        }, clear=True), patch(
+            "telegram_bot.state.instance_lock_is_held",
+            return_value=True,
+        ), patch.object(
+            TelegramState,
+            "pending_lifecycle_notice_count",
+            1,
+            create=True,
+        ):
+            root = Path(tmp)
+            state = TelegramState(root / "logs" / "telegram" / "state.json")
+            state.bind_bot_identity(99, "monday_bot")
+            self._mark_runtime_ready(state)
+            args = SimpleNamespace(
+                project_root=tmp,
+                health=True,
+                json=True,
+                identify=False,
+                provider="",
+                once=False,
+            )
+            output = StringIO()
+
+            with redirect_stdout(output):
+                result = _cmd_telegram(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(payload["healthy"])
+        self.assertEqual(payload["service"]["pending_lifecycle_notices"], 1)
+        self.assertNotIn("super-secret-token", output.getvalue())
 
     @patch("telegram_bot.client.HttpTelegramClient")
     def test_identify_holds_worker_lock_and_does_not_confirm_updates(self, client_type):

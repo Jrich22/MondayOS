@@ -1520,3 +1520,92 @@ explanatory text; they never append the persisted team message.
   both the contents and filesystem metadata of outside files.
 - Detailed vendor diagnostics must be investigated at the provider boundary or
   vendor console rather than copied into MondayOS durable state or chat.
+
+---
+
+## ADR-030: PR Observation Must Not Depend on Telegram Delivery
+
+**Date:** 2026-10-15
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+The first pull-request follow-up loop observed GitHub, rendered a lifecycle
+message, sent it to Telegram, and only then checkpointed the observation. It
+also checked the current Telegram allowlist before observing. A rate limit could
+therefore delay the only GitHub polling clock for up to 24 hours, while a
+blocked bot, deleted chat, or revoked destination could stop the watcher
+permanently. A crash after the remote send but before the local checkpoint also
+forced the combined operation to be retried. Messaging availability was
+incorrectly capable of preventing later merge, closure, or divergence evidence
+from reaching MondayOS task state.
+
+### Decision
+
+Exact PR observation and Telegram delivery are independent durable lanes. The
+observer calls the public `build observe` operation without first authorizing a
+Telegram destination. After the delivery, task, project, and PR identities are
+revalidated, one atomic local write records the bounded observation, schedules
+the next GitHub poll or completes the watcher, and enqueues or supersedes at
+most one semantic lifecycle notice.
+
+The lifecycle-notice outbox contains only the immutable source identity,
+minimal private route, normalized PR/check state, optional verified merge SHA,
+bounded retry metadata, and a deterministic source binding. It contains no
+request body, check name, annotation, log, or raw provider, GitHub, or Telegram
+diagnostic. An unchanged observation neither duplicates a resolved notice nor
+resets an existing notice's backoff. A newer unsent transition replaces the
+older notice; a terminal transition therefore supersedes stale open-check
+status. Active notices and watchers have explicit capacity bounds, and their
+completed source tombstones remain protected from history eviction.
+
+A separate worker lane revalidates the binding and current allowlist before
+sending. Telegram rate limits create a durable lane-wide pause that also covers
+notices created during the retry window; other retryable failures defer only
+their notice.
+Revocation and permanent destination failures terminalize and scrub only the
+notice; they do not alter the watcher. Verified terminal PR state completes the
+watcher even when its notification cannot be delivered. GitHub observation
+failures alone control the observer's bounded backoff.
+If the watcher's 30-day lifetime expires first, any still-unsent open-state
+notice is resolved and scrubbed in the same checkpoint instead of surviving as
+stale monitoring status.
+
+Once a durable delivery-recovery run has staged an outcome for a newly opened
+PR, its watcher is likewise independent: retry-outcome notification backoff or
+permanent failure cannot suppress GitHub observation.
+
+Lifecycle delivery is at-least-once because Telegram and the local state file
+cannot share a transaction. A crash after Telegram accepts a message but before
+the local acknowledgement may replay the same fixed notice. Once observation
+and notice creation have been atomically persisted, restart sends the notice
+without re-observing GitHub. A crash before that write may repeat the exact
+observer operation; task reconciliation is separately identity-bound and
+idempotent.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Keep one combined poll-and-send operation | Telegram availability would continue to control GitHub truth and task reconciliation. |
+| Check destination authorization before observing | Revocation is a messaging decision, not authority to stop exact PR reconciliation. |
+| Retry notices only in memory | Restart could silently lose a transition that was already recorded. |
+| Queue every observed transition | A prolonged outage could produce stale message bursts and unbounded state; only the newest semantic transition is useful. |
+| Claim exactly-once message delivery | Telegram cannot atomically commit with the local checkpoint, so that guarantee would be false. |
+
+### Consequences
+
+- Merge, closure, and reviewed-SHA divergence continue to reconcile tasks when
+  Telegram is slow, blocked, deleted, or no longer allowlisted.
+- Telegram backoff cannot reduce GitHub polling frequency, and observation
+  backoff cannot discard an already-recorded message.
+- Operators may rarely receive the same fixed lifecycle message twice after a
+  crash at the remote/local acknowledgement boundary.
+- Health exposes unresolved lifecycle notices independently from active
+  watchers, while permanent route failures resolve instead of hot-looping.
+- The normal daemon remains required for continuous observation and outbox
+  delivery; one-shot mode neither observes nor delivers lifecycle state, so it
+  cannot send a saved status without first reconciling GitHub.

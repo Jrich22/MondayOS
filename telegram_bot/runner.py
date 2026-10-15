@@ -134,18 +134,6 @@ class TelegramJobWorker:
             return True
         try:
             poller(update_id, follow_up)
-        except TelegramRateLimitError as exc:
-            self._state.defer_rate_limited_follow_up(
-                update_id,
-                retry_after=_telegram_notice_rate_limit_delay(exc.retry_after),
-            )
-        except TelegramAPIError as exc:
-            if exc.retryable:
-                self._state.defer_follow_up(update_id, delay_seconds=60)
-            else:
-                # A blocked bot or deleted chat will never recover by polling.
-                # Stop this watcher without retaining Telegram's diagnostic.
-                self._state.mark_follow_up_notification_failed(update_id)
         except Exception:
             # Observation failures are deliberately isolated from accepted
             # work. The tombstone remains restart-safe and retains no raw
@@ -206,6 +194,60 @@ class TelegramJobWorker:
             )
         return True
 
+    def run_lifecycle_notice_once(self) -> bool:
+        """Send one due PR notice without delaying lifecycle observation."""
+        due = self._state.due_lifecycle_notice_ids()
+        if not due:
+            return False
+        update_id = due[0]
+        notice = self._state.lifecycle_notice(update_id)
+        if not notice:
+            return False
+        binding = str(notice.get("source_binding") or "")
+        deliverer = getattr(self._service, "deliver_lifecycle_notice", None)
+        if not callable(deliverer):
+            self._state.complete_lifecycle_notice(
+                update_id,
+                source_binding=binding,
+                delivered=False,
+            )
+            return True
+        try:
+            delivered = deliverer(notice)
+        except TelegramRateLimitError as exc:
+            self._state.defer_lifecycle_notices(
+                due,
+                delay_seconds=_telegram_notice_rate_limit_delay(exc.retry_after),
+            )
+        except TelegramAPIError as exc:
+            if exc.retryable:
+                self._state.defer_lifecycle_notice(
+                    update_id,
+                    source_binding=binding,
+                    delay_seconds=30,
+                )
+            else:
+                self._state.complete_lifecycle_notice(
+                    update_id,
+                    source_binding=binding,
+                    delivered=False,
+                )
+        except Exception:
+            # Never retain GitHub or Telegram diagnostic text. The semantic
+            # notice remains source-bound and independently retryable.
+            self._state.defer_lifecycle_notice(
+                update_id,
+                source_binding=binding,
+                delay_seconds=60,
+            )
+        else:
+            self._state.complete_lifecycle_notice(
+                update_id,
+                source_binding=binding,
+                delivered=delivered is not False,
+            )
+        return True
+
     def run_delivery_retry_once(self) -> bool:
         """Run one due request-free retry without blocking the main FIFO."""
         claimed = self._state.claim_due_delivery_retry()
@@ -259,7 +301,11 @@ class TelegramJobWorker:
                     pending_delivery = True
                 self._mark_background_active()
                 followed_up = self.run_follow_up_once()
-                if noticed or worked or retried or followed_up:
+                # Observe first so a newer GitHub transition can atomically
+                # replace a stale unsent notice before this lane selects it.
+                self._mark_background_active()
+                lifecycle_noticed = self.run_lifecycle_notice_once()
+                if noticed or lifecycle_noticed or worked or retried or followed_up:
                     backoff = 1
                     continue
                 if pending_delivery:
@@ -486,9 +532,9 @@ class TelegramRunner:
         """Ingest one batch and drain it synchronously for CLI setup/tests."""
         handled = self.ingest_once()
         while True:
-            noticed = self._worker.run_delivery_notice_once()
+            delivery_noticed = self._worker.run_delivery_notice_once()
             worked = self._worker.run_once()
-            if not noticed and not worked:
+            if not delivery_noticed and not worked:
                 break
         return handled
 

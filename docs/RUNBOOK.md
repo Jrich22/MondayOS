@@ -134,10 +134,13 @@ outage or rate limit may delay that notice, but it does not stop polling; a
 later `/cancel` can still arrive and free capacity. Health remains nonzero while
 any refusal notice is unresolved.
 
-Accepted-job receipts and terminal live-build messages use separate bounded
-outboxes. A failed final send does not retain the original build request, rerun
-the build, or hold later FIFO work. Leave the service running so it can retry;
-health remains nonzero until the corresponding request-free outbox drains.
+Accepted-job receipts, terminal live-build messages, and PR lifecycle messages
+use separate bounded outboxes. A failed final or lifecycle send does not retain
+the original build request, rerun the build, delay GitHub observation, or hold
+later FIFO work. Leave the service running so it can retry. A blocked or revoked
+destination can discard its message, but the exact PR watcher still reconciles
+verified merge, closure, or divergence state. Health remains nonzero while a
+retryable request-free message is unresolved.
 
 ## Logs and safe rotation
 
