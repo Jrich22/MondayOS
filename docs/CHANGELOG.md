@@ -187,6 +187,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Terminal and expired Telegram pull-request watchers now retain the same
+  authoritative source-binding guarantee as active watchers after notices are
+  removed. Restart rejects deleted, malformed, or mismatched bindings on the
+  first load; pre-v9 active and terminal watchers are rebound only when their
+  saved delivery source still proves the exact route, otherwise they become
+  inert migration tombstones. Expired route-less compatibility records are
+  reduced to exact inert tombstones so repeated restarts remain safe.
 - Opening a reviewed pull request and moving its MondayOS task to `REVIEW` are
   now two explicit durable effects. The successful delivery is first recorded
   as `pr-open` with `review_reconciliation=review-pending`; a task-store outage
