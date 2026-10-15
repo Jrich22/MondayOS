@@ -57,6 +57,8 @@ Then send `/status` in the allowlisted private Telegram chat. Healthy means:
 
 - launchd reports the service instead of `service not found`;
 - `monday telegram --health` reports a held worker lock and fresh heartbeat;
+- the inbox line reports fewer than 25 pending jobs and `accepting work`;
+- the refusals line reports `0 pending`;
 - MondayOS status is healthy;
 - build capabilities reports `ready: True` for subscription-based Codex review;
 - GitHub CLI authentication is valid;
@@ -70,8 +72,9 @@ monday telegram --health --json
 ```
 
 The command never contacts Telegram, never prints the bot token, and exits
-nonzero when the local configuration, worker lock, heartbeat, state, or required
-live-build capabilities are not ready.
+nonzero when the local configuration, worker lock, heartbeat, state, inbox
+capacity, unresolved refusal notices, or required live-build capabilities are
+not ready.
 
 Use `monday build history --limit 20` to review recent deliveries. For a known
 delivery ID:
@@ -96,6 +99,8 @@ normal text                 create, build, review, and open a PR
 /run TASK-ID                run the advisory team
 /status [TASK-ID]           show system or task status
 /tasks                      list active tasks
+/queue                      show your pending job handles and positions
+/cancel JOB-ID              cancel a job that has not started
 /help                       show supported commands
 ```
 
@@ -103,6 +108,15 @@ The durable FIFO acknowledges a request only after saving it. One worker runs
 model/build work at a time while polling remains responsive. Delayed retries and
 open-PR follow-ups survive restart. Do not resend a request merely because a
 build is slow; use `/status TASK-ID` or the delivery history first.
+
+The inbox admits at most 25 pending jobs. If Telegram reports that the inbox is
+full, use `/queue` to inspect request-free job handles and `/cancel JOB-ID` to
+remove an unstarted job, then submit the refused request again. A cancellation
+cannot interrupt running, waiting, retrying, or side-effectful work. Do not edit
+`logs/telegram/state.json` manually to make room; cancellation and normal job
+completion release capacity safely and preserve replay protection. For a job
+submitted in an allowed group, open Monday's private chat: the same submitting
+user can see and cancel it there, while other users cannot.
 
 ## Logs and safe rotation
 

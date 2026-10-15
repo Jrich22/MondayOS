@@ -231,6 +231,11 @@ class TelegramRunner:
 
     def ingest_once(self) -> int:
         """Persist one Telegram batch without running any Monday/model work."""
+        # Telegram retains updates for a limited period. Retry request-free
+        # refusal notices from our durable state before polling so a long
+        # outage cannot strand a notice merely because its source update aged
+        # out of Telegram's queue.
+        self._drain_queue_full_notices()
         updates = self._client.get_updates(
             offset=self._state.next_offset,
             timeout=self._poll_timeout,
@@ -241,7 +246,10 @@ class TelegramRunner:
             if update_id < 0:
                 continue
             if self._state.is_terminal(update_id):
-                self._state.reaffirm_terminal(update_id)
+                if self._state.queue_full_notice(update_id):
+                    self._deliver_queue_full_notice(update_id, update)
+                else:
+                    self._state.reaffirm_terminal(update_id)
                 handled += 1
                 continue
 
@@ -276,10 +284,32 @@ class TelegramRunner:
                 handled += 1
                 continue
 
+            try:
+                controlled = self._handle_intake_control(normalized)
+            except TelegramAPIError as exc:
+                if exc.retryable:
+                    # The state-only control mutation is idempotent. Leave this
+                    # update unacknowledged so Telegram can redeliver it and the
+                    # user can receive the same safe result after recovery.
+                    raise
+                # A permanently unreachable chat must not wedge intake after a
+                # control mutation has already reached durable state.
+                self._state.acknowledge(update_id)
+                handled += 1
+                continue
+            if controlled:
+                self._state.acknowledge(update_id)
+                handled += 1
+                continue
+
             created, position = self._state.enqueue(update_id, normalized)
             if created:
                 self._announce_queued(normalized, position)
                 self._wake.set()
+            elif position == 0:
+                tombstone = self._state.completed_job(update_id)
+                if tombstone.get("phase") == "queue-full":
+                    self._deliver_queue_full_notice(update_id, normalized)
             handled += 1
         return handled
 
@@ -362,6 +392,11 @@ class TelegramRunner:
         # Compatibility for small embedders that implement only handle_update.
         return update
 
+    def _handle_intake_control(self, update: dict[str, Any]) -> bool:
+        """Run one state-only control without entering the model/build FIFO."""
+        handler = getattr(self._service, "handle_intake_control", None)
+        return bool(handler(update)) if callable(handler) else False
+
     def _announce_queued(self, update: dict[str, Any], position: int) -> None:
         announcer = getattr(self._service, "announce_queued", None)
         if not callable(announcer):
@@ -374,3 +409,59 @@ class TelegramRunner:
             pass
         except Exception:
             print("Could not send Telegram queue acknowledgement.", file=sys.stderr)
+
+    def _deliver_queue_full_notice(
+        self,
+        update_id: int,
+        update: dict[str, Any] | None = None,
+    ) -> None:
+        """Deliver and checkpoint one request-free capacity refusal notice."""
+        notice = self._state.queue_full_notice(update_id)
+        if not notice:
+            self._state.reaffirm_terminal(update_id)
+            return
+        announcer = getattr(self._service, "announce_queue_full_notice", None)
+        legacy_announcer = getattr(self._service, "announce_queue_full", None)
+        try:
+            if callable(announcer):
+                delivered = announcer(notice)
+                if delivered is False:
+                    self._state.complete_queue_full_notice(
+                        update_id,
+                        delivered=False,
+                    )
+                    return
+            elif callable(legacy_announcer):
+                legacy_announcer(update or {
+                    "update_id": update_id,
+                    "message": {
+                        "from": {
+                            "id": notice["user_id"],
+                            "is_bot": False,
+                        },
+                        "chat": {
+                            "id": notice["chat_id"],
+                            "type": notice["chat_type"],
+                        },
+                    },
+                })
+            else:
+                self._state.complete_queue_full_notice(update_id, delivered=False)
+                return
+        except TelegramAPIError as exc:
+            if exc.retryable:
+                # The durable tombstone deliberately leaves the Telegram
+                # offset behind this update so a restart/redelivery retries
+                # the same request-free notice without re-admitting the job.
+                raise
+            self._state.complete_queue_full_notice(update_id, delivered=False)
+        except Exception:
+            print("Could not send Telegram queue-full notice.", file=sys.stderr)
+            self._state.complete_queue_full_notice(update_id, delivered=False)
+        else:
+            self._state.complete_queue_full_notice(update_id, delivered=True)
+
+    def _drain_queue_full_notices(self) -> None:
+        """Retry durable refusal notices without relying on Telegram replay."""
+        for update_id in self._state.pending_queue_full_notice_ids():
+            self._deliver_queue_full_notice(update_id)

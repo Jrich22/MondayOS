@@ -9,7 +9,7 @@ from typing import Any
 
 from telegram_bot.client import TelegramAPIError, TelegramClient, TelegramRateLimitError
 from telegram_bot.config import TelegramConfig
-from telegram_bot.state import TelegramState
+from telegram_bot.state import TelegramState, job_id, parse_job_id
 
 _TASK_ID = re.compile(
     r"^TASK-\d{1,64}(?:-[a-z0-9]{1,12})?$",
@@ -122,11 +122,124 @@ class TelegramBotService:
         context = self._authorized_context(message)
         if context is None:
             return
+        handle = job_id(_integer(update.get("update_id"), -1))
         if position <= 1:
-            text = "Request saved. Monday is starting it automatically."
+            text = f"Request saved as {handle}. Monday is starting it automatically."
         else:
-            text = f"Request saved. Queue position: {position}."
+            text = f"Request saved as {handle}. Queue position: {position}."
         self._client.send_message(context[0], text)
+
+    def announce_queue_full(self, update: dict[str, Any]) -> None:
+        """Report a durable capacity refusal without repeating request text."""
+        message = update.get("message")
+        if not isinstance(message, dict):
+            return
+        context = self._authorized_context(message)
+        if context is None:
+            return
+        self.announce_queue_full_notice({
+            "user_id": context[1],
+            "chat_id": context[0],
+            "chat_type": context[2],
+        })
+
+    def announce_queue_full_notice(self, notice: dict[str, Any]) -> bool:
+        """Reauthorize and send one request-free capacity notice."""
+        user_id = notice.get("user_id")
+        chat_id = notice.get("chat_id")
+        chat_type = str(notice.get("chat_type") or "")
+        if (
+            isinstance(user_id, bool)
+            or not isinstance(user_id, int)
+            or user_id <= 0
+            or isinstance(chat_id, bool)
+            or not isinstance(chat_id, int)
+            or chat_id == 0
+            or chat_type not in {"private", "group", "supergroup"}
+            or (chat_type == "private" and chat_id < 0)
+            or (chat_type in {"group", "supergroup"} and chat_id > 0)
+            or (chat_type == "private" and chat_id != user_id)
+        ):
+            raise ValueError("Invalid Telegram queue-full notice destination")
+        if user_id not in self._config.allowed_user_ids:
+            return False
+        if (
+            chat_type in {"group", "supergroup"}
+            and chat_id not in self._config.allowed_chat_ids
+        ):
+            return False
+        guidance = (
+            "Use /queue or /cancel JOB-ID, then send it again later."
+            if chat_type == "private"
+            else "Open Monday's private chat and use /queue or /cancel JOB-ID, "
+            "then send it again later."
+        )
+        self._client.send_message(
+            chat_id,
+            "Monday's inbox is full, so this request was not saved. "
+            + guidance,
+        )
+        return True
+
+    def handle_intake_control(self, update: dict[str, Any]) -> bool:
+        """Handle private state-only controls while model/build work is busy."""
+        message = update.get("message")
+        if not isinstance(message, dict):
+            return False
+        context = self._authorized_context(message)
+        if context is None:
+            return False
+        chat_id, user_id, chat_type = context
+        if chat_type != "private":
+            return False
+        parsed = _parse(str(message.get("text") or "").strip(), self._bot_username)
+        if parsed is None:
+            return False
+        command, argument = parsed
+        if command == "queue":
+            if argument:
+                self._client.send_message(chat_id, "Use /queue")
+                return True
+            entries = self._state.queue_summary(user_id=user_id, chat_id=chat_id)
+            if not entries:
+                self._client.send_message(chat_id, "Your Monday inbox is empty.")
+                return True
+            lines = ["Your Monday inbox:"]
+            for entry in entries:
+                suffix = " · /cancel " + str(entry["job_id"]) if entry["cancellable"] else ""
+                lines.append(
+                    f"{entry['job_id']} · {entry['phase']} · "
+                    f"position {entry['position']}{suffix}"
+                )
+            self._client.send_message(chat_id, "\n".join(lines))
+            return True
+        if command != "cancel":
+            return False
+
+        parts = argument.split()
+        if len(parts) != 1:
+            self._client.send_message(chat_id, "Use /cancel JOB-123")
+            return True
+        try:
+            target = parse_job_id(parts[0])
+        except ValueError:
+            self._client.send_message(chat_id, "Use /cancel JOB-123")
+            return True
+        result = self._state.cancel_queued(
+            target,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        status = str(result.get("status") or "not-found")
+        handle = str(result.get("job_id") or job_id(target))
+        if status in {"cancelled", "already-cancelled"}:
+            response = f"{handle} is cancelled. It will not run."
+        else:
+            # Keep every unsuccessful result indistinguishable and stable
+            # across retries as a job moves from running to completed.
+            response = f"{handle} is not queued and was not cancelled."
+        self._client.send_message(chat_id, response)
+        return True
 
     def handle_update(self, update: dict[str, Any]) -> None:
         update_id = _integer(update.get("update_id"), -1)
@@ -157,10 +270,17 @@ class TelegramBotService:
         if chat_type != "private" and command not in {"build", "run", "status", "help"}:
             return
 
+        if command in {"queue", "cancel"}:
+            self.handle_intake_control(update)
+            return
+
         if command in {"start", "help"}:
             self._client.send_message(
                 chat_id,
-                _help(live_build=self._config.live_build and chat_type == "private"),
+                _help(
+                    live_build=self._config.live_build and chat_type == "private",
+                    private_chat=chat_type == "private",
+                ),
             )
             return
         if command == "tasks":
@@ -561,7 +681,14 @@ class TelegramBotService:
         user_id = _integer(sender.get("id"), 0)
         chat_id = _integer(chat.get("id"), 0)
         chat_type = str(chat.get("type") or "")
-        if user_id <= 0 or chat_id == 0:
+        if (
+            user_id <= 0
+            or chat_id == 0
+            or chat_type not in {"private", "group", "supergroup"}
+            or (chat_type == "private" and chat_id < 0)
+            or (chat_type in {"group", "supergroup"} and chat_id > 0)
+            or (chat_type == "private" and chat_id != user_id)
+        ):
             return None
         if user_id not in self._config.allowed_user_ids:
             return None
@@ -1810,7 +1937,7 @@ def _finite_timestamp(value: Any) -> float:
     return parsed
 
 
-def _help(*, live_build: bool = False) -> str:
+def _help(*, live_build: bool = False, private_chat: bool = True) -> str:
     build = (
         "/build REQUEST — create, build, review, and open a pull request\n"
         "/build PROJECT :: REQUEST — build a registered project\n"
@@ -1821,20 +1948,30 @@ def _help(*, live_build: bool = False) -> str:
             "/build PROJECT :: REQUEST — create a project-bound task\n"
         )
     )
-    intro = (
-        "Send a normal text message and Monday will build it, validate it, have ChatGPT "
-        "review it, and open a pull request."
-        if live_build
-        else "Send a normal text message and MondayOS will create a task and assign its agent team."
-    )
+    if private_chat:
+        intro = (
+            "Send a normal text message and Monday will build it, validate it, have "
+            "ChatGPT review it, and open a pull request."
+            if live_build
+            else "Send a normal text message and MondayOS will create a task and "
+            "assign its agent team."
+        )
+        private_commands = (
+            "/tasks — active tasks\n"
+            "/queue — show your active Monday inbox\n"
+            "/cancel JOB-ID — cancel one queued request\n"
+            "/approve RUN-ID — approve a reviewed run\n"
+            "/reject RUN-ID REASON — reject a reviewed run\n"
+        )
+    else:
+        intro = "Use these commands in this allowlisted group."
+        private_commands = ""
     return (
         f"{intro}\n\n"
         f"{build}"
         "/run TASK-ID — run an existing task\n"
         "/status [TASK-ID] — system or task status\n"
-        "/tasks — active tasks\n"
-        "/approve RUN-ID — approve a reviewed run\n"
-        "/reject RUN-ID REASON — reject a reviewed run\n"
+        f"{private_commands}"
         "/help — show these commands"
     )
 

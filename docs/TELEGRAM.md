@@ -24,6 +24,14 @@ outbound long polling, so it does not open a public port or require a tunnel.
   offset in `logs/telegram/state.json`, then immediately confirms that it was
   saved and reports its FIFO queue position. Unauthorized or otherwise ignored
   content is never queued.
+- Bounds the durable inbox at 25 pending jobs. Every accepted request receives a
+  stable `JOB-<Telegram update ID>` handle; a full inbox is refused durably,
+  without retaining the rejected request text. The request-free refusal notice
+  retries from local durable state after a transient Telegram failure or
+  restart, even if Telegram no longer retains the original update.
+- Keeps private, allowlisted `/queue` and queued-only `/cancel JOB-ID` controls
+  responsive on the polling path while model/build work is busy. These controls
+  expose only job handles, phases, and positions—not saved request text.
 - Keeps polling and acknowledging new requests while one non-daemon worker
   exclusively runs Monday/model work. Commands execute in FIFO order, and
   provider/build concurrency stays at one because a MondayOS instance and its
@@ -32,6 +40,8 @@ outbound long polling, so it does not open a public port or require a tunnel.
   same Telegram job, task, run, and delivery identities. It retries an
   unexpected poison failure at most three times, then terminalizes that job so
   later work can proceed.
+- Revalidates each persisted request's update identity, digest, message shape,
+  origin, and resumable phase immediately before the worker can execute it.
 - Removes active request text when a job becomes a terminal replay tombstone.
   A graceful stop finishes the current job and leaves the rest durably queued.
 
@@ -118,7 +128,8 @@ monday telegram --health --json
 
 The JSON form is suitable for monitoring and exits nonzero when configuration,
 durable state, the worker lock, heartbeat freshness, or required live-build
-capabilities are unhealthy. Full installation and recovery procedures are in
+capabilities are unhealthy, or when the inbox is not accepting new work. Full
+installation and recovery procedures are in
 [SETUP_GUIDE.md](SETUP_GUIDE.md) and [RUNBOOK.md](RUNBOOK.md).
 
 At startup MondayOS verifies the bot identity and removes any prior webhook
@@ -144,6 +155,8 @@ normal text             create and run a task
 /run TASK-ID            run an existing task
 /status [TASK-ID]       system or task status
 /tasks                  list active tasks
+/queue                  show your pending jobs without request text
+/cancel JOB-ID          cancel one job that has not started
 /approve RUN-ID         approve a reviewed run
 /reject RUN-ID REASON   reject a reviewed run
 /help                   show help
@@ -178,10 +191,13 @@ task implicitly. In an allowlisted group, a command addressed with
 addressed to another bot are ignored.
 
 Allowlisted groups intentionally expose only `/build`, `/run`, `/status`, and
-`/help`. A group `/build` always uses the advisory team even when private live
-builds are enabled; `/deliver` is ignored. Task listings and approval decisions
+`/help`; `/queue` and `/cancel` are private-chat-only. A group `/build` always
+uses the advisory team even when private live builds are enabled; `/deliver` is
+ignored. Task listings and approval decisions
 (`/tasks`, `/approve`, `/reject`) remain private-chat-only even when the group
-itself is allowlisted.
+itself is allowlisted. A user can open the bot's private chat to list or cancel
+their own still-queued requests that they originally submitted in an allowed
+group; another user's group requests remain hidden.
 
 ## Pull-request lifecycle follow-ups
 
@@ -220,6 +236,33 @@ unless a newer open delivery remains authoritative. A newer open delivery also
 prevents an older merged PR from completing the task underneath newer work.
 Human-managed states are not overridden. The bot reports that result but still
 never merges or deploys it.
+
+## Bounded inbox and cancellation
+
+MondayOS accepts at most 25 pending Telegram jobs across the durable inbox.
+When it is full, the original update becomes a request-free refusal tombstone.
+Its Telegram offset stays unacknowledged until the refusal notice is delivered
+or Telegram reports a permanent destination failure. A transient send failure
+or restart therefore retries the notice directly from durable local state,
+without relying on Telegram to redeliver the original update and without ever
+re-admitting or retaining the rejected request. A retry also rechecks the
+current user and group
+allowlists; a revoked destination is not contacted. The user is told that the
+request was not saved and can use `/queue` or `/cancel` before trying again.
+Existing state with more than 25 pending jobs remains loadable and drains
+normally; the cap applies to new admission. `monday telegram --health` reports
+the current usage and unresolved refusal notices, and is unhealthy at or above
+the cap or while a refusal remains unresolved.
+
+`/queue` lists only jobs owned by the same allowlisted user: requests from that
+private chat plus requests that user submitted in an allowed group. `/cancel
+JOB-ID` uses the same ownership rule and intentionally gives no indication that
+another user's handle exists. Cancellation is allowed only while a job is still
+queued and has no side-effect checkpoint. Running,
+waiting, retrying, delivered, or otherwise started work is not interrupted.
+Cancellation is durable, survives restart, releases inbox capacity, and removes
+the saved request text. A replay receives the same safe confirmation without
+executing the job twice.
 
 ## Automatic delivery recovery
 

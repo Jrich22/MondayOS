@@ -196,8 +196,10 @@ Start with the [operator setup guide](docs/SETUP_GUIDE.md), then use the
 [operations runbook](docs/RUNBOOK.md) for routine health, backup, recovery, and
 incident handling. The command-level Telegram reference remains in
 [docs/TELEGRAM.md](docs/TELEGRAM.md). Accepted requests are atomically persisted
-to a local, Git-ignored FIFO queue before Telegram is acknowledged; one
-background worker runs Monday/model jobs while intake continues polling. After
+to a bounded, Git-ignored FIFO queue before Telegram is acknowledged and receive
+stable job handles; private `/queue` and queued-only `/cancel JOB-ID` controls
+remain responsive without exposing request text. One background worker runs
+Monday/model jobs while intake continues polling. After
 a live build opens a PR, request-free follow-up state survives restarts and
 reports meaningful GitHub check, merge, closure, or head-divergence changes.
 

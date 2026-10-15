@@ -2312,6 +2312,7 @@ def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:
     from telegram_bot.client import HttpTelegramClient
     from telegram_bot.config import TelegramConfig
     from telegram_bot.state import (
+        MAX_PENDING_JOBS,
         TelegramState,
         TelegramStateError,
         instance_lock_is_held,
@@ -2325,6 +2326,10 @@ def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:
             "state_exists": False,
             "state_readable": False,
             "heartbeat_fresh": False,
+            "pending_jobs": None,
+            "max_pending_jobs": MAX_PENDING_JOBS,
+            "accepting_work": False,
+            "pending_capacity_notices": None,
         },
         "build": {"required": False, "ready": None},
     }
@@ -2347,7 +2352,12 @@ def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:
         )
         service.update(worker)
         service["state_readable"] = True
-        service["pending_jobs"] = state.pending_count
+        pending_jobs = state.pending_count
+        service["pending_jobs"] = pending_jobs
+        service["accepting_work"] = pending_jobs < MAX_PENDING_JOBS
+        service["pending_capacity_notices"] = (
+            state.pending_queue_full_notice_count
+        )
         service["running"] = instance_lock_is_held(config.lock_path)
     except (OSError, TelegramStateError, ValueError) as exc:
         service["reason"] = redact_text(str(exc))
@@ -2372,6 +2382,8 @@ def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:
         and service.get("state_exists")
         and service.get("state_readable")
         and service.get("heartbeat_fresh")
+        and service.get("accepting_work")
+        and service.get("pending_capacity_notices") == 0
         and (not config.live_build or build.get("ready"))
     )
     return _print_telegram_health(report, as_json=bool(getattr(args, "json", False)))
@@ -2396,6 +2408,26 @@ def _print_telegram_health(report: dict[str, Any], *, as_json: bool) -> int:
         "  Heartbeat    : "
         f"{'fresh' if service.get('heartbeat_fresh') else 'missing or stale'}"
     )
+    pending_jobs = service.get("pending_jobs")
+    max_pending_jobs = service.get("max_pending_jobs")
+    queue_usage = (
+        f"{pending_jobs}/{max_pending_jobs} pending"
+        if isinstance(pending_jobs, int) and isinstance(max_pending_jobs, int)
+        else "unavailable"
+    )
+    accepting = (
+        "accepting work"
+        if service.get("accepting_work")
+        else "not accepting work"
+    )
+    print(f"  Inbox        : {queue_usage}; {accepting}")
+    pending_notices = service.get("pending_capacity_notices")
+    notice_status = (
+        f"{pending_notices} pending"
+        if isinstance(pending_notices, int)
+        else "unavailable"
+    )
+    print(f"  Refusals     : {notice_status}")
     if build.get("required"):
         print(f"  Live builds  : {'ready' if build.get('ready') else 'not ready'}")
     reason = configuration.get("reason") or service.get("reason") or build.get("reason")
