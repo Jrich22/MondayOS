@@ -218,9 +218,13 @@ when `monday telegram --health` reports healthy, status responds, build
 capabilities are ready, GitHub authentication is valid, and the error log has
 no current startup loop. Monitoring systems can use
 `monday telegram --health --json`; it performs no Telegram network request and
-returns a nonzero status when configuration, the daemon heartbeat, inbox
-capacity, required live-build capabilities, or any acceptance receipt,
-capacity-refusal notice, or live-build delivery notice is unresolved.
+returns a nonzero status when configuration, the daemon supervisor heartbeat,
+the independent intake or worker progress lease, inbox capacity, required
+live-build capabilities, or any acceptance receipt, capacity-refusal notice, or
+live-build delivery notice is unresolved. The human report must show both
+`Intake` and `Worker` as ready. A legacy heartbeat after an upgrade is expected
+to fail closed until the normal daemon is restarted; `--once` records stopped
+runtime state and never advertises daemon health.
 
 ## Data and secret boundary
 

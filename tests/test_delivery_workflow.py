@@ -1116,6 +1116,7 @@ def test_success_reviews_exact_artifact_pushes_branch_and_opens_pr(tmp_path: Pat
         root, builder=builder, reviewer=reviewer, validator=validator, github=github
     )
     push_requests: list[dict[str, Any]] = []
+    progress_phases: list[str] = []
     original_push = workflow.repository.push
 
     def recording_push(*args: Any, **kwargs: Any) -> str:
@@ -1124,7 +1125,11 @@ def test_success_reviews_exact_artifact_pushes_branch_and_opens_pr(tmp_path: Pat
 
     workflow.repository.push = recording_push
 
-    job = workflow.run(task_id="TASK-0001", delivery_id="delivery-success")
+    job = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-success",
+        progress_callback=lambda current: progress_phases.append(current["phase"]),
+    )
 
     assert job.success is True
     assert job.status == "pr-open"
@@ -1139,6 +1144,9 @@ def test_success_reviews_exact_artifact_pushes_branch_and_opens_pr(tmp_path: Pat
     assert isinstance(guard_fds, tuple) and len(guard_fds) == 2
     assert guard_fds[0] != guard_fds[1]
     assert push_requests[0]["inherited_guard_fds"] == guard_fds
+    assert "pushing" in progress_phases
+    assert "pull-request" in progress_phases
+    assert progress_phases.index("pushing") < progress_phases.index("pull-request")
     for descriptor in guard_fds:
         with pytest.raises(OSError):
             os.fstat(descriptor)
@@ -1337,13 +1345,16 @@ def test_controller_death_after_pr_creation_is_reconciled_exactly(
 
     workflow._finish_published = finish_while_repository_lease_is_held  # type: ignore[method-assign]
 
+    recovery_phases: list[str] = []
     recovered = workflow.run(
         task_id="TASK-0001",
         delivery_id="delivery-crash-after-pr",
+        progress_callback=lambda current: recovery_phases.append(current["phase"]),
     )
 
     assert recovered.success is True
     assert recovered.pr_url.endswith("/pull/12")
+    assert "pull-request" in recovery_phases
     assert push_calls == 1
     # The second idempotent ensure call represents the exact PR lookup that a
     # production GhCliClient performs before it ever attempts creation.

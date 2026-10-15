@@ -56,7 +56,8 @@ tail -n 50 logs/telegram-stderr.log
 Then send `/status` in the allowlisted private Telegram chat. Healthy means:
 
 - launchd reports the service instead of `service not found`;
-- `monday telegram --health` reports a held worker lock and fresh heartbeat;
+- `monday telegram --health` reports a held worker lock, fresh supervisor
+  heartbeat, and ready `Intake` and `Worker` lanes;
 - the inbox line reports fewer than 25 pending jobs and `accepting work`;
 - the receipts line reports `0 pending`;
 - the refusals line reports `0 pending`;
@@ -74,9 +75,14 @@ monday telegram --health --json
 ```
 
 The command never contacts Telegram, never prints the bot token, and exits
-nonzero when the local configuration, worker lock, heartbeat, state, inbox
-capacity, unresolved acceptance receipts, refusal notices, or live-build
-delivery notices, or required live-build capabilities are not ready.
+nonzero when the local configuration, worker lock, supervisor heartbeat,
+independent intake/worker progress leases, state, inbox capacity, unresolved
+acceptance receipts, refusal notices, live-build delivery notices, or required
+live-build capabilities are not ready. A lane in `starting`, `backoff`, or
+`stopped`, or an active lane past its deadline, is deliberately unhealthy even
+when the supervisor still pulses. An idle worker is healthy. If the heartbeat
+is reported as legacy or invalid after an upgrade, restart the normal daemon;
+never hand-edit `logs/telegram/heartbeat.json`.
 
 Use `monday build history --limit 20` to review recent deliveries. For a known
 delivery ID:

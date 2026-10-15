@@ -38,6 +38,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
   independent daemon heartbeat and the existing single-worker lock. It validates
   local configuration and state without contacting Telegram, includes live-build
   capability readiness when enabled, and exits nonzero for watchdog use.
+- Progress-aware Telegram runtime health with independent supervisor, intake,
+  and build-worker checkpoints. A fresh supervisor pulse can no longer hide a
+  stalled long poll, dispatch path, model/build phase, publication step, or
+  retry wait. Fixed secret-free operation names use bounded phase leases;
+  startup, backoff, stopped, corrupt, future, and legacy heartbeat states fail
+  closed. Telegram `retry_after` hints are normalized before formatting or time
+  arithmetic and capped at 24 hours.
 - Least-privilege GitHub Actions CI for the autonomous delivery path and the
   complete test suite on supported Python versions, with third-party actions
   pinned to immutable release commits.

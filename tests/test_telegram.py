@@ -642,6 +642,48 @@ class TestTelegramService(TelegramFixture):
         self.assertIn("passed ChatGPT review", combined)
         self.assertIn("https://github.com/example/mondayos/pull/55", combined)
 
+    def test_live_build_progress_renews_fixed_runtime_operations(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            provider="fake",
+            live_build=True,
+        )
+        operations = []
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        service.bind_bot_identity(self.client.get_me())
+        service.bind_runtime_progress(operations.append)
+
+        service.handle_update(
+            _update(update_id=41, text="/build Exercise every live phase")
+        )
+
+        self.assertEqual(
+            operations,
+            ["preparing", "implementing", "validating", "reviewing", "pushing"],
+        )
+
+    def test_team_runtime_progress_precedes_a_failed_telegram_update(self):
+        operations = []
+
+        class FailingProgressClient(FakeTelegramClient):
+            def send_message(self, chat_id, text):
+                raise TelegramAPIError("temporary outage", retryable=True)
+
+        service = TelegramBotService(
+            self.monday,
+            FailingProgressClient(),
+            self.state,
+            self.config,
+        )
+        service.bind_runtime_progress(operations.append)
+
+        with self.assertRaises(TelegramAPIError):
+            service._progress(7, {"event": "team_started"})
+
+        self.assertEqual(operations, ["team-stage"])
+
     def test_private_build_can_explicitly_target_a_registered_project(self):
         config = TelegramConfig(
             token=_fake_token(),
@@ -1439,6 +1481,40 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
         return root_delivery_id
 
+    def test_retry_build_progress_renews_without_recreating_acknowledged_job(self):
+        operations = []
+        root_delivery_id = self._seed_delivery_retry(42, now=100.0)
+        self.state.acknowledge(42)
+        service = TelegramBotService(
+            self.monday,
+            self.client,
+            self.state,
+            self.config,
+        )
+        service.bind_runtime_progress(operations.append)
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        with (
+            patch("telegram_bot.state.time.time", return_value=161.0),
+            patch("telegram_bot.service.time.time", return_value=161.0),
+        ):
+            self.assertTrue(worker.run_delivery_retry_once())
+
+        self.assertEqual(
+            operations,
+            ["preparing", "implementing", "validating", "reviewing", "pushing"],
+        )
+        self.assertEqual(self.state.job(42), {})
+        self.assertEqual(
+            self.monday.build_calls[-1][1]["delivery_id"],
+            f"{root_delivery_id}-r2",
+        )
+
     def _stage_terminal_notice(
         self,
         update_id: int,
@@ -1505,6 +1581,448 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
         self.assertFalse(stopped["heartbeat_fresh"])
         self.assertEqual(stopped["stopped_at"], 126.0)
+
+    def test_runtime_heartbeat_requires_both_independent_lanes(self):
+        self.state.mark_worker_started(now=100.0)
+        starting = self.state.worker_status(now=100.0, stale_after_seconds=10.0)
+        self.assertTrue(starting["heartbeat_fresh"])
+        self.assertFalse(starting["runtime_ready"])
+
+        self.state.mark_runtime_lane(
+            "intake",
+            "active",
+            "poll",
+            timeout_seconds=40,
+            now=101.0,
+        )
+        self.state.mark_runtime_lane(
+            "worker",
+            "idle",
+            "idle",
+            now=102.0,
+        )
+        self.state.mark_worker_heartbeat(now=103.0)
+        ready = TelegramState(self.config.state_path).worker_status(
+            now=104.0,
+            stale_after_seconds=10.0,
+        )
+        self.assertTrue(ready["runtime_ready"])
+        self.assertTrue(ready["intake"]["ready"])
+        self.assertTrue(ready["worker"]["ready"])
+
+        before = json.loads(
+            self.state.heartbeat_path.read_text(encoding="utf-8")
+        )["lanes"]
+        self.state.mark_worker_heartbeat(now=105.0)
+        after = json.loads(
+            self.state.heartbeat_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(after["lanes"], before)
+        self.assertEqual(after["supervisor"], {"pulse_at": 105.0})
+
+    def test_overdue_or_backing_off_lane_fails_runtime_health(self):
+        self.state.mark_worker_started(now=100.0)
+        self.state.mark_runtime_lane(
+            "intake",
+            "active",
+            "poll",
+            timeout_seconds=40,
+            now=100.0,
+        )
+        self.state.mark_runtime_lane("worker", "idle", "idle", now=100.0)
+        self.state.mark_worker_heartbeat(now=150.0)
+
+        overdue_intake = self.state.worker_status(
+            now=150.0,
+            stale_after_seconds=10.0,
+        )
+        self.assertTrue(overdue_intake["heartbeat_fresh"])
+        self.assertFalse(overdue_intake["intake"]["ready"])
+        self.assertTrue(overdue_intake["worker"]["ready"])
+        self.assertFalse(overdue_intake["runtime_ready"])
+
+        self.state.mark_runtime_lane(
+            "intake",
+            "active",
+            "dispatch",
+            timeout_seconds=300,
+            now=150.0,
+        )
+        self.state.mark_runtime_lane(
+            "worker",
+            "active",
+            "job",
+            timeout_seconds=10,
+            now=150.0,
+        )
+        self.state.mark_worker_heartbeat(now=161.0)
+        overdue_worker = self.state.worker_status(
+            now=161.0,
+            stale_after_seconds=10.0,
+        )
+        self.assertTrue(overdue_worker["intake"]["ready"])
+        self.assertFalse(overdue_worker["worker"]["ready"])
+        self.assertFalse(overdue_worker["runtime_ready"])
+
+        self.state.mark_runtime_lane(
+            "worker",
+            "backoff",
+            "retry",
+            resume_after_seconds=5,
+            now=162.0,
+        )
+        self.state.mark_worker_heartbeat(now=170.0)
+        after_resume = self.state.worker_status(
+            now=170.0,
+            stale_after_seconds=10.0,
+        )
+        self.assertGreater(170.0, after_resume["worker"]["resume_at"])
+        self.assertFalse(after_resume["worker"]["ready"])
+
+        self.state.mark_runtime_lane("worker", "idle", "idle", now=171.0)
+        recovered = self.state.worker_status(
+            now=171.0,
+            stale_after_seconds=10.0,
+        )
+        self.assertTrue(recovered["runtime_ready"])
+
+    def test_long_worker_phase_lease_boundaries_are_exact(self):
+        leases = {
+            "implementing": 2_100.0,
+            "validating": 2_100.0,
+            "reviewing": 2_700.0,
+            "team-stage": 3_900.0,
+        }
+        for operation, lease in leases.items():
+            with self.subTest(operation=operation):
+                self.state.mark_worker_started(now=100.0)
+                self.state.mark_runtime_lane(
+                    "worker",
+                    "active",
+                    operation,
+                    timeout_seconds=lease,
+                    now=100.0,
+                )
+                boundary = 100.0 + lease
+                self.state.mark_worker_heartbeat(now=boundary)
+                at_boundary = self.state.worker_status(
+                    now=boundary,
+                    stale_after_seconds=10.0,
+                )
+                self.assertTrue(at_boundary["worker"]["ready"])
+                after_boundary = self.state.worker_status(
+                    now=boundary + 0.01,
+                    stale_after_seconds=10.0,
+                )
+                self.assertFalse(after_boundary["worker"]["ready"])
+
+    def test_runtime_heartbeat_rejects_legacy_corrupt_and_future_state(self):
+        legacy = {"started_at": 1.0, "heartbeat_at": 2.0}
+        self.state.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state.heartbeat_path.write_text(
+            json.dumps(legacy),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(TelegramStateError, "heartbeat"):
+            self.state.worker_status(now=3.0)
+
+        self.state.mark_worker_started(now=100.0)
+        baseline = json.loads(
+            self.state.heartbeat_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(baseline["version"], 2)
+        self.assertNotIn("heartbeat_at", baseline)
+
+        def extra_field(candidate):
+            candidate["private_diagnostic"] = "must not be accepted"
+
+        def unknown_operation(candidate):
+            candidate["lanes"]["worker"]["operation"] = "private-task-name"
+
+        def unknown_active_operation(candidate):
+            lane = candidate["lanes"]["worker"]
+            lane.update({
+                "state": "active",
+                "operation": "secret-bearing-private-operation",
+                "deadline_at": lane["progress_at"] + 1.0,
+            })
+
+        def unknown_version(candidate):
+            candidate["version"] = 99
+
+        def future_started(candidate):
+            candidate["started_at"] = 201.0
+
+        def future_supervisor(candidate):
+            candidate["supervisor"]["pulse_at"] = 201.0
+
+        def future_stopped(candidate):
+            candidate["stopped_at"] = 201.0
+            for lane in candidate["lanes"].values():
+                lane.update({
+                    "state": "stopped",
+                    "operation": "stopped",
+                    "progress_at": 201.0,
+                    "deadline_at": None,
+                    "resume_at": None,
+                })
+
+        def future_progress(candidate):
+            candidate["lanes"]["worker"]["progress_at"] = 201.0
+
+        def oversized_deadline(candidate):
+            lane = candidate["lanes"]["worker"]
+            lane.update({
+                "state": "active",
+                "operation": "job",
+                "deadline_at": lane["progress_at"] + 301.0,
+            })
+
+        huge_timestamp = 10**1_000
+
+        def overflow_started(candidate):
+            candidate["started_at"] = huge_timestamp
+
+        def overflow_stopped(candidate):
+            candidate["stopped_at"] = huge_timestamp
+
+        def overflow_supervisor(candidate):
+            candidate["supervisor"]["pulse_at"] = huge_timestamp
+
+        def overflow_progress(candidate):
+            candidate["lanes"]["worker"]["progress_at"] = huge_timestamp
+
+        def overflow_deadline(candidate):
+            candidate["lanes"]["worker"]["deadline_at"] = huge_timestamp
+
+        def overflow_resume(candidate):
+            candidate["lanes"]["worker"]["resume_at"] = huge_timestamp
+
+        for label, mutate in (
+            ("extra-field", extra_field),
+            ("unknown-operation", unknown_operation),
+            ("unknown-active-operation", unknown_active_operation),
+            ("unknown-version", unknown_version),
+            ("future-started", future_started),
+            ("future-supervisor", future_supervisor),
+            ("future-stopped", future_stopped),
+            ("future-progress", future_progress),
+            ("oversized-deadline", oversized_deadline),
+            ("overflow-started", overflow_started),
+            ("overflow-stopped", overflow_stopped),
+            ("overflow-supervisor", overflow_supervisor),
+            ("overflow-progress", overflow_progress),
+            ("overflow-deadline", overflow_deadline),
+            ("overflow-resume", overflow_resume),
+        ):
+            with self.subTest(label=label):
+                candidate = json.loads(json.dumps(baseline))
+                mutate(candidate)
+                self.state.heartbeat_path.write_text(
+                    json.dumps(candidate),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    TelegramStateError,
+                    "heartbeat|runtime",
+                ):
+                    self.state.worker_status(now=200.0)
+
+        self.state.heartbeat_path.write_text(
+            json.dumps(legacy),
+            encoding="utf-8",
+        )
+        self.state.mark_worker_started(now=300.0)
+        restarted = self.state.worker_status(now=300.0)
+        self.assertFalse(restarted["runtime_ready"])
+        self.assertEqual(restarted["intake"]["state"], "starting")
+        self.assertEqual(restarted["worker"]["state"], "starting")
+
+    def test_runtime_heartbeat_rejects_oversized_nonregular_and_deep_files(self):
+        heartbeat = self.state.heartbeat_path
+        heartbeat.parent.mkdir(parents=True, exist_ok=True)
+
+        heartbeat.write_bytes(b"{" + (b" " * 16_384) + b"}")
+        with self.assertRaisesRegex(TelegramStateError, "heartbeat"):
+            self.state.worker_status()
+
+        heartbeat.write_text(("[" * 2_000) + ("]" * 2_000), encoding="utf-8")
+        with self.assertRaisesRegex(TelegramStateError, "heartbeat"):
+            self.state.worker_status()
+
+        target = self.root / "heartbeat-target.json"
+        target.write_text("{}", encoding="utf-8")
+        heartbeat.unlink()
+        heartbeat.symlink_to(target)
+        with self.assertRaisesRegex(TelegramStateError, "heartbeat"):
+            self.state.worker_status()
+
+        heartbeat.unlink()
+        os.mkfifo(heartbeat)
+        with self.assertRaisesRegex(TelegramStateError, "heartbeat"):
+            self.state.worker_status()
+
+    def test_known_worker_crash_immediately_fails_its_runtime_lane(self):
+        now = time.time()
+        self.state.mark_worker_started(now=now)
+        self.state.mark_runtime_lane(
+            "intake",
+            "active",
+            "poll",
+            timeout_seconds=60,
+            now=now,
+        )
+        self.state.mark_runtime_lane("worker", "idle", "idle", now=now)
+        runner = TelegramRunner(self.client, self.service, self.state)
+        runner._runtime_leases_enabled = True
+        runner._worker.enable_runtime_leases(True)
+
+        with patch.object(
+            runner._worker,
+            "run_forever",
+            side_effect=RuntimeError("simulated worker crash"),
+        ):
+            runner._worker_main()
+
+        status = self.state.worker_status()
+        self.assertFalse(status["runtime_ready"])
+        self.assertEqual(status["worker"]["state"], "stopped")
+        self.assertFalse(status["worker"]["ready"])
+        self.assertIsInstance(runner._worker_error, RuntimeError)
+
+    def test_daemon_poll_lease_matches_the_configured_long_poll(self):
+        stop = threading.Event()
+        observed = {}
+        state = self.state
+
+        class InspectingClient(FakeTelegramClient):
+            def get_updates(self, *, offset, timeout):
+                self.offsets.append(offset)
+                observed.update(state.worker_status())
+                stop.set()
+                return []
+
+        client = InspectingClient()
+        service = TelegramBotService(self.monday, client, state, self.config)
+        runner = TelegramRunner(
+            client,
+            service,
+            state,
+            poll_timeout=17,
+            stop_event=stop,
+        )
+
+        runner.run_forever()
+
+        self.assertEqual(observed["intake"]["state"], "active")
+        self.assertEqual(observed["intake"]["operation"], "poll")
+        self.assertTrue(observed["intake"]["ready"])
+        self.assertEqual(
+            observed["intake"]["deadline_at"]
+            - observed["intake"]["progress_at"],
+            47.0,
+        )
+        stopped = state.worker_status()
+        self.assertEqual(stopped["intake"]["state"], "stopped")
+        self.assertEqual(stopped["worker"]["state"], "stopped")
+
+    def test_daemon_binds_service_progress_to_the_persisted_worker_lease(self):
+        stop = threading.Event()
+        observed = {}
+        state = self.state
+
+        class ProgressService:
+            reporter = None
+
+            def bind_runtime_progress(self, reporter):
+                self.reporter = reporter
+
+        service = ProgressService()
+
+        class ReportingClient(FakeTelegramClient):
+            def get_updates(self, *, offset, timeout):
+                self.offsets.append(offset)
+                self_service_reporter = service.reporter
+                if not callable(self_service_reporter):
+                    raise AssertionError("daemon did not bind runtime progress")
+                self_service_reporter("reviewing")
+                observed.update(state.worker_status())
+                stop.set()
+                return []
+
+        runner = TelegramRunner(
+            ReportingClient(),
+            service,
+            state,
+            poll_timeout=1,
+            stop_event=stop,
+        )
+
+        with patch.object(
+            runner._worker,
+            "run_forever",
+            side_effect=lambda: stop.wait(5),
+        ):
+            runner.run_forever()
+
+        self.assertEqual(observed["worker"]["state"], "active")
+        self.assertEqual(observed["worker"]["operation"], "reviewing")
+        self.assertEqual(
+            observed["worker"]["deadline_at"]
+            - observed["worker"]["progress_at"],
+            2_700.0,
+        )
+        self.assertIsNone(service.reporter)
+
+    def test_worker_progress_uses_exact_phase_leases_and_safe_fallback(self):
+        now = time.time()
+        self.state.mark_worker_started(now=now)
+        runner = TelegramRunner(self.client, self.service, self.state)
+        runner._runtime_leases_enabled = True
+
+        expected = {
+            "background": 300.0,
+            "job": 300.0,
+            "preflight": 300.0,
+            "preparing": 300.0,
+            "implementing": 2_100.0,
+            "validating": 2_100.0,
+            "reviewing": 2_700.0,
+            "team-stage": 3_900.0,
+            "committing": 300.0,
+            "publication-ready": 300.0,
+            "pushing": 300.0,
+            "pull-request": 300.0,
+        }
+        for operation, lease in expected.items():
+            with self.subTest(operation=operation):
+                runner._renew_worker_runtime(operation)
+                checkpoint = self.state.worker_status()["worker"]
+                self.assertEqual(checkpoint["operation"], operation)
+                self.assertEqual(
+                    checkpoint["deadline_at"] - checkpoint["progress_at"],
+                    lease,
+                )
+
+        runner._renew_worker_runtime("untrusted-private-phase")
+        fallback = self.state.worker_status()["worker"]
+        self.assertEqual(fallback["operation"], "job")
+        self.assertEqual(
+            fallback["deadline_at"] - fallback["progress_at"],
+            300.0,
+        )
+
+    def test_one_shot_runner_never_advertises_daemon_runtime_health(self):
+        runner = TelegramRunner(
+            self.client,
+            self.service,
+            self.state,
+            poll_timeout=1,
+        )
+
+        self.assertEqual(runner.run_once(), 0)
+
+        self.assertFalse(self.state.heartbeat_path.exists())
 
     def test_instance_lock_probe_does_not_create_a_missing_lock(self):
         lock_path = self.root / "logs" / "telegram" / "health.lock"
@@ -4359,6 +4877,33 @@ class TestTelegramStateAndRunner(TelegramFixture):
             [],
         )
 
+    def test_receipt_drain_renews_intake_dispatch_for_each_network_send(self):
+        self.state.enqueue(57, _update(update_id=57, text="first receipt"))
+        self.state.enqueue(58, _update(update_id=58, text="second receipt"))
+        now = time.time()
+        self.state.mark_worker_started(now=now)
+        runner = TelegramRunner(
+            self.client,
+            self.service,
+            self.state,
+            poll_timeout=1,
+        )
+        runner._runtime_leases_enabled = True
+
+        with patch.object(
+            runner,
+            "_mark_intake_dispatch",
+            wraps=runner._mark_intake_dispatch,
+        ) as renew:
+            runner._drain_acceptance_receipts()
+
+        self.assertEqual(renew.call_count, 2)
+        self.assertEqual(self.state.pending_acceptance_receipt_count, 0)
+        intake = self.state.worker_status()["intake"]
+        self.assertEqual(intake["state"], "active")
+        self.assertEqual(intake["operation"], "dispatch")
+        self.assertTrue(intake["ready"])
+
     def test_receipt_rate_limit_is_durable_before_send_helper_returns(self):
         self.state.enqueue(61, _update(update_id=61, text="durable cooldown"))
 
@@ -5102,6 +5647,25 @@ class TestTelegramStateAndRunner(TelegramFixture):
             with self.assertRaisesRegex(TelegramStateError, "already running"):
                 with InstanceLock(self.config.lock_path):
                     pass
+
+    def test_instance_lock_invalidates_a_prior_ready_runtime_immediately(self):
+        now = time.time()
+        self.state.mark_worker_started(now=now)
+        self.state.mark_runtime_lane(
+            "intake",
+            "active",
+            "poll",
+            timeout_seconds=60,
+            now=now,
+        )
+        self.state.mark_runtime_lane("worker", "idle", "idle", now=now)
+        self.assertTrue(self.state.worker_status()["runtime_ready"])
+
+        with InstanceLock(self.config.lock_path):
+            stopped = self.state.worker_status()
+            self.assertFalse(stopped["runtime_ready"])
+            self.assertEqual(stopped["intake"]["state"], "stopped")
+            self.assertEqual(stopped["worker"]["state"], "stopped")
 
     def test_runner_advances_offset_only_after_handling(self):
         self.client.updates = [_update(update_id=12, text="/help")]
@@ -6020,6 +6584,92 @@ class TestTelegramStateAndRunner(TelegramFixture):
         runner.run_forever()
         self.assertEqual(waits, [9])
 
+    def test_daemon_bounds_hostile_rate_limit_before_wait_and_marks_backoff(self):
+        stop = threading.Event()
+        waits = []
+        observed = []
+        state = self.state
+
+        class LimitedClient(FakeTelegramClient):
+            def get_updates(self, *, offset, timeout):
+                error = TelegramRateLimitError(1)
+                error.retry_after = 10**10_000
+                raise error
+
+        def wait(seconds):
+            waits.append(seconds)
+            observed.append(state.worker_status())
+            stop.set()
+            return True
+
+        runner = TelegramRunner(
+            LimitedClient(),
+            self.service,
+            state,
+            stop_event=stop,
+            wait=wait,
+        )
+
+        runner.run_forever()
+
+        self.assertEqual(waits, [86_400.0])
+        intake = observed[0]["intake"]
+        self.assertEqual(intake["state"], "backoff")
+        self.assertEqual(intake["operation"], "rate-limit")
+        self.assertFalse(intake["ready"])
+        self.assertEqual(intake["resume_at"] - intake["progress_at"], 86_400.0)
+
+    def test_worker_rate_limit_backoff_stays_unready_until_new_progress(self):
+        self.state.enqueue(36, _update(update_id=36, text="/help"))
+        self._complete_acceptance_receipt(36)
+        now = time.time()
+        self.state.mark_worker_started(now=now)
+        self.state.mark_runtime_lane(
+            "intake",
+            "active",
+            "poll",
+            timeout_seconds=60,
+            now=now,
+        )
+        stop = threading.Event()
+        waits = []
+        observed = []
+
+        class RateLimitedService:
+            def handle_update(self, update):
+                error = TelegramRateLimitError(1)
+                error.retry_after = 10**10_000
+                raise error
+
+        def wait(seconds):
+            waits.append(seconds)
+            observed.append(self.state.worker_status())
+            stop.set()
+            return True
+
+        worker = TelegramJobWorker(
+            RateLimitedService(),
+            self.state,
+            stop_event=stop,
+            wake_event=threading.Event(),
+            wait=wait,
+        )
+        worker.enable_runtime_leases(True)
+
+        worker.run_forever()
+
+        self.assertEqual(waits, [86_400.0])
+        checkpoint = observed[0]["worker"]
+        self.assertEqual(checkpoint["state"], "backoff")
+        self.assertEqual(checkpoint["operation"], "rate-limit")
+        self.assertFalse(checkpoint["ready"])
+        after_resume = self.state.worker_status(
+            now=checkpoint["resume_at"] + 1.0,
+            stale_after_seconds=90_000.0,
+        )
+        self.assertTrue(after_resume["heartbeat_fresh"])
+        self.assertFalse(after_resume["worker"]["ready"])
+
     def test_unexpected_handler_failure_retries_then_dead_letters(self):
         class BrokenService:
             def __init__(self):
@@ -6160,6 +6810,38 @@ class TestHttpTelegramClient(unittest.TestCase):
         self.assertNotIn("secret-token", str(raised.exception))
 
     @patch("urllib.request.urlopen")
+    def test_retry_after_is_bounded_before_exception_rendering(self, urlopen):
+        body = BytesIO(json.dumps({
+            "ok": False,
+            "error_code": 429,
+            "parameters": {"retry_after": 10**1_000},
+        }).encode())
+        urlopen.side_effect = HTTPError("ignored", 429, "rate", {}, body)
+
+        with self.assertRaises(TelegramRateLimitError) as raised:
+            HttpTelegramClient("token").get_me()
+
+        self.assertEqual(raised.exception.retry_after, 86_400)
+        self.assertIn("86400", str(raised.exception))
+        direct = TelegramRateLimitError(10**10_000)
+        self.assertEqual(direct.retry_after, 86_400)
+        self.assertLess(len(str(direct)), 100)
+
+    @patch("urllib.request.urlopen")
+    def test_oversized_retry_after_text_uses_bounded_default(self, urlopen):
+        body = BytesIO(json.dumps({
+            "ok": False,
+            "error_code": 429,
+            "parameters": {"retry_after": "9" * 10_000},
+        }).encode())
+        urlopen.side_effect = HTTPError("ignored", 429, "rate", {}, body)
+
+        with self.assertRaises(TelegramRateLimitError) as raised:
+            HttpTelegramClient("token").get_me()
+
+        self.assertEqual(raised.exception.retry_after, 5)
+
+    @patch("urllib.request.urlopen")
     def test_http_429_without_retry_after_uses_retryable_default(self, urlopen):
         body = BytesIO(json.dumps({
             "ok": False,
@@ -6203,6 +6885,19 @@ class TestHttpTelegramClient(unittest.TestCase):
 
 
 class TestTelegramIdentify(unittest.TestCase):
+    @staticmethod
+    def _mark_runtime_ready(state: TelegramState) -> None:
+        now = time.time()
+        state.mark_worker_started(now=now)
+        state.mark_runtime_lane(
+            "intake",
+            "active",
+            "poll",
+            timeout_seconds=60,
+            now=now,
+        )
+        state.mark_runtime_lane("worker", "idle", "idle", now=now)
+
     def test_health_json_is_secret_free_and_reports_running_worker(self):
         with TemporaryDirectory() as tmp, patch.dict(os.environ, {
             "TELEGRAM_BOT_TOKEN": "123:super-secret-token",
@@ -6214,7 +6909,7 @@ class TestTelegramIdentify(unittest.TestCase):
             root = Path(tmp)
             state = TelegramState(root / "logs" / "telegram" / "state.json")
             state.bind_bot_identity(99, "monday_bot")
-            state.mark_worker_started()
+            self._mark_runtime_ready(state)
             args = SimpleNamespace(
                 project_root=tmp,
                 health=True,
@@ -6232,6 +6927,12 @@ class TestTelegramIdentify(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertTrue(payload["healthy"])
         self.assertTrue(payload["service"]["running"])
+        self.assertTrue(payload["service"]["heartbeat_fresh"])
+        self.assertTrue(payload["service"]["runtime_ready"])
+        self.assertEqual(payload["service"]["intake"]["operation"], "poll")
+        self.assertTrue(payload["service"]["intake"]["ready"])
+        self.assertEqual(payload["service"]["worker"]["operation"], "idle")
+        self.assertTrue(payload["service"]["worker"]["ready"])
         self.assertEqual(payload["service"]["pending_jobs"], 0)
         self.assertEqual(payload["service"]["max_pending_jobs"], 25)
         self.assertTrue(payload["service"]["accepting_work"])
@@ -6239,6 +6940,96 @@ class TestTelegramIdentify(unittest.TestCase):
         self.assertEqual(payload["service"]["pending_acceptance_receipts"], 0)
         self.assertEqual(payload["service"]["pending_delivery_notices"], 0)
         self.assertIsNone(payload["build"]["ready"])
+        self.assertNotIn("super-secret-token", output.getvalue())
+
+    def test_health_fails_when_intake_stalls_behind_fresh_supervisor(self):
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "123:super-secret-token",
+            "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+        }, clear=True), patch(
+            "telegram_bot.state.instance_lock_is_held",
+            return_value=True,
+        ):
+            root = Path(tmp)
+            state = TelegramState(root / "logs" / "telegram" / "state.json")
+            state.bind_bot_identity(99, "monday_bot")
+            started = time.time() - 120
+            state.mark_worker_started(now=started)
+            state.mark_runtime_lane(
+                "intake",
+                "active",
+                "poll",
+                timeout_seconds=1,
+                now=started,
+            )
+            state.mark_runtime_lane("worker", "idle", "idle", now=started)
+            state.mark_worker_heartbeat()
+            args = SimpleNamespace(
+                project_root=tmp,
+                health=True,
+                json=True,
+                identify=False,
+                provider="",
+                once=False,
+            )
+            json_output = StringIO()
+            with redirect_stdout(json_output):
+                json_result = _cmd_telegram(args)
+
+            args.json = False
+            human_output = StringIO()
+            with redirect_stdout(human_output):
+                human_result = _cmd_telegram(args)
+
+        payload = json.loads(json_output.getvalue())
+        self.assertEqual(json_result, 1)
+        self.assertEqual(human_result, 1)
+        self.assertTrue(payload["service"]["heartbeat_fresh"])
+        self.assertFalse(payload["service"]["runtime_ready"])
+        self.assertFalse(payload["service"]["intake"]["ready"])
+        self.assertTrue(payload["service"]["worker"]["ready"])
+        self.assertIn("Intake", human_output.getvalue())
+        self.assertIn("active/poll; not ready", human_output.getvalue())
+        self.assertIn("Worker", human_output.getvalue())
+        self.assertIn("idle/idle; ready", human_output.getvalue())
+        self.assertNotIn("super-secret-token", json_output.getvalue())
+
+    def test_health_reports_readable_state_when_legacy_heartbeat_fails_closed(self):
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "123:super-secret-token",
+            "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+        }, clear=True), patch(
+            "telegram_bot.state.instance_lock_is_held",
+            return_value=True,
+        ):
+            root = Path(tmp)
+            state = TelegramState(root / "logs" / "telegram" / "state.json")
+            state.bind_bot_identity(99, "monday_bot")
+            state.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+            state.heartbeat_path.write_text(json.dumps({
+                "started_at": 1.0,
+                "heartbeat_at": 2.0,
+            }), encoding="utf-8")
+            args = SimpleNamespace(
+                project_root=tmp,
+                health=True,
+                json=True,
+                identify=False,
+                provider="",
+                once=False,
+            )
+            output = StringIO()
+            with redirect_stdout(output):
+                result = _cmd_telegram(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(payload["healthy"])
+        self.assertTrue(payload["service"]["state_readable"])
+        self.assertTrue(payload["service"]["running"])
+        self.assertFalse(payload["service"]["heartbeat_fresh"])
+        self.assertFalse(payload["service"]["runtime_ready"])
+        self.assertIn("heartbeat", payload["service"]["heartbeat_reason"].lower())
         self.assertNotIn("super-secret-token", output.getvalue())
 
     def test_health_is_unhealthy_for_unresolved_acceptance_receipt(self):
@@ -6253,7 +7044,7 @@ class TestTelegramIdentify(unittest.TestCase):
             root = Path(tmp)
             state = TelegramState(root / "logs" / "telegram" / "state.json")
             state.bind_bot_identity(99, "monday_bot")
-            state.mark_worker_started()
+            self._mark_runtime_ready(state)
             state.enqueue(1, _update(update_id=1, text=secret))
             args = SimpleNamespace(
                 project_root=tmp,
@@ -6288,7 +7079,7 @@ class TestTelegramIdentify(unittest.TestCase):
             root = Path(tmp)
             state = TelegramState(root / "logs" / "telegram" / "state.json")
             state.bind_bot_identity(99, "monday_bot")
-            state.mark_worker_started()
+            self._mark_runtime_ready(state)
             with patch("telegram_bot.state.MAX_PENDING_JOBS", 1):
                 state.enqueue(1, _update(update_id=1, text="fills temporary cap"))
                 state.enqueue(2, _update(update_id=2, text=secret))
@@ -6327,7 +7118,7 @@ class TestTelegramIdentify(unittest.TestCase):
             root = Path(tmp)
             state = TelegramState(root / "logs" / "telegram" / "state.json")
             state.bind_bot_identity(99, "monday_bot")
-            state.mark_worker_started()
+            self._mark_runtime_ready(state)
             for update_id in range(1, 26):
                 self.assertTrue(state.enqueue(
                     update_id,
@@ -6367,7 +7158,7 @@ class TestTelegramIdentify(unittest.TestCase):
             root = Path(tmp)
             state = TelegramState(root / "logs" / "telegram" / "state.json")
             state.bind_bot_identity(99, "monday_bot")
-            state.mark_worker_started()
+            self._mark_runtime_ready(state)
             with patch("telegram_bot.state.MAX_PENDING_JOBS", 26):
                 for update_id in range(1, 27):
                     self.assertTrue(state.enqueue(
@@ -6426,7 +7217,7 @@ class TestTelegramIdentify(unittest.TestCase):
             root = Path(tmp)
             state = TelegramState(root / "logs" / "telegram" / "state.json")
             state.bind_bot_identity(99, "monday_bot")
-            state.mark_worker_started()
+            self._mark_runtime_ready(state)
             args = SimpleNamespace(
                 project_root=tmp,
                 health=True,
@@ -6483,7 +7274,7 @@ class TestTelegramIdentify(unittest.TestCase):
             root = Path(tmp)
             state = TelegramState(root / "logs" / "telegram" / "state.json")
             state.bind_bot_identity(99, "monday_bot")
-            state.mark_worker_started()
+            self._mark_runtime_ready(state)
             args = SimpleNamespace(
                 project_root=tmp,
                 health=True,
@@ -6519,7 +7310,7 @@ class TestTelegramIdentify(unittest.TestCase):
             root = Path(tmp)
             state = TelegramState(root / "logs" / "telegram" / "state.json")
             state.bind_bot_identity(99, "monday_bot")
-            state.mark_worker_started()
+            self._mark_runtime_ready(state)
             args = SimpleNamespace(
                 project_root=tmp,
                 health=True,
@@ -6597,6 +7388,49 @@ class TestTelegramIdentify(unittest.TestCase):
         state_type.return_value.mark_worker_stopped.assert_called_once_with()
         config = service_type.call_args.args[3]
         self.assertEqual(config.provider, "")
+
+    def test_one_shot_replaces_legacy_heartbeat_with_stopped_runtime(self):
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "123:abc",
+            "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+        }, clear=False), patch("monday.Monday"), patch(
+            "monday.provider_env.provider_config", return_value=None,
+        ), patch(
+            "monday.provider_env.provider_configs", return_value=[],
+        ), patch("telegram_bot.client.HttpTelegramClient"), patch(
+            "telegram_bot.service.TelegramBotService"
+        ), patch(
+            "telegram_bot.runner.TelegramRunner",
+        ) as runner_type:
+            root = Path(tmp)
+            state = TelegramState(root / "logs" / "telegram" / "state.json")
+            state.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+            state.heartbeat_path.write_text(json.dumps({
+                "started_at": 1.0,
+                "heartbeat_at": 2.0,
+            }), encoding="utf-8")
+            runner_type.return_value.start.return_value = {
+                "id": 99,
+                "username": "monday_bot",
+            }
+            runner_type.return_value.run_once.return_value = 0
+            args = SimpleNamespace(
+                project_root=tmp,
+                identify=False,
+                provider="",
+                once=True,
+            )
+
+            self.assertEqual(_cmd_telegram(args), 0)
+
+            stopped = TelegramState(
+                root / "logs" / "telegram" / "state.json"
+            ).worker_status()
+
+        self.assertFalse(stopped["heartbeat_fresh"])
+        self.assertFalse(stopped["runtime_ready"])
+        self.assertEqual(stopped["intake"]["state"], "stopped")
+        self.assertEqual(stopped["worker"]["state"], "stopped")
 
 
 class TestTelegramMondayIntegration(unittest.TestCase):

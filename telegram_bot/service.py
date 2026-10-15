@@ -5,6 +5,7 @@ import hashlib
 import re
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from telegram_bot.client import TelegramAPIError, TelegramClient
@@ -35,6 +36,18 @@ _DELIVERY_NOTICE_FOLLOW_UP_PHASES = frozenset({
 _DELIVERY_NOTICE_UNAVAILABLE_PHASES = frozenset({
     "", "not-started-capacity", "not-started-deadline",
 })
+_RUNTIME_DELIVERY_OPERATIONS = frozenset({
+    "preflight",
+    "preparing",
+    "implementing",
+    "validating",
+    "reviewing",
+    "committing",
+    "publication-ready",
+    "pushing",
+    "pull-request",
+})
+_RUNTIME_PROGRESS_OPERATIONS = _RUNTIME_DELIVERY_OPERATIONS | {"job", "team-stage"}
 _ROLE_NAMES = {
     "cpo": "Product strategy",
     "lead-engineer": "Technical design",
@@ -64,11 +77,21 @@ class TelegramBotService:
         self._config = config
         self._bot_id = 0
         self._bot_username = ""
+        self._runtime_progress_reporter: Callable[[str], None] | None = None
 
     def bind_bot_identity(self, identity: dict[str, Any]) -> None:
         """Record the verified getMe username used for addressed commands."""
         self._bot_id = _integer(identity.get("id"), 0)
         self._bot_username = str(identity.get("username") or "").strip().lstrip("@").lower()
+
+    def bind_runtime_progress(
+        self,
+        reporter: Callable[[str], None] | None,
+    ) -> None:
+        """Bind daemon-only worker lease renewal to fixed semantic operations."""
+        if reporter is not None and not callable(reporter):
+            raise TypeError("runtime progress reporter must be callable")
+        self._runtime_progress_reporter = reporter
 
     def normalize_update(self, update: dict[str, Any]) -> dict[str, Any] | None:
         """Return the minimum authorized request safe to persist in the inbox.
@@ -627,6 +650,7 @@ class TelegramBotService:
         kwargs: dict[str, Any] = {
             "task_id": task_id,
             "delivery_id": delivery_id,
+            "progress_callback": self._retry_delivery_progress,
         }
         if project_name:
             kwargs["project"] = project_name
@@ -1156,6 +1180,7 @@ class TelegramBotService:
 
     def _live_progress(self, update_id: int, chat_id: int, event: Any) -> None:
         snapshot = _delivery_progress_snapshot(event)
+        self._report_runtime_progress(_runtime_delivery_operation(snapshot))
         if not snapshot:
             return
         text = _delivery_progress_text(snapshot)
@@ -1171,6 +1196,17 @@ class TelegramBotService:
             return
         self._client.send_message(chat_id, text)
         self._state.set_job(update_id, last_delivery_progress_text=text)
+
+    def _retry_delivery_progress(self, event: Any) -> None:
+        """Renew a retry build lease without recreating its acknowledged job."""
+        snapshot = _delivery_progress_snapshot(event)
+        self._report_runtime_progress(_runtime_delivery_operation(snapshot))
+
+    def _report_runtime_progress(self, operation: str) -> None:
+        reporter = self._runtime_progress_reporter
+        if reporter is None:
+            return
+        reporter(operation if operation in _RUNTIME_PROGRESS_OPERATIONS else "job")
 
     def _find_task_for_update(self, update_id: int) -> str:
         marker = self._idempotency_marker(update_id)
@@ -1311,6 +1347,7 @@ class TelegramBotService:
         event: dict[str, Any],
     ) -> None:
         """Durably bind this update to its team before any model work begins."""
+        self._report_runtime_progress("team-stage")
         if event.get("event") == "team_started" and event.get("team_run_id"):
             self._state.set_job(
                 update_id,
@@ -1322,6 +1359,7 @@ class TelegramBotService:
             )
 
     def _progress(self, chat_id: int, event: dict[str, Any]) -> None:
+        self._report_runtime_progress("team-stage")
         kind = event.get("event")
         if kind == "team_started":
             self._client.send_message(chat_id, "Agent team started.")
@@ -1616,6 +1654,13 @@ def _uncertain_delivery_snapshot(delivery_id: str) -> dict[str, Any]:
         "retry_after_seconds": 0,
         "message": "",
     }
+
+
+def _runtime_delivery_operation(progress: dict[str, Any]) -> str:
+    phase = progress.get("phase")
+    if isinstance(phase, str) and phase in _RUNTIME_DELIVERY_OPERATIONS:
+        return phase
+    return "job"
 
 
 def _delivery_progress_snapshot(event: Any) -> dict[str, Any]:

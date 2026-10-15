@@ -2326,6 +2326,17 @@ def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:
             "state_exists": False,
             "state_readable": False,
             "heartbeat_fresh": False,
+            "runtime_ready": False,
+            "intake": {
+                "state": None,
+                "operation": None,
+                "ready": False,
+            },
+            "worker": {
+                "state": None,
+                "operation": None,
+                "ready": False,
+            },
             "pending_jobs": None,
             "max_pending_jobs": MAX_PENDING_JOBS,
             "accepting_work": False,
@@ -2349,10 +2360,6 @@ def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:
     service["state_exists"] = state_exists
     try:
         state = TelegramState(config.state_path)
-        worker = state.worker_status(
-            stale_after_seconds=max(60.0, float(config.poll_timeout * 3)),
-        )
-        service.update(worker)
         service["state_readable"] = True
         pending_jobs = state.pending_count
         service["pending_jobs"] = pending_jobs
@@ -2369,6 +2376,16 @@ def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:
         service["running"] = instance_lock_is_held(config.lock_path)
     except (OSError, TelegramStateError, ValueError) as exc:
         service["reason"] = redact_text(str(exc))
+    else:
+        try:
+            runtime = state.worker_status(
+                stale_after_seconds=max(60.0, float(config.poll_timeout * 3)),
+            )
+            service.update(runtime)
+        except (OSError, TelegramStateError, ValueError) as exc:
+            # A corrupt or legacy heartbeat must fail closed without making a
+            # readable durable queue look corrupt in monitoring output.
+            service["heartbeat_reason"] = redact_text(str(exc))
 
     build = report["build"]
     build["required"] = config.live_build
@@ -2390,6 +2407,7 @@ def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:
         and service.get("state_exists")
         and service.get("state_readable")
         and service.get("heartbeat_fresh")
+        and service.get("runtime_ready")
         and service.get("accepting_work")
         and service.get("pending_capacity_notices") == 0
         and service.get("pending_acceptance_receipts") == 0
@@ -2418,6 +2436,17 @@ def _print_telegram_health(report: dict[str, Any], *, as_json: bool) -> int:
         "  Heartbeat    : "
         f"{'fresh' if service.get('heartbeat_fresh') else 'missing or stale'}"
     )
+    for label, key in (("Intake", "intake"), ("Worker", "worker")):
+        lane = service.get(key, {})
+        lane_state = lane.get("state") if isinstance(lane, dict) else None
+        operation = lane.get("operation") if isinstance(lane, dict) else None
+        lane_status = (
+            f"{lane_state}/{operation}"
+            if isinstance(lane_state, str) and isinstance(operation, str)
+            else "unavailable"
+        )
+        ready = bool(isinstance(lane, dict) and lane.get("ready"))
+        print(f"  {label:<13}: {lane_status}; {'ready' if ready else 'not ready'}")
     pending_jobs = service.get("pending_jobs")
     max_pending_jobs = service.get("max_pending_jobs")
     queue_usage = (
@@ -2454,7 +2483,12 @@ def _print_telegram_health(report: dict[str, Any], *, as_json: bool) -> int:
     print(f"  Deliveries   : {delivery_status}")
     if build.get("required"):
         print(f"  Live builds  : {'ready' if build.get('ready') else 'not ready'}")
-    reason = configuration.get("reason") or service.get("reason") or build.get("reason")
+    reason = (
+        configuration.get("reason")
+        or service.get("reason")
+        or service.get("heartbeat_reason")
+        or build.get("reason")
+    )
     if reason:
         print(f"  Reason       : {reason}")
     return 0 if healthy else 1

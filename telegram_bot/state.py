@@ -6,7 +6,9 @@ import fcntl
 import hashlib
 import json
 import math
+import os
 import re
+import stat
 import threading
 import time
 from pathlib import Path
@@ -29,6 +31,40 @@ _MAX_QUEUE_FULL_NOTICE_RETRY_SECONDS = 86_400.0
 _MAX_ACTIVE_QUEUE_FULL_NOTICES = 500
 _MAX_DELIVERY_NOTICE_RETRY_SECONDS = 86_400.0
 _MAX_ACTIVE_DELIVERY_NOTICES = 500
+_RUNTIME_HEARTBEAT_VERSION = 2
+_MAX_RUNTIME_HEARTBEAT_BYTES = 16_384
+_MAX_RUNTIME_BACKOFF_SECONDS = 86_400.0
+_RUNTIME_HEARTBEAT_FIELDS = frozenset({
+    "version", "started_at", "stopped_at", "supervisor", "lanes",
+})
+_RUNTIME_SUPERVISOR_FIELDS = frozenset({"pulse_at"})
+_RUNTIME_LANE_FIELDS = frozenset({
+    "state", "operation", "progress_at", "deadline_at", "resume_at",
+})
+_RUNTIME_LANE_STATES = frozenset({
+    "starting", "idle", "active", "backoff", "stopped",
+})
+_RUNTIME_ACTIVE_LEASES: dict[str, dict[str, float]] = {
+    "intake": {
+        "poll": 80.0,
+        "dispatch": 300.0,
+    },
+    "worker": {
+        "background": 300.0,
+        "job": 300.0,
+        "preflight": 300.0,
+        "preparing": 300.0,
+        "implementing": 2_100.0,
+        "validating": 2_100.0,
+        "reviewing": 2_700.0,
+        "team-stage": 3_900.0,
+        "committing": 300.0,
+        "publication-ready": 300.0,
+        "pushing": 300.0,
+        "pull-request": 300.0,
+    },
+}
+_RUNTIME_BACKOFF_OPERATIONS = frozenset({"rate-limit", "retry"})
 _DELIVERY_ID = re.compile(r"^delivery-[A-Za-z0-9-]{1,80}$")
 _TASK_ID = re.compile(r"^TASK-\d{1,64}(?:-[a-z0-9]{1,12})?$", re.IGNORECASE)
 _PROJECT_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -558,31 +594,81 @@ class TelegramState:
 
     def mark_worker_started(self, *, now: float | None = None) -> None:
         """Record a new daemon lifetime without persisting process identifiers."""
-        timestamp = _worker_timestamp(now)
         with self._lock:
-            write_json_atomic(self.heartbeat_path, {
-                "started_at": timestamp,
-                "heartbeat_at": timestamp,
-            })
+            timestamp = _worker_timestamp(now)
+            # Starting a new lifetime deliberately replaces legacy or corrupt
+            # heartbeat data. No authorization or queue state lives here.
+            write_json_atomic(
+                self.heartbeat_path,
+                _new_runtime_heartbeat(timestamp),
+            )
 
     def mark_worker_heartbeat(self, *, now: float | None = None) -> None:
-        """Refresh the daemon liveness marker used by local health checks."""
-        timestamp = _worker_timestamp(now)
+        """Refresh only the independent supervisor liveness pulse."""
         with self._lock:
+            timestamp = _worker_timestamp(now)
             worker = self._read_worker_status()
-            worker.setdefault("started_at", timestamp)
-            worker["heartbeat_at"] = timestamp
-            worker.pop("stopped_at", None)
+            if not worker:
+                raise TelegramStateError(
+                    "Telegram runtime heartbeat has not been started"
+                )
+            worker = _normalized_runtime_heartbeat(worker, now=timestamp)
+            if worker["stopped_at"] is not None:
+                raise TelegramStateError(
+                    "Telegram runtime heartbeat is already stopped"
+                )
+            worker["supervisor"]["pulse_at"] = timestamp
             write_json_atomic(self.heartbeat_path, worker)
 
     def mark_worker_stopped(self, *, now: float | None = None) -> None:
         """Record a clean daemon stop while preserving the prior lifetime."""
-        timestamp = _worker_timestamp(now)
         with self._lock:
+            timestamp = _worker_timestamp(now)
+            try:
+                worker = self._read_worker_status()
+                if worker:
+                    worker = _normalized_runtime_heartbeat(worker, now=timestamp)
+                else:
+                    worker = _new_runtime_heartbeat(timestamp)
+            except TelegramStateError:
+                # Heartbeat state is ephemeral and carries no authority. A
+                # shutdown or one-shot run must be able to replace a corrupt or
+                # legacy record with an explicitly unhealthy stopped record.
+                worker = _new_runtime_heartbeat(timestamp)
+            worker = _stopped_runtime_heartbeat(worker, timestamp)
+            write_json_atomic(self.heartbeat_path, worker)
+
+    def mark_runtime_lane(
+        self,
+        lane: str,
+        state: str,
+        operation: str,
+        timeout_seconds: float = 0,
+        resume_after_seconds: float = 0,
+        now: float | None = None,
+    ) -> None:
+        """Record bounded progress for one secret-free runtime lane."""
+        with self._lock:
+            timestamp = _worker_timestamp(now)
+            checkpoint = _runtime_lane_checkpoint(
+                lane,
+                state,
+                operation,
+                timestamp,
+                timeout_seconds=timeout_seconds,
+                resume_after_seconds=resume_after_seconds,
+            )
             worker = self._read_worker_status()
-            worker.setdefault("started_at", timestamp)
-            worker.setdefault("heartbeat_at", timestamp)
-            worker["stopped_at"] = timestamp
+            if not worker:
+                raise TelegramStateError(
+                    "Telegram runtime heartbeat has not been started"
+                )
+            worker = _normalized_runtime_heartbeat(worker, now=timestamp)
+            if worker["stopped_at"] is not None:
+                raise TelegramStateError(
+                    "Telegram runtime heartbeat is already stopped"
+                )
+            worker["lanes"][lane] = checkpoint
             write_json_atomic(self.heartbeat_path, worker)
 
     def worker_status(
@@ -590,9 +676,8 @@ class TelegramState:
         *,
         now: float | None = None,
         stale_after_seconds: float = 90.0,
-    ) -> dict[str, float | bool | None]:
-        """Return a secret-free daemon heartbeat summary."""
-        timestamp = _worker_timestamp(now)
+    ) -> dict[str, Any]:
+        """Return strict supervisor and progress-lane health."""
         if (
             isinstance(stale_after_seconds, bool)
             or not isinstance(stale_after_seconds, (int, float))
@@ -602,15 +687,30 @@ class TelegramState:
             raise ValueError("stale_after_seconds must be a positive finite number")
         with self._lock:
             worker = self._read_worker_status()
-            started_at = _optional_worker_timestamp(worker.get("started_at"))
-            heartbeat_at = _optional_worker_timestamp(worker.get("heartbeat_at"))
-            stopped_at = _optional_worker_timestamp(worker.get("stopped_at"))
-        age = max(0.0, timestamp - heartbeat_at) if heartbeat_at is not None else None
+            # Read first when using the wall clock so a separately constructed
+            # health reader cannot reject a checkpoint atomically replaced a
+            # few microseconds after it entered this method.
+            timestamp = _worker_timestamp(now)
+            if not worker:
+                return _missing_runtime_status()
+            worker = _normalized_runtime_heartbeat(worker, now=timestamp)
+        started_at = worker["started_at"]
+        heartbeat_at = worker["supervisor"]["pulse_at"]
+        stopped_at = worker["stopped_at"]
+        age = timestamp - heartbeat_at
         fresh = bool(
-            heartbeat_at is not None
-            and stopped_at is None
-            and age is not None
+            stopped_at is None
             and age <= float(stale_after_seconds)
+        )
+        intake = _runtime_lane_summary(
+            worker["lanes"]["intake"],
+            now=timestamp,
+            supervisor_fresh=fresh,
+        )
+        worker_lane = _runtime_lane_summary(
+            worker["lanes"]["worker"],
+            now=timestamp,
+            supervisor_fresh=fresh,
         )
         return {
             "started_at": started_at,
@@ -618,29 +718,51 @@ class TelegramState:
             "stopped_at": stopped_at,
             "heartbeat_age_seconds": age,
             "heartbeat_fresh": fresh,
+            "runtime_ready": bool(intake["ready"] and worker_lane["ready"]),
+            "intake": intake,
+            "worker": worker_lane,
         }
 
     def _read_worker_status(self) -> dict[str, Any]:
-        if not self.heartbeat_path.exists():
-            return {}
+        descriptor = -1
         try:
-            worker = json.loads(self.heartbeat_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+            flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(self.heartbeat_path, flags)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > _MAX_RUNTIME_HEARTBEAT_BYTES
+            ):
+                raise TelegramStateError(
+                    f"Invalid Telegram heartbeat at {self.heartbeat_path}"
+                )
+            raw = os.read(descriptor, _MAX_RUNTIME_HEARTBEAT_BYTES + 1)
+            if len(raw) > _MAX_RUNTIME_HEARTBEAT_BYTES:
+                raise TelegramStateError(
+                    f"Invalid Telegram heartbeat at {self.heartbeat_path}"
+                )
+            worker = json.loads(raw.decode("utf-8"))
+        except FileNotFoundError:
+            return {}
+        except TelegramStateError:
+            raise
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise TelegramStateError(
                 f"Cannot read Telegram heartbeat at {self.heartbeat_path}"
             ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
         if not isinstance(worker, dict):
             raise TelegramStateError(
                 f"Invalid Telegram heartbeat at {self.heartbeat_path}"
             )
         try:
-            for name in ("started_at", "heartbeat_at", "stopped_at"):
-                _optional_worker_timestamp(worker.get(name))
-        except ValueError as exc:
+            return _normalized_runtime_heartbeat(worker)
+        except (TelegramStateError, TypeError, ValueError) as exc:
             raise TelegramStateError(
                 f"Invalid Telegram heartbeat at {self.heartbeat_path}"
             ) from exc
-        return worker
 
     def enqueue(self, update_id: int, request: dict[str, Any]) -> tuple[bool, int]:
         """Durably enqueue or reject one Telegram request.
@@ -3643,6 +3765,24 @@ class InstanceLock:
             self._file.close()
             self._file = None
             raise TelegramStateError("Another MondayOS Telegram worker is already running") from exc
+        try:
+            # The lock is shared by daemon, one-shot, and identify modes. Clear
+            # any prior ready lease before the new owner performs network or
+            # startup work so health never mistakes a utility process for the
+            # daemon that previously crashed.
+            timestamp = _worker_timestamp()
+            write_json_atomic(
+                self.path.with_name("heartbeat.json"),
+                _stopped_runtime_heartbeat(
+                    _new_runtime_heartbeat(timestamp),
+                    timestamp,
+                ),
+            )
+        except BaseException:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+            self._file.close()
+            self._file = None
+            raise
         return self
 
     def __exit__(self, *_args: Any) -> None:
@@ -3679,14 +3819,294 @@ def _worker_timestamp(value: float | None = None) -> float:
     if (
         isinstance(timestamp, bool)
         or not isinstance(timestamp, (int, float))
-        or not math.isfinite(float(timestamp))
-        or timestamp < 0
     ):
         raise ValueError("worker timestamp must be a non-negative finite number")
-    return float(timestamp)
+    try:
+        normalized = float(timestamp)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "worker timestamp must be a non-negative finite number"
+        ) from exc
+    if not math.isfinite(normalized) or normalized < 0:
+        raise ValueError("worker timestamp must be a non-negative finite number")
+    return normalized
 
 
 def _optional_worker_timestamp(value: Any) -> float | None:
     if value is None:
         return None
     return _worker_timestamp(value)
+
+
+def _new_runtime_heartbeat(timestamp: float) -> dict[str, Any]:
+    return {
+        "version": _RUNTIME_HEARTBEAT_VERSION,
+        "started_at": timestamp,
+        "stopped_at": None,
+        "supervisor": {"pulse_at": timestamp},
+        "lanes": {
+            lane: _runtime_lane_checkpoint(
+                lane,
+                "starting",
+                "starting",
+                timestamp,
+                timeout_seconds=0.0,
+                resume_after_seconds=0.0,
+            )
+            for lane in ("intake", "worker")
+        },
+    }
+
+
+def _stopped_runtime_heartbeat(
+    worker: dict[str, Any],
+    timestamp: float,
+) -> dict[str, Any]:
+    worker["stopped_at"] = timestamp
+    for lane in ("intake", "worker"):
+        worker["lanes"][lane] = _runtime_lane_checkpoint(
+            lane,
+            "stopped",
+            "stopped",
+            timestamp,
+            timeout_seconds=0.0,
+            resume_after_seconds=0.0,
+        )
+    return worker
+
+
+def _runtime_duration(value: Any, label: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) < 0
+    ):
+        raise ValueError(f"{label} must be a non-negative finite number")
+    return float(value)
+
+
+def _runtime_lane_checkpoint(
+    lane: str,
+    state: str,
+    operation: str,
+    timestamp: float,
+    *,
+    timeout_seconds: Any,
+    resume_after_seconds: Any,
+) -> dict[str, Any]:
+    if lane not in _RUNTIME_ACTIVE_LEASES:
+        raise ValueError("runtime lane must be intake or worker")
+    if state not in _RUNTIME_LANE_STATES:
+        raise ValueError("invalid runtime lane state")
+    timeout = _runtime_duration(timeout_seconds, "timeout_seconds")
+    resume_after = _runtime_duration(
+        resume_after_seconds,
+        "resume_after_seconds",
+    )
+
+    deadline_at: float | None = None
+    resume_at: float | None = None
+    if state == "active":
+        maximum = _RUNTIME_ACTIVE_LEASES[lane].get(operation)
+        if maximum is None:
+            raise ValueError("invalid active runtime lane operation")
+        if timeout <= 0 or timeout > maximum:
+            raise ValueError(
+                f"timeout_seconds must be between 0 and {maximum:g}"
+            )
+        if resume_after != 0:
+            raise ValueError("active runtime lanes cannot set resume_after_seconds")
+        deadline_at = timestamp + timeout
+    elif state == "backoff":
+        if operation not in _RUNTIME_BACKOFF_OPERATIONS:
+            raise ValueError("invalid backoff runtime lane operation")
+        if timeout != 0:
+            raise ValueError("backoff runtime lanes cannot set timeout_seconds")
+        if not 0 < resume_after <= _MAX_RUNTIME_BACKOFF_SECONDS:
+            raise ValueError(
+                "resume_after_seconds must be between 0 and 86400"
+            )
+        resume_at = timestamp + resume_after
+    else:
+        expected_operation = state
+        if state == "idle" and lane != "worker":
+            raise ValueError("only the worker runtime lane can be idle")
+        if operation != expected_operation:
+            raise ValueError(f"runtime {state} state requires {state} operation")
+        if timeout != 0 or resume_after != 0:
+            raise ValueError(
+                f"runtime {state} state cannot set a timeout or resume delay"
+            )
+
+    return {
+        "state": state,
+        "operation": operation,
+        "progress_at": timestamp,
+        "deadline_at": deadline_at,
+        "resume_at": resume_at,
+    }
+
+
+def _normalized_runtime_lane(
+    value: Any,
+    lane: str,
+    *,
+    started_at: float,
+    stopped_at: float | None,
+    now: float | None,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _RUNTIME_LANE_FIELDS:
+        raise TelegramStateError("Invalid Telegram runtime lane")
+    state = value.get("state")
+    operation = value.get("operation")
+    if not isinstance(state, str) or not isinstance(operation, str):
+        raise TelegramStateError("Invalid Telegram runtime lane")
+    try:
+        progress_at = _worker_timestamp(value.get("progress_at"))
+        deadline_at = _optional_worker_timestamp(value.get("deadline_at"))
+        resume_at = _optional_worker_timestamp(value.get("resume_at"))
+    except ValueError as exc:
+        raise TelegramStateError("Invalid Telegram runtime lane timestamp") from exc
+    if progress_at < started_at or (now is not None and progress_at > now):
+        raise TelegramStateError("Invalid Telegram runtime lane progress")
+    if stopped_at is not None and progress_at > stopped_at:
+        raise TelegramStateError("Invalid Telegram runtime lane stop order")
+
+    if state == "active":
+        maximum = _RUNTIME_ACTIVE_LEASES[lane].get(operation)
+        if (
+            maximum is None
+            or deadline_at is None
+            or resume_at is not None
+            or deadline_at <= progress_at
+            or deadline_at - progress_at > maximum
+        ):
+            raise TelegramStateError("Invalid Telegram runtime active lease")
+    elif state == "backoff":
+        if (
+            operation not in _RUNTIME_BACKOFF_OPERATIONS
+            or deadline_at is not None
+            or resume_at is None
+            or resume_at <= progress_at
+            or resume_at - progress_at > _MAX_RUNTIME_BACKOFF_SECONDS
+        ):
+            raise TelegramStateError("Invalid Telegram runtime backoff")
+    else:
+        if (
+            state not in _RUNTIME_LANE_STATES
+            or operation != state
+            or deadline_at is not None
+            or resume_at is not None
+            or (state == "idle" and lane != "worker")
+        ):
+            raise TelegramStateError("Invalid Telegram runtime lane state")
+
+    return {
+        "state": state,
+        "operation": operation,
+        "progress_at": progress_at,
+        "deadline_at": deadline_at,
+        "resume_at": resume_at,
+    }
+
+
+def _normalized_runtime_heartbeat(
+    value: Any,
+    *,
+    now: float | None = None,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _RUNTIME_HEARTBEAT_FIELDS:
+        raise TelegramStateError("Invalid Telegram runtime heartbeat")
+    version = value.get("version")
+    supervisor = value.get("supervisor")
+    lanes = value.get("lanes")
+    if (
+        isinstance(version, bool)
+        or version != _RUNTIME_HEARTBEAT_VERSION
+        or not isinstance(supervisor, dict)
+        or set(supervisor) != _RUNTIME_SUPERVISOR_FIELDS
+        or not isinstance(lanes, dict)
+        or set(lanes) != {"intake", "worker"}
+    ):
+        raise TelegramStateError("Invalid Telegram runtime heartbeat")
+    try:
+        started_at = _worker_timestamp(value.get("started_at"))
+        stopped_at = _optional_worker_timestamp(value.get("stopped_at"))
+        pulse_at = _worker_timestamp(supervisor.get("pulse_at"))
+    except ValueError as exc:
+        raise TelegramStateError(
+            "Invalid Telegram runtime heartbeat timestamp"
+        ) from exc
+    if (
+        pulse_at < started_at
+        or (stopped_at is not None and stopped_at < pulse_at)
+        or (now is not None and (
+            started_at > now
+            or pulse_at > now
+            or (stopped_at is not None and stopped_at > now)
+        ))
+    ):
+        raise TelegramStateError("Invalid Telegram runtime heartbeat order")
+
+    normalized_lanes = {
+        lane: _normalized_runtime_lane(
+            lanes[lane],
+            lane,
+            started_at=started_at,
+            stopped_at=stopped_at,
+            now=now,
+        )
+        for lane in ("intake", "worker")
+    }
+    if stopped_at is not None and any(
+        checkpoint["state"] != "stopped"
+        or checkpoint["progress_at"] != stopped_at
+        for checkpoint in normalized_lanes.values()
+    ):
+        raise TelegramStateError("Invalid stopped Telegram runtime heartbeat")
+    return {
+        "version": _RUNTIME_HEARTBEAT_VERSION,
+        "started_at": started_at,
+        "stopped_at": stopped_at,
+        "supervisor": {"pulse_at": pulse_at},
+        "lanes": normalized_lanes,
+    }
+
+
+def _runtime_lane_summary(
+    checkpoint: dict[str, Any],
+    *,
+    now: float,
+    supervisor_fresh: bool,
+) -> dict[str, Any]:
+    state = checkpoint["state"]
+    ready = bool(
+        supervisor_fresh
+        and (
+            (state == "active" and now <= checkpoint["deadline_at"])
+            or (state == "idle" and checkpoint["operation"] == "idle")
+        )
+    )
+    return {**copy.deepcopy(checkpoint), "ready": ready}
+
+
+def _missing_runtime_status() -> dict[str, Any]:
+    missing_lane = {
+        "state": None,
+        "operation": None,
+        "progress_at": None,
+        "deadline_at": None,
+        "resume_at": None,
+        "ready": False,
+    }
+    return {
+        "started_at": None,
+        "heartbeat_at": None,
+        "stopped_at": None,
+        "heartbeat_age_seconds": None,
+        "heartbeat_fresh": False,
+        "runtime_ready": False,
+        "intake": copy.deepcopy(missing_lane),
+        "worker": copy.deepcopy(missing_lane),
+    }
