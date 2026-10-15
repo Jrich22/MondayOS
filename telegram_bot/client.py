@@ -10,6 +10,30 @@ from collections.abc import Mapping
 from typing import Any, Protocol
 
 _DEFAULT_RATE_LIMIT_DELAY = 5
+_MAX_RATE_LIMIT_DELAY = 86_400
+_MAX_RETRY_AFTER_TEXT_LENGTH = 20
+
+
+def _normalize_retry_after(value: Any, *, default: int) -> int:
+    """Return a bounded delay without coercing arbitrary or oversized values."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        # Avoid handing attacker-controlled, arbitrarily long decimal strings to
+        # int(), whose work and memory use scale with the input size.
+        if len(value) > _MAX_RETRY_AFTER_TEXT_LENGTH:
+            return default
+        clean_value = value.strip()
+        if not clean_value or not clean_value.isascii() or not clean_value.isdecimal():
+            return default
+        parsed = int(clean_value)
+    else:
+        return default
+    if parsed <= 0:
+        return default
+    return min(parsed, _MAX_RATE_LIMIT_DELAY)
 
 
 class TelegramAPIError(RuntimeError):
@@ -28,13 +52,17 @@ class TelegramAPIError(RuntimeError):
 
 
 class TelegramRateLimitError(TelegramAPIError):
-    def __init__(self, retry_after: int) -> None:
+    def __init__(self, retry_after: Any) -> None:
+        bounded_retry_after = _normalize_retry_after(
+            retry_after,
+            default=_DEFAULT_RATE_LIMIT_DELAY,
+        )
         super().__init__(
-            f"Telegram rate limit; retry after {retry_after} seconds",
+            f"Telegram rate limit; retry after {bounded_retry_after} seconds",
             retryable=True,
             status_code=429,
         )
-        self.retry_after = retry_after
+        self.retry_after = bounded_retry_after
 
 
 class TelegramClient(Protocol):
@@ -178,10 +206,7 @@ def _retry_after(payload: Any) -> int:
     parameters = payload.get("parameters")
     if not isinstance(parameters, dict):
         return 0
-    try:
-        return max(0, int(parameters.get("retry_after", 0)))
-    except (TypeError, ValueError):
-        return 0
+    return _normalize_retry_after(parameters.get("retry_after"), default=0)
 
 
 def _error_code(payload: Any) -> int:

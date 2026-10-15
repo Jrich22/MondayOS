@@ -14,6 +14,22 @@ from telegram_bot.state import TelegramState
 _MAX_HANDLER_ATTEMPTS = 3
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
 _MAX_TELEGRAM_NOTICE_PAUSE_SECONDS = 86_400
+_RUNTIME_INTAKE_DISPATCH_TIMEOUT_SECONDS = 300.0
+_RUNTIME_WORKER_TIMEOUT_SECONDS = 300.0
+_RUNTIME_WORKER_OPERATION_TIMEOUTS = {
+    "background": 300.0,
+    "job": 300.0,
+    "preflight": 300.0,
+    "preparing": 300.0,
+    "implementing": 2_100.0,
+    "validating": 2_100.0,
+    "reviewing": 2_700.0,
+    "team-stage": 3_900.0,
+    "committing": 300.0,
+    "publication-ready": 300.0,
+    "pushing": 300.0,
+    "pull-request": 300.0,
+}
 
 
 class TelegramUpdateRetryError(RuntimeError):
@@ -44,6 +60,11 @@ class TelegramJobWorker:
         self._stop = stop_event
         self._wake = wake_event
         self._wait = wait or self._stop.wait
+        self._runtime_leases_enabled = False
+
+    def enable_runtime_leases(self, enabled: bool) -> None:
+        """Enable daemon-only lane updates without affecting one-shot callers."""
+        self._runtime_leases_enabled = enabled
 
     def run_once(self) -> bool:
         """Process one claimed request, returning false when the inbox is empty."""
@@ -51,6 +72,11 @@ class TelegramJobWorker:
         if claimed is None:
             return False
         update_id, update = claimed
+        self._mark_runtime_lane(
+            "active",
+            "job",
+            timeout_seconds=_RUNTIME_WORKER_TIMEOUT_SECONDS,
+        )
         try:
             self._service.handle_update(update)
         except TelegramUpdatePendingError:
@@ -111,7 +137,7 @@ class TelegramJobWorker:
         except TelegramRateLimitError as exc:
             self._state.defer_rate_limited_follow_up(
                 update_id,
-                retry_after=exc.retry_after,
+                retry_after=_telegram_notice_rate_limit_delay(exc.retry_after),
             )
         except TelegramAPIError as exc:
             if exc.retryable:
@@ -195,7 +221,7 @@ class TelegramJobWorker:
         except TelegramRateLimitError as exc:
             self._state.defer_delivery_retry(
                 update_id,
-                delay_seconds=exc.retry_after,
+                delay_seconds=_telegram_notice_rate_limit_delay(exc.retry_after),
             )
         except TelegramAPIError as exc:
             if exc.retryable:
@@ -218,40 +244,93 @@ class TelegramJobWorker:
                 # A due delivery retry supersedes its stale "will retry"
                 # notice atomically when claimed, so retry work must win this
                 # tie before terminal notices are selected for delivery.
+                self._mark_background_active()
                 retried = self.run_delivery_retry_once()
+                self._mark_background_active()
                 noticed = self.run_delivery_notice_once()
                 pending_delivery = False
                 try:
+                    self._mark_background_active()
                     worked = self.run_once()
                 except TelegramUpdatePendingError:
                     # One long-running FIFO delivery must not starve durable
                     # retry notifications or PR lifecycle observation.
                     worked = False
                     pending_delivery = True
+                self._mark_background_active()
                 followed_up = self.run_follow_up_once()
                 if noticed or worked or retried or followed_up:
                     backoff = 1
                     continue
                 if pending_delivery:
+                    self._mark_runtime_lane(
+                        "backoff",
+                        "retry",
+                        resume_after_seconds=backoff,
+                    )
                     self._wait(backoff)
                     backoff = min(60, backoff * 2)
                     continue
                 delay = self._state.next_follow_up_delay()
+                self._mark_runtime_lane("idle", "idle")
                 self._wake.wait(timeout=delay)
                 self._wake.clear()
             except TelegramRateLimitError as exc:
                 print(str(exc), file=sys.stderr)
-                self._wait(max(1, exc.retry_after))
+                delay = _telegram_notice_rate_limit_delay(exc.retry_after)
+                self._mark_runtime_lane(
+                    "backoff",
+                    "rate-limit",
+                    resume_after_seconds=delay,
+                )
+                self._wait(delay)
             except TelegramAPIError as exc:
                 if not exc.retryable:
                     raise
                 print(str(exc), file=sys.stderr)
+                self._mark_runtime_lane(
+                    "backoff",
+                    "retry",
+                    resume_after_seconds=backoff,
+                )
                 self._wait(backoff)
                 backoff = min(60, backoff * 2)
             except TelegramUpdateRetryError as exc:
                 print(str(exc), file=sys.stderr)
+                self._mark_runtime_lane(
+                    "backoff",
+                    "retry",
+                    resume_after_seconds=backoff,
+                )
                 self._wait(backoff)
                 backoff = min(60, backoff * 2)
+
+    def _mark_background_active(self) -> None:
+        self._mark_runtime_lane(
+            "active",
+            "background",
+            timeout_seconds=_RUNTIME_WORKER_TIMEOUT_SECONDS,
+        )
+
+    def _mark_runtime_lane(
+        self,
+        state: str,
+        operation: str,
+        *,
+        timeout_seconds: float = 0.0,
+        resume_after_seconds: float = 0.0,
+    ) -> None:
+        if not self._runtime_leases_enabled:
+            return
+        marker = getattr(self._state, "mark_runtime_lane", None)
+        if callable(marker):
+            marker(
+                "worker",
+                state,
+                operation,
+                timeout_seconds=timeout_seconds,
+                resume_after_seconds=resume_after_seconds,
+            )
 
 
 class TelegramRunner:
@@ -283,6 +362,7 @@ class TelegramRunner:
         self._worker_error: BaseException | None = None
         self._acceptance_receipts_paused_until = 0.0
         self._capacity_notices_paused_until = 0.0
+        self._runtime_leases_enabled = False
 
     def start(self) -> dict[str, object]:
         identity = self._client.get_me()
@@ -303,16 +383,25 @@ class TelegramRunner:
         # refusal notices from our durable state before polling so a long
         # outage cannot strand a notice merely because its source update aged
         # out of Telegram's queue.
+        self._mark_intake_dispatch()
         self._drain_queue_full_notices()
         # Accepted-job receipts use their own request-free outbox. Failures are
         # isolated here so polling can still accept /queue and /cancel controls.
+        self._mark_intake_dispatch()
         self._drain_acceptance_receipts()
+        self._mark_runtime_lane(
+            "intake",
+            "active",
+            "poll",
+            timeout_seconds=min(80, max(1, self._poll_timeout + 30)),
+        )
         updates = self._client.get_updates(
             offset=self._state.next_offset,
             timeout=self._poll_timeout,
         )
         handled = 0
         for update in sorted(updates, key=lambda item: int(item.get("update_id", -1))):
+            self._mark_intake_dispatch()
             update_id = int(update.get("update_id", -1))
             if update_id < 0:
                 continue
@@ -387,7 +476,9 @@ class TelegramRunner:
             handled += 1
         # Process state-only controls before attempting a newly-created
         # capacity notice, so a slow send cannot hold a later /cancel behind it.
+        self._mark_intake_dispatch()
         self._drain_queue_full_notices()
+        self._mark_intake_dispatch()
         self._drain_acceptance_receipts()
         return handled
 
@@ -413,33 +504,62 @@ class TelegramRunner:
             daemon=False,
         )
         self._state.mark_worker_started()
-        self._wake.set()  # Recover jobs already durable before this process.
-        worker_thread.start()
-        heartbeat_thread.start()
-        backoff = 1
+        self._runtime_leases_enabled = True
+        self._worker.enable_runtime_leases(True)
         try:
+            self._bind_runtime_progress(self._renew_worker_runtime)
+            self._wake.set()  # Recover jobs already durable before this process.
+            worker_thread.start()
+            heartbeat_thread.start()
+            backoff = 1
             while not self._stop.is_set():
                 try:
                     self.ingest_once()
                     backoff = 1
                 except TelegramRateLimitError as exc:
                     print(str(exc), file=sys.stderr)
-                    self._wait(max(1, exc.retry_after))
+                    delay = _telegram_notice_rate_limit_delay(exc.retry_after)
+                    self._mark_runtime_lane(
+                        "intake",
+                        "backoff",
+                        "rate-limit",
+                        resume_after_seconds=delay,
+                    )
+                    self._wait(delay)
                 except TelegramAPIError as exc:
                     if not exc.retryable:
                         raise
                     print(str(exc), file=sys.stderr)
+                    self._mark_runtime_lane(
+                        "intake",
+                        "backoff",
+                        "retry",
+                        resume_after_seconds=backoff,
+                    )
                     self._wait(backoff)
                     backoff = min(60, backoff * 2)
                 except TelegramUpdateRetryError as exc:
                     print(str(exc), file=sys.stderr)
+                    self._mark_runtime_lane(
+                        "intake",
+                        "backoff",
+                        "retry",
+                        resume_after_seconds=backoff,
+                    )
                     self._wait(backoff)
                     backoff = min(60, backoff * 2)
         finally:
             self.stop()
-            worker_thread.join()
-            heartbeat_thread.join()
-            self._state.mark_worker_stopped()
+            if worker_thread.ident is not None:
+                worker_thread.join()
+            if heartbeat_thread.ident is not None:
+                heartbeat_thread.join()
+            try:
+                self._bind_runtime_progress(None)
+            finally:
+                self._worker.enable_runtime_leases(False)
+                self._runtime_leases_enabled = False
+                self._state.mark_worker_stopped()
         if self._worker_error is not None:
             raise self._worker_error
 
@@ -453,7 +573,17 @@ class TelegramRunner:
             self._worker.run_forever()
         except BaseException as exc:
             self._worker_error = exc
+            try:
+                # The supervisor can still pulse while intake unwinds from its
+                # current long poll. Publish the known worker failure first so
+                # health cannot remain falsely ready during that window.
+                self._mark_runtime_lane("worker", "stopped", "stopped")
+            except BaseException:
+                # Preserve the original worker failure. A heartbeat write
+                # failure is independently visible as unreadable/stale health.
+                pass
             self._stop.set()
+            self._wake.set()
 
     def _heartbeat_main(self) -> None:
         while not self._stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
@@ -464,6 +594,55 @@ class TelegramRunner:
                 self._stop.set()
                 self._wake.set()
                 return
+
+    def _bind_runtime_progress(
+        self,
+        reporter: Callable[[str], None] | None,
+    ) -> None:
+        binder = getattr(self._service, "bind_runtime_progress", None)
+        if callable(binder):
+            binder(reporter)
+
+    def _renew_worker_runtime(self, operation: str) -> None:
+        timeout = _RUNTIME_WORKER_OPERATION_TIMEOUTS.get(operation)
+        if timeout is None:
+            operation = "job"
+            timeout = _RUNTIME_WORKER_OPERATION_TIMEOUTS[operation]
+        self._mark_runtime_lane(
+            "worker",
+            "active",
+            operation,
+            timeout_seconds=timeout,
+        )
+
+    def _mark_intake_dispatch(self) -> None:
+        self._mark_runtime_lane(
+            "intake",
+            "active",
+            "dispatch",
+            timeout_seconds=_RUNTIME_INTAKE_DISPATCH_TIMEOUT_SECONDS,
+        )
+
+    def _mark_runtime_lane(
+        self,
+        lane: str,
+        state: str,
+        operation: str,
+        *,
+        timeout_seconds: float = 0.0,
+        resume_after_seconds: float = 0.0,
+    ) -> None:
+        if not self._runtime_leases_enabled:
+            return
+        marker = getattr(self._state, "mark_runtime_lane", None)
+        if callable(marker):
+            marker(
+                lane,
+                state,
+                operation,
+                timeout_seconds=timeout_seconds,
+                resume_after_seconds=resume_after_seconds,
+            )
 
     def _normalize(self, update: dict[str, Any]) -> dict[str, Any] | None:
         normalizer = getattr(self._service, "normalize_update", None)
@@ -545,6 +724,10 @@ class TelegramRunner:
         """Retry due receipts from state without relying on Telegram replay."""
         due = self._state.due_acceptance_receipt_ids()
         for index, update_id in enumerate(due):
+            # Each send can consume the full HTTP timeout. Renew between
+            # independent receipts so a progressing bounded drain never looks
+            # like one stalled dispatch operation.
+            self._mark_intake_dispatch()
             paused_for = self._deliver_acceptance_receipt(
                 update_id,
                 rate_limit_scope=due[index:],

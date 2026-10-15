@@ -136,10 +136,15 @@ monday telegram --health --json
 ```
 
 The JSON form is suitable for monitoring and exits nonzero when configuration,
-durable state, the worker lock, heartbeat freshness, or required live-build
-capabilities are unhealthy, when the inbox is not accepting new work, or while
-an acceptance receipt, capacity refusal, or live-build delivery notice remains
-unresolved. Full installation and recovery procedures are in
+durable state, the worker lock, supervisor heartbeat, either runtime lane, or
+required live-build capabilities are unhealthy, when the inbox is not accepting
+new work, or while an acceptance receipt, capacity refusal, or live-build
+delivery notice remains unresolved. Intake and worker are checked independently:
+a fresh supervisor cannot hide a stuck poll, dispatch, team, build, validation,
+review, push, or pull-request operation. Idle workers remain ready; startup,
+backoff, stopped, expired, malformed, future-dated, and legacy heartbeat records
+fail closed. Restart the normal daemon to replace a legacy heartbeat. Full
+installation and recovery procedures are in
 [SETUP_GUIDE.md](SETUP_GUIDE.md) and [RUNBOOK.md](RUNBOOK.md).
 
 At startup MondayOS verifies the bot identity and removes any prior webhook
@@ -231,7 +236,10 @@ the completed job tombstone in `logs/telegram/state.json`, without retaining the
 original request text. A restart can reclaim a poll that was in flight. Pending
 checks are polled more frequently, settled open-PR states more slowly, and
 transient observation failures use exponential backoff capped at five minutes;
-Telegram rate limits are honored separately for up to 24 hours. A permanent
+Telegram rate limits are honored separately for up to 24 hours. Untrusted
+`retry_after` values are normalized before they reach logs or time arithmetic;
+invalid values use a safe default and oversized values are capped at 24 hours.
+A permanent
 Telegram destination failure, such as a blocked bot or deleted chat, ends that
 watcher in a request-free `notification-failed` state instead of retrying
 forever. Each watcher has a durable 30-day lifetime, and at most 500 can be

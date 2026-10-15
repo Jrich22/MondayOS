@@ -481,7 +481,7 @@ monday telegram [--once | --identify | --health] [--json] [--provider NAME]
 |------|---------|-------------|
 | `--once` | off | Ingest one long-poll response, drain the durable inbox synchronously, and exit. Useful during setup; it does not provide ongoing PR monitoring. |
 | `--identify` | off | Print pending Telegram user/chat IDs and exit. |
-| `--health` | off | Check local configuration, durable state, inbox capacity, unresolved receipt/refusal/delivery outboxes, worker lock, heartbeat freshness, and required live-build capabilities without contacting Telegram. Exits nonzero when unhealthy. |
+| `--health` | off | Check local configuration, durable state, inbox capacity, unresolved receipt/refusal/delivery outboxes, worker lock, supervisor freshness, independent intake/worker progress leases, and required live-build capabilities without contacting Telegram. Exits nonzero when unhealthy. |
 | `--json` | off | Emit machine-readable output for `--health`. |
 | `--provider NAME` | role defaults | Pin one provider for productive team stages. The final Reviewer still requires OpenAI/ChatGPT (`fake` is available for offline tests). Without a pin, productive roles use their preferred provider with ordered fallback. |
 
@@ -502,7 +502,14 @@ durably without storing the rejected request. The health report exposes pending
 and maximum jobs, whether the inbox is accepting work, and unresolved
 acceptance receipts, capacity-refusal notices, and live-build delivery notices.
 It becomes unhealthy at or above the cap or while any of those request-free
-outboxes remains unresolved.
+outboxes remains unresolved. Daemon health also requires both runtime lanes to
+be ready: intake must be inside its bounded poll or dispatch lease, and the
+worker must be idle or inside the fixed lease for its current build/team phase.
+A fresh supervisor pulse alone is not sufficient. Startup, retry backoff,
+stopped, overdue, malformed, and pre-v2 heartbeat records fail closed; restarting
+the daemon replaces a legacy heartbeat with the current secret-free format.
+`--once` never advertises ready daemon lanes; it records an explicitly stopped
+runtime before synchronous work and does not renew progress leases.
 See [TELEGRAM.md](TELEGRAM.md) for setup, commands, restart behavior, and the
 always-on Mac mini service.
 

@@ -1365,3 +1365,72 @@ and remains unhealthy while any delivery notice is pending.
 - Rare duplicate fixed messages remain possible at the remote/local checkpoint
   boundary, and an exhausted or permanently invalid outbox may drop a notice
   to preserve privacy and control-plane availability.
+
+---
+
+## ADR-028: Telegram Health Requires Independent Progress Leases
+
+**Date:** 2026-10-15
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+The Telegram daemon previously exposed one periodic heartbeat. Its supervisor
+thread could continue writing that pulse while the intake thread was stuck in
+polling or notification dispatch, or while the sequential worker was stuck in a
+model, validation, review, publication, or retry operation. Monitoring could
+therefore report a fresh heartbeat for a process that was no longer making
+useful progress. Telegram also supplies remote `retry_after` values that must
+not be allowed to create unbounded waits or expensive exception rendering.
+
+### Decision
+
+The ephemeral Telegram heartbeat uses a strict versioned schema with three
+independent signals: a supervisor pulse, an intake checkpoint, and a worker
+checkpoint. The supervisor renews only its own pulse. Each lane records only a
+fixed state and fixed operation name plus bounded timestamps; it never records
+request text, task titles, provider output, diagnostics, credentials, or other
+attacker-controlled strings.
+
+An active intake poll receives at most its configured timeout plus 30 seconds,
+capped at 80 seconds; intake dispatch receives 300 seconds. Ordinary worker
+operations receive 300 seconds, implementation and validation 35 minutes,
+review 45 minutes, and a team stage 65 minutes. The worker may also report a
+healthy idle state. Startup, backoff, stopped, overdue, malformed,
+future-dated, unknown-version, and legacy records fail closed. The daemon
+replaces the ephemeral heartbeat on startup; durable Telegram queue schema and
+recovery state are unchanged. One-shot execution records stopped runtime state
+and does not create or renew ready daemon leases.
+
+Runtime health requires the worker lock, a fresh supervisor pulse, and both
+lanes ready. Backoff remains visibly unhealthy until the loop actually resumes,
+even after its scheduled time passes. Telegram rate-limit hints are normalized
+before exception rendering and time arithmetic. Invalid hints use a small safe
+default and valid hints are capped at 86,400 seconds. Every new owner of the
+single-process lock first records stopped runtime state, so setup, identify, and
+one-shot work cannot inherit a crashed daemon's still-fresh ready leases.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Keep one supervisor heartbeat | It measures process/thread survival, not intake or worker progress. |
+| Let the supervisor renew every lane | A healthy supervisor could continue masking a hung lane. |
+| Derive operations from task or provider messages | Arbitrary content would leak into an operational health file and make validation unbounded. |
+| Mark a backoff ready once `resume_at` passes | The underlying loop may still be stuck; only a new checkpoint proves that it resumed. |
+| Accept Telegram's delay without a maximum | Hostile or malformed input could suppress work for an unreasonable period or consume resources while rendered. |
+
+### Consequences
+
+- Watchdogs can distinguish supervisor survival, intake progress, and worker
+  progress without contacting Telegram.
+- Long legitimate phases stay healthy only while their bounded lease is current;
+  progress callbacks renew the lease at durable workflow transitions.
+- A process can temporarily report unhealthy during startup or an intentional
+  retry wait. This is an accurate availability signal rather than a crash claim.
+- Upgrades from the old heartbeat format require one normal daemon restart.
+- The heartbeat remains ephemeral, strict, bounded, and safe to expose through
+  the secret-free health command.

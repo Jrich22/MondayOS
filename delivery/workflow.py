@@ -873,6 +873,7 @@ class DeliveryWorkflow:
                             current,
                             recovered_worktree,
                             workflow_guard_fd,
+                            progress_callback,
                         )
                     except Exception as exc:
                         result = self._publication_pending(current, exc)
@@ -933,6 +934,7 @@ class DeliveryWorkflow:
         job: DeliveryJob,
         worktree: Worktree,
         workflow_guard_fd: int,
+        progress_callback: ProgressCallback | None,
     ) -> DeliveryJob:
         published = self.repository.remote_branch_is_exact(worktree, job.commit_sha)
         if not published:
@@ -958,6 +960,7 @@ class DeliveryWorkflow:
                 phase="pull-request",
                 message="Reconciling the exact published branch with GitHub",
             )
+            self._notify(job, progress_callback)
             current_task = self.monday.task("get", task_id=job.task_id)
             current_task_data = dict(getattr(current_task, "data", {}) or {})
             title = str(current_task_data.get("title", "Autonomous build"))
@@ -1335,6 +1338,7 @@ class DeliveryWorkflow:
                 return self._fail(job, "project-mismatch", target_error)
 
             self._update(job, phase="pushing", message="Pushing the approved branch")
+            self._notify(job, progress_callback)
             inherited_guard_fds = (publication_guard_fd, workflow_guard_fd)
             pushed_sha = self.repository.push(
                 worktree,
@@ -1348,6 +1352,7 @@ class DeliveryWorkflow:
             self.store.persist(job)
 
             self._update(job, phase="pull-request", message="Opening the GitHub pull request")
+            self._notify(job, progress_callback)
             result = self.github.ensure_pull_request(
                 repo_root=self.repository_root,
                 repository=job.repository,
