@@ -25,6 +25,8 @@ _DELIVERY_RETRY_MAX_AGE_SECONDS = 24 * 60 * 60
 _MAX_DELIVERY_RETRY_RUNS = 6
 _MAX_DELIVERY_RETRY_NOTIFICATION_FAILURES = 3
 _MAX_ACCEPTANCE_RECEIPT_RETRY_SECONDS = 86_400.0
+_MAX_QUEUE_FULL_NOTICE_RETRY_SECONDS = 86_400.0
+_MAX_ACTIVE_QUEUE_FULL_NOTICES = 500
 _DELIVERY_ID = re.compile(r"^delivery-[A-Za-z0-9-]{1,80}$")
 _TASK_ID = re.compile(r"^TASK-\d{1,64}(?:-[a-z0-9]{1,12})?$", re.IGNORECASE)
 _PROJECT_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -39,6 +41,20 @@ _PRISTINE_QUEUE_FIELDS = frozenset({
     "phase", "request", "request_digest", *_ORIGIN_FIELDS,
 })
 _ACCEPTANCE_RECEIPT_PHASES = frozenset({"pending", "retrying", "sent"})
+_QUEUE_FULL_NOTICE_STATUSES = frozenset({
+    "pending", "retrying", "sent", "failed",
+})
+_QUEUE_FULL_NOTICE_TERMINAL_FIELDS = frozenset({
+    "phase", "request_digest", "notice_status",
+})
+_QUEUE_FULL_NOTICE_ACTIVE_FIELDS = frozenset({
+    *_QUEUE_FULL_NOTICE_TERMINAL_FIELDS,
+    *_ORIGIN_FIELDS,
+    "notice_binding",
+    "notice_failure_count",
+    "notice_deferred_at",
+    "notice_next_attempt_at",
+})
 _TERMINAL_DELIVERY_STATUSES = frozenset({
     "blocked", "cancelled", "completed", "failed", "interrupted", "pr-open",
     "publication-pending", "rejected", "succeeded",
@@ -110,10 +126,10 @@ class TelegramState:
                 or legacy_with_state
                 or current_id != normalized_id
                 or self._data.get("bot_username") != normalized_username
-                or self._data.get("version") != 6
+                or self._data.get("version") != 7
             )
             self._data.update({
-                "version": 6,
+                "version": 7,
                 "bot_id": normalized_id,
                 "bot_username": normalized_username,
             })
@@ -146,6 +162,71 @@ class TelegramState:
                 for value in self._data.setdefault("completed_jobs", {}).values()
                 if _queue_full_notice_pending(value)
             )
+
+    def due_queue_full_notice_ids(
+        self,
+        *,
+        now: float | None = None,
+    ) -> list[int]:
+        """Return request-free capacity notices whose retry is due."""
+        current = time.time() if now is None else _finite_nonnegative(now, time.time())
+        with self._lock:
+            due: list[int] = []
+            for key, record in self._data.setdefault("completed_jobs", {}).items():
+                if not _queue_full_notice_pending(record):
+                    continue
+                update_id = _queue_full_notice_key(key)
+                notice = _normalized_queue_full_notice(record, update_id)
+                if notice["next_attempt_at"] <= current:
+                    due.append(update_id)
+            return sorted(due)
+
+    def defer_queue_full_notice(
+        self,
+        update_id: int,
+        *,
+        delay_seconds: float,
+        now: float | None = None,
+    ) -> None:
+        """Persist bounded capacity-notice backoff without diagnostics."""
+        self.defer_queue_full_notices(
+            [update_id],
+            delay_seconds=delay_seconds,
+            now=now,
+        )
+
+    def defer_queue_full_notices(
+        self,
+        update_ids: list[int],
+        *,
+        delay_seconds: float,
+        now: float | None = None,
+    ) -> None:
+        """Atomically defer a cohort of due capacity notices."""
+        normalized_ids = sorted({_update_id(value) for value in update_ids})
+        current = time.time() if now is None else _finite_nonnegative(now, time.time())
+        delay = _bounded_delay(
+            delay_seconds,
+            _MAX_QUEUE_FULL_NOTICE_RETRY_SECONDS,
+        )
+        with self._lock:
+            pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            completed = self._data.setdefault("completed_jobs", {})
+            for normalized_id in normalized_ids:
+                record = completed.get(str(normalized_id))
+                if not _queue_full_notice_pending(record):
+                    continue
+                notice = _normalized_queue_full_notice(record, normalized_id)
+                pending.append((record, notice))
+            for record, notice in pending:
+                record.update({
+                    "notice_status": "retrying",
+                    "notice_failure_count": int(notice["failure_count"]) + 1,
+                    "notice_deferred_at": current,
+                    "notice_next_attempt_at": current + delay,
+                })
+            if pending:
+                self._write()
 
     @property
     def pending_acceptance_receipt_count(self) -> int:
@@ -317,16 +398,8 @@ class TelegramState:
             for key, value in self._data.setdefault("completed_jobs", {}).items():
                 if not _queue_full_notice_pending(value):
                     continue
-                try:
-                    update_id = _update_id(int(key))
-                except (TelegramStateError, TypeError, ValueError) as exc:
-                    raise TelegramStateError(
-                        "Invalid Telegram queue-full notice key"
-                    ) from exc
-                if key != str(update_id):
-                    raise TelegramStateError(
-                        "Invalid Telegram queue-full notice key"
-                    )
+                update_id = _queue_full_notice_key(key)
+                _normalized_queue_full_notice(value, update_id)
                 pending.append(update_id)
             return sorted(pending)
 
@@ -557,9 +630,9 @@ class TelegramState:
         integer is that entry's current FIFO position, or zero for a terminal
         replay. Telegram update ids are bot-scoped and immutable, so seeing the
         same id with different content is treated as corrupt input. Accepted
-        work advances the polling offset immediately. A capacity refusal keeps
-        the offset behind its request-free tombstone until its user notice is
-        sent or permanently fails, so Telegram can redeliver it after restart.
+        work and capacity refusals advance the polling offset immediately. A
+        refused request keeps only a request-free notice outbox, so delivery
+        recovery never depends on Telegram retaining or replaying the update.
         """
         normalized_id = _update_id(update_id)
         normalized_request, digest = _canonical_request(request)
@@ -576,8 +649,7 @@ class TelegramState:
                 _verify_digest(terminal, digest, normalized_id)
                 if not terminal.get("request_digest"):
                     terminal["request_digest"] = digest
-                if not _queue_full_notice_pending(terminal):
-                    self._advance(normalized_id)
+                self._advance(normalized_id)
                 self._write()
                 return False, 0
 
@@ -637,15 +709,34 @@ class TelegramState:
                     digest=digest,
                     origin=origin,
                 )
-                tombstone["notice_status"] = "pending"
+                active_notices = sum(
+                    1 for value in completed.values()
+                    if _queue_full_notice_pending(value)
+                )
+                if origin is not None and (
+                    active_notices < _MAX_ACTIVE_QUEUE_FULL_NOTICES
+                ):
+                    tombstone.update({
+                        "notice_status": "pending",
+                        "notice_binding": _queue_full_notice_binding(
+                            normalized_id,
+                            digest,
+                            origin,
+                        ),
+                        "notice_failure_count": 0,
+                        "notice_deferred_at": 0.0,
+                        "notice_next_attempt_at": 0.0,
+                    })
+                else:
+                    tombstone["notice_status"] = "failed"
+                    for name in _ORIGIN_FIELDS:
+                        tombstone.pop(name, None)
                 completed[key] = tombstone
+                self._advance(normalized_id)
                 _bound_completed(
                     completed,
                     _MAX_COMPLETED_JOBS,
-                    protected={
-                        *self._data.setdefault("delivery_retries", {}),
-                        key,
-                    },
+                    protected=set(self._data.setdefault("delivery_retries", {})),
                 )
                 self._write()
                 return False, 0
@@ -1463,15 +1554,11 @@ class TelegramState:
             )
             if not _queue_full_notice_pending(record):
                 return {}
-            origin = _saved_origin(record)
-            if origin is None:
-                raise TelegramStateError(
-                    f"Telegram update {normalized_id} lost its notice destination"
-                )
+            notice = _normalized_queue_full_notice(record, normalized_id)
             return {
-                "user_id": origin[0],
-                "chat_id": origin[1],
-                "chat_type": origin[2],
+                "user_id": notice["origin_user_id"],
+                "chat_id": notice["origin_chat_id"],
+                "chat_type": notice["origin_chat_type"],
             }
 
     def complete_queue_full_notice(
@@ -1480,7 +1567,7 @@ class TelegramState:
         *,
         delivered: bool,
     ) -> None:
-        """Finish a capacity notice and only then advance its polling offset."""
+        """Finish a capacity notice and scrub its temporary destination."""
         normalized_id = _update_id(update_id)
         key = str(normalized_id)
         with self._lock:
@@ -1490,15 +1577,20 @@ class TelegramState:
                 raise TelegramStateError(
                     f"Telegram update {normalized_id} has no queue-full notice"
                 )
-            status = record.get("notice_status", "pending")
-            if status not in {"pending", "sent", "failed"}:
+            status = record.get("notice_status")
+            if status not in _QUEUE_FULL_NOTICE_STATUSES:
                 raise TelegramStateError(
                     f"Telegram update {normalized_id} has invalid notice state"
                 )
-            if status == "pending":
-                record["notice_status"] = "sent" if delivered else "failed"
-            for name in _ORIGIN_FIELDS:
-                record.pop(name, None)
+            _normalized_queue_full_notice(record, normalized_id)
+            final_status = status
+            if status in {"pending", "retrying"}:
+                final_status = "sent" if delivered else "failed"
+            completed[key] = {
+                "phase": "queue-full",
+                "request_digest": record["request_digest"],
+                "notice_status": final_status,
+            }
             self._advance(normalized_id)
             _bound_completed(
                 completed,
@@ -1590,7 +1682,7 @@ class TelegramState:
         with self._lock:
             if not self.path.exists():
                 return {
-                    "version": 6,
+                    "version": 7,
                     "bot_id": None,
                     "bot_username": "",
                     "last_update_id": -1,
@@ -1626,6 +1718,7 @@ class TelegramState:
             if not isinstance(payload.get("bot_username", ""), str):
                 raise TelegramStateError(f"Invalid Telegram state at {self.path}")
             try:
+                _validate_loaded_queue_full_notices(payload)
                 _validate_loaded_acceptance_receipts(payload)
                 _validate_loaded_delivery_retries(payload)
             except (TelegramStateError, TypeError, ValueError) as exc:
@@ -1636,7 +1729,7 @@ class TelegramState:
 
     def _write(self) -> None:
         with self._lock:
-            self._data["version"] = 6
+            self._data["version"] = 7
             write_json_atomic(self.path, self._data)
 
 
@@ -1692,6 +1785,201 @@ def _follow_up_active(value: Any) -> TypeGuard[dict[str, Any]]:
         and value.get("kind") == "pr-lifecycle"
         and value.get("phase") in {"pending", "polling", "retrying"}
     )
+
+
+def _queue_full_notice_key(value: Any) -> int:
+    try:
+        update_id = _update_id(int(value))
+    except (TelegramStateError, TypeError, ValueError) as exc:
+        raise TelegramStateError("Invalid Telegram queue-full notice key") from exc
+    if value != str(update_id):
+        raise TelegramStateError("Invalid Telegram queue-full notice key")
+    return update_id
+
+
+def _queue_full_notice_binding(
+    update_id: int,
+    digest: str,
+    origin: tuple[int, int, str],
+) -> str:
+    payload = {
+        "kind": "queue-full-notice-binding-v1",
+        "update_id": _update_id(update_id),
+        "request_digest": digest,
+        "origin_user_id": origin[0],
+        "origin_chat_id": origin[1],
+        "origin_chat_type": origin[2],
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _normalized_queue_full_notice(
+    value: Any,
+    update_id: int,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("phase") != "queue-full":
+        raise TelegramStateError("Invalid Telegram queue-full notice")
+    status = value.get("notice_status")
+    digest = value.get("request_digest")
+    if (
+        status not in _QUEUE_FULL_NOTICE_STATUSES
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        raise TelegramStateError("Invalid Telegram queue-full notice")
+
+    if status in {"sent", "failed"}:
+        if set(value) != _QUEUE_FULL_NOTICE_TERMINAL_FIELDS:
+            raise TelegramStateError(
+                "Terminal Telegram queue-full notice retained unexpected state"
+            )
+        return {
+            "status": status,
+            "failure_count": 0,
+            "deferred_at": 0.0,
+            "next_attempt_at": 0.0,
+            "origin_user_id": None,
+            "origin_chat_id": None,
+            "origin_chat_type": None,
+        }
+
+    if set(value) != _QUEUE_FULL_NOTICE_ACTIVE_FIELDS:
+        raise TelegramStateError(
+            "Active Telegram queue-full notice retained unexpected state"
+        )
+    origin = _validated_origin(
+        value.get("origin_user_id"),
+        value.get("origin_chat_id"),
+        value.get("origin_chat_type"),
+    )
+    binding = value.get("notice_binding")
+    if (
+        not isinstance(binding, str)
+        or binding != _queue_full_notice_binding(update_id, digest, origin)
+    ):
+        raise TelegramStateError(
+            "Telegram queue-full notice changed source binding"
+        )
+    failure_count = value.get("notice_failure_count")
+    if (
+        isinstance(failure_count, bool)
+        or not isinstance(failure_count, int)
+        or failure_count < 0
+    ):
+        raise TelegramStateError("Invalid Telegram queue-full notice retry state")
+    deferred_at = _strict_timestamp(
+        value.get("notice_deferred_at"),
+        allow_zero=True,
+    )
+    next_attempt_at = _strict_timestamp(
+        value.get("notice_next_attempt_at"),
+        allow_zero=True,
+    )
+    if (
+        next_attempt_at < deferred_at
+        or next_attempt_at - deferred_at
+        > _MAX_QUEUE_FULL_NOTICE_RETRY_SECONDS + 1
+        or (
+            status == "pending"
+            and (failure_count or deferred_at or next_attempt_at)
+        )
+        or (
+            status == "retrying"
+            and (
+                failure_count < 1
+                or deferred_at <= 0
+                or next_attempt_at <= deferred_at
+            )
+        )
+    ):
+        raise TelegramStateError("Invalid Telegram queue-full notice retry state")
+    return {
+        "status": status,
+        "failure_count": failure_count,
+        "deferred_at": deferred_at,
+        "next_attempt_at": next_attempt_at,
+        "origin_user_id": origin[0],
+        "origin_chat_id": origin[1],
+        "origin_chat_type": origin[2],
+    }
+
+
+def _validate_loaded_queue_full_notices(payload: dict[str, Any]) -> None:
+    version = payload.get("version", 0)
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or not 0 <= version <= 7
+    ):
+        raise TelegramStateError("Invalid Telegram state version")
+    last_update_id = payload.get("last_update_id", -1)
+    if (
+        isinstance(last_update_id, bool)
+        or not isinstance(last_update_id, int)
+        or last_update_id < -1
+    ):
+        raise TelegramStateError("Invalid Telegram update offset")
+
+    active_count = 0
+    completed = payload.setdefault("completed_jobs", {})
+    for key, record in sorted(completed.items(), key=lambda item: int(item[0])):
+        if not isinstance(record, dict) or record.get("phase") != "queue-full":
+            continue
+        update_id = _queue_full_notice_key(key)
+        if version < 7:
+            status = record.get("notice_status", "pending")
+            digest = record.get("request_digest")
+            if (
+                not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise TelegramStateError("Invalid legacy queue-full notice")
+            if status == "pending":
+                # A pre-v7 route has no binding to its original update. Do not
+                # turn mutable legacy routing fields into a new authorization
+                # to message someone during migration. Advance past the old
+                # refusal and retain only its request-free terminal digest.
+                record = {
+                    "phase": "queue-full",
+                    "request_digest": digest,
+                    "notice_status": "failed",
+                }
+            elif status in {"sent", "failed"}:
+                record = {
+                    "phase": "queue-full",
+                    "request_digest": digest,
+                    "notice_status": status,
+                }
+            else:
+                raise TelegramStateError("Invalid legacy queue-full notice")
+            completed[key] = record
+            payload["last_update_id"] = max(
+                int(payload.get("last_update_id", -1)),
+                update_id,
+            )
+        elif last_update_id < update_id:
+            raise TelegramStateError(
+                f"Telegram queue-full notice {update_id} exceeds saved offset"
+            )
+
+        notice = _normalized_queue_full_notice(record, update_id)
+        if notice["status"] in {"pending", "retrying"}:
+            active_count += 1
+            if active_count > _MAX_ACTIVE_QUEUE_FULL_NOTICES:
+                raise TelegramStateError("Too many pending queue-full notices")
+
+    if version < 7:
+        _bound_completed(
+            completed,
+            _MAX_COMPLETED_JOBS,
+            protected=set(payload.setdefault("delivery_retries", {})),
+        )
 
 
 def _acceptance_receipt_pending(value: Any) -> TypeGuard[dict[str, Any]]:
@@ -1799,7 +2087,7 @@ def _validate_loaded_acceptance_receipts(payload: dict[str, Any]) -> None:
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
-        or not 0 <= version <= 6
+        or not 0 <= version <= 7
     ):
         raise TelegramStateError("Invalid Telegram state version")
 
@@ -2378,7 +2666,7 @@ def _queue_full_notice_pending(record: Any) -> bool:
     return (
         isinstance(record, dict)
         and record.get("phase") == "queue-full"
-        and record.get("notice_status", "pending") == "pending"
+        and record.get("notice_status") in {"pending", "retrying"}
     )
 
 
