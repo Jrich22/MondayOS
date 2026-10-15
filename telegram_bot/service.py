@@ -852,9 +852,36 @@ class TelegramBotService:
         job = self._state.job(update_id)
         if bool(job.get("delivery_final_sent")):
             return
+        stable_id = self._delivery_id(update_id)
+        recorded_id = str(job.get("delivery_id") or "")
+        if recorded_id and recorded_id != stable_id:
+            raise RuntimeError("The saved Telegram delivery identity does not match")
+        project_name = str(job.get("project_name") or "")
         saved_result = job.get("delivery_result")
         if bool(job.get("delivery_terminal")) and isinstance(saved_result, dict):
+            if str(saved_result.get("delivery_id") or "") != stable_id:
+                raise RuntimeError("The saved Telegram delivery result changed identity")
             retry = self._state.delivery_retry(update_id)
+            retry_unavailable = ""
+            if (
+                not retry
+                and not isinstance(job.get("delivery_retry"), dict)
+                and _safe_transient_delivery_failure(saved_result)
+            ):
+                # The terminal result and scheduler checkpoint are separate
+                # durable writes. Reconstruct the deterministic first retry if
+                # a crash or power loss landed between them.
+                retry, retry_unavailable = self._schedule_initial_delivery_retry(
+                    update_id,
+                    chat_id,
+                    task_id,
+                    stable_id,
+                    project_name,
+                    saved_result,
+                    expires_at=_finite_timestamp(
+                        job.get("delivery_retry_expires_at")
+                    ),
+                )
             if retry:
                 now = time.time()
                 expires_at = _finite_timestamp(retry.get("expires_at"))
@@ -879,14 +906,14 @@ class TelegramBotService:
                 chat_id,
                 task_id,
                 saved_result,
-                str(job.get("project_name") or ""),
+                project_name,
             )
             text = _delivery_result(
                 task_id,
                 saved_result,
                 follow_up_phase=follow_up_phase,
             )
-            unavailable = _delivery_retry_unavailable_notice(
+            unavailable = retry_unavailable or _delivery_retry_unavailable_notice(
                 job.get("delivery_retry")
             )
             if unavailable:
@@ -898,10 +925,6 @@ class TelegramBotService:
             self._state.set_job(update_id, delivery_final_sent=True)
             return
 
-        stable_id = self._delivery_id(update_id)
-        recorded_id = str(job.get("delivery_id") or "")
-        if recorded_id and recorded_id != stable_id:
-            raise RuntimeError("The saved Telegram delivery identity does not match")
         self._state.set_job(
             update_id,
             task_id=task_id,
@@ -917,7 +940,6 @@ class TelegramBotService:
                 update_id, chat_id, event,
             ),
         }
-        project_name = str(job.get("project_name") or "")
         if project_name:
             build_kwargs["project"] = project_name
         response = self._monday.build("run", **build_kwargs)
@@ -925,6 +947,11 @@ class TelegramBotService:
         if result["delivery_id"] != stable_id:
             raise RuntimeError("MondayOS did not honor the reserved delivery identity")
         terminal = _delivery_terminal(str(result.get("status") or ""))
+        retry_expires_at = (
+            time.time() + _DELIVERY_RETRY_WINDOW_SECONDS
+            if terminal and _safe_transient_delivery_failure(result)
+            else 0.0
+        )
         self._state.set_job(
             update_id,
             delivery_reserved=False,
@@ -933,67 +960,32 @@ class TelegramBotService:
             delivery_status=result["status"],
             delivery_phase=result["phase"],
             delivery_result=result,
+            delivery_retry_expires_at=retry_expires_at,
         )
         if terminal:
             retry_unavailable = ""
             if _safe_transient_delivery_failure(result):
-                next_attempt = 2
-                delay = _delivery_retry_delay(
-                    next_attempt,
-                    result.get("retry_after_seconds", 0),
+                retry, retry_unavailable = self._schedule_initial_delivery_retry(
+                    update_id,
+                    chat_id,
+                    task_id,
+                    stable_id,
+                    project_name,
+                    result,
+                    expires_at=retry_expires_at,
                 )
-                if delay < _DELIVERY_RETRY_WINDOW_SECONDS:
-                    retry = self._state.schedule_delivery_retry(
-                        update_id,
-                        {
-                            "kind": "delivery-retry",
-                            "root_delivery_id": stable_id,
-                            "delivery_id": _retry_delivery_id(stable_id, next_attempt),
-                            "task_id": task_id,
-                            "project_name": project_name,
-                            "chat_id": chat_id,
-                            "attempt": next_attempt,
-                            "max_attempts": _MAX_DELIVERY_RUNS,
-                            "failure_code": str(
-                                result.get("failure_code") or "temporary-outage"
-                            ),
-                        },
-                        delay_seconds=delay,
-                    )
-                    if retry.get("phase") not in {
-                        "not-started-capacity",
-                        "not-started-deadline",
-                    }:
-                        self._client.send_message(
-                            chat_id,
-                            _delivery_retry_notice(
-                                task_id,
-                                next_attempt,
-                                _MAX_DELIVERY_RUNS,
-                                delay,
-                            ),
-                        )
-                        self._state.set_job(update_id, delivery_final_sent=True)
-                        return
-                    retry_phase = str(retry.get("phase") or "")
-                else:
-                    retry_phase = "not-started-deadline"
-                if retry_phase in {
-                    "not-started-capacity",
-                    "not-started-deadline",
-                }:
-                    summary = {
-                        "phase": retry_phase,
-                        "root_delivery_id": stable_id,
-                        "delivery_id": stable_id,
-                        "attempt": 1,
-                        "max_attempts": _MAX_DELIVERY_RUNS,
-                        "failure_code": str(
-                            result.get("failure_code") or "temporary-outage"
+                if retry:
+                    self._client.send_message(
+                        chat_id,
+                        _delivery_retry_notice(
+                            task_id,
+                            _integer(retry.get("attempt"), 0),
+                            _integer(retry.get("max_attempts"), 0),
+                            _delivery_retry_remaining_delay(retry),
                         ),
-                    }
-                    self._state.set_job(update_id, delivery_retry=summary)
-                    retry_unavailable = _delivery_retry_unavailable_notice(summary)
+                    )
+                    self._state.set_job(update_id, delivery_final_sent=True)
+                    return
             follow_up_phase = self._ensure_lifecycle_follow_up(
                 update_id,
                 chat_id,
@@ -1026,6 +1018,64 @@ class TelegramBotService:
         raise TelegramUpdatePendingError(
             f"Telegram update {update_id} live delivery is still in progress"
         )
+
+    def _schedule_initial_delivery_retry(
+        self,
+        update_id: int,
+        chat_id: int,
+        task_id: str,
+        stable_id: str,
+        project_name: str,
+        result: dict[str, Any],
+        *,
+        expires_at: float,
+    ) -> tuple[dict[str, Any], str]:
+        """Idempotently checkpoint the first safe retry or its refusal."""
+        next_attempt = 2
+        delay = _delivery_retry_delay(
+            next_attempt,
+            result.get("retry_after_seconds", 0),
+        )
+        if delay < _DELIVERY_RETRY_WINDOW_SECONDS:
+            retry = self._state.schedule_delivery_retry(
+                update_id,
+                {
+                    "kind": "delivery-retry",
+                    "root_delivery_id": stable_id,
+                    "delivery_id": _retry_delivery_id(stable_id, next_attempt),
+                    "task_id": task_id,
+                    "project_name": project_name,
+                    "chat_id": chat_id,
+                    "attempt": next_attempt,
+                    "max_attempts": _MAX_DELIVERY_RUNS,
+                    "failure_code": str(
+                        result.get("failure_code") or "temporary-outage"
+                    ),
+                },
+                delay_seconds=delay,
+                expires_at=expires_at,
+            )
+            retry_phase = str(retry.get("phase") or "")
+            if retry_phase not in {
+                "not-started-capacity",
+                "not-started-deadline",
+            }:
+                return retry, ""
+        else:
+            retry_phase = "not-started-deadline"
+
+        summary = {
+            "phase": retry_phase,
+            "root_delivery_id": stable_id,
+            "delivery_id": stable_id,
+            "attempt": 1,
+            "max_attempts": _MAX_DELIVERY_RUNS,
+            "failure_code": str(
+                result.get("failure_code") or "temporary-outage"
+            ),
+        }
+        self._state.set_job(update_id, delivery_retry=summary)
+        return {}, _delivery_retry_unavailable_notice(summary)
 
     def _delivery_id(self, update_id: int) -> str:
         identity = f"telegram:{self._bot_id}:{update_id}".encode()
@@ -1487,6 +1537,14 @@ def _delivery_retry_delay(attempt: int, retry_after: Any) -> int:
     controller_delay = _DELIVERY_RETRY_DELAYS_SECONDS[index]
     provider_delay = max(0, min(86_400, _integer(retry_after, 0)))
     return max(controller_delay, provider_delay)
+
+
+def _delivery_retry_remaining_delay(retry: dict[str, Any]) -> int:
+    """Return a stable positive delay for a persisted scheduled retry."""
+    return max(
+        1,
+        int(_finite_timestamp(retry.get("next_attempt_at")) - time.time()),
+    )
 
 
 def _expired_delivery_snapshot(delivery_id: str) -> dict[str, Any]:

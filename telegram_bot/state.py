@@ -580,6 +580,7 @@ class TelegramState:
         retry: dict[str, Any],
         *,
         delay_seconds: float,
+        expires_at: float | None = None,
         now: float | None = None,
     ) -> dict[str, Any]:
         """Reserve one request-free retry before acknowledging its source update.
@@ -590,6 +591,14 @@ class TelegramState:
         """
         normalized_id = _update_id(update_id)
         current = time.time() if now is None else _finite_nonnegative(now, time.time())
+        deadline = (
+            current + _DELIVERY_RETRY_MAX_AGE_SECONDS
+            if expires_at is None
+            else min(
+                _finite_nonnegative(expires_at, 0.0),
+                current + _DELIVERY_RETRY_MAX_AGE_SECONDS,
+            )
+        )
         candidate = _normalize_delivery_retry(retry)
         candidate.update({
             "phase": "pending",
@@ -601,7 +610,7 @@ class TelegramState:
                 _MAX_TELEGRAM_RATE_LIMIT_SECONDS,
             ),
             "created_at": current,
-            "expires_at": current + _DELIVERY_RETRY_MAX_AGE_SECONDS,
+            "expires_at": deadline,
         })
         if candidate["next_attempt_at"] >= candidate["expires_at"]:
             candidate.update({

@@ -278,8 +278,11 @@ retry checkpoint containing the task, registered project, originating chat, and
 a deterministic next delivery identity. The original request text is then
 removed in the normal replay tombstone. A delayed retry runs outside the main
 FIFO, so new Telegram requests continue while it waits. Restarts reclaim the
-same checkpoint, and a crash during a retry reconciles that exact identity
-instead of opening a duplicate pull request.
+same checkpoint. If a crash lands after the safe transient result is saved but
+before that checkpoint is created, resume reconstructs the same deterministic
+next identity within the original saved 24-hour deadline, without rerunning the
+root delivery. Downtime never resets that deadline. A crash during a retry
+reconciles that exact identity instead of opening a duplicate pull request.
 
 Each retry is a new immutable delivery record linked by deterministic identity.
 MondayOS makes at most six delivery runs over a bounded 24-hour window, using
