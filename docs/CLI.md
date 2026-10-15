@@ -481,7 +481,7 @@ monday telegram [--once | --identify | --health] [--json] [--provider NAME]
 |------|---------|-------------|
 | `--once` | off | Ingest one long-poll response, drain the durable inbox synchronously, and exit. Useful during setup; it does not provide ongoing PR monitoring. |
 | `--identify` | off | Print pending Telegram user/chat IDs and exit. |
-| `--health` | off | Check local configuration, durable state, inbox capacity, worker lock, heartbeat freshness, and required live-build capabilities without contacting Telegram. Exits nonzero when unhealthy. |
+| `--health` | off | Check local configuration, durable state, inbox capacity, unresolved receipt/refusal/delivery outboxes, worker lock, heartbeat freshness, and required live-build capabilities without contacting Telegram. Exits nonzero when unhealthy. |
 | `--json` | off | Emit machine-readable output for `--health`. |
 | `--provider NAME` | role defaults | Pin one provider for productive team stages. The final Reviewer still requires OpenAI/ChatGPT (`fake` is available for offline tests). Without a pin, productive roles use their preferred provider with ordered fallback. |
 
@@ -499,9 +499,10 @@ leaving the remainder queued. Admission is capped at 25 pending jobs. Stable
 `JOB-ID` handles support private, ownership-bound `/queue` and queued-only
 `/cancel JOB-ID` controls without exposing request text; a full inbox is refused
 durably without storing the rejected request. The health report exposes pending
-and maximum jobs, unresolved capacity-refusal notices, plus whether the inbox is
-accepting work. It becomes unhealthy at or above the cap or while a refusal
-notice remains unresolved.
+and maximum jobs, whether the inbox is accepting work, and unresolved
+acceptance receipts, capacity-refusal notices, and live-build delivery notices.
+It becomes unhealthy at or above the cap or while any of those request-free
+outboxes remains unresolved.
 See [TELEGRAM.md](TELEGRAM.md) for setup, commands, restart behavior, and the
 always-on Mac mini service.
 

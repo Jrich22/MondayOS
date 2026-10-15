@@ -2331,6 +2331,7 @@ def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:
             "accepting_work": False,
             "pending_capacity_notices": None,
             "pending_acceptance_receipts": None,
+            "pending_delivery_notices": None,
         },
         "build": {"required": False, "ready": None},
     }
@@ -2362,6 +2363,9 @@ def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:
         service["pending_acceptance_receipts"] = (
             state.pending_acceptance_receipt_count
         )
+        service["pending_delivery_notices"] = (
+            state.pending_delivery_notice_count
+        )
         service["running"] = instance_lock_is_held(config.lock_path)
     except (OSError, TelegramStateError, ValueError) as exc:
         service["reason"] = redact_text(str(exc))
@@ -2389,6 +2393,7 @@ def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:
         and service.get("accepting_work")
         and service.get("pending_capacity_notices") == 0
         and service.get("pending_acceptance_receipts") == 0
+        and service.get("pending_delivery_notices") == 0
         and (not config.live_build or build.get("ready"))
     )
     return _print_telegram_health(report, as_json=bool(getattr(args, "json", False)))
@@ -2440,6 +2445,13 @@ def _print_telegram_health(report: dict[str, Any], *, as_json: bool) -> int:
         else "unavailable"
     )
     print(f"  Receipts     : {receipt_status}")
+    pending_deliveries = service.get("pending_delivery_notices")
+    delivery_status = (
+        f"{pending_deliveries} pending"
+        if isinstance(pending_deliveries, int)
+        else "unavailable"
+    )
+    print(f"  Deliveries   : {delivery_status}")
     if build.get("required"):
         print(f"  Live builds  : {'ready' if build.get('ready') else 'not ready'}")
     reason = configuration.get("reason") or service.get("reason") or build.get("reason")

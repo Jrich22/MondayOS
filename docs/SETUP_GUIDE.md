@@ -218,8 +218,9 @@ when `monday telegram --health` reports healthy, status responds, build
 capabilities are ready, GitHub authentication is valid, and the error log has
 no current startup loop. Monitoring systems can use
 `monday telegram --health --json`; it performs no Telegram network request and
-returns a nonzero status when configuration, the daemon heartbeat, or required
-live-build capabilities are unhealthy.
+returns a nonzero status when configuration, the daemon heartbeat, inbox
+capacity, required live-build capabilities, or any acceptance receipt,
+capacity-refusal notice, or live-build delivery notice is unresolved.
 
 ## Data and secret boundary
 

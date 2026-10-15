@@ -127,6 +127,59 @@ class TelegramJobWorker:
             self._state.defer_follow_up(update_id, delay_seconds=60)
         return True
 
+    def run_delivery_notice_once(self) -> bool:
+        """Send one due request-free terminal notice without blocking work."""
+        due = self._state.due_delivery_notice_ids()
+        if not due:
+            return False
+        update_id = due[0]
+        notice = self._state.delivery_notice(update_id)
+        if not notice:
+            return False
+        binding = str(notice.get("source_binding") or "")
+        deliverer = getattr(self._service, "deliver_delivery_notice", None)
+        if not callable(deliverer):
+            self._state.complete_delivery_notice(
+                update_id,
+                source_binding=binding,
+                delivered=False,
+            )
+            return True
+        try:
+            delivered = deliverer(notice)
+        except TelegramRateLimitError as exc:
+            self._state.defer_delivery_notices(
+                due,
+                delay_seconds=_telegram_notice_rate_limit_delay(exc.retry_after),
+            )
+        except TelegramAPIError as exc:
+            if exc.retryable:
+                self._state.defer_delivery_notice(
+                    update_id,
+                    source_binding=binding,
+                    delay_seconds=30,
+                )
+            else:
+                self._state.complete_delivery_notice(
+                    update_id,
+                    source_binding=binding,
+                    delivered=False,
+                )
+        except Exception:
+            # Never retain provider, local, or Telegram diagnostic text.
+            self._state.defer_delivery_notice(
+                update_id,
+                source_binding=binding,
+                delay_seconds=60,
+            )
+        else:
+            self._state.complete_delivery_notice(
+                update_id,
+                source_binding=binding,
+                delivered=delivered is not False,
+            )
+        return True
+
     def run_delivery_retry_once(self) -> bool:
         """Run one due request-free retry without blocking the main FIFO."""
         claimed = self._state.claim_due_delivery_retry()
@@ -162,6 +215,11 @@ class TelegramJobWorker:
         backoff = 1
         while not self._stop.is_set():
             try:
+                # A due delivery retry supersedes its stale "will retry"
+                # notice atomically when claimed, so retry work must win this
+                # tie before terminal notices are selected for delivery.
+                retried = self.run_delivery_retry_once()
+                noticed = self.run_delivery_notice_once()
                 pending_delivery = False
                 try:
                     worked = self.run_once()
@@ -170,9 +228,8 @@ class TelegramJobWorker:
                     # retry notifications or PR lifecycle observation.
                     worked = False
                     pending_delivery = True
-                retried = self.run_delivery_retry_once()
                 followed_up = self.run_follow_up_once()
-                if worked or retried or followed_up:
+                if noticed or worked or retried or followed_up:
                     backoff = 1
                     continue
                 if pending_delivery:
@@ -337,8 +394,11 @@ class TelegramRunner:
     def run_once(self) -> int:
         """Ingest one batch and drain it synchronously for CLI setup/tests."""
         handled = self.ingest_once()
-        while self._worker.run_once():
-            pass
+        while True:
+            noticed = self._worker.run_delivery_notice_once()
+            worked = self._worker.run_once()
+            if not noticed and not worked:
+                break
         return handled
 
     def run_forever(self) -> None:

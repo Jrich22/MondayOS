@@ -15,6 +15,10 @@ outbound long polling, so it does not open a public port or require a tunnel.
 - Automatically retries a live build when the delivery controller explicitly
   classifies a pre-publication model or tool failure as temporary. Delayed
   retries are request-free, survive restarts, and do not block newer requests.
+- Stages terminal and retry-scheduled live-build messages in a bounded,
+  request-free delivery outbox before removing the completed source request.
+  A Telegram send outage therefore cannot keep finished work or its request
+  text in the active FIFO.
 - After a successful live build, durably watches the exact reviewed PR and sends
   restart-safe follow-ups only when its aggregate checks or lifecycle meaningfully
   change. Observation failures back off without exposing remote diagnostics.
@@ -134,8 +138,8 @@ monday telegram --health --json
 The JSON form is suitable for monitoring and exits nonzero when configuration,
 durable state, the worker lock, heartbeat freshness, or required live-build
 capabilities are unhealthy, when the inbox is not accepting new work, or while
-an accepted-job receipt remains unresolved. Full installation and recovery
-procedures are in
+an acceptance receipt, capacity refusal, or live-build delivery notice remains
+unresolved. Full installation and recovery procedures are in
 [SETUP_GUIDE.md](SETUP_GUIDE.md) and [RUNBOOK.md](RUNBOOK.md).
 
 At startup MondayOS verifies the bot identity and removes any prior webhook
@@ -275,8 +279,8 @@ without retaining their route.
 Existing state with more than 25 pending jobs remains loadable and drains
 normally; the cap applies to new admission. `monday telegram --health` reports
 the current usage, unresolved acceptance receipts, and unresolved refusal
-notices. It is unhealthy at or above the cap or while either kind of notice
-remains unresolved.
+notices, plus unresolved live-build delivery notices. It is unhealthy at or
+above the cap or while any of those outboxes remains unresolved.
 
 `/queue` lists only jobs owned by the same allowlisted user: requests from that
 private chat plus requests that user submitted in an allowed group. `/cancel
@@ -290,6 +294,25 @@ the saved request text. A replay receives the same safe confirmation without
 executing the job twice.
 
 ## Automatic delivery recovery
+
+Terminal live-build results and retry-scheduled messages cross a separate
+durability boundary from their source jobs. Before the worker acknowledges a
+completed source job, it stages the safe user-facing message in a bounded,
+request-free delivery-notice outbox. The normal acknowledgment can then scrub
+the original request and release the FIFO even when Telegram is unavailable.
+The outbox retries independently after restart; it never reruns the build or
+creates a second retry checkpoint merely to recover a notification.
+
+Each notice retains only its fixed kind and safe structured delivery fields,
+minimal private destination, bounded retry metadata, and a deterministic
+binding to the source update, request digest, origin, task, and delivery. It
+does not retain the request body, provider diagnostics, credentials, or other
+free-form failure text. Before every send, MondayOS verifies that binding and
+rechecks the current private destination and allowlists. Malformed, redirected,
+revoked, or permanently failed notices are terminalized and scrubbed instead of
+contacting a different destination. A crash at Telegram's remote/local
+checkpoint boundary can duplicate the same fixed message, but cannot duplicate
+the build or retry scheduling.
 
 A live delivery can fail before commit or push because a model session, network
 connection, or required tool is temporarily unavailable. MondayOS retries only
