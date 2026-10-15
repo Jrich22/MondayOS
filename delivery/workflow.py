@@ -344,7 +344,30 @@ class DeliveryWorkflow:
         job.observation_message = self._observation_message(job)
         self.store.persist(job)
 
-        if job.pr_state in {"merged", "closed", "diverged"}:
+        if job.pr_state == "open" and job.review_reconciliation == "review-pending":
+            try:
+                self._reconcile_open_pr_review(job)
+            except Exception:
+                # GitHub observation succeeded.  The independent task repair is
+                # retryable and must not erase that exact remote state.
+                job.review_reconciliation = "review-pending"
+                job.review_reconciled_at = ""
+                self._set_review_reconciliation_message(job)
+            if job.review_reconciliation == "review-pending":
+                job.observation_success = False
+                job.observation_message = (
+                    f"{self._observation_message(job)} Task reconciliation is "
+                    "temporarily unavailable; retry observation."
+                )
+            job.updated_at = _now()
+            self.store.persist(job)
+        elif job.pr_state in {"merged", "closed", "diverged"}:
+            if job.review_reconciliation == "review-pending":
+                # Terminal GitHub truth supersedes the earlier desire to place
+                # an open pull request in REVIEW.  Never move the task to
+                # REVIEW immediately before completing or reopening it.
+                job.review_reconciliation = "terminal-unchanged"
+                job.review_reconciled_at = _now()
             try:
                 self._reconcile_observed_task(job)
             except Exception:
@@ -396,6 +419,12 @@ class DeliveryWorkflow:
         if existing is not None:
             self._require_binding(existing, job)
             if existing.terminal:
+                if existing.review_reconciliation == "review-pending":
+                    return self._repair_open_pr_review(
+                        existing,
+                        requested=job,
+                        progress_callback=progress_callback,
+                    )
                 return existing
             return self._reconcile_interrupted(
                 existing,
@@ -433,6 +462,9 @@ class DeliveryWorkflow:
                     if existing is not None:
                         self._require_binding(existing, job)
                         if existing.terminal:
+                            if existing.review_reconciliation == "review-pending":
+                                self._reconcile_open_pr_review(existing)
+                                self._notify(existing, progress_callback)
                             return existing
                         return self._mark_interrupted(existing, progress_callback)
                     reservation_owned = True
@@ -842,6 +874,11 @@ class DeliveryWorkflow:
                 candidate.delivery_id != job.delivery_id
                 and candidate.repo_root == job.repo_root
                 and candidate.project_name == job.project_name
+                and candidate.expected_repository.casefold()
+                == job.expected_repository.casefold()
+                and candidate.repository.casefold() == job.repository.casefold()
+                and candidate.root_device == job.root_device
+                and candidate.root_inode == job.root_inode
                 and candidate.status == "pr-open"
                 and candidate.success
                 and candidate.pr_state not in {"merged", "closed", "diverged"}
@@ -891,6 +928,27 @@ class DeliveryWorkflow:
         except _WorkflowLeaseTimeoutError:
             current = self.store.get(job.delivery_id)
             self._require_binding(current, job)
+            return current
+
+    def _repair_open_pr_review(
+        self,
+        job: DeliveryJob,
+        *,
+        requested: DeliveryJob,
+        progress_callback: ProgressCallback | None,
+    ) -> DeliveryJob:
+        """Repair only an explicitly pending PR-open task transition."""
+        try:
+            with self._workflow_lease():
+                current = self.store.get(job.delivery_id)
+                self._require_binding(current, requested)
+                if current.review_reconciliation == "review-pending":
+                    self._reconcile_open_pr_review(current)
+                    self._notify(current, progress_callback)
+                return current
+        except _WorkflowLeaseTimeoutError:
+            current = self.store.get(job.delivery_id)
+            self._require_binding(current, requested)
             return current
 
     def _blocking_delivery(self, requested: DeliveryJob) -> DeliveryJob | None:
@@ -981,7 +1039,9 @@ class DeliveryWorkflow:
                     failure_class=getattr(result, "failure_class", ""),
                     retry_after_seconds=getattr(result, "retry_after_seconds", 0),
                 )
-            return self._record_pr_success(job, result.url, result.number)
+            published_job = self._record_pr_success(job, result.url, result.number)
+            self._reconcile_open_pr_review(published_job)
+            return published_job
 
     def _mark_interrupted(
         self,
@@ -1336,6 +1396,8 @@ class DeliveryWorkflow:
             target_error = self._task_target_error(current_task_data)
             if target_error:
                 return self._fail(job, "project-mismatch", target_error)
+            job.review_expected_task_revision = task_manager.revision(job.task_id)
+            self.store.persist(job)
 
             self._update(job, phase="pushing", message="Pushing the approved branch")
             self._notify(job, progress_callback)
@@ -1376,6 +1438,7 @@ class DeliveryWorkflow:
             else:
                 pending = None
                 self._record_pr_success(job, result.url, result.number)
+                self._reconcile_open_pr_review(job)
 
         self._notify(job, progress_callback)
         if pending is not None:
@@ -1391,6 +1454,8 @@ class DeliveryWorkflow:
         job.failure_code = ""
         job.failure_class = ""
         job.retry_after_seconds = 0
+        job.review_reconciliation = "review-pending"
+        job.review_reconciled_at = ""
         job.message = f"ChatGPT approved the exact artifact and PR #{number} is open"
         job.updated_at = _now()
         self.store.persist(job)
@@ -1435,19 +1500,14 @@ class DeliveryWorkflow:
         progress_callback: ProgressCallback | None,
     ) -> DeliveryJob:
         try:
-            reviewed = self.monday.task(
-                "review",
-                task_id=job.task_id,
-                changed_by=f"delivery:{job.delivery_id}",
-                reason=f"Approved autonomous build opened {job.pr_url}",
-            )
+            self._reconcile_open_pr_review(job)
         except Exception:
             # GitHub is authoritative once the exact verified PR has been
             # durably recorded. A local task-store failure must not rewrite an
             # already published success as a failed delivery.
-            reviewed = None
-        if not getattr(reviewed, "success", False):
-            job.message += "; task status could not be moved to REVIEW"
+            job.review_reconciliation = "review-pending"
+            job.review_reconciled_at = ""
+            self._set_review_reconciliation_message(job)
             try:
                 self.store.persist(job)
             except Exception:
@@ -1466,6 +1526,113 @@ class DeliveryWorkflow:
             except Exception:
                 pass
         return job
+
+    def _reconcile_open_pr_review(self, job: DeliveryJob) -> None:
+        """Move one explicitly pending PR-backed task to REVIEW, once.
+
+        The reviewed pull request is already durable when this runs.  Only the
+        exact ``review-pending`` marker authorizes a task mutation; an absent or
+        invalid legacy value is deliberately non-actionable because it cannot
+        distinguish an outage from a later human restart.
+        """
+        if (
+            job.review_reconciliation != "review-pending"
+            or bool(job.review_reconciled_at)
+        ):
+            return
+        settled = "review-pending"
+        reconciled_at = ""
+        try:
+            if job.pr_state in {"merged", "closed", "diverged"}:
+                # Observation may crash after saving terminal PR truth but
+                # before retiring this marker. Terminal truth always wins.
+                settled = "terminal-unchanged"
+                reconciled_at = _now()
+            elif job.pr_state not in {"unobserved", "open"}:
+                raise ArtifactSecurityError(
+                    "Delivery pull-request state cannot authorize task review"
+                )
+            else:
+                self._require_observation_binding(job)
+                self._require_observable_pull_request(job)
+                self.repository.validate_trusted_root()
+                if self.repository.github_slug().casefold() != job.repository.casefold():
+                    raise ArtifactSecurityError(
+                        "Delivery repository no longer matches the target origin"
+                    )
+                task_manager = TaskManager(self.controller_root)
+                with task_manager.lock(job.task_id):
+                    task = self.monday.task("get", task_id=job.task_id)
+                    if getattr(task, "success", False):
+                        task_data = dict(getattr(task, "data", {}) or {})
+                        if self._task_target_error(task_data):
+                            settled = "target-changed"
+                        elif self._newer_open_delivery(job) is not None:
+                            settled = "superseded"
+                        else:
+                            status = str(task_data.get("status", ""))
+                            if status == "review":
+                                settled = "reviewed"
+                            elif status in {"completed", "cancelled"}:
+                                settled = "terminal-unchanged"
+                            elif status != "in-progress":
+                                settled = "state-unchanged"
+                            elif not job.review_expected_task_revision:
+                                settled = "legacy-unverifiable"
+                            elif (
+                                task_manager.revision(job.task_id)
+                                != job.review_expected_task_revision
+                            ):
+                                settled = "state-changed"
+                            else:
+                                reviewed = self.monday.task(
+                                    "review",
+                                    task_id=job.task_id,
+                                    changed_by=f"delivery:{job.delivery_id}",
+                                    reason=f"Approved autonomous build opened {job.pr_url}",
+                                )
+                                reviewed_data = dict(
+                                    getattr(reviewed, "data", {}) or {}
+                                )
+                                if (
+                                    getattr(reviewed, "success", False)
+                                    and reviewed_data.get("status") == "review"
+                                ):
+                                    settled = "reviewed"
+                    if settled != "review-pending":
+                        reconciled_at = _now()
+        except Exception:
+            # The exact PR success is immutable; retain an explicit retry marker
+            # and a bounded message instead of converting delivery to failure.
+            settled = "review-pending"
+            reconciled_at = ""
+
+        job.review_reconciliation = settled
+        job.review_reconciled_at = reconciled_at
+        self._set_review_reconciliation_message(job)
+        job.updated_at = _now()
+        try:
+            self.store.persist(job)
+        except Exception:
+            # The durable PR record already says review-pending.  If the task
+            # write succeeded, replay observes REVIEW and settles it exactly
+            # once; until then the public snapshot must not claim durable repair.
+            job.review_reconciliation = "review-pending"
+            job.review_reconciled_at = ""
+            self._set_review_reconciliation_message(job)
+
+    @staticmethod
+    def _set_review_reconciliation_message(job: DeliveryJob) -> None:
+        cleanup_retained = "the local worktree was retained for cleanup" in job.message
+        base = f"ChatGPT approved the exact artifact and PR #{job.pr_number} is open"
+        if job.review_reconciliation == "review-pending":
+            job.message = f"{base}; task status could not be moved to REVIEW"
+        elif job.review_reconciliation == "reviewed":
+            job.message = base
+        else:
+            job.message = f"{base}; task status was left unchanged"
+        if cleanup_retained:
+            job.message += "; the local worktree was retained for cleanup"
 
     def _select_builders(
         self,

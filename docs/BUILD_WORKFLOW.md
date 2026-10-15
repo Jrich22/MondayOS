@@ -23,6 +23,10 @@ task
       block/failure → stop without pushing
 
 open pull request
+  → durable review-pending task reconciliation
+      exact unchanged in-progress task revision → REVIEW
+      local task-store outage → same delivery ID or open-PR observation repairs
+      changed/retargeted/superseded/human-managed task → leave unchanged
   → exact-SHA-bound, read-only GitHub observation
       open → report pending/passed/failed/no configured checks
       exact reviewed head merged → complete an eligible MondayOS task
@@ -102,6 +106,16 @@ that the remote branch still equals the approved commit and then reconciles the
 exact pull request without pushing twice. A different delivery ID for the same
 task and repository is rejected while that state remains unresolved.
 
+Immediately before publication, while still holding the task lock, Monday
+captures a SHA-256 revision of the complete canonical persisted task record.
+That digest covers status history, work log, metadata, and targeting as well as
+the displayed timestamp, so even two edits within the same second cannot share
+mutation authority. Once GitHub confirms the exact reviewed pull request, Monday
+durably records the delivery as `pr-open` and separately records
+`review_reconciliation=review-pending` before attempting the local task move.
+The pull request is therefore never downgraded to a failed delivery merely
+because the task store is temporarily unavailable.
+
 External projects use only the controlled-context Codex patch builder. Claude
 Code remains available as the first builder for MondayOS self-builds, with
 controlled-context Codex as fallback. Both builders receive only bounded,
@@ -141,14 +155,32 @@ observer reports only bounded aggregate check state and PR lifecycle, and it
 still never merges or deploys.
 
 On success the task moves to `REVIEW` to represent an open GitHub pull request.
-That status is not a request for the old team-workflow approval command.
+That status is not a request for the old team-workflow approval command. The
+transition is complete only when its separate durable reconciliation state is
+`reviewed`. If it remains `review-pending`, retrying `monday build run` with the
+same delivery ID or observing that same exact open pull request retries only the
+task transition. Repair does not invoke a builder, validation, the independent
+reviewer, commit, push, or pull-request creation.
+
+Repair revalidates the delivery's exact task, project, repository, reviewed PR,
+and complete-record task revision captured at publication. It moves the task
+only when the task is still `in-progress` at that exact revision. An already-
+`review` task is settled idempotently. Completed or cancelled tasks, blocked or
+otherwise human-managed states, changed revisions, retargeted tasks, and
+deliveries superseded by a newer open PR are recorded as unchanged outcomes;
+Monday does not override them. Legacy `pr-open` records without an explicit
+pending marker do not gain task-mutation authority, and a pending record without
+a trustworthy captured revision also fails closed.
+
 The delivery result remains `pr-open`; later GitHub state is stored separately
 as an observation so a failed check cannot rewrite the fact that the reviewed
-artifact was delivered. `monday build observe` reads only structured PR and
-check metadata. It follows the REST totals for latest check runs and combined
-commit statuses, paginating at most 500 combined checks; partial responses,
-inconsistent pagination, or a larger result fail closed as unavailable. It
-never reads check logs, changes the PR, merges, or deploys.
+artifact was delivered. The open-PR REVIEW reconciliation is also stored
+separately from the existing merged/closed/diverged task reconciliation.
+`monday build observe` reads only structured PR and check metadata. It follows
+the REST totals for latest check runs and combined commit statuses, paginating
+at most 500 combined checks; partial responses, inconsistent pagination, or a
+larger result fail closed as unavailable. It never reads check logs, changes the
+PR, merges, or deploys.
 
 If a newer PR-backed delivery exists for the same task, any terminal outcome for
 an older PR is recorded but does not change the task underneath the newer work.

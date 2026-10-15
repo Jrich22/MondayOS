@@ -2041,6 +2041,48 @@ def test_delivery_job_failure_classification_is_bounded_and_legacy_safe() -> Non
     assert unsafe["retry_after_seconds"] == 0
 
 
+@pytest.mark.parametrize(
+    ("reconciliation", "revision"),
+    [
+        ("review-pending please retry", "A" * 64),
+        ("review-pending", "a" * 63),
+        ("review-pending", "g" * 64),
+        ("review-pending", "2026-10-13T00:00:00+00:00"),
+        (7, ["a" * 64]),
+    ],
+)
+def test_delivery_job_review_reconciliation_serialization_fails_closed(
+    reconciliation: object,
+    revision: object,
+) -> None:
+    payload = DeliveryJob(
+        "delivery-review-reconciliation",
+        "TASK-0001",
+        "objective",
+        "/repo",
+        review_reconciliation="review-pending",
+        review_reconciled_at="",
+        review_expected_task_revision="A" * 64,
+    ).to_dict()
+    payload["review_reconciliation"] = reconciliation
+    payload["review_expected_task_revision"] = revision
+
+    restored = DeliveryJob.from_dict(payload)
+
+    assert restored.review_reconciliation == (
+        "review-pending" if reconciliation == "review-pending" else ""
+    )
+    assert restored.review_expected_task_revision == (
+        "a" * 64 if revision == "A" * 64 else ""
+    )
+    serialized = restored.to_dict()
+    assert serialized["review_reconciliation"] == restored.review_reconciliation
+    assert (
+        serialized["review_expected_task_revision"]
+        == restored.review_expected_task_revision
+    )
+
+
 def test_delivery_store_reserves_identity_and_rejects_tampered_record(tmp_path: Path) -> None:
     store = DeliveryStore(tmp_path)
     owner_token = "a" * 64

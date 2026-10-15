@@ -170,6 +170,18 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Opening a reviewed pull request and moving its MondayOS task to `REVIEW` are
+  now two explicit durable effects. The successful delivery is first recorded
+  as `pr-open` with `review_reconciliation=review-pending`; a task-store outage
+  can no longer leave that missed transition implicit or permanently
+  unrecoverable. Retrying the same delivery ID, or observing the same exact open
+  pull request, repairs only the pending task transition and never rebuilds,
+  recommits, pushes, or recreates the pull request. Publication captures the
+  complete canonical task revision as a SHA-256 digest under its lock, and
+  repair moves only that still-current `in-progress` revision to `REVIEW`. A
+  changed or retargeted task, a newer authoritative delivery, human-managed or
+  terminal state, and legacy records without explicit pending authority fail
+  closed and remain unchanged.
 - Automatic Telegram delivery recovery now reconstructs the deterministic
   first retry when a crash or power loss occurs after a safe transient result
   is saved but before its request-free scheduler checkpoint is written. Resume

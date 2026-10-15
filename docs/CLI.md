@@ -441,14 +441,16 @@ check names, descriptions, annotations, and logs are not exposed or persisted.
 Text output shows the PR lifecycle and aggregate check state; `--json` returns
 the same bounded observation fields in the full `BuildResponse`.
 
-An open PR observation updates only the saved observation and does not change
-the task, including when checks fail or a previously terminal PR is reopened.
-Task reconciliation happens only after an exact-identity terminal state is
-verified: a verified merge completes an eligible task idempotently, while a
-closed PR or a head that diverged from the reviewed SHA returns a task still in
-`REVIEW` to `IN_PROGRESS`. An older failed PR cannot reopen a task when a newer
-open delivery for that task remains authoritative. Completed, cancelled,
-blocked, or otherwise human-managed states are not overridden.
+Open check results never drive task state. An open observation may, however,
+repair an explicitly recorded `review-pending` transition for the same exact
+reviewed PR; it revalidates the complete task revision and moves only an
+unchanged `IN_PROGRESS` task to `REVIEW`. Legacy records do not gain this
+authority. After an exact-identity terminal state is verified, a verified merge
+completes an eligible task idempotently, while a closed PR or a head that
+diverged from the reviewed SHA returns a task still in `REVIEW` to
+`IN_PROGRESS`. An older failed PR cannot reopen a task when a newer open
+delivery for that task remains authoritative. Completed, cancelled, blocked,
+retargeted, or otherwise human-managed states are not overridden.
 
 `capabilities` is read-only and reports the selected builder, ChatGPT/Codex
 Reviewer, validation, repository, and GitHub readiness. MondayOS self-builds can

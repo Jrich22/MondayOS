@@ -247,13 +247,15 @@ active at once. If that capacity is full, the final build message says that
 monitoring did not start; the pull request itself is unaffected. Monitoring
 also stops after a verified terminal PR state.
 
-Open-PR check results do not change the MondayOS task. Only a verified terminal
-state is reconciled: an exact reviewed merge completes an eligible task, while a
-closed or SHA-diverged PR returns a task still in `REVIEW` to `IN_PROGRESS`
-unless a newer open delivery remains authoritative. A newer open delivery also
-prevents an older merged PR from completing the task underneath newer work.
-Human-managed states are not overridden. The bot reports that result but still
-never merges or deploys it.
+Open-PR check results do not drive MondayOS task state. An observation may
+repair the delivery's separately recorded, explicitly `review-pending` initial
+transition, but only for the same reviewed PR and the unchanged complete task
+revision. Terminal reconciliation remains separate: an exact reviewed merge
+completes an eligible task, while a closed or SHA-diverged PR returns a task
+still in `REVIEW` to `IN_PROGRESS` unless a newer open delivery remains
+authoritative. A newer open delivery also prevents an older merged PR from
+completing the task underneath newer work. Human-managed states are not
+overridden. The bot reports that result but still never merges or deploys it.
 
 ## Bounded inbox and cancellation
 

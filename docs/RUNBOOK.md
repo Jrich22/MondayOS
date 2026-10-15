@@ -92,8 +92,11 @@ monday build get DELIVERY-ID
 monday build observe DELIVERY-ID
 ```
 
-`observe` is read-only. It verifies the exact reviewed commit and reports the
-aggregate pull-request/check state; it never merges or deploys.
+`observe` is read-only at GitHub. It verifies the exact reviewed commit and
+reports the aggregate pull-request/check state; it never pushes, edits, closes,
+merges, or deploys. If that delivery explicitly records a pending initial
+task-to-`REVIEW` transition, observation may safely repair only that local
+transition after revalidating the unchanged complete task revision.
 
 ## Normal Telegram behavior
 
