@@ -2041,6 +2041,33 @@ def test_delivery_job_failure_classification_is_bounded_and_legacy_safe() -> Non
     assert unsafe["retry_after_seconds"] == 0
 
 
+def test_delivery_job_deferred_commit_checkpoint_round_trips_and_defaults_legacy_safe() -> None:
+    job = DeliveryJob(
+        "delivery-deferred-commit",
+        "TASK-0001",
+        "objective",
+        "/repo",
+        prepared_commit_sha="a" * 40,
+        deferred_commit_authorization=True,
+    )
+
+    payload = job.to_dict(include_private=True)
+    restored = DeliveryJob.from_dict(payload)
+
+    assert restored.prepared_commit_sha == "a" * 40
+    assert restored.deferred_commit_authorization is True
+
+    legacy = dict(payload)
+    legacy.pop("prepared_commit_sha")
+    legacy.pop("deferred_commit_authorization")
+    restored_legacy = DeliveryJob.from_dict(legacy)
+    assert restored_legacy.prepared_commit_sha == ""
+    assert restored_legacy.deferred_commit_authorization is False
+
+    malformed = dict(payload, deferred_commit_authorization="true")
+    assert DeliveryJob.from_dict(malformed).deferred_commit_authorization is False
+
+
 @pytest.mark.parametrize(
     ("reconciliation", "revision"),
     [
