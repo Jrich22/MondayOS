@@ -46,10 +46,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
   Codex fallback; registered external targets use Codex only. It cannot merge
   or deploy. Task and repository guards survive controller exit while a
   publication child is running; exact-ID recovery verifies the approved remote
-  commit and reconciles the pull request without a second push. Codex builder
-  and reviewer sessions run from private
-  non-repository runtimes with model tools disabled; the reviewer receives the
-  controller's bounded exact staged diff and verifies its SHA-256 before launch.
+  commit and reconciles the pull request without a second push. Claude and Codex
+  builder sessions receive only bounded, controller-selected tracked content and
+  run tool-free from checked private directories outside every Git repository.
+  Their temporary-file directory is pinned to that runtime. Codex reviewer
+  sessions use the same isolation guarantee, and Claude's host-derived default
+  prompt is replaced by a fixed controller policy; the
+  reviewer receives the controller's bounded exact staged diff and verifies its
+  SHA-256 before launch.
 - A GitHub-read-only, exact-SHA pull-request lifecycle observer through
   `Monday.build("observe")` and
   `monday build observe DELIVERY-ID [--project NAME] [--json]`. It revalidates

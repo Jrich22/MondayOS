@@ -452,9 +452,10 @@ blocked, or otherwise human-managed states are not overridden.
 
 `capabilities` is read-only and reports the selected builder, ChatGPT/Codex
 Reviewer, validation, repository, and GitHub readiness. MondayOS self-builds can
-use Claude Code with Codex fallback; external projects use the controlled-context
-Codex builder only. All builds require the separate high-confidence
-ChatGPT/Codex review. `capabilities` exits with status `1` when the report says
+use controlled-context Claude Code with controlled-context Codex fallback;
+external projects use the controlled-context Codex builder only. These builders
+run tool-free outside the target worktree. All builds require the separate
+high-confidence ChatGPT/Codex review. `capabilities` exits with status `1` when the report says
 `ready: false`, including with `--json`, so startup scripts can use it as a real
 preflight check. The JSON response still has `success: true` when the inspection
 itself completed; the runnable verdict is `data.ready`.
