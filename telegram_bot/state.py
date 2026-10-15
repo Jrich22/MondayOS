@@ -115,6 +115,10 @@ _LIFECYCLE_NOTICE_PR_STATES = frozenset({
 _LIFECYCLE_NOTICE_CHECK_STATUSES = frozenset({
     "pending", "passed", "failed", "no-checks", "timed-out", "unknown",
 })
+_LIFECYCLE_FOLLOW_UP_PHASES = frozenset({
+    "pending", "polling", "retrying", "completed", "expired",
+    "not-started-capacity", "notification-failed",
+})
 _LIFECYCLE_NOTICE_FIELDS = frozenset({
     "kind", "phase", "delivery_id", "task_id", "project_name", "pr_url",
     *_ORIGIN_FIELDS,
@@ -2756,6 +2760,15 @@ class TelegramState:
                     expires_at = created_at + _FOLLOW_UP_MAX_AGE_SECONDS
                     changed = True
                 if expires_at <= now:
+                    if _is_expired_legacy_follow_up(follow_up, now):
+                        # Some early v9 records lost their route fields before
+                        # the source-bound watcher contract was enforced. They
+                        # are safe to load only after their lifetime has ended,
+                        # and must be reduced to an inert tombstone so a second
+                        # restart cannot mistake the stale binding for authority.
+                        record["follow_up"] = _legacy_terminal_follow_up("expired")
+                        changed = True
+                        continue
                     notice = notices.get(key)
                     if notice is not None:
                         normalized_id = _lifecycle_notice_update_id(key)
@@ -3526,6 +3539,7 @@ def _lifecycle_follow_up_identity(
         not _DELIVERY_ID.fullmatch(delivery_id)
         or not _TASK_ID.fullmatch(task_id)
         or follow_up.get("task_id") != task_id
+        or follow_up.get("phase") not in _LIFECYCLE_FOLLOW_UP_PHASES
         or not isinstance(project_name, str)
         or len(project_name) > 160
         or any(not character.isprintable() for character in project_name)
@@ -4124,6 +4138,53 @@ def _require_lifecycle_notice_binding(
         )
 
 
+def _migrate_legacy_lifecycle_follow_up(
+    follow_up: dict[str, Any],
+    source: dict[str, Any],
+    update_id: int,
+    *,
+    retry: Any,
+) -> dict[str, Any]:
+    """Bind one pre-v9 watcher to its still-authoritative delivery source."""
+    candidate = copy.deepcopy(follow_up)
+    identity = _lifecycle_follow_up_identity(
+        candidate,
+        update_id,
+        require_source_binding=False,
+    )
+    source_payload = _lifecycle_source_payload(
+        source,
+        update_id,
+        retry=retry,
+    )
+    expected = {
+        "delivery_id": source_payload["delivery_id"],
+        "task_id": source_payload["task_id"],
+        "project_name": source_payload["project_name"],
+        "chat_id": source_payload["chat_id"],
+        "pr_url": source_payload["pr_url"],
+    }
+    if any(
+        type(identity.get(name)) is not type(value)
+        or identity.get(name) != value
+        for name, value in expected.items()
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} lifecycle route changed"
+        )
+    candidate["source_binding"] = _lifecycle_source_binding(
+        update_id,
+        source_payload,
+    )
+    _require_lifecycle_follow_up_binding(
+        candidate,
+        source,
+        update_id,
+        retry=retry,
+    )
+    return candidate
+
+
 def _validate_loaded_follow_ups(payload: dict[str, Any]) -> None:
     """Migrate legacy watchers and reject unbound actionable v9 state."""
     version = payload.get("version", 0)
@@ -4159,44 +4220,53 @@ def _validate_loaded_follow_ups(payload: dict[str, Any]) -> None:
 
     preserved = 0
     retries = payload.setdefault("delivery_retries", {})
+    if version < 9:
+        for bucket_name in ("jobs", "completed_jobs"):
+            bucket = payload.setdefault(bucket_name, {})
+            for key, source in bucket.items():
+                follow_up = source.get("follow_up") if isinstance(source, dict) else None
+                if (
+                    not isinstance(follow_up, dict)
+                    or _follow_up_active(follow_up)
+                    or _is_legacy_terminal_follow_up(follow_up)
+                ):
+                    continue
+                try:
+                    update_id = _lifecycle_notice_update_id(key)
+                    source["follow_up"] = _migrate_legacy_lifecycle_follow_up(
+                        follow_up,
+                        source,
+                        update_id,
+                        retry=retries.get(key),
+                    )
+                except (TelegramStateError, TypeError, ValueError):
+                    source["follow_up"] = _legacy_terminal_follow_up(
+                        "migration-invalid"
+                    )
+    if version >= 9:
+        for bucket_name in ("jobs", "completed_jobs"):
+            bucket = payload.setdefault(bucket_name, {})
+            for key, source in bucket.items():
+                follow_up = source.get("follow_up") if isinstance(source, dict) else None
+                if not isinstance(follow_up, dict) or _follow_up_active(follow_up):
+                    continue
+                if _is_legacy_terminal_follow_up(follow_up):
+                    continue
+                update_id = _lifecycle_notice_update_id(key)
+                _require_lifecycle_follow_up_binding(
+                    follow_up,
+                    source,
+                    update_id,
+                    retry=retries.get(key),
+                )
     for update_id, _bucket_name, key, source, follow_up in sorted(
         active,
         key=lambda item: (item[0], item[1]),
     ):
         if version < 9:
             try:
-                candidate = copy.deepcopy(follow_up)
-                identity = _lifecycle_follow_up_identity(
-                    candidate,
-                    update_id,
-                    require_source_binding=False,
-                )
-                source_payload = _lifecycle_source_payload(
-                    source,
-                    update_id,
-                    retry=retries.get(key),
-                )
-                expected = {
-                    "delivery_id": source_payload["delivery_id"],
-                    "task_id": source_payload["task_id"],
-                    "project_name": source_payload["project_name"],
-                    "chat_id": source_payload["chat_id"],
-                    "pr_url": source_payload["pr_url"],
-                }
-                if any(
-                    type(identity.get(name)) is not type(value)
-                    or identity.get(name) != value
-                    for name, value in expected.items()
-                ):
-                    raise TelegramStateError(
-                        f"Telegram update {update_id} lifecycle route changed"
-                    )
-                candidate["source_binding"] = _lifecycle_source_binding(
-                    update_id,
-                    source_payload,
-                )
-                _require_lifecycle_follow_up_binding(
-                    candidate,
+                candidate = _migrate_legacy_lifecycle_follow_up(
+                    follow_up,
                     source,
                     update_id,
                     retry=retries.get(key),
@@ -4218,11 +4288,7 @@ def _validate_loaded_follow_ups(payload: dict[str, Any]) -> None:
             preserved += 1
             continue
 
-        expires_at = _finite_nonnegative(
-            follow_up.get("expires_at"),
-            0.0,
-        )
-        if expires_at and expires_at <= current:
+        if _is_expired_legacy_follow_up(follow_up, current):
             # Expired compatibility placeholders cannot perform remote work;
             # the normal expiry pass will make them terminal on first use.
             continue
@@ -4240,6 +4306,31 @@ def _legacy_terminal_follow_up(phase: str) -> dict[str, Any]:
         "phase": phase,
         "next_poll_at": 0.0,
     }
+
+
+def _is_legacy_terminal_follow_up(value: Any) -> bool:
+    """Recognize only inert tombstones produced by lifecycle migration."""
+    if not isinstance(value, dict):
+        return False
+    phase = value.get("phase")
+    return (
+        phase in {"expired", "migration-invalid", "migration-invalid-capacity"}
+        and value == _legacy_terminal_follow_up(str(phase))
+    )
+
+
+def _is_expired_legacy_follow_up(value: Any, now: float) -> bool:
+    """Recognize an expired pre-binding watcher with every route field absent."""
+    return (
+        _follow_up_active(value)
+        and 0 < _finite_nonnegative(value.get("expires_at"), 0.0) <= now
+        and all(
+            field not in value
+            for field in (
+                "delivery_id", "task_id", "project_name", "chat_id", "pr_url",
+            )
+        )
+    )
 
 
 def _validate_loaded_lifecycle_notices(payload: dict[str, Any]) -> None:

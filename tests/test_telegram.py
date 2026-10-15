@@ -7210,6 +7210,35 @@ class TestTelegramStateAndRunner(TelegramFixture):
             restarted.completed_job(781)["follow_up"]["phase"],
             "expired",
         )
+        self.assertEqual(
+            restarted.completed_job(781)["follow_up"],
+            {
+                "kind": "pr-lifecycle",
+                "phase": "expired",
+                "next_poll_at": 0.0,
+            },
+        )
+        second_restart = TelegramState(self.config.state_path)
+        self.assertEqual(
+            second_restart.completed_job(781)["follow_up"],
+            restarted.completed_job(781)["follow_up"],
+        )
+
+    def test_expired_active_bound_watcher_tampering_fails_first_restart(self):
+        delivery_id, _pr_url = self._seed_pr_lifecycle_source(7811)
+        with patch("telegram_bot.state._FOLLOW_UP_MAX_AGE_SECONDS", 10):
+            self.state.start_follow_up(
+                7811,
+                self._pr_follow_up_candidate(delivery_id),
+                now=100.0,
+            )
+        self.state.acknowledge(7811)
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        payload["completed_jobs"]["7811"]["project_name"] = "Tampered Project"
+        self.config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with self.assertRaisesRegex(TelegramStateError, "Invalid Telegram state"):
+            TelegramState(self.config.state_path)
 
     def test_v8_migration_terminalizes_unbound_watcher_before_v9_write(self):
         self.state.bind_bot_identity(99, "monday_test_bot")
@@ -7264,6 +7293,50 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(
             restarted.completed_job(783)["follow_up"],
             follow_up,
+        )
+
+    def test_v8_migration_binds_terminal_watchers_before_v9_restart(self):
+        self.state.bind_bot_identity(99, "monday_test_bot")
+        phases = (
+            "completed",
+            "expired",
+            "notification-failed",
+            "not-started-capacity",
+        )
+        for index in range(7831, 7831 + len(phases)):
+            delivery_id, _pr_url = self._seed_pr_lifecycle_source(index)
+            self.state.start_follow_up(
+                index,
+                self._pr_follow_up_candidate(delivery_id),
+                now=time.time(),
+            )
+            self.state.acknowledge(index)
+
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        payload["version"] = 8
+        for index, phase in enumerate(phases, start=7831):
+            follow_up = payload["completed_jobs"][str(index)]["follow_up"]
+            follow_up["phase"] = phase
+            follow_up["next_poll_at"] = 0.0
+            follow_up.pop("source_binding")
+        self.config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        migrated = TelegramState(self.config.state_path)
+        first_restart = {
+            index: migrated.completed_job(index)["follow_up"]
+            for index in range(7831, 7831 + len(phases))
+        }
+        for follow_up in first_restart.values():
+            self.assertRegex(follow_up["source_binding"], r"^[0-9a-f]{64}$")
+        migrated.bind_bot_identity(99, "monday_test_bot")
+
+        restarted = TelegramState(self.config.state_path)
+        self.assertEqual(
+            {
+                index: restarted.completed_job(index)["follow_up"]
+                for index in range(7831, 7831 + len(phases))
+            },
+            first_restart,
         )
 
     def test_v8_migration_neutralizes_pre_outcome_retry_watcher(self):
@@ -7378,6 +7451,89 @@ class TestTelegramStateAndRunner(TelegramFixture):
                         "Invalid Telegram state",
                     ):
                         TelegramState(self.config.state_path)
+        finally:
+            self.config.state_path.write_text(
+                json.dumps(original),
+                encoding="utf-8",
+            )
+
+    def test_settled_and_expired_bound_watcher_tampering_fails_closed(self):
+        self._stage_lifecycle_observation(
+            7951,
+            pr_state="merged",
+            checks_status="passed",
+            merge_commit_sha="d" * 40,
+            now=100.0,
+        )
+        notice = self.state.lifecycle_notice(7951)
+        self.state.complete_lifecycle_notice(
+            7951,
+            source_binding=str(notice["source_binding"]),
+            delivered=True,
+        )
+
+        delivery_id, _pr_url = self._seed_pr_lifecycle_source(7952)
+        with patch("telegram_bot.state._FOLLOW_UP_MAX_AGE_SECONDS", 10):
+            self.state.start_follow_up(
+                7952,
+                self._pr_follow_up_candidate(delivery_id),
+                now=100.0,
+            )
+        self.state.acknowledge(7952)
+        self.state.next_follow_up_delay(now=111.0)
+        original = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            original["completed_jobs"]["7951"]["follow_up"]["phase"],
+            "completed",
+        )
+        self.assertEqual(
+            original["completed_jobs"]["7952"]["follow_up"]["phase"],
+            "expired",
+        )
+
+        def tamper_source(payload, update_id):
+            payload["completed_jobs"][str(update_id)][
+                "project_name"
+            ] = "Tampered Project"
+
+        def delete_binding(payload, update_id):
+            payload["completed_jobs"][str(update_id)]["follow_up"].pop(
+                "source_binding"
+            )
+
+        def empty_binding(payload, update_id):
+            payload["completed_jobs"][str(update_id)]["follow_up"][
+                "source_binding"
+            ] = ""
+
+        def unknown_phase(payload, update_id):
+            payload["completed_jobs"][str(update_id)]["follow_up"][
+                "phase"
+            ] = "unknown"
+
+        try:
+            for update_id in (7951, 7952):
+                for mutation in (
+                    tamper_source,
+                    delete_binding,
+                    empty_binding,
+                    unknown_phase,
+                ):
+                    with self.subTest(
+                        update_id=update_id,
+                        mutation=mutation.__name__,
+                    ):
+                        payload = json.loads(json.dumps(original))
+                        mutation(payload, update_id)
+                        self.config.state_path.write_text(
+                            json.dumps(payload),
+                            encoding="utf-8",
+                        )
+                        with self.assertRaisesRegex(
+                            TelegramStateError,
+                            "Invalid Telegram state",
+                        ):
+                            TelegramState(self.config.state_path)
         finally:
             self.config.state_path.write_text(
                 json.dumps(original),
