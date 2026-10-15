@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -12,10 +13,18 @@ from telegram_bot.state import TelegramState
 
 _MAX_HANDLER_ATTEMPTS = 3
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
+_MAX_ACCEPTANCE_RECEIPT_PAUSE_SECONDS = 86_400
 
 
 class TelegramUpdateRetryError(RuntimeError):
     """A queued handler failed but its durable checkpoint remains retryable."""
+
+
+def _acceptance_receipt_rate_limit_delay(value: Any) -> float:
+    """Bound an untrusted Bot API retry hint before float/time arithmetic."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 1.0
+    return float(min(max(value, 1), _MAX_ACCEPTANCE_RECEIPT_PAUSE_SECONDS))
 
 
 class TelegramJobWorker:
@@ -215,6 +224,7 @@ class TelegramRunner:
             wake_event=self._wake,
         )
         self._worker_error: BaseException | None = None
+        self._acceptance_receipts_paused_until = 0.0
 
     def start(self) -> dict[str, object]:
         identity = self._client.get_me()
@@ -236,6 +246,9 @@ class TelegramRunner:
         # outage cannot strand a notice merely because its source update aged
         # out of Telegram's queue.
         self._drain_queue_full_notices()
+        # Accepted-job receipts use their own request-free outbox. Failures are
+        # isolated here so polling can still accept /queue and /cancel controls.
+        self._drain_acceptance_receipts()
         updates = self._client.get_updates(
             offset=self._state.next_offset,
             timeout=self._poll_timeout,
@@ -299,18 +312,24 @@ class TelegramRunner:
                 continue
             if controlled:
                 self._state.acknowledge(update_id)
+                # Cancelling an unresolved FIFO head may expose the next job.
+                self._wake.set()
                 handled += 1
                 continue
 
             created, position = self._state.enqueue(update_id, normalized)
             if created:
-                self._announce_queued(normalized, position)
+                self._deliver_acceptance_receipt(
+                    update_id,
+                    rate_limit_scope=self._state.due_acceptance_receipt_ids(),
+                )
                 self._wake.set()
             elif position == 0:
                 tombstone = self._state.completed_job(update_id)
                 if tombstone.get("phase") == "queue-full":
                     self._deliver_queue_full_notice(update_id, normalized)
             handled += 1
+        self._drain_acceptance_receipts()
         return handled
 
     def run_once(self) -> int:
@@ -397,18 +416,80 @@ class TelegramRunner:
         handler = getattr(self._service, "handle_intake_control", None)
         return bool(handler(update)) if callable(handler) else False
 
-    def _announce_queued(self, update: dict[str, Any], position: int) -> None:
-        announcer = getattr(self._service, "announce_queued", None)
+    def _deliver_acceptance_receipt(
+        self,
+        update_id: int,
+        *,
+        rate_limit_scope: list[int] | None = None,
+    ) -> float | None:
+        """Resolve one due receipt without exposing or rehydrating its request."""
+        defer_scope = rate_limit_scope or [update_id]
+        paused_for = self._acceptance_receipts_paused_until - time.time()
+        if paused_for > 0:
+            self._state.defer_acceptance_receipts(
+                defer_scope,
+                delay_seconds=paused_for,
+            )
+            return paused_for
+        notice = self._state.acceptance_receipt_notice(update_id)
+        if not notice:
+            return None
+        announcer = getattr(self._service, "announce_acceptance_receipt", None)
         if not callable(announcer):
-            return
+            self._state.complete_acceptance_receipt(
+                update_id,
+                delivered=False,
+            )
+            self._wake.set()
+            return None
         try:
-            announcer(update, position)
-        except TelegramAPIError:
-            # The request and offset are already durable. Execution will retry
-            # its own messages, so a best-effort receipt cannot discard work.
-            pass
+            delivered = announcer(notice)
+        except TelegramRateLimitError as exc:
+            delay = _acceptance_receipt_rate_limit_delay(exc.retry_after)
+            self._acceptance_receipts_paused_until = time.time() + delay
+            self._state.defer_acceptance_receipts(
+                defer_scope,
+                delay_seconds=delay,
+            )
+            return delay
+        except TelegramAPIError as exc:
+            if exc.retryable:
+                self._state.defer_acceptance_receipt(
+                    update_id,
+                    delay_seconds=30,
+                )
+            else:
+                self._state.complete_acceptance_receipt(
+                    update_id,
+                    delivered=False,
+                )
+                self._wake.set()
         except Exception:
-            print("Could not send Telegram queue acknowledgement.", file=sys.stderr)
+            # Persist neither request text nor raw API/internal diagnostics.
+            print("Could not send Telegram acceptance receipt.", file=sys.stderr)
+            self._state.defer_acceptance_receipt(
+                update_id,
+                delay_seconds=60,
+            )
+        else:
+            self._state.complete_acceptance_receipt(
+                update_id,
+                delivered=delivered is not False,
+            )
+            self._wake.set()
+        return None
+
+    def _drain_acceptance_receipts(self) -> None:
+        """Retry due receipts from state without relying on Telegram replay."""
+        due = self._state.due_acceptance_receipt_ids()
+        for index, update_id in enumerate(due):
+            paused_for = self._deliver_acceptance_receipt(
+                update_id,
+                rate_limit_scope=due[index:],
+            )
+            if paused_for is None:
+                continue
+            break
 
     def _deliver_queue_full_notice(
         self,
@@ -416,13 +497,13 @@ class TelegramRunner:
         update: dict[str, Any] | None = None,
     ) -> None:
         """Deliver and checkpoint one request-free capacity refusal notice."""
-        notice = self._state.queue_full_notice(update_id)
-        if not notice:
-            self._state.reaffirm_terminal(update_id)
-            return
-        announcer = getattr(self._service, "announce_queue_full_notice", None)
-        legacy_announcer = getattr(self._service, "announce_queue_full", None)
         try:
+            notice = self._state.queue_full_notice(update_id)
+            if not notice:
+                self._state.reaffirm_terminal(update_id)
+                return
+            announcer = getattr(self._service, "announce_queue_full_notice", None)
+            legacy_announcer = getattr(self._service, "announce_queue_full", None)
             if callable(announcer):
                 delivered = announcer(notice)
                 if delivered is False:

@@ -957,6 +957,53 @@ class TestTelegramService(TelegramFixture):
         self.assertIn("request was not saved", self.client.sent[-1][1])
         self.assertIn("Open Monday's private chat", self.client.sent[-1][1])
 
+    def test_acceptance_receipt_is_fixed_request_free_and_reauthorized(self):
+        group_config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            allowed_chat_ids=frozenset({-100}),
+            project_root=self.root,
+            provider="fake",
+        )
+        service = TelegramBotService(
+            self.monday,
+            self.client,
+            self.state,
+            group_config,
+        )
+        notice = {
+            "job_id": "JOB-123",
+            "user_id": 7,
+            "chat_id": -100,
+            "chat_type": "group",
+        }
+
+        self.assertTrue(service.announce_acceptance_receipt(notice))
+        text = self.client.sent[-1][1]
+        self.assertEqual(self.client.sent[-1][0], -100)
+        self.assertEqual(
+            text,
+            "Request saved as JOB-123. Open Monday's private chat to view or "
+            "cancel your queued requests.",
+        )
+        self.assertNotIn("position", text.lower())
+
+        revoked_group = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            provider="fake",
+        )
+        revoked_service = TelegramBotService(
+            self.monday,
+            self.client,
+            self.state,
+            revoked_group,
+        )
+        sent_before = len(self.client.sent)
+        self.assertFalse(revoked_service.announce_acceptance_receipt(notice))
+        self.assertEqual(len(self.client.sent), sent_before)
+
     def test_deliver_reports_disabled_without_touching_task_or_build(self):
         self.service.handle_update(_update(text="/deliver TASK-0001"))
 
@@ -1224,6 +1271,11 @@ class TestTelegramService(TelegramFixture):
 
 
 class TestTelegramStateAndRunner(TelegramFixture):
+    def _complete_acceptance_receipt(self, update_id: int) -> None:
+        notice = self.state.acceptance_receipt_notice(update_id)
+        self.assertEqual(notice.get("job_id"), f"JOB-{update_id}")
+        self.state.complete_acceptance_receipt(update_id, delivered=True)
+
     def _seed_terminal_live_build_checkpoint(
         self,
         update_id: int,
@@ -1252,6 +1304,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         normalized = service.normalize_update(update)
         self.assertIsNotNone(normalized)
         self.state.enqueue(update_id, normalized)
+        self._complete_acceptance_receipt(update_id)
         claimed = self.state.claim_next()
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed[0], update_id)
@@ -1401,7 +1454,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         loaded.bind_bot_identity(99, "monday_test_bot")
         self.assertEqual(
             json.loads(self.config.state_path.read_text(encoding="utf-8"))["version"],
-            5,
+            6,
         )
 
     def test_transient_live_build_retries_after_restart_without_request_text(self):
@@ -1654,6 +1707,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
         second = _update(update_id=86, text="/help")
         self.state.enqueue(86, service.normalize_update(second))
+        self._complete_acceptance_receipt(86)
         worker = TelegramJobWorker(
             service,
             self.state,
@@ -2448,10 +2502,14 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self._seed_delivery_retry(96, now=1.0, delay_seconds=1.0)
         self.state.acknowledge(96)
         self.state.enqueue(97, _update(update_id=97, text="/help"))
+        self._complete_acceptance_receipt(97)
         stop = threading.Event()
         retried = []
 
         class PendingService:
+            def announce_acceptance_receipt(self, _notice):
+                return True
+
             def handle_update(self, _update):
                 raise TelegramUpdatePendingError("still running")
 
@@ -2553,6 +2611,209 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.state.acknowledge(10)
         self.assertEqual(self.state.enqueue(10, request), (False, 0))
         self.assertEqual(self.state.pending_count, 0)
+
+    def test_enqueue_atomically_creates_request_free_acceptance_receipt(self):
+        secret = "private objective must not enter the receipt outbox"
+
+        self.assertEqual(
+            self.state.enqueue(15, _update(update_id=15, text=secret)),
+            (True, 1),
+        )
+
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        receipt = payload["acceptance_receipts"]["15"]
+        self.assertEqual(payload["version"], 6)
+        self.assertEqual(payload["last_update_id"], 15)
+        self.assertEqual(receipt["kind"], "acceptance-receipt")
+        self.assertEqual(receipt["phase"], "pending")
+        self.assertEqual(receipt["origin_user_id"], 7)
+        self.assertEqual(receipt["origin_chat_id"], 7)
+        self.assertEqual(receipt["origin_chat_type"], "private")
+        self.assertEqual(receipt["request_digest"], payload["jobs"]["15"]["request_digest"])
+        self.assertNotIn("request", receipt)
+        self.assertNotIn(secret, json.dumps(receipt))
+        self.assertEqual(self.state.pending_acceptance_receipt_count, 1)
+        self.assertIsNone(self.state.claim_next())
+
+    def test_oldest_unresolved_receipt_blocks_newer_confirmed_job(self):
+        self.state.enqueue(16, _update(update_id=16, text="first"))
+        self.state.enqueue(17, _update(update_id=17, text="second"))
+        self.state.complete_acceptance_receipt(17, delivered=True)
+
+        self.assertIsNone(self.state.claim_next())
+
+        self.state.complete_acceptance_receipt(16, delivered=True)
+        claimed = self.state.claim_next()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed[0], 16)
+
+    def test_acceptance_receipt_backoff_is_bounded_and_survives_restart(self):
+        self.state.enqueue(18, _update(update_id=18, text="retry receipt"))
+        self.state.defer_acceptance_receipt(
+            18,
+            delay_seconds=9,
+            now=100.0,
+        )
+
+        self.assertEqual(self.state.due_acceptance_receipt_ids(now=108.0), [])
+        restarted = TelegramState(self.config.state_path)
+        self.assertEqual(
+            restarted.due_acceptance_receipt_ids(now=109.0),
+            [18],
+        )
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        receipt = payload["acceptance_receipts"]["18"]
+        self.assertEqual(receipt["failure_count"], 1)
+        self.assertEqual(receipt["deferred_at"], 100.0)
+        self.assertEqual(receipt["next_attempt_at"], 109.0)
+
+    def test_legacy_active_job_migrates_to_pending_receipt_without_rewrite(self):
+        path = self.root / "legacy-receipt-state.json"
+        state = TelegramState(path)
+        state.bind_bot_identity(99, "monday_test_bot")
+        state.enqueue(19, _update(update_id=19, text="legacy active work"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["version"] = 5
+        payload.pop("acceptance_receipts")
+        for name in _ORIGIN_KEYS:
+            payload["jobs"]["19"].pop(name)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        migrated = TelegramState(path)
+
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8"))["version"],
+            5,
+        )
+        self.assertEqual(migrated.pending_acceptance_receipt_count, 1)
+        self.assertEqual(migrated.due_acceptance_receipt_ids(), [19])
+        self.assertIsNone(migrated.claim_next())
+        migrated.bind_bot_identity(99, "monday_test_bot")
+        persisted = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["version"], 6)
+        self.assertIn("19", persisted["acceptance_receipts"])
+
+    def test_legacy_replay_atomically_attaches_bound_receipt(self):
+        path = self.root / "legacy-replay-state.json"
+        path.write_text(json.dumps({
+            "version": 5,
+            "bot_id": 99,
+            "bot_username": "monday_test_bot",
+            "last_update_id": 20,
+            "cancellation_sequence": 0,
+            "jobs": {
+                "21": {"task_id": "TASK-0001"},
+            },
+            "completed_jobs": {},
+            "failed_jobs": {},
+            "delivery_retries": {},
+        }), encoding="utf-8")
+        state = TelegramState(path)
+
+        self.assertEqual(
+            state.enqueue(21, _update(update_id=21, text="resume checkpoint")),
+            (True, 1),
+        )
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        receipt = payload["acceptance_receipts"]["21"]
+        self.assertEqual(payload["version"], 6)
+        self.assertEqual(receipt["phase"], "sent")
+        self.assertEqual(
+            receipt["request_digest"],
+            payload["jobs"]["21"]["request_digest"],
+        )
+        claimed = state.claim_next()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed[0], 21)
+
+    def test_legacy_started_job_is_not_discarded_by_receipt_migration(self):
+        path = self.root / "legacy-started-receipt-state.json"
+        state = TelegramState(path)
+        state.bind_bot_identity(99, "monday_test_bot")
+        state.enqueue(22, _update(update_id=22, text="recover started work"))
+        state.set_job(22, phase="waiting", task_id="TASK-0001")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["version"] = 5
+        payload.pop("acceptance_receipts")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        migrated = TelegramState(path)
+
+        self.assertEqual(migrated.pending_acceptance_receipt_count, 0)
+        self.assertEqual(migrated.due_acceptance_receipt_ids(), [])
+        claimed = migrated.claim_next()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed[0], 22)
+        self.assertEqual(migrated.job(22)["task_id"], "TASK-0001")
+
+    def test_current_receipt_tampering_fails_closed_on_load(self):
+        def changed_route(payload):
+            payload["acceptance_receipts"]["20"]["origin_chat_id"] = 999
+
+        def changed_digest(payload):
+            payload["acceptance_receipts"]["20"]["request_digest"] = "a" * 64
+
+        def changed_key(payload):
+            payload["acceptance_receipts"]["21"] = (
+                payload["acceptance_receipts"].pop("20")
+            )
+
+        def missing_receipt(payload):
+            payload["acceptance_receipts"].pop("20")
+
+        for label, mutate in (
+            ("route", changed_route),
+            ("digest", changed_digest),
+            ("key", changed_key),
+            ("missing", missing_receipt),
+        ):
+            with self.subTest(label=label):
+                path = self.root / f"tampered-receipt-{label}.json"
+                state = TelegramState(path)
+                state.enqueue(20, _update(update_id=20, text="bound receipt"))
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                mutate(payload)
+                path.write_text(json.dumps(payload), encoding="utf-8")
+
+                with self.assertRaises(TelegramStateError):
+                    TelegramState(path)
+
+    def test_pending_phase_cannot_be_forged_for_started_job(self):
+        path = self.root / "tampered-started-receipt.json"
+        state = TelegramState(path)
+        state.enqueue(23, _update(update_id=23, text="started checkpoint"))
+        state.complete_acceptance_receipt(23, delivered=True)
+        claimed = state.claim_next()
+        self.assertIsNotNone(claimed)
+        state.set_job(23, phase="waiting", task_id="TASK-0001")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["acceptance_receipts"]["23"]["phase"] = "pending"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with self.assertRaises(TelegramStateError):
+            TelegramState(path)
+
+    def test_boolean_request_identity_with_matching_digests_fails_closed(self):
+        path = self.root / "tampered-boolean-request-identity.json"
+        state = TelegramState(path)
+        state.enqueue(1, _update(update_id=1, text="strict identity"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        record = payload["jobs"]["1"]
+        record["request"]["update_id"] = True
+        canonical = json.dumps(
+            record["request"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        record["request_digest"] = digest
+        payload["acceptance_receipts"]["1"]["request_digest"] = digest
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with self.assertRaises(TelegramStateError):
+            TelegramState(path)
 
     def test_job_ids_are_stable_and_strictly_validated(self):
         self.assertEqual(job_id(42), "JOB-42")
@@ -2673,6 +2934,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
                     update_id,
                     _update(update_id=update_id, text=f"request {update_id}"),
                 )[0])
+                self._complete_acceptance_receipt(update_id)
 
         with patch("telegram_bot.state.MAX_PENDING_JOBS", 2):
             reloaded = TelegramState(self.config.state_path)
@@ -2741,9 +3003,16 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.state.enqueue(33, own_group)
         self.state.enqueue(34, foreign_group)
 
-        # Active records derive ownership from the minimal saved request; they
-        # do not duplicate the sender or chat identity into checkpoint fields.
-        self.assertTrue(_ORIGIN_KEYS.isdisjoint(self.state.job(33)))
+        # The request-free receipt outbox duplicates only the minimal origin
+        # and binds it back to the canonical request before every delivery.
+        self.assertEqual(
+            {key: self.state.job(33)[key] for key in _ORIGIN_KEYS},
+            {
+                "origin_user_id": 7,
+                "origin_chat_id": -100,
+                "origin_chat_type": "supergroup",
+            },
+        )
         summary = self.state.queue_summary(7, 7)
         self.assertEqual([row["job_id"] for row in summary], ["JOB-33"])
         self.assertTrue(summary[0]["cancellable"])
@@ -2768,13 +3037,10 @@ class TestTelegramStateAndRunner(TelegramFixture):
             text="invalid group routing",
         )
         invalid_group["message"]["chat"]["type"] = "group"
-        self.state.enqueue(35, invalid_group)
+        with self.assertRaisesRegex(TelegramStateError, "receipt destination"):
+            self.state.enqueue(35, invalid_group)
 
         self.assertEqual(self.state.queue_summary(7, 7), [])
-        self.assertEqual(
-            self.state.cancel_queued("JOB-35", user_id=7, chat_id=7),
-            {"status": "not-found", "job_id": "JOB-35"},
-        )
 
     def test_ordinary_completion_strips_legacy_saved_origin_fields(self):
         self.state.enqueue(36, _update(update_id=36, text="legacy origin"))
@@ -2896,6 +3162,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
     def test_claim_and_cancel_race_has_one_linearized_winner(self):
         self.state.enqueue(61, _update(update_id=61, text="race safely"))
+        self._complete_acceptance_receipt(61)
         barrier = threading.Barrier(3)
         outcome = {}
 
@@ -2937,6 +3204,8 @@ class TestTelegramStateAndRunner(TelegramFixture):
         # Deliberately enqueue out of order: Telegram update ids define FIFO.
         self.state.enqueue(12, _update(update_id=12, text="second"))
         self.state.enqueue(11, _update(update_id=11, text="first"))
+        self._complete_acceptance_receipt(12)
+        self._complete_acceptance_receipt(11)
         worker = TelegramJobWorker(
             RecordingService(),
             self.state,
@@ -2975,6 +3244,348 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(len(self.monday.tasks), 2)
         self.assertEqual(self.monday.team_calls, 2)
         self.assertEqual(self.state.pending_count, 0)
+
+    def test_transient_receipt_failure_recovers_without_telegram_redelivery(self):
+        update = _update(
+            update_id=53,
+            text="Build only after my durable receipt",
+        )
+
+        class FailFirstReceiptClient(FakeTelegramClient):
+            def __init__(self):
+                super().__init__([update])
+                self.receipt_attempts = []
+                self.fail_receipt = True
+
+            def send_message(self, chat_id, text):
+                if text.startswith("Request saved as JOB-53"):
+                    self.receipt_attempts.append((chat_id, text))
+                    if self.fail_receipt:
+                        raise TelegramAPIError("temporary outage", retryable=True)
+                return super().send_message(chat_id, text)
+
+        client = FailFirstReceiptClient()
+        service = TelegramBotService(self.monday, client, self.state, self.config)
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+
+        self.assertEqual(runner.ingest_once(), 1)
+        self.assertEqual(self.state.pending_acceptance_receipt_count, 1)
+        self.assertIsNone(self.state.claim_next())
+        self.assertFalse(self.monday.tasks)
+
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        due_at = payload["acceptance_receipts"]["53"]["next_attempt_at"]
+        client.fail_receipt = False
+        client.updates = []
+        restarted_state = TelegramState(self.config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday,
+            client,
+            restarted_state,
+            self.config,
+        )
+        restarted_runner = TelegramRunner(
+            client,
+            restarted_service,
+            restarted_state,
+            poll_timeout=1,
+        )
+
+        with patch("telegram_bot.state.time.time", return_value=due_at + 1):
+            self.assertEqual(restarted_runner.run_once(), 0)
+
+        self.assertEqual(len(client.receipt_attempts), 2)
+        self.assertEqual(client.receipt_attempts[0], client.receipt_attempts[1])
+        self.assertEqual(len(self.monday.tasks), 1)
+        self.assertEqual(restarted_state.pending_count, 0)
+        self.assertEqual(restarted_state.pending_acceptance_receipt_count, 0)
+
+    def test_receipt_rate_limit_defers_all_due_sends_without_blocking_poll(self):
+        self.state.enqueue(59, _update(update_id=59, text="first receipt"))
+        self.state.enqueue(60, _update(update_id=60, text="second receipt"))
+
+        class RateLimitedReceiptClient(FakeTelegramClient):
+            def __init__(self):
+                super().__init__()
+                self.send_attempts = 0
+
+            def send_message(self, chat_id, text):
+                self.send_attempts += 1
+                raise TelegramRateLimitError(9)
+
+        client = RateLimitedReceiptClient()
+        service = TelegramBotService(self.monday, client, self.state, self.config)
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+        before = time.time()
+
+        with patch.object(
+            self.state,
+            "_write",
+            wraps=self.state._write,
+        ) as persist:
+            self.assertEqual(runner.ingest_once(), 0)
+
+        self.assertEqual(client.send_attempts, 1)
+        self.assertEqual(persist.call_count, 1)
+        self.assertEqual(client.offsets, [61])
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        for update_id in (59, 60):
+            receipt = payload["acceptance_receipts"][str(update_id)]
+            self.assertEqual(receipt["phase"], "retrying")
+            self.assertGreaterEqual(receipt["next_attempt_at"], before + 9)
+        restarted = TelegramState(self.config.state_path)
+        self.assertEqual(
+            restarted.due_acceptance_receipt_ids(now=before + 8),
+            [],
+        )
+
+    def test_receipt_rate_limit_is_durable_before_send_helper_returns(self):
+        self.state.enqueue(61, _update(update_id=61, text="durable cooldown"))
+
+        class RateLimitedReceiptClient(FakeTelegramClient):
+            def send_message(self, chat_id, text):
+                raise TelegramRateLimitError(9)
+
+        client = RateLimitedReceiptClient()
+        service = TelegramBotService(self.monday, client, self.state, self.config)
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+        started = time.time()
+
+        pause = runner._deliver_acceptance_receipt(
+            61,
+            rate_limit_scope=[61],
+        )
+
+        self.assertEqual(pause, 9.0)
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        receipt = payload["acceptance_receipts"]["61"]
+        self.assertEqual(receipt["phase"], "retrying")
+        self.assertGreaterEqual(receipt["next_attempt_at"], started + 9)
+
+    def test_receipt_rate_limit_caps_untrusted_huge_retry_hint(self):
+        self.state.enqueue(62, _update(update_id=62, text="bounded receipt"))
+
+        class HugeRateLimitClient(FakeTelegramClient):
+            def send_message(self, chat_id, text):
+                error = TelegramRateLimitError(1)
+                error.retry_after = 10**10_000
+                raise error
+
+        client = HugeRateLimitClient()
+        service = TelegramBotService(self.monday, client, self.state, self.config)
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+        started = time.time()
+
+        self.assertEqual(runner.ingest_once(), 0)
+
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        receipt = payload["acceptance_receipts"]["62"]
+        self.assertEqual(receipt["phase"], "retrying")
+        self.assertGreaterEqual(receipt["next_attempt_at"], started + 86_400)
+        self.assertLess(receipt["next_attempt_at"], started + 86_401)
+
+    def test_immediate_receipt_rate_limit_is_durable_before_later_update_crash(self):
+        first = _update(update_id=63, text="persist my receipt cooldown")
+        second = _update(update_id=64, text="fail later in this batch")
+
+        class RateLimitedReceiptClient(FakeTelegramClient):
+            def send_message(self, chat_id, text):
+                raise TelegramRateLimitError(9)
+
+        client = RateLimitedReceiptClient([first, second])
+        service = TelegramBotService(self.monday, client, self.state, self.config)
+        normalized_first = service.normalize_update(first)
+
+        def normalize(update):
+            if update.get("update_id") == 64:
+                raise RuntimeError("simulated later intake crash")
+            return normalized_first
+
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+        started = time.time()
+        with (
+            patch.object(service, "normalize_update", side_effect=normalize),
+            patch.object(service, "report_error"),
+            self.assertRaises(TelegramUpdateRetryError),
+        ):
+            runner.ingest_once()
+
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        receipt = payload["acceptance_receipts"]["63"]
+        self.assertEqual(receipt["phase"], "retrying")
+        self.assertGreaterEqual(receipt["next_attempt_at"], started + 9)
+        restarted = TelegramState(self.config.state_path)
+        self.assertEqual(
+            restarted.due_acceptance_receipt_ids(now=started + 8),
+            [],
+        )
+
+    def test_crash_after_receipt_send_replays_identical_text_and_runs_once(self):
+        update = _update(update_id=54, text="Recover ambiguous receipt send")
+        self.client.updates = [update]
+        runner = TelegramRunner(
+            self.client,
+            self.service,
+            self.state,
+            poll_timeout=1,
+        )
+
+        with (
+            patch.object(
+                self.state,
+                "complete_acceptance_receipt",
+                side_effect=RuntimeError("simulated crash after remote send"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            runner.ingest_once()
+
+        self.assertEqual(self.state.pending_acceptance_receipt_count, 1)
+        self.assertFalse(self.monday.tasks)
+        restarted_state = TelegramState(self.config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday,
+            self.client,
+            restarted_state,
+            self.config,
+        )
+        restarted_runner = TelegramRunner(
+            self.client,
+            restarted_service,
+            restarted_state,
+            poll_timeout=1,
+        )
+        self.client.updates = []
+
+        self.assertEqual(restarted_runner.run_once(), 0)
+
+        receipts = [
+            text for _chat, text in self.client.sent
+            if text.startswith("Request saved as JOB-54")
+        ]
+        self.assertEqual(len(receipts), 2)
+        self.assertEqual(receipts[0], receipts[1])
+        self.assertEqual(len(self.monday.tasks), 1)
+
+    def test_permanent_receipt_failure_scrubs_request_and_never_runs(self):
+        secret = "never execute or retain this unreachable request"
+
+        class BlockedReceiptClient(FakeTelegramClient):
+            def send_message(self, chat_id, text):
+                if text.startswith("Request saved as JOB-55"):
+                    raise TelegramAPIError(
+                        "chat unavailable",
+                        retryable=False,
+                        status_code=403,
+                    )
+                return super().send_message(chat_id, text)
+
+        client = BlockedReceiptClient([
+            _update(update_id=55, text=secret),
+        ])
+        service = TelegramBotService(self.monday, client, self.state, self.config)
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+
+        self.assertEqual(runner.run_once(), 1)
+
+        self.assertEqual(self.state.job(55), {})
+        self.assertEqual(self.state.failed_job(55)["phase"], "receipt-failed")
+        self.assertEqual(self.state.pending_count, 0)
+        self.assertEqual(self.state.pending_acceptance_receipt_count, 0)
+        self.assertFalse(self.monday.tasks)
+        self.assertNotIn(
+            secret,
+            self.config.state_path.read_text(encoding="utf-8"),
+        )
+
+    def test_receipt_retry_rechecks_allowlist_and_drops_revoked_work(self):
+        secret = "revoked work must be scrubbed before execution"
+        update = _update(update_id=56, text=secret)
+
+        class FailingReceiptClient(FakeTelegramClient):
+            def __init__(self):
+                super().__init__([update])
+                self.attempts = 0
+
+            def send_message(self, chat_id, text):
+                if text.startswith("Request saved as JOB-56"):
+                    self.attempts += 1
+                    raise TelegramAPIError("temporary outage", retryable=True)
+                return super().send_message(chat_id, text)
+
+        client = FailingReceiptClient()
+        service = TelegramBotService(self.monday, client, self.state, self.config)
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+        self.assertEqual(runner.ingest_once(), 1)
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        due_at = payload["acceptance_receipts"]["56"]["next_attempt_at"]
+
+        revoked = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({8}),
+            project_root=self.root,
+            provider="fake",
+        )
+        restarted_state = TelegramState(self.config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday,
+            client,
+            restarted_state,
+            revoked,
+        )
+        restarted_runner = TelegramRunner(
+            client,
+            restarted_service,
+            restarted_state,
+            poll_timeout=1,
+        )
+        client.updates = []
+
+        with patch("telegram_bot.state.time.time", return_value=due_at + 1):
+            self.assertEqual(restarted_runner.run_once(), 0)
+
+        self.assertEqual(client.attempts, 1)
+        self.assertEqual(restarted_state.job(56), {})
+        self.assertEqual(
+            restarted_state.failed_job(56)["phase"],
+            "receipt-failed",
+        )
+        self.assertFalse(self.monday.tasks)
+        self.assertNotIn(
+            secret,
+            self.config.state_path.read_text(encoding="utf-8"),
+        )
+
+    def test_cancel_stays_responsive_during_transient_receipt_failure(self):
+        request = _update(update_id=57, text="cancel during receipt outage")
+        cancel = _update(update_id=58, text="/cancel JOB-57")
+
+        class ReceiptOutageClient(FakeTelegramClient):
+            def __init__(self):
+                super().__init__([request, cancel])
+                self.receipt_attempts = 0
+
+            def send_message(self, chat_id, text):
+                if text.startswith("Request saved as JOB-57"):
+                    self.receipt_attempts += 1
+                    raise TelegramAPIError("temporary outage", retryable=True)
+                return super().send_message(chat_id, text)
+
+        client = ReceiptOutageClient()
+        service = TelegramBotService(self.monday, client, self.state, self.config)
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+
+        self.assertEqual(runner.run_once(), 2)
+
+        self.assertEqual(client.receipt_attempts, 1)
+        self.assertEqual(self.state.completed_job(57)["phase"], "cancelled")
+        self.assertEqual(self.state.pending_acceptance_receipt_count, 0)
+        self.assertEqual(self.state.job(57), {})
+        self.assertFalse(self.monday.tasks)
+        self.assertIn(
+            "JOB-57 is cancelled. It will not run.",
+            [text for _chat, text in client.sent],
+        )
 
     def test_unauthorized_update_body_is_never_persisted(self):
         secret = "never-persist-this-private-message"
@@ -3029,6 +3640,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
     def test_queue_full_notice_retries_after_restart_then_advances_offset(self):
         rejected_text = "retry notice without retaining this objective"
         self.state.enqueue(60, _update(update_id=60, text="fills capacity"))
+        self._complete_acceptance_receipt(60)
         refused = _update(update_id=61, text=rejected_text)
 
         class RetryOnceClient(FakeTelegramClient):
@@ -3082,6 +3694,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
     def test_permanent_queue_full_notice_failure_does_not_wedge_intake(self):
         self.state.enqueue(65, _update(update_id=65, text="fills capacity"))
+        self._complete_acceptance_receipt(65)
         refused = _update(update_id=66, text="permanently refused objective")
 
         class PermanentlyFailingClient(FakeTelegramClient):
@@ -3102,6 +3715,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
     def test_queue_full_retry_respects_allowlist_revocation(self):
         self.state.enqueue(67, _update(update_id=67, text="fills capacity"))
+        self._complete_acceptance_receipt(67)
         refused = _update(update_id=68, text="revoked destination request")
 
         class FirstSendFails(FakeTelegramClient):
@@ -3146,6 +3760,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
     def test_queue_full_retry_does_not_send_to_tampered_destination(self):
         self.state.enqueue(69, _update(update_id=69, text="fills capacity"))
+        self._complete_acceptance_receipt(69)
         refused = _update(update_id=70, text="never redirect this notice")
         with patch("telegram_bot.state.MAX_PENDING_JOBS", 1):
             self.state.enqueue(70, refused)
@@ -3247,6 +3862,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
     def test_cancel_reply_retry_is_idempotent_and_permanent_failure_acks(self):
         self.state.enqueue(90, _update(update_id=90, text="cancel me once"))
+        self._complete_acceptance_receipt(90)
         command = _update(update_id=91, text="/cancel JOB-90")
 
         class RetryOnceClient(FakeTelegramClient):
@@ -3282,6 +3898,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
 
         self.state.enqueue(100, _update(update_id=100, text="cancel permanently"))
+        self._complete_acceptance_receipt(100)
         permanent_command = _update(update_id=101, text="/cancel JOB-100")
 
         class PermanentlyFailingClient(FakeTelegramClient):
@@ -3343,9 +3960,8 @@ class TestTelegramStateAndRunner(TelegramFixture):
                 mutate(payload)
                 path.write_text(json.dumps(payload), encoding="utf-8")
 
-                restarted = TelegramState(path)
                 with self.assertRaises(TelegramStateError):
-                    restarted.claim_next()
+                    TelegramState(path)
 
     def test_only_one_worker_can_hold_instance_lock(self):
         with InstanceLock(self.config.lock_path):
@@ -3395,7 +4011,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
             def send_message(self, chat_id, text):
                 result = super().send_message(chat_id, text)
-                if "Queue position: 2" in text:
+                if "Request saved as JOB-101" in text:
                     second_queued.set()
                 return result
 
@@ -3552,6 +4168,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         normalized = service.normalize_update(build_update)
         self.assertIsNotNone(normalized)
         self.state.enqueue(70, normalized)
+        self._complete_acceptance_receipt(70)
         worker = TelegramJobWorker(
             service,
             self.state,
@@ -4083,6 +4700,9 @@ class TestTelegramStateAndRunner(TelegramFixture):
         update = _update(update_id=28, text="/help")
 
         class PendingService:
+            def announce_acceptance_receipt(self, _notice):
+                return True
+
             def handle_update(self, _update):
                 raise TelegramUpdatePendingError("still running")
 
@@ -4271,6 +4891,9 @@ class TestTelegramStateAndRunner(TelegramFixture):
             def __init__(self):
                 self.notices = []
 
+            def announce_acceptance_receipt(self, _notice):
+                return True
+
             def handle_update(self, _update):
                 raise RuntimeError("boom")
 
@@ -4296,6 +4919,9 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
     def test_permanent_error_notice_failure_does_not_escape_retry_lifecycle(self):
         class BrokenService:
+            def announce_acceptance_receipt(self, _notice):
+                return True
+
             def handle_update(self, _update):
                 raise RuntimeError("handler failed")
 
@@ -4321,6 +4947,9 @@ class TestTelegramStateAndRunner(TelegramFixture):
         handled = []
 
         class SelectiveService:
+            def announce_acceptance_receipt(self, _notice):
+                return True
+
             def handle_update(self, update):
                 if update["update_id"] == 40:
                     raise TelegramAPIError(
@@ -4473,7 +5102,43 @@ class TestTelegramIdentify(unittest.TestCase):
         self.assertEqual(payload["service"]["max_pending_jobs"], 25)
         self.assertTrue(payload["service"]["accepting_work"])
         self.assertEqual(payload["service"]["pending_capacity_notices"], 0)
+        self.assertEqual(payload["service"]["pending_acceptance_receipts"], 0)
         self.assertIsNone(payload["build"]["ready"])
+        self.assertNotIn("super-secret-token", output.getvalue())
+
+    def test_health_is_unhealthy_for_unresolved_acceptance_receipt(self):
+        secret = "receipt health must never reveal this objective"
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "123:super-secret-token",
+            "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+        }, clear=True), patch(
+            "telegram_bot.state.instance_lock_is_held",
+            return_value=True,
+        ):
+            root = Path(tmp)
+            state = TelegramState(root / "logs" / "telegram" / "state.json")
+            state.bind_bot_identity(99, "monday_bot")
+            state.mark_worker_started()
+            state.enqueue(1, _update(update_id=1, text=secret))
+            args = SimpleNamespace(
+                project_root=tmp,
+                health=True,
+                json=True,
+                identify=False,
+                provider="",
+                once=False,
+            )
+            output = StringIO()
+
+            with redirect_stdout(output):
+                result = _cmd_telegram(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(payload["healthy"])
+        self.assertEqual(payload["service"]["pending_jobs"], 1)
+        self.assertEqual(payload["service"]["pending_acceptance_receipts"], 1)
+        self.assertNotIn(secret, output.getvalue())
         self.assertNotIn("super-secret-token", output.getvalue())
 
     def test_health_json_is_unhealthy_while_capacity_notice_is_unresolved(self):
