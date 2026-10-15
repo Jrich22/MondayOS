@@ -1,6 +1,7 @@
 """Telegram control-plane tests: no sockets, no real bot, no provider calls."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import plistlib
@@ -41,11 +42,20 @@ from telegram_bot.state import (
     TelegramState,
     TelegramStateError,
     instance_lock_is_held,
+    job_id,
+    parse_job_id,
 )
 
 
 def _fake_token() -> str:
     return "secret-" + "token"
+
+
+_ORIGIN_KEYS = frozenset({
+    "origin_user_id",
+    "origin_chat_id",
+    "origin_chat_type",
+})
 
 
 def _update(update_id=10, user_id=7, chat_id=7, text="Build a health endpoint"):
@@ -926,6 +936,27 @@ class TestTelegramService(TelegramFixture):
         self.assertEqual(self.monday.build_executions, 0)
         self.assertFalse(self.client.sent)
 
+    def test_group_queue_full_notice_points_to_private_controls(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            allowed_chat_ids=frozenset({-100}),
+            project_root=self.root,
+            provider="fake",
+        )
+        service = TelegramBotService(
+            self.monday, self.client, self.state, config,
+        )
+        service.announce_queue_full_notice({
+            "user_id": 7,
+            "chat_id": -100,
+            "chat_type": "group",
+        })
+
+        self.assertEqual(self.client.sent[-1][0], -100)
+        self.assertIn("request was not saved", self.client.sent[-1][1])
+        self.assertIn("Open Monday's private chat", self.client.sent[-1][1])
+
     def test_deliver_reports_disabled_without_touching_task_or_build(self):
         self.service.handle_update(_update(text="/deliver TASK-0001"))
 
@@ -1145,6 +1176,35 @@ class TestTelegramService(TelegramFixture):
         self.assertIn("no active", combined.lower())
         self.assertIn("is healthy", combined)
         self.assertIn("Unknown command", combined)
+
+    def test_group_help_only_advertises_group_commands(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            allowed_chat_ids=frozenset({-100}),
+            project_root=self.root,
+            provider="fake",
+        )
+        service = TelegramBotService(
+            self.monday,
+            self.client,
+            self.state,
+            config,
+        )
+        update = _update(update_id=11, chat_id=-100, text="/help")
+        update["message"]["chat"]["type"] = "group"
+
+        service.handle_update(update)
+
+        help_text = self.client.sent[-1][1]
+        self.assertIn("/build REQUEST", help_text)
+        self.assertIn("/run TASK-ID", help_text)
+        self.assertIn("/status [TASK-ID]", help_text)
+        self.assertNotIn("/queue", help_text)
+        self.assertNotIn("/cancel", help_text)
+        self.assertNotIn("/tasks", help_text)
+        self.assertNotIn("/approve", help_text)
+        self.assertNotIn("/reject", help_text)
 
     def test_run_requires_task_id(self):
         self.service.handle_update(_update(text="/run no"))
@@ -2284,6 +2344,379 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(self.state.enqueue(10, request), (False, 0))
         self.assertEqual(self.state.pending_count, 0)
 
+    def test_job_ids_are_stable_and_strictly_validated(self):
+        self.assertEqual(job_id(42), "JOB-42")
+        self.assertEqual(parse_job_id("JOB-42"), 42)
+        self.assertEqual(parse_job_id(" job-42 "), 42)
+
+        for invalid in ("42", "JOB-", "JOB-042", "JOB--1", True, -1):
+            with self.subTest(invalid=invalid):
+                if isinstance(invalid, int):
+                    with self.assertRaises(TelegramStateError):
+                        job_id(invalid)
+                else:
+                    with self.assertRaises(ValueError):
+                        parse_job_id(invalid)
+
+    def test_full_inbox_writes_request_free_terminal_tombstone_atomically(self):
+        with patch("telegram_bot.state.MAX_PENDING_JOBS", 2):
+            self.assertEqual(
+                self.state.enqueue(10, _update(update_id=10, text="first")),
+                (True, 1),
+            )
+            self.assertEqual(
+                self.state.enqueue(11, _update(update_id=11, text="second")),
+                (True, 2),
+            )
+            rejected = _update(update_id=12, text="never persist full objective")
+            self.assertEqual(self.state.enqueue(12, rejected), (False, 0))
+
+            self.assertEqual(self.state.pending_count, 2)
+            self.assertEqual(self.state.next_offset, 12)
+            tombstone = self.state.completed_job(12)
+            self.assertEqual(tombstone["phase"], "queue-full")
+            self.assertEqual(tombstone["notice_status"], "pending")
+            self.assertEqual(tombstone["origin_user_id"], 7)
+            self.assertEqual(tombstone["origin_chat_id"], 7)
+            self.assertEqual(tombstone["origin_chat_type"], "private")
+            self.assertNotIn("request", tombstone)
+            self.assertNotIn(
+                "never persist full objective",
+                self.config.state_path.read_text(encoding="utf-8"),
+            )
+
+            # Exact replay is terminal; changed content cannot reuse the id.
+            self.assertEqual(self.state.enqueue(12, rejected), (False, 0))
+            self.assertEqual(self.state.next_offset, 12)
+            with self.assertRaisesRegex(TelegramStateError, "does not match"):
+                self.state.enqueue(
+                    12,
+                    _update(update_id=12, text="changed rejected objective"),
+                )
+            self.assertEqual(
+                self.state.queue_full_notice(12),
+                {"user_id": 7, "chat_id": 7, "chat_type": "private"},
+            )
+            self.state.complete_queue_full_notice(12, delivered=True)
+            self.assertEqual(self.state.next_offset, 13)
+            self.assertEqual(
+                self.state.completed_job(12)["notice_status"],
+                "sent",
+            )
+            self.assertTrue(
+                _ORIGIN_KEYS.isdisjoint(self.state.completed_job(12))
+            )
+            self.assertEqual(self.state.queue_full_notice(12), {})
+
+    def test_full_inbox_keeps_minimal_group_origin_for_routing(self):
+        group = _update(
+            update_id=14,
+            user_id=7,
+            chat_id=-100,
+            text="rejected group objective",
+        )
+        group["message"]["chat"]["type"] = "group"
+
+        with patch("telegram_bot.state.MAX_PENDING_JOBS", 1):
+            self.state.enqueue(13, _update(update_id=13, text="fills inbox"))
+            self.assertEqual(self.state.enqueue(14, group), (False, 0))
+
+        tombstone = self.state.completed_job(14)
+        self.assertEqual(tombstone["origin_user_id"], 7)
+        self.assertEqual(tombstone["origin_chat_id"], -100)
+        self.assertEqual(tombstone["origin_chat_type"], "group")
+        self.assertEqual(
+            self.state.queue_full_notice(14),
+            {"user_id": 7, "chat_id": -100, "chat_type": "group"},
+        )
+        self.assertNotIn("request", tombstone)
+        self.assertNotIn(
+            "rejected group objective",
+            self.config.state_path.read_text(encoding="utf-8"),
+        )
+
+    def test_pending_queue_full_notice_survives_completed_history_eviction(self):
+        with (
+            patch("telegram_bot.state.MAX_PENDING_JOBS", 1),
+            patch("telegram_bot.state._MAX_COMPLETED_JOBS", 1),
+        ):
+            self.state.acknowledge(1)
+            self.state.enqueue(10, _update(update_id=10, text="fills capacity"))
+            self.state.enqueue(11, _update(update_id=11, text="refused safely"))
+            self.state.acknowledge(10)
+
+        self.assertEqual(
+            self.state.queue_full_notice(11),
+            {"user_id": 7, "chat_id": 7, "chat_type": "private"},
+        )
+        self.assertEqual(
+            self.state.completed_job(11)["notice_status"],
+            "pending",
+        )
+        self.assertEqual(self.state.pending_queue_full_notice_count, 1)
+        self.assertEqual(self.state.pending_queue_full_notice_ids(), [11])
+
+    def test_existing_over_capacity_inbox_loads_and_drains(self):
+        with patch("telegram_bot.state.MAX_PENDING_JOBS", 4):
+            for update_id in (20, 21, 22):
+                self.assertTrue(self.state.enqueue(
+                    update_id,
+                    _update(update_id=update_id, text=f"request {update_id}"),
+                )[0])
+
+        with patch("telegram_bot.state.MAX_PENDING_JOBS", 2):
+            reloaded = TelegramState(self.config.state_path)
+            self.assertEqual(reloaded.pending_count, 3)
+            self.assertEqual(
+                reloaded.enqueue(23, _update(update_id=23, text="still full")),
+                (False, 0),
+            )
+            reloaded.complete_queue_full_notice(23, delivered=True)
+            claimed = reloaded.claim_next()
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed[0], 20)
+            reloaded.acknowledge(20)
+            claimed = reloaded.claim_next()
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed[0], 21)
+            reloaded.acknowledge(21)
+            self.assertEqual(reloaded.pending_count, 1)
+            self.assertEqual(
+                reloaded.enqueue(24, _update(update_id=24, text="capacity freed")),
+                (True, 2),
+            )
+
+    def test_queue_summary_is_origin_scoped_and_contains_no_request_text(self):
+        secret = "private objective that must not appear in queue summaries"
+        self.state.enqueue(30, _update(update_id=30, text=secret))
+        self.state.enqueue(
+            31,
+            _update(update_id=31, user_id=8, chat_id=8, text="someone else's job"),
+        )
+        self.state.enqueue(32, _update(update_id=32, text="later own job"))
+
+        own = self.state.queue_summary(7, 7)
+
+        self.assertEqual([row["job_id"] for row in own], ["JOB-30", "JOB-32"])
+        self.assertEqual([row["position"] for row in own], [1, 3])
+        self.assertTrue(all(row["phase"] == "queued" for row in own))
+        self.assertTrue(all(row["cancellable"] for row in own))
+        self.assertEqual(
+            set().union(*(row.keys() for row in own)),
+            {"job_id", "phase", "position", "cancellable"},
+        )
+        self.assertNotIn(secret, json.dumps(own))
+        self.assertEqual(
+            [row["job_id"] for row in self.state.queue_summary(8, 8)],
+            ["JOB-31"],
+        )
+        self.assertEqual(self.state.queue_summary(9, 9), [])
+
+    def test_private_controls_manage_own_group_jobs_without_exposing_others(self):
+        own_group = _update(
+            update_id=33,
+            user_id=7,
+            chat_id=-100,
+            text="own group objective",
+        )
+        own_group["message"]["chat"]["type"] = "supergroup"
+        foreign_group = _update(
+            update_id=34,
+            user_id=8,
+            chat_id=-100,
+            text="foreign group objective",
+        )
+        foreign_group["message"]["chat"]["type"] = "group"
+
+        self.state.enqueue(33, own_group)
+        self.state.enqueue(34, foreign_group)
+
+        # Active records derive ownership from the minimal saved request; they
+        # do not duplicate the sender or chat identity into checkpoint fields.
+        self.assertTrue(_ORIGIN_KEYS.isdisjoint(self.state.job(33)))
+        summary = self.state.queue_summary(7, 7)
+        self.assertEqual([row["job_id"] for row in summary], ["JOB-33"])
+        self.assertTrue(summary[0]["cancellable"])
+        self.assertEqual(
+            self.state.cancel_queued("JOB-34", user_id=7, chat_id=7),
+            {"status": "not-found", "job_id": "JOB-34"},
+        )
+        self.assertEqual(
+            self.state.cancel_queued("JOB-33", user_id=7, chat_id=7)["status"],
+            "cancelled",
+        )
+        tombstone = self.state.completed_job(33)
+        self.assertEqual(tombstone["origin_user_id"], 7)
+        self.assertEqual(tombstone["origin_chat_id"], -100)
+        self.assertEqual(tombstone["origin_chat_type"], "supergroup")
+
+    def test_invalid_positive_group_chat_id_cannot_be_managed(self):
+        invalid_group = _update(
+            update_id=35,
+            user_id=7,
+            chat_id=100,
+            text="invalid group routing",
+        )
+        invalid_group["message"]["chat"]["type"] = "group"
+        self.state.enqueue(35, invalid_group)
+
+        self.assertEqual(self.state.queue_summary(7, 7), [])
+        self.assertEqual(
+            self.state.cancel_queued("JOB-35", user_id=7, chat_id=7),
+            {"status": "not-found", "job_id": "JOB-35"},
+        )
+
+    def test_ordinary_completion_strips_legacy_saved_origin_fields(self):
+        self.state.enqueue(36, _update(update_id=36, text="legacy origin"))
+        self.state.set_job(
+            36,
+            origin_user_id=7,
+            origin_chat_id=7,
+            origin_chat_type="private",
+        )
+
+        # Loaded records from the earlier schema remain manageable until they
+        # finish, then ordinary completion sheds the redundant identity fields.
+        self.assertEqual(
+            [row["job_id"] for row in self.state.queue_summary(7, 7)],
+            ["JOB-36"],
+        )
+        self.state.acknowledge(36)
+
+        completed = self.state.completed_job(36)
+        self.assertTrue(_ORIGIN_KEYS.isdisjoint(completed))
+        persisted = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        self.assertTrue(_ORIGIN_KEYS.isdisjoint(persisted["completed_jobs"]["36"]))
+
+    def test_queued_cancellation_is_origin_bound_durable_and_frees_capacity(self):
+        secret = "cancelled objective must be erased"
+        with patch("telegram_bot.state.MAX_PENDING_JOBS", 1):
+            self.state.enqueue(40, _update(update_id=40, text=secret))
+            self.assertEqual(
+                self.state.cancel_queued("JOB-40", user_id=8, chat_id=8),
+                {"status": "not-found", "job_id": "JOB-40"},
+            )
+            cancelled = self.state.cancel_queued(
+                "job-40",
+                user_id=7,
+                chat_id=7,
+            )
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertFalse(cancelled["cancellable"])
+            self.assertEqual(self.state.pending_count, 0)
+            tombstone = self.state.completed_job(40)
+            self.assertEqual(tombstone["phase"], "cancelled")
+            self.assertNotIn("request", tombstone)
+            self.assertNotIn(secret, self.config.state_path.read_text(encoding="utf-8"))
+
+            restarted = TelegramState(self.config.state_path)
+            self.assertEqual(
+                restarted.cancel_queued("JOB-40", user_id=7, chat_id=7)["status"],
+                "already-cancelled",
+            )
+            self.assertEqual(
+                restarted.cancel_queued("JOB-40", user_id=8, chat_id=8),
+                {"status": "not-found", "job_id": "JOB-40"},
+            )
+            self.assertEqual(
+                restarted.enqueue(41, _update(update_id=41, text="new work")),
+                (True, 1),
+            )
+
+    def test_recent_cancellation_survives_bounded_control_history_churn(self):
+        with patch("telegram_bot.state._MAX_COMPLETED_JOBS", 2):
+            self.state.enqueue(100, _update(update_id=100, text="first cancellation"))
+            self.state.cancel_queued("JOB-100", user_id=7, chat_id=7)
+            self.state.enqueue(1, _update(update_id=1, text="old queued target"))
+            self.assertEqual(
+                self.state.cancel_queued(
+                    "JOB-1",
+                    user_id=7,
+                    chat_id=7,
+                )["status"],
+                "cancelled",
+            )
+            restarted = TelegramState(self.config.state_path)
+            restarted.enqueue(50, _update(update_id=50, text="third cancellation"))
+            restarted.cancel_queued("JOB-50", user_id=7, chat_id=7)
+            # The inline /cancel command itself then adds an ordinary terminal
+            # record. Neither sorted JSON keys nor that control acknowledgement
+            # may immediately evict the more recent old-id target cancellation.
+            restarted.acknowledge(200)
+
+            final = TelegramState(self.config.state_path)
+            self.assertEqual(
+                final.cancel_queued(
+                    "JOB-1",
+                    user_id=7,
+                    chat_id=7,
+                )["status"],
+                "already-cancelled",
+            )
+            payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+            self.assertLessEqual(len(payload["completed_jobs"]), 2)
+            self.assertNotIn("100", payload["completed_jobs"])
+
+    def test_cancellation_refuses_claimed_retrying_and_side_effectful_jobs(self):
+        phases = ("running", "waiting", "retrying")
+        for update_id, phase in enumerate(phases, start=50):
+            self.state.enqueue(
+                update_id,
+                _update(update_id=update_id, text=f"{phase} request"),
+            )
+            self.state.set_job(update_id, phase=phase)
+            result = self.state.cancel_queued(
+                job_id(update_id),
+                user_id=7,
+                chat_id=7,
+            )
+            self.assertEqual(result["status"], "not-cancellable")
+            self.assertEqual(result["phase"], phase)
+            self.assertTrue(self.state.job(update_id).get("request"))
+
+        self.state.enqueue(60, _update(update_id=60, text="checkpointed request"))
+        self.state.set_job(60, task_id="TASK-0001")
+        result = self.state.cancel_queued("JOB-60", user_id=7, chat_id=7)
+        self.assertEqual(result["status"], "not-cancellable")
+        self.assertFalse(result["cancellable"])
+        summary = {
+            row["job_id"]: row for row in self.state.queue_summary(7, 7)
+        }
+        self.assertFalse(summary["JOB-60"]["cancellable"])
+
+    def test_claim_and_cancel_race_has_one_linearized_winner(self):
+        self.state.enqueue(61, _update(update_id=61, text="race safely"))
+        barrier = threading.Barrier(3)
+        outcome = {}
+
+        def claim() -> None:
+            barrier.wait()
+            outcome["claim"] = self.state.claim_next()
+
+        def cancel() -> None:
+            barrier.wait()
+            outcome["cancel"] = self.state.cancel_queued(
+                "JOB-61", user_id=7, chat_id=7,
+            )
+
+        claim_thread = threading.Thread(target=claim)
+        cancel_thread = threading.Thread(target=cancel)
+        claim_thread.start()
+        cancel_thread.start()
+        barrier.wait()
+        claim_thread.join(5)
+        cancel_thread.join(5)
+
+        self.assertFalse(claim_thread.is_alive())
+        self.assertFalse(cancel_thread.is_alive())
+        if outcome["cancel"]["status"] == "cancelled":
+            self.assertIsNone(outcome["claim"])
+            self.assertEqual(self.state.completed_job(61)["phase"], "cancelled")
+        else:
+            self.assertEqual(outcome["cancel"]["status"], "not-cancellable")
+            self.assertEqual(outcome["claim"][0], 61)
+            self.assertEqual(self.state.job(61)["phase"], "running")
+
     def test_worker_claims_fifo_and_processes_only_one_request_per_call(self):
         handled = []
 
@@ -2353,11 +2786,356 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertFalse(self.monday.tasks)
         self.assertFalse(self.client.sent)
 
+    def test_runner_announces_job_handle_and_never_readmits_full_replay(self):
+        rejected_text = "full inbox objective must never be retained"
+        self.client.updates = [
+            _update(update_id=60, text="accepted objective"),
+            _update(update_id=61, text=rejected_text),
+        ]
+        runner = TelegramRunner(
+            self.client, self.service, self.state, poll_timeout=1,
+        )
+
+        with patch("telegram_bot.state.MAX_PENDING_JOBS", 1):
+            self.assertEqual(runner.ingest_once(), 2)
+
+        sent = [text for _chat_id, text in self.client.sent]
+        self.assertIn("Request saved as JOB-60", sent[0])
+        self.assertIn("inbox is full", sent[1])
+        self.assertEqual(self.state.pending_count, 1)
+        self.assertEqual(self.state.completed_job(61)["phase"], "queue-full")
+        self.assertNotIn(
+            rejected_text,
+            self.config.state_path.read_text(encoding="utf-8"),
+        )
+
+        self.state.cancel_queued("JOB-60", user_id=7, chat_id=7)
+        self.client.updates = [_update(update_id=61, text=rejected_text)]
+        sent_before = len(self.client.sent)
+        self.assertEqual(runner.ingest_once(), 1)
+        self.assertEqual(self.state.pending_count, 0)
+        self.assertEqual(len(self.client.sent), sent_before)
+
+    def test_queue_full_notice_retries_after_restart_then_advances_offset(self):
+        rejected_text = "retry notice without retaining this objective"
+        self.state.enqueue(60, _update(update_id=60, text="fills capacity"))
+        refused = _update(update_id=61, text=rejected_text)
+
+        class RetryOnceClient(FakeTelegramClient):
+            def __init__(self):
+                super().__init__([refused])
+                self.attempted = []
+
+            def send_message(self, chat_id, text):
+                self.attempted.append((chat_id, text))
+                if len(self.attempted) == 1:
+                    raise TelegramAPIError("temporary outage", retryable=True)
+                return super().send_message(chat_id, text)
+
+        client = RetryOnceClient()
+        service = TelegramBotService(self.monday, client, self.state, self.config)
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+        with (
+            patch("telegram_bot.state.MAX_PENDING_JOBS", 1),
+            self.assertRaises(TelegramAPIError),
+        ):
+            runner.ingest_once()
+
+        self.assertEqual(self.state.next_offset, 61)
+        self.assertEqual(
+            self.state.completed_job(61)["notice_status"],
+            "pending",
+        )
+        self.assertNotIn(
+            rejected_text,
+            self.config.state_path.read_text(encoding="utf-8"),
+        )
+
+        restarted = TelegramState(self.config.state_path)
+        # Recovery is state-driven. Telegram may have aged the original update
+        # out of its own temporary queue during a long outage.
+        client.updates = []
+        restarted_service = TelegramBotService(
+            self.monday, client, restarted, self.config,
+        )
+        restarted_runner = TelegramRunner(
+            client, restarted_service, restarted, poll_timeout=1,
+        )
+        self.assertEqual(restarted_runner.ingest_once(), 0)
+        self.assertEqual(restarted.next_offset, 62)
+        self.assertEqual(
+            restarted.completed_job(61)["notice_status"],
+            "sent",
+        )
+        self.assertEqual(restarted.pending_queue_full_notice_count, 0)
+        self.assertEqual(client.attempted[0], client.attempted[1])
+
+    def test_permanent_queue_full_notice_failure_does_not_wedge_intake(self):
+        self.state.enqueue(65, _update(update_id=65, text="fills capacity"))
+        refused = _update(update_id=66, text="permanently refused objective")
+
+        class PermanentlyFailingClient(FakeTelegramClient):
+            def send_message(self, chat_id, text):
+                raise TelegramAPIError("chat unavailable", retryable=False)
+
+        client = PermanentlyFailingClient([refused])
+        service = TelegramBotService(self.monday, client, self.state, self.config)
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+        with patch("telegram_bot.state.MAX_PENDING_JOBS", 1):
+            self.assertEqual(runner.ingest_once(), 1)
+
+        self.assertEqual(self.state.next_offset, 67)
+        self.assertEqual(
+            self.state.completed_job(66)["notice_status"],
+            "failed",
+        )
+
+    def test_queue_full_retry_respects_allowlist_revocation(self):
+        self.state.enqueue(67, _update(update_id=67, text="fills capacity"))
+        refused = _update(update_id=68, text="revoked destination request")
+
+        class FirstSendFails(FakeTelegramClient):
+            def __init__(self):
+                super().__init__([refused])
+                self.attempted = []
+
+            def send_message(self, chat_id, text):
+                self.attempted.append((chat_id, text))
+                raise TelegramAPIError("temporary outage", retryable=True)
+
+        client = FirstSendFails()
+        service = TelegramBotService(self.monday, client, self.state, self.config)
+        runner = TelegramRunner(client, service, self.state, poll_timeout=1)
+        with (
+            patch("telegram_bot.state.MAX_PENDING_JOBS", 1),
+            self.assertRaises(TelegramAPIError),
+        ):
+            runner.ingest_once()
+
+        revoked = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({8}),
+            project_root=self.root,
+            provider="fake",
+        )
+        restarted = TelegramState(self.config.state_path)
+        client.updates = []
+        revoked_service = TelegramBotService(
+            self.monday, client, restarted, revoked,
+        )
+        revoked_runner = TelegramRunner(
+            client, revoked_service, restarted, poll_timeout=1,
+        )
+        self.assertEqual(revoked_runner.ingest_once(), 0)
+        self.assertEqual(len(client.attempted), 1)
+        self.assertEqual(restarted.next_offset, 69)
+        self.assertEqual(
+            restarted.completed_job(68)["notice_status"],
+            "failed",
+        )
+
+    def test_queue_full_retry_does_not_send_to_tampered_destination(self):
+        self.state.enqueue(69, _update(update_id=69, text="fills capacity"))
+        refused = _update(update_id=70, text="never redirect this notice")
+        with patch("telegram_bot.state.MAX_PENDING_JOBS", 1):
+            self.state.enqueue(70, refused)
+
+        payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        payload["completed_jobs"]["70"]["origin_chat_id"] = 999
+        self.config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        restarted = TelegramState(self.config.state_path)
+        client = FakeTelegramClient()
+        service = TelegramBotService(self.monday, client, restarted, self.config)
+        runner = TelegramRunner(client, service, restarted, poll_timeout=1)
+        self.assertEqual(runner.ingest_once(), 0)
+        self.assertFalse(client.sent)
+        self.assertEqual(restarted.next_offset, 71)
+        self.assertEqual(
+            restarted.completed_job(70)["notice_status"],
+            "failed",
+        )
+
+    def test_intake_controls_are_private_origin_bound_and_validate_input(self):
+        private_text = "private own objective"
+        foreign_text = "private foreign objective"
+        self.state.enqueue(70, _update(update_id=70, text=private_text))
+        self.state.enqueue(
+            71,
+            _update(
+                update_id=71,
+                user_id=8,
+                chat_id=8,
+                text=foreign_text,
+            ),
+        )
+        own_group = _update(
+            update_id=72,
+            user_id=7,
+            chat_id=-100,
+            text="own allowed-group objective",
+        )
+        own_group["message"]["chat"]["type"] = "group"
+        self.state.enqueue(72, own_group)
+
+        self.assertTrue(self.service.handle_intake_control(
+            _update(update_id=80, text="/queue")
+        ))
+        queue_text = self.client.sent[-1][1]
+        self.assertIn("JOB-70", queue_text)
+        self.assertIn("JOB-72", queue_text)
+        self.assertNotIn("JOB-71", queue_text)
+        self.assertNotIn(private_text, queue_text)
+        self.assertNotIn(foreign_text, queue_text)
+
+        self.assertTrue(self.service.handle_intake_control(
+            _update(update_id=81, text="/cancel JOB-71")
+        ))
+        foreign_result = self.client.sent[-1][1]
+        self.assertEqual(
+            foreign_result,
+            "JOB-71 is not queued and was not cancelled.",
+        )
+        self.assertTrue(self.service.handle_intake_control(
+            _update(update_id=82, text="/cancel JOB-999")
+        ))
+        self.assertEqual(
+            self.client.sent[-1][1],
+            "JOB-999 is not queued and was not cancelled.",
+        )
+        self.assertTrue(self.service.handle_intake_control(
+            _update(update_id=83, text="/cancel not-a-job")
+        ))
+        self.assertEqual(self.client.sent[-1][1], "Use /cancel JOB-123")
+        self.assertTrue(self.service.handle_intake_control(
+            _update(update_id=84, text="/cancel JOB-72")
+        ))
+        self.assertEqual(
+            self.client.sent[-1][1],
+            "JOB-72 is cancelled. It will not run.",
+        )
+
+        sent_before = len(self.client.sent)
+        self.assertFalse(self.service.handle_intake_control(
+            _update(update_id=85, user_id=999, chat_id=999, text="/queue")
+        ))
+        group = _update(update_id=86, chat_id=-100, text="/queue")
+        group["message"]["chat"]["type"] = "group"
+        group_config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            allowed_chat_ids=frozenset({-100}),
+            project_root=self.root,
+            provider="fake",
+        )
+        group_service = TelegramBotService(
+            self.monday, self.client, self.state, group_config,
+        )
+        self.assertFalse(group_service.handle_intake_control(group))
+        self.assertEqual(len(self.client.sent), sent_before)
+        self.assertFalse(self.monday.tasks)
+
+    def test_cancel_reply_retry_is_idempotent_and_permanent_failure_acks(self):
+        self.state.enqueue(90, _update(update_id=90, text="cancel me once"))
+        command = _update(update_id=91, text="/cancel JOB-90")
+
+        class RetryOnceClient(FakeTelegramClient):
+            def __init__(self):
+                super().__init__([command])
+                self.attempted = []
+
+            def send_message(self, chat_id, text):
+                self.attempted.append((chat_id, text))
+                if len(self.attempted) == 1:
+                    raise TelegramAPIError("temporary outage", retryable=True)
+                return super().send_message(chat_id, text)
+
+        retry_client = RetryOnceClient()
+        retry_service = TelegramBotService(
+            self.monday, retry_client, self.state, self.config,
+        )
+        retry_runner = TelegramRunner(
+            retry_client, retry_service, self.state, poll_timeout=1,
+        )
+        with self.assertRaises(TelegramAPIError):
+            retry_runner.ingest_once()
+        self.assertEqual(self.state.completed_job(90)["phase"], "cancelled")
+        self.assertEqual(self.state.next_offset, 91)
+
+        retry_client.updates = [command]
+        self.assertEqual(retry_runner.ingest_once(), 1)
+        self.assertEqual(self.state.next_offset, 92)
+        self.assertEqual(retry_client.attempted[0], retry_client.attempted[1])
+        self.assertEqual(
+            retry_client.attempted[1][1],
+            "JOB-90 is cancelled. It will not run.",
+        )
+
+        self.state.enqueue(100, _update(update_id=100, text="cancel permanently"))
+        permanent_command = _update(update_id=101, text="/cancel JOB-100")
+
+        class PermanentlyFailingClient(FakeTelegramClient):
+            def send_message(self, chat_id, text):
+                raise TelegramAPIError("chat unavailable", retryable=False)
+
+        permanent_client = PermanentlyFailingClient([permanent_command])
+        permanent_service = TelegramBotService(
+            self.monday, permanent_client, self.state, self.config,
+        )
+        permanent_runner = TelegramRunner(
+            permanent_client, permanent_service, self.state, poll_timeout=1,
+        )
+        self.assertEqual(permanent_runner.ingest_once(), 1)
+        self.assertEqual(self.state.completed_job(100)["phase"], "cancelled")
+        self.assertEqual(self.state.next_offset, 102)
+        self.assertFalse(self.monday.tasks)
+
     def test_corrupt_state_fails_closed_instead_of_replaying_updates(self):
         self.config.state_path.parent.mkdir(parents=True)
         self.config.state_path.write_text("not-json", encoding="utf-8")
         with self.assertRaises(TelegramStateError):
             TelegramState(self.config.state_path)
+
+    def test_claim_revalidates_persisted_request_before_execution(self):
+        def changed_text(payload):
+            payload["jobs"]["10"]["request"]["message"]["text"] = "tampered"
+
+        def changed_identity(payload):
+            payload["jobs"]["11"] = payload["jobs"].pop("10")
+
+        def changed_phase(payload):
+            payload["jobs"]["10"]["phase"] = "unexpected"
+
+        def changed_origin_with_matching_digest(payload):
+            record = payload["jobs"]["10"]
+            record["request"]["message"]["chat"]["type"] = "channel"
+            canonical = json.dumps(
+                record["request"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            record["request_digest"] = hashlib.sha256(
+                canonical.encode("utf-8")
+            ).hexdigest()
+
+        for label, mutate in (
+            ("digest", changed_text),
+            ("identity", changed_identity),
+            ("phase", changed_phase),
+            ("origin", changed_origin_with_matching_digest),
+        ):
+            with self.subTest(label=label):
+                path = self.root / f"tampered-{label}.json"
+                state = TelegramState(path)
+                state.enqueue(10, _update(update_id=10, text="original"))
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                mutate(payload)
+                path.write_text(json.dumps(payload), encoding="utf-8")
+
+                restarted = TelegramState(path)
+                with self.assertRaises(TelegramStateError):
+                    restarted.claim_next()
 
     def test_only_one_worker_can_hold_instance_lock(self):
         with InstanceLock(self.config.lock_path):
@@ -2448,6 +3226,92 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(errors, [])
         self.assertEqual(self.state.pending_count, 1)
         self.assertEqual(self.state.job(101)["phase"], "queued")
+
+    def test_queue_and_cancel_stay_responsive_while_worker_is_blocked(self):
+        first_started = threading.Event()
+        release_first = threading.Event()
+        cancellation_sent = threading.Event()
+        stop = threading.Event()
+        errors = []
+
+        class BlockingMonday(FakeMonday):
+            def team(self, action, **kwargs):
+                if action == "run":
+                    first_started.set()
+                    if not release_first.wait(5):
+                        raise AssertionError("test did not release the active job")
+                return super().team(action, **kwargs)
+
+        class ControlClient(FakeTelegramClient):
+            def __init__(self):
+                super().__init__()
+                self.poll_count = 0
+
+            def get_updates(self, *, offset, timeout):
+                self.offsets.append(offset)
+                self.poll_count += 1
+                if self.poll_count == 1:
+                    return [_update(update_id=110, text="Build the slow request")]
+                if self.poll_count == 2:
+                    if not first_started.wait(5):
+                        raise AssertionError("active job never started")
+                    return [_update(update_id=111, text="Never execute this request")]
+                if self.poll_count == 3:
+                    return [_update(update_id=112, text="/queue")]
+                if self.poll_count == 4:
+                    return [_update(update_id=113, text="/cancel JOB-111")]
+                stop.wait(5)
+                return []
+
+            def send_message(self, chat_id, text):
+                result = super().send_message(chat_id, text)
+                if text == "JOB-111 is cancelled. It will not run.":
+                    cancellation_sent.set()
+                return result
+
+        monday = BlockingMonday()
+        client = ControlClient()
+        service = TelegramBotService(monday, client, self.state, self.config)
+        runner = TelegramRunner(
+            client,
+            service,
+            self.state,
+            poll_timeout=1,
+            stop_event=stop,
+        )
+
+        def run() -> None:
+            try:
+                runner.run_forever()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            self.assertTrue(cancellation_sent.wait(5))
+            self.assertEqual(self.state.completed_job(111)["phase"], "cancelled")
+            self.assertEqual(self.state.job(110)["phase"], "running")
+            self.assertEqual(len(monday.tasks), 1)
+            self.assertNotIn(
+                "Never execute this request",
+                [task["objective"] for task in monday.tasks.values()],
+            )
+            queue_replies = [
+                text for _chat_id, text in client.sent
+                if text.startswith("Your Monday inbox:")
+            ]
+            self.assertEqual(len(queue_replies), 1)
+            self.assertIn("JOB-110 · running", queue_replies[0])
+            self.assertIn("JOB-111 · queued", queue_replies[0])
+            self.assertNotIn("Build the slow request", queue_replies[0])
+            self.assertNotIn("Never execute this request", queue_replies[0])
+        finally:
+            runner.stop()
+            release_first.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
 
     def test_restart_drains_running_and_queued_jobs_with_same_delivery_id(self):
         config = TelegramConfig(
@@ -3395,8 +4259,143 @@ class TestTelegramIdentify(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertTrue(payload["healthy"])
         self.assertTrue(payload["service"]["running"])
+        self.assertEqual(payload["service"]["pending_jobs"], 0)
+        self.assertEqual(payload["service"]["max_pending_jobs"], 25)
+        self.assertTrue(payload["service"]["accepting_work"])
+        self.assertEqual(payload["service"]["pending_capacity_notices"], 0)
         self.assertIsNone(payload["build"]["ready"])
         self.assertNotIn("super-secret-token", output.getvalue())
+
+    def test_health_json_is_unhealthy_while_capacity_notice_is_unresolved(self):
+        secret = "refused request must stay out of health output"
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "123:super-secret-token",
+            "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+        }, clear=True), patch(
+            "telegram_bot.state.instance_lock_is_held",
+            return_value=True,
+        ):
+            root = Path(tmp)
+            state = TelegramState(root / "logs" / "telegram" / "state.json")
+            state.bind_bot_identity(99, "monday_bot")
+            state.mark_worker_started()
+            with patch("telegram_bot.state.MAX_PENDING_JOBS", 1):
+                state.enqueue(1, _update(update_id=1, text="fills temporary cap"))
+                state.enqueue(2, _update(update_id=2, text=secret))
+            state.acknowledge(1)
+            args = SimpleNamespace(
+                project_root=tmp,
+                health=True,
+                json=True,
+                identify=False,
+                provider="",
+                once=False,
+            )
+            output = StringIO()
+
+            with redirect_stdout(output):
+                result = _cmd_telegram(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(payload["healthy"])
+        self.assertEqual(payload["service"]["pending_jobs"], 0)
+        self.assertTrue(payload["service"]["accepting_work"])
+        self.assertEqual(payload["service"]["pending_capacity_notices"], 1)
+        self.assertNotIn(secret, output.getvalue())
+        self.assertNotIn("super-secret-token", output.getvalue())
+
+    def test_health_json_full_inbox_is_not_ready_for_new_work(self):
+        secret = "private full-inbox objective"
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "123:super-secret-token",
+            "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+        }, clear=True), patch(
+            "telegram_bot.state.instance_lock_is_held",
+            return_value=True,
+        ):
+            root = Path(tmp)
+            state = TelegramState(root / "logs" / "telegram" / "state.json")
+            state.bind_bot_identity(99, "monday_bot")
+            state.mark_worker_started()
+            for update_id in range(1, 26):
+                self.assertTrue(state.enqueue(
+                    update_id,
+                    _update(update_id=update_id, text=f"{secret} {update_id}"),
+                )[0])
+            args = SimpleNamespace(
+                project_root=tmp,
+                health=True,
+                json=True,
+                identify=False,
+                provider="",
+                once=False,
+            )
+            output = StringIO()
+
+            with redirect_stdout(output):
+                result = _cmd_telegram(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(payload["healthy"])
+        self.assertEqual(payload["service"]["pending_jobs"], 25)
+        self.assertEqual(payload["service"]["max_pending_jobs"], 25)
+        self.assertFalse(payload["service"]["accepting_work"])
+        self.assertNotIn(secret, output.getvalue())
+        self.assertNotIn("super-secret-token", output.getvalue())
+
+    def test_health_reports_legacy_over_capacity_and_human_queue_usage(self):
+        secret = "private legacy-over-capacity objective"
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "123:super-secret-token",
+            "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+        }, clear=True), patch(
+            "telegram_bot.state.instance_lock_is_held",
+            return_value=True,
+        ):
+            root = Path(tmp)
+            state = TelegramState(root / "logs" / "telegram" / "state.json")
+            state.bind_bot_identity(99, "monday_bot")
+            state.mark_worker_started()
+            with patch("telegram_bot.state.MAX_PENDING_JOBS", 26):
+                for update_id in range(1, 27):
+                    self.assertTrue(state.enqueue(
+                        update_id,
+                        _update(update_id=update_id, text=f"{secret} {update_id}"),
+                    )[0])
+            args = SimpleNamespace(
+                project_root=tmp,
+                health=True,
+                json=True,
+                identify=False,
+                provider="",
+                once=False,
+            )
+            json_output = StringIO()
+            with redirect_stdout(json_output):
+                json_result = _cmd_telegram(args)
+
+            args.json = False
+            human_output = StringIO()
+            with redirect_stdout(human_output):
+                human_result = _cmd_telegram(args)
+
+        payload = json.loads(json_output.getvalue())
+        self.assertEqual(json_result, 1)
+        self.assertEqual(human_result, 1)
+        self.assertFalse(payload["healthy"])
+        self.assertEqual(payload["service"]["pending_jobs"], 26)
+        self.assertEqual(payload["service"]["max_pending_jobs"], 25)
+        self.assertFalse(payload["service"]["accepting_work"])
+        self.assertIn("Telegram health: UNHEALTHY", human_output.getvalue())
+        self.assertIn(
+            "Inbox        : 26/25 pending; not accepting work",
+            human_output.getvalue(),
+        )
+        self.assertNotIn(secret, json_output.getvalue())
+        self.assertNotIn(secret, human_output.getvalue())
+        self.assertNotIn("super-secret-token", json_output.getvalue())
 
     def test_health_json_fails_closed_when_live_build_is_not_ready(self):
         response = SimpleNamespace(

@@ -1099,3 +1099,80 @@ lifecycle monitor.
   investigation remains in GitHub.
 - MondayOS can complete or reopen its local task after verified terminal
   evidence, but merge and deployment remain human/external actions.
+
+---
+
+## ADR-024: Bound Telegram Intake and Keep Queue Controls State-Only
+
+**Date:** 2026-10-14
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+The Telegram poller can keep accepting work while one long-running model or
+build job occupies the single execution worker. An unbounded durable queue can
+therefore consume storage and promise more work than one operator-controlled
+Mac mini can reasonably process. Operators also need a way to inspect and undo
+unstarted work without waiting behind that work or exposing private request
+text.
+
+### Decision
+
+MondayOS admits at most 25 pending Telegram jobs. Admission and its Telegram
+offset advance remain one atomic state transition. When capacity is exhausted,
+the update first becomes a terminal, request-free `queue-full` tombstone without
+advancing its offset. That tombstone prevents re-admission while Telegram
+redelivery supplies a restart-safe refusal-notice retry. The offset advances
+only after that notice succeeds or Telegram reports a permanent destination
+failure. Before any retry sends, the saved user and chat destination must still
+pass the current allowlists; revoked or malformed routing is terminalized
+without contact. The intake loop drains pending refusal notices directly from
+durable state before every poll, so recovery does not depend on Telegram still
+retaining the original update. Existing state above the cap remains valid and
+can drain, but no new work is admitted until capacity is available. Local health
+reports queue usage and unresolved refusal notices, and is unhealthy whenever
+the inbox cannot accept another job or a refusal remains unresolved.
+
+Every admitted update receives a deterministic `JOB-<update ID>` handle. The
+private, allowlisted `/queue` command lists that user's private-chat jobs and
+jobs the same user submitted from an allowed group, while hiding every other
+user's work. `/cancel JOB-ID` has the same ownership boundary and treats a
+foreign or absent handle identically. It may
+terminalize only a still-queued job with no side-effect checkpoint. Running,
+waiting, retrying, delivered, or otherwise started jobs cannot be interrupted.
+Cancellation removes request text, releases capacity, and remains replay-safe
+after restart.
+
+These controls execute on the lightweight intake path, not the model/build
+FIFO. A control mutation is durable before its Telegram reply. If a retryable
+send fails, the update stays unacknowledged; redelivery repeats the idempotent
+operation and sends the same safe confirmation. A crash may therefore duplicate
+a confirmation, but cannot duplicate execution or reverse cancellation.
+Before the worker claims any persisted request, it recomputes its digest and
+revalidates the queue key, update identity, resumable phase, message shape, and
+origin. Semantic corruption therefore fails closed instead of executing altered
+work.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Leave intake unbounded | One slow worker could accumulate unlimited retained work and request text. |
+| Put `/queue` and `/cancel` into the work FIFO | Operators could not regain control while the worker was occupied. |
+| Cancel active jobs by terminating their process | Current provider and delivery boundaries do not prove that all external side effects are reversible. |
+| Show request excerpts in `/queue` | Telegram handles and phases are enough to operate the queue without redisclosing retained text. |
+| Reveal that a foreign job exists | That would leak another origin's activity through guessed update IDs. |
+
+### Consequences
+
+- Intake has a small, explicit storage and backlog bound.
+- The operator can see and remove their own unstarted work while a build runs.
+- A temporary notification outage cannot silently discard a capacity refusal,
+  and monitoring distinguishes runtime liveness from admission readiness.
+- Cancellation is deliberately narrower than process interruption; active work
+  continues until its existing terminal or recovery path.
+- Rejected and cancelled jobs preserve replay identity without preserving the
+  request that caused them.

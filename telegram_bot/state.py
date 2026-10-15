@@ -16,6 +16,7 @@ from core.atomic import write_json_atomic
 
 _MAX_OBSERVATION_RETRY_SECONDS = 300.0
 _MAX_TELEGRAM_RATE_LIMIT_SECONDS = 86_400.0
+MAX_PENDING_JOBS = 25
 _MAX_ACTIVE_FOLLOW_UPS = 500
 _MAX_ACTIVE_DELIVERY_RETRIES = 500
 _MAX_COMPLETED_JOBS = 1_000
@@ -29,6 +30,13 @@ _PROJECT_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _FAILURE_CODE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _GITHUB_PR_URL = re.compile(r"^https://github\.com/[^\s/]+/[^\s/]+/pull/\d+$")
+_JOB_ID = re.compile(r"^JOB-(0|[1-9]\d*)$", re.IGNORECASE)
+_ORIGIN_FIELDS = frozenset({
+    "origin_user_id", "origin_chat_id", "origin_chat_type",
+})
+_PRISTINE_QUEUE_FIELDS = frozenset({
+    "phase", "request", "request_digest", *_ORIGIN_FIELDS,
+})
 _TERMINAL_DELIVERY_STATUSES = frozenset({
     "blocked", "cancelled", "completed", "failed", "interrupted", "pr-open",
     "publication-pending", "rejected", "succeeded",
@@ -37,6 +45,27 @@ _TERMINAL_DELIVERY_STATUSES = frozenset({
 
 class TelegramStateError(RuntimeError):
     pass
+
+
+def job_id(update_id: int) -> str:
+    """Return the stable public identifier for one Telegram inbox job."""
+    return f"JOB-{_update_id(update_id)}"
+
+
+def parse_job_id(value: Any) -> int:
+    """Validate a public inbox job identifier and return its update id."""
+    if not isinstance(value, str):
+        raise ValueError("Telegram job ids must use JOB-<update_id>")
+    candidate = value.strip()
+    match = _JOB_ID.fullmatch(candidate)
+    if match is None:
+        raise ValueError("Telegram job ids must use JOB-<update_id>")
+    try:
+        return _update_id(int(match.group(1)))
+    except (TelegramStateError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "Telegram job ids must use JOB-<update_id>"
+        ) from exc
 
 
 class TelegramState:
@@ -66,6 +95,7 @@ class TelegramState:
             if changed or legacy_with_state:
                 self._data.update({
                     "last_update_id": -1,
+                    "cancellation_sequence": 0,
                     "jobs": {},
                     "completed_jobs": {},
                     "failed_jobs": {},
@@ -103,6 +133,164 @@ class TelegramState:
                 for value in self._data.setdefault("jobs", {}).values()
                 if _is_pending(value)
             )
+
+    @property
+    def pending_queue_full_notice_count(self) -> int:
+        """Return capacity refusals whose request-free notice is unresolved."""
+        with self._lock:
+            return sum(
+                1
+                for value in self._data.setdefault("completed_jobs", {}).values()
+                if _queue_full_notice_pending(value)
+            )
+
+    def pending_queue_full_notice_ids(self) -> list[int]:
+        """Return durable capacity notices in Telegram update order."""
+        with self._lock:
+            pending: list[int] = []
+            for key, value in self._data.setdefault("completed_jobs", {}).items():
+                if not _queue_full_notice_pending(value):
+                    continue
+                try:
+                    update_id = _update_id(int(key))
+                except (TelegramStateError, TypeError, ValueError) as exc:
+                    raise TelegramStateError(
+                        "Invalid Telegram queue-full notice key"
+                    ) from exc
+                if key != str(update_id):
+                    raise TelegramStateError(
+                        "Invalid Telegram queue-full notice key"
+                    )
+                pending.append(update_id)
+            return sorted(pending)
+
+    def queue_summary(
+        self,
+        user_id: int,
+        chat_id: int,
+    ) -> list[dict[str, object]]:
+        """Return active jobs the user can manage from their private chat."""
+        private_origin = _private_origin(user_id, chat_id)
+        with self._lock:
+            retries = self._data.setdefault("delivery_retries", {})
+            active = sorted(
+                (
+                    (_update_id(int(key)), value)
+                    for key, value in self._data.setdefault("jobs", {}).items()
+                    if _is_pending(value)
+                ),
+                key=lambda item: item[0],
+            )
+            summary: list[dict[str, object]] = []
+            for position, (update_id, record) in enumerate(active, start=1):
+                if not _owned_by_private_control(record, private_origin):
+                    continue
+                summary.append({
+                    "job_id": job_id(update_id),
+                    "phase": _safe_job_phase(record.get("phase")),
+                    "position": position,
+                    "cancellable": _queued_job_is_cancellable(
+                        record,
+                        retry=retries.get(str(update_id)),
+                    ),
+                })
+            return summary
+
+    def cancel_queued(
+        self,
+        job: str | int,
+        *,
+        user_id: int,
+        chat_id: int,
+    ) -> dict[str, object]:
+        """Cancel one pristine queued request owned by the private caller.
+
+        The caller may also manage jobs they submitted from a group. Ownership
+        mismatches deliberately look identical to unknown job ids. Once a
+        worker has claimed or checkpointed any work, cancellation is refused so
+        this method can never race or pretend to undo an external effect.
+        """
+        private_origin = _private_origin(user_id, chat_id)
+        try:
+            update_id = parse_job_id(job) if isinstance(job, str) else _update_id(job)
+        except (TelegramStateError, ValueError):
+            return {"status": "not-found", "job_id": ""}
+        public_id = job_id(update_id)
+        key = str(update_id)
+        with self._lock:
+            completed = self._data.setdefault("completed_jobs", {})
+            terminal = completed.get(key)
+            if (
+                isinstance(terminal, dict)
+                and terminal.get("phase") == "cancelled"
+                and _owned_by_private_control(terminal, private_origin)
+            ):
+                return {
+                    "status": "already-cancelled",
+                    "job_id": public_id,
+                    "phase": "cancelled",
+                    "cancellable": False,
+                }
+
+            jobs = self._data.setdefault("jobs", {})
+            record = jobs.get(key)
+            if (
+                not isinstance(record, dict)
+                or not _owned_by_private_control(record, private_origin)
+            ):
+                return {"status": "not-found", "job_id": public_id}
+
+            retry = self._data.setdefault("delivery_retries", {}).get(key)
+            if not _queued_job_is_cancellable(record, retry=retry):
+                return {
+                    "status": "not-cancellable",
+                    "job_id": public_id,
+                    "phase": _safe_job_phase(record.get("phase")),
+                    "cancellable": False,
+                }
+
+            request = record.get("request")
+            if not isinstance(request, dict):  # guarded by the predicate above
+                raise TelegramStateError(
+                    f"Telegram update {update_id} lost its queued request"
+                )
+            _normalized, digest = _canonical_request(request)
+            stored_digest = str(record.get("request_digest") or "")
+            if stored_digest and stored_digest != digest:
+                raise TelegramStateError(
+                    f"Telegram update {update_id} does not match its saved request"
+                )
+            origin = _saved_origin(record)
+            if origin is None:  # guarded by the ownership check above
+                raise TelegramStateError(
+                    f"Telegram update {update_id} lost its origin"
+                )
+            tombstone = _origin_tombstone(
+                phase="cancelled",
+                digest=stored_digest or digest,
+                origin=origin,
+            )
+            tombstone["cancellation_sequence"] = _next_cancellation_sequence(
+                self._data
+            )
+            jobs.pop(key)
+            completed[key] = tombstone
+            self._advance(update_id)
+            _bound_completed(
+                completed,
+                _MAX_COMPLETED_JOBS,
+                protected={
+                    *self._data.setdefault("delivery_retries", {}),
+                    key,
+                },
+            )
+            self._write()
+            return {
+                "status": "cancelled",
+                "job_id": public_id,
+                "phase": "cancelled",
+                "cancellable": False,
+            }
 
     @property
     def heartbeat_path(self) -> Path:
@@ -196,12 +384,15 @@ class TelegramState:
         return worker
 
     def enqueue(self, update_id: int, request: dict[str, Any]) -> tuple[bool, int]:
-        """Durably enqueue one Telegram request and advance its polling offset.
+        """Durably enqueue or reject one Telegram request.
 
         The returned boolean reports whether a new queue entry was created. The
         integer is that entry's current FIFO position, or zero for a terminal
         replay. Telegram update ids are bot-scoped and immutable, so seeing the
-        same id with different content is treated as corrupt input.
+        same id with different content is treated as corrupt input. Accepted
+        work advances the polling offset immediately. A capacity refusal keeps
+        the offset behind its request-free tombstone until its user notice is
+        sent or permanently fails, so Telegram can redeliver it after restart.
         """
         normalized_id = _update_id(update_id)
         normalized_request, digest = _canonical_request(request)
@@ -210,6 +401,7 @@ class TelegramState:
             raise TelegramStateError(
                 "Telegram queue key does not match the saved request update id"
             )
+        origin = _request_origin(normalized_request)
         key = str(normalized_id)
         with self._lock:
             terminal = self._terminal_record(key)
@@ -217,7 +409,8 @@ class TelegramState:
                 _verify_digest(terminal, digest, normalized_id)
                 if not terminal.get("request_digest"):
                     terminal["request_digest"] = digest
-                self._advance(normalized_id)
+                if not _queue_full_notice_pending(terminal):
+                    self._advance(normalized_id)
                 self._write()
                 return False, 0
 
@@ -244,11 +437,32 @@ class TelegramState:
                 self._write()
                 return created, self._queue_position(normalized_id)
 
-            jobs[key] = {
+            if sum(1 for value in jobs.values() if _is_pending(value)) >= MAX_PENDING_JOBS:
+                completed = self._data.setdefault("completed_jobs", {})
+                tombstone = _origin_tombstone(
+                    phase="queue-full",
+                    digest=digest,
+                    origin=origin,
+                )
+                tombstone["notice_status"] = "pending"
+                completed[key] = tombstone
+                _bound_completed(
+                    completed,
+                    _MAX_COMPLETED_JOBS,
+                    protected={
+                        *self._data.setdefault("delivery_retries", {}),
+                        key,
+                    },
+                )
+                self._write()
+                return False, 0
+
+            record = {
                 "phase": "queued",
                 "request": normalized_request,
                 "request_digest": digest,
             }
+            jobs[key] = record
             self._advance(normalized_id)
             self._write()
             return True, self._queue_position(normalized_id)
@@ -257,18 +471,30 @@ class TelegramState:
         """Claim the oldest resumable request for the single build worker."""
         with self._lock:
             jobs = self._data.setdefault("jobs", {})
-            candidates = [
-                int(key)
-                for key, value in jobs.items()
-                if _is_pending(value) and isinstance(value.get("request"), dict)
-            ]
+            candidates: dict[int, dict[str, Any]] = {}
+            for key, value in jobs.items():
+                try:
+                    update_id = _update_id(int(key))
+                except (TelegramStateError, TypeError, ValueError) as exc:
+                    raise TelegramStateError(
+                        "Invalid Telegram queued job key"
+                    ) from exc
+                if key != str(update_id) or not isinstance(value, dict):
+                    raise TelegramStateError("Invalid Telegram queued job state")
+                if "request" not in value:
+                    continue
+                if not _is_pending(value):
+                    raise TelegramStateError(
+                        f"Telegram update {update_id} has an invalid queued phase"
+                    )
+                candidates[update_id] = _validated_saved_request(update_id, value)
             if not candidates:
                 return None
             update_id = min(candidates)
             record = jobs[str(update_id)]
             record["phase"] = "running"
             self._write()
-            return update_id, copy.deepcopy(record["request"])
+            return update_id, copy.deepcopy(candidates[update_id])
 
     def mark_waiting(self, update_id: int) -> None:
         """Return a claimed request to the resumable queue without losing it."""
@@ -991,9 +1217,67 @@ class TelegramState:
             key = str(update_id)
             return self._terminal_record(key) is not None
 
+    def queue_full_notice(self, update_id: int) -> dict[str, object]:
+        """Return the request-free destination for a pending capacity notice."""
+        normalized_id = _update_id(update_id)
+        with self._lock:
+            record = self._data.setdefault("completed_jobs", {}).get(
+                str(normalized_id)
+            )
+            if not _queue_full_notice_pending(record):
+                return {}
+            origin = _saved_origin(record)
+            if origin is None:
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} lost its notice destination"
+                )
+            return {
+                "user_id": origin[0],
+                "chat_id": origin[1],
+                "chat_type": origin[2],
+            }
+
+    def complete_queue_full_notice(
+        self,
+        update_id: int,
+        *,
+        delivered: bool,
+    ) -> None:
+        """Finish a capacity notice and only then advance its polling offset."""
+        normalized_id = _update_id(update_id)
+        key = str(normalized_id)
+        with self._lock:
+            completed = self._data.setdefault("completed_jobs", {})
+            record = completed.get(key)
+            if not isinstance(record, dict) or record.get("phase") != "queue-full":
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has no queue-full notice"
+                )
+            status = record.get("notice_status", "pending")
+            if status not in {"pending", "sent", "failed"}:
+                raise TelegramStateError(
+                    f"Telegram update {normalized_id} has invalid notice state"
+                )
+            if status == "pending":
+                record["notice_status"] = "sent" if delivered else "failed"
+            for name in _ORIGIN_FIELDS:
+                record.pop(name, None)
+            self._advance(normalized_id)
+            _bound_completed(
+                completed,
+                _MAX_COMPLETED_JOBS,
+                protected=set(self._data.setdefault("delivery_retries", {})),
+            )
+            self._write()
+
     def reaffirm_terminal(self, update_id: int) -> None:
         """Advance the offset for a replay without replacing its tombstone."""
         with self._lock:
+            record = self._terminal_record(str(_update_id(update_id)))
+            if _queue_full_notice_pending(record):
+                raise TelegramStateError(
+                    f"Telegram update {update_id} still needs its capacity notice"
+                )
             self._advance(update_id)
             self._write()
 
@@ -1003,6 +1287,8 @@ class TelegramState:
             jobs = self._data.setdefault("jobs", {})
             record = copy.deepcopy(jobs.pop(key, {}))
             record.pop("request", None)
+            for name in _ORIGIN_FIELDS:
+                record.pop(name, None)
             record["phase"] = "completed"
             completed = self._data.setdefault("completed_jobs", {})
             completed[key] = record
@@ -1070,6 +1356,7 @@ class TelegramState:
                     "bot_id": None,
                     "bot_username": "",
                     "last_update_id": -1,
+                    "cancellation_sequence": 0,
                     "jobs": {},
                     "completed_jobs": {},
                     "failed_jobs": {},
@@ -1125,15 +1412,35 @@ def _bound_completed(
     *,
     protected: set[str] | None = None,
 ) -> None:
-    """Bound replay tombstones without discarding an active PR observer."""
+    """Bound replay tombstones without discarding active background work.
+
+    Cancellation tombstones are evicted after ordinary history so a retryable
+    cancellation reply can safely re-run the command and receive the same
+    result. Among cancellations, a durable monotonic sequence preserves the
+    most recently performed cancellation even when JSON key sorting reorders
+    its older target update id across restart.
+    """
     if len(records) <= limit:
         return
     removable = [
-        key for key in sorted(records, key=int)
-        if key not in (protected or set()) and not _follow_up_active(
-            records[key].get("follow_up") if isinstance(records[key], dict) else None
+        key for key in records
+        if key not in (protected or set())
+        and not _queue_full_notice_pending(records[key])
+        and not _follow_up_active(
+            records[key].get("follow_up")
+            if isinstance(records[key], dict)
+            else None
         )
     ]
+    removable.sort(key=lambda key: (
+        isinstance(records[key], dict)
+        and records[key].get("phase") == "cancelled",
+        _cancellation_sequence(records[key])
+        if isinstance(records[key], dict)
+        and records[key].get("phase") == "cancelled"
+        else int(key),
+        int(key),
+    ))
     for key in removable[: max(0, len(records) - limit)]:
         records.pop(key, None)
 
@@ -1490,6 +1797,239 @@ def _strict_timestamp(value: Any, *, allow_zero: bool = False) -> float:
 def _bounded_delay(value: Any, maximum: float) -> float:
     parsed = _finite_nonnegative(value, 1.0)
     return min(maximum, max(1.0, parsed))
+
+
+def _cancellation_sequence(record: dict[str, Any]) -> int:
+    value = record.get("cancellation_sequence", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _next_cancellation_sequence(data: dict[str, Any]) -> int:
+    current = data.get("cancellation_sequence", 0)
+    if isinstance(current, bool) or not isinstance(current, int) or current < 0:
+        current = 0
+    completed = data.setdefault("completed_jobs", {})
+    latest = max(
+        (
+            _cancellation_sequence(record)
+            for record in completed.values()
+            if isinstance(record, dict) and record.get("phase") == "cancelled"
+        ),
+        default=0,
+    )
+    sequence = max(current, latest) + 1
+    data["cancellation_sequence"] = sequence
+    return sequence
+
+
+def _private_origin(user_id: Any, chat_id: Any) -> tuple[int, int]:
+    if (
+        isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or user_id <= 0
+        or isinstance(chat_id, bool)
+        or not isinstance(chat_id, int)
+        or chat_id <= 0
+    ):
+        raise TelegramStateError(
+            "Telegram private origins require positive integer user and chat ids"
+        )
+    return user_id, chat_id
+
+
+def _request_origin(request: Any) -> tuple[int, int, str] | None:
+    if not isinstance(request, dict):
+        return None
+    message = request.get("message")
+    if not isinstance(message, dict):
+        return None
+    sender = message.get("from")
+    chat = message.get("chat")
+    if (
+        not isinstance(sender, dict)
+        or not isinstance(chat, dict)
+    ):
+        return None
+    chat_type = chat.get("type")
+    try:
+        return _validated_origin(sender.get("id"), chat.get("id"), chat_type)
+    except TelegramStateError:
+        return None
+
+
+def _validated_origin(
+    user_id: Any,
+    chat_id: Any,
+    chat_type: Any,
+) -> tuple[int, int, str]:
+    if (
+        isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or user_id <= 0
+        or isinstance(chat_id, bool)
+        or not isinstance(chat_id, int)
+        or not isinstance(chat_type, str)
+        or chat_type not in {"private", "group", "supergroup"}
+        or (chat_type == "private" and chat_id <= 0)
+        or (chat_type in {"group", "supergroup"} and chat_id >= 0)
+    ):
+        raise TelegramStateError("Invalid Telegram request origin")
+    return user_id, chat_id, chat_type
+
+
+def _saved_origin(record: Any) -> tuple[int, int, str] | None:
+    if not isinstance(record, dict):
+        return None
+    has_saved_origin = any(name in record for name in _ORIGIN_FIELDS)
+    request_origin = _request_origin(record.get("request"))
+    if not has_saved_origin:
+        return request_origin
+    if not _ORIGIN_FIELDS.issubset(record):
+        return None
+    try:
+        saved = _validated_origin(
+            record.get("origin_user_id"),
+            record.get("origin_chat_id"),
+            record.get("origin_chat_type"),
+        )
+    except TelegramStateError:
+        return None
+    if request_origin is not None and request_origin != saved:
+        return None
+    return saved
+
+
+def _owned_by_private_control(
+    record: Any,
+    private_origin: tuple[int, int],
+) -> bool:
+    origin = _saved_origin(record)
+    if origin is None or origin[0] != private_origin[0]:
+        return False
+    if origin[2] == "private":
+        return origin[:2] == private_origin
+    return origin[2] in {"group", "supergroup"}
+
+
+def _save_origin(
+    record: dict[str, Any],
+    origin: tuple[int, int, str],
+) -> None:
+    record.update({
+        "origin_user_id": origin[0],
+        "origin_chat_id": origin[1],
+        "origin_chat_type": origin[2],
+    })
+
+
+def _origin_tombstone(
+    *,
+    phase: str,
+    digest: str,
+    origin: tuple[int, int, str] | None,
+) -> dict[str, Any]:
+    if phase not in {"cancelled", "queue-full"}:
+        raise TelegramStateError("Invalid Telegram inbox tombstone phase")
+    record: dict[str, Any] = {
+        "phase": phase,
+        "request_digest": digest,
+    }
+    if origin is not None:
+        _save_origin(record, origin)
+    return record
+
+
+def _queue_full_notice_pending(record: Any) -> bool:
+    return (
+        isinstance(record, dict)
+        and record.get("phase") == "queue-full"
+        and record.get("notice_status", "pending") == "pending"
+    )
+
+
+def _queued_job_is_cancellable(record: Any, *, retry: Any) -> bool:
+    if (
+        not isinstance(record, dict)
+        or record.get("phase") != "queued"
+        or not isinstance(record.get("request"), dict)
+        or not set(record).issubset(_PRISTINE_QUEUE_FIELDS)
+        or _saved_origin(record) is None
+        or retry is not None
+    ):
+        return False
+    try:
+        _normalized, digest = _canonical_request(record["request"])
+    except TelegramStateError:
+        return False
+    stored_digest = str(record.get("request_digest") or "")
+    return not stored_digest or stored_digest == digest
+
+
+def _safe_job_phase(value: Any) -> str:
+    phase = str(value or "")
+    return phase if phase in {"queued", "running", "waiting", "retrying"} else "unknown"
+
+
+def _validated_saved_request(
+    update_id: int,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Revalidate persisted request bytes immediately before execution."""
+    request = record.get("request")
+    if not isinstance(request, dict):
+        raise TelegramStateError(
+            f"Telegram update {update_id} has no valid saved request"
+        )
+    normalized, digest = _canonical_request(request)
+    if normalized.get("update_id") != update_id:
+        raise TelegramStateError(
+            f"Telegram update {update_id} changed its saved identity"
+        )
+    stored_digest = record.get("request_digest")
+    if (
+        not isinstance(stored_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", stored_digest)
+        or stored_digest != digest
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} does not match its saved request"
+        )
+
+    message = normalized.get("message")
+    if not isinstance(message, dict):
+        raise TelegramStateError(
+            f"Telegram update {update_id} has an invalid saved message"
+        )
+    sender = message.get("from")
+    chat = message.get("chat")
+    valid_text = (
+        isinstance(message.get("text"), str)
+        and bool(str(message.get("text")).strip())
+        and "voice" not in message
+    )
+    valid_voice = (
+        "text" not in message
+        and message.get("voice") == {"queued": True}
+    )
+    if (
+        not isinstance(sender, dict)
+        or sender.get("is_bot") is not False
+        or not isinstance(chat, dict)
+        or not (valid_text or valid_voice)
+        or _request_origin(normalized) is None
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} has an invalid saved message"
+        )
+    if any(name in record for name in _ORIGIN_FIELDS):
+        saved_origin = _saved_origin(record)
+        if saved_origin is None or saved_origin != _request_origin(normalized):
+            raise TelegramStateError(
+                f"Telegram update {update_id} changed its saved origin"
+            )
+    return normalized
 
 
 def _canonical_request(request: dict[str, Any]) -> tuple[dict[str, Any], str]:
