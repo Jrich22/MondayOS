@@ -108,6 +108,19 @@ Identification takes the same single-worker lock as the daemon and never confirm
 the pending messages it reads. It refuses to run while the normal worker is live,
 so setup cannot steal or drop a real request.
 
+To check local daemon readiness without contacting Telegram or exposing the bot
+token:
+
+```bash
+monday telegram --health
+monday telegram --health --json
+```
+
+The JSON form is suitable for monitoring and exits nonzero when configuration,
+durable state, the worker lock, heartbeat freshness, or required live-build
+capabilities are unhealthy. Full installation and recovery procedures are in
+[SETUP_GUIDE.md](SETUP_GUIDE.md) and [RUNBOOK.md](RUNBOOK.md).
+
 At startup MondayOS verifies the bot identity and removes any prior webhook
 without dropping queued updates. Polling and webhooks cannot be used at the same
 time, so this ensures one predictable delivery path.

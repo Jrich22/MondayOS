@@ -11,6 +11,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A secret-free `monday telegram --health [--json]` probe backed by a durable,
+  independent daemon heartbeat and the existing single-worker lock. It validates
+  local configuration and state without contacting Telegram, includes live-build
+  capability readiness when enabled, and exits nonzero for watchdog use.
+- Least-privilege GitHub Actions CI for the autonomous delivery path and the
+  complete test suite on supported Python versions, with third-party actions
+  pinned to immutable release commits.
+- A safe `.env.example`, complete Mac mini setup guide, and operations runbook
+  covering launchd, power settings, backups, restores, log rotation, rollback,
+  health checks, and incident response without committing secrets or runtime
+  queue state.
 - An artifact-bound `Monday.build()` workflow and `monday build` CLI. It creates
   a job-owned worktree from the exact remote base, accepts structured text
   patches, runs fixed validation and secret checks, requires a fresh

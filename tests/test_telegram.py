@@ -7,7 +7,8 @@ import plistlib
 import threading
 import time
 import unittest
-from io import BytesIO
+from contextlib import redirect_stdout
+from io import BytesIO, StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -35,7 +36,12 @@ from telegram_bot.service import (
     _parse,
     _title,
 )
-from telegram_bot.state import InstanceLock, TelegramState, TelegramStateError
+from telegram_bot.state import (
+    InstanceLock,
+    TelegramState,
+    TelegramStateError,
+    instance_lock_is_held,
+)
 
 
 def _fake_token() -> str:
@@ -1218,6 +1224,33 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(final.next_offset, 11)
         self.assertEqual(final.job(10), {})
         self.assertEqual(final.completed_job(10)["task_id"], "TASK-0001")
+
+    def test_worker_heartbeat_survives_restart_and_clean_stop_is_not_fresh(self):
+        self.state.mark_worker_started(now=100.0)
+        self.state.mark_worker_heartbeat(now=120.0)
+
+        reloaded = TelegramState(self.config.state_path)
+        active = reloaded.worker_status(now=125.0, stale_after_seconds=10.0)
+        self.assertTrue(active["heartbeat_fresh"])
+        self.assertEqual(active["heartbeat_age_seconds"], 5.0)
+
+        reloaded.mark_worker_stopped(now=126.0)
+        stopped = TelegramState(self.config.state_path).worker_status(
+            now=127.0,
+            stale_after_seconds=10.0,
+        )
+        self.assertFalse(stopped["heartbeat_fresh"])
+        self.assertEqual(stopped["stopped_at"], 126.0)
+
+    def test_instance_lock_probe_does_not_create_a_missing_lock(self):
+        lock_path = self.root / "logs" / "telegram" / "health.lock"
+        self.assertFalse(instance_lock_is_held(lock_path))
+        self.assertFalse(lock_path.exists())
+
+        with InstanceLock(lock_path):
+            self.assertTrue(instance_lock_is_held(lock_path))
+
+        self.assertFalse(instance_lock_is_held(lock_path))
 
     def test_legacy_state_load_is_read_only_until_the_first_mutation(self):
         legacy = {
@@ -3333,6 +3366,133 @@ class TestHttpTelegramClient(unittest.TestCase):
 
 
 class TestTelegramIdentify(unittest.TestCase):
+    def test_health_json_is_secret_free_and_reports_running_worker(self):
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "123:super-secret-token",
+            "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+        }, clear=True), patch(
+            "telegram_bot.state.instance_lock_is_held",
+            return_value=True,
+        ):
+            root = Path(tmp)
+            state = TelegramState(root / "logs" / "telegram" / "state.json")
+            state.bind_bot_identity(99, "monday_bot")
+            state.mark_worker_started()
+            args = SimpleNamespace(
+                project_root=tmp,
+                health=True,
+                json=True,
+                identify=False,
+                provider="",
+                once=False,
+            )
+            output = StringIO()
+
+            with redirect_stdout(output):
+                result = _cmd_telegram(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertTrue(payload["healthy"])
+        self.assertTrue(payload["service"]["running"])
+        self.assertIsNone(payload["build"]["ready"])
+        self.assertNotIn("super-secret-token", output.getvalue())
+
+    def test_health_json_fails_closed_when_live_build_is_not_ready(self):
+        response = SimpleNamespace(
+            success=True,
+            data={"ready": False},
+            message="Build capabilities are unavailable",
+        )
+        monday = MagicMock()
+        monday.build.return_value = response
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "123:abc",
+            "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+            "MONDAYOS_TELEGRAM_LIVE_BUILD": "true",
+        }, clear=True), patch(
+            "telegram_bot.state.instance_lock_is_held",
+            return_value=True,
+        ), patch("monday.cli._monday", return_value=monday):
+            root = Path(tmp)
+            state = TelegramState(root / "logs" / "telegram" / "state.json")
+            state.bind_bot_identity(99, "monday_bot")
+            state.mark_worker_started()
+            args = SimpleNamespace(
+                project_root=tmp,
+                health=True,
+                json=True,
+                identify=False,
+                provider="",
+                once=False,
+            )
+            output = StringIO()
+
+            with redirect_stdout(output):
+                result = _cmd_telegram(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(payload["healthy"])
+        self.assertTrue(payload["build"]["required"])
+        self.assertFalse(payload["build"]["ready"])
+
+    def test_health_json_reports_missing_configuration(self):
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            args = SimpleNamespace(
+                project_root=tmp,
+                health=True,
+                json=True,
+                identify=False,
+                provider="",
+                once=False,
+            )
+            output = StringIO()
+
+            with redirect_stdout(output):
+                result = _cmd_telegram(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(payload["healthy"])
+        self.assertIn("TELEGRAM_BOT_TOKEN", payload["configuration"]["reason"])
+
+    def test_health_json_redacts_secrets_from_capability_failures(self):
+        token = "123:telegram-secret-value"
+        provider_key = "deepseek-secret-value"
+        monday = MagicMock()
+        monday.build.side_effect = RuntimeError(f"failed with {token} and {provider_key}")
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": token,
+            "MONDAYOS_TELEGRAM_ALLOWED_USER_IDS": "7",
+            "MONDAYOS_TELEGRAM_LIVE_BUILD": "true",
+            "DEEPSEEK_API_KEY": provider_key,
+        }, clear=True), patch(
+            "telegram_bot.state.instance_lock_is_held",
+            return_value=True,
+        ), patch("monday.cli._monday", return_value=monday):
+            root = Path(tmp)
+            state = TelegramState(root / "logs" / "telegram" / "state.json")
+            state.bind_bot_identity(99, "monday_bot")
+            state.mark_worker_started()
+            args = SimpleNamespace(
+                project_root=tmp,
+                health=True,
+                json=True,
+                identify=False,
+                provider="",
+                once=False,
+            )
+            output = StringIO()
+
+            with redirect_stdout(output):
+                result = _cmd_telegram(args)
+
+        self.assertEqual(result, 1)
+        self.assertNotIn(token, output.getvalue())
+        self.assertNotIn(provider_key, output.getvalue())
+        self.assertIn("***REDACTED***", output.getvalue())
+
     @patch("telegram_bot.client.HttpTelegramClient")
     def test_identify_holds_worker_lock_and_does_not_confirm_updates(self, client_type):
         with TemporaryDirectory() as tmp, patch.dict(
@@ -3363,7 +3523,9 @@ class TestTelegramIdentify(unittest.TestCase):
             "monday.provider_env.provider_configs", return_value=[],
         ), patch("telegram_bot.client.HttpTelegramClient"), patch(
             "telegram_bot.state.TelegramState",
-        ), patch("telegram_bot.service.TelegramBotService") as service_type, patch(
+        ) as state_type, patch(
+            "telegram_bot.service.TelegramBotService"
+        ) as service_type, patch(
             "telegram_bot.runner.TelegramRunner",
         ) as runner_type:
             os.environ.pop("MONDAYOS_TELEGRAM_PROVIDER", None)
@@ -3378,6 +3540,7 @@ class TestTelegramIdentify(unittest.TestCase):
             self.assertEqual(_cmd_telegram(args), 0)
 
         monday_type.assert_called_once()
+        state_type.return_value.mark_worker_stopped.assert_called_once_with()
         config = service_type.call_args.args[3]
         self.assertEqual(config.provider, "")
 

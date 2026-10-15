@@ -5,6 +5,7 @@ import copy
 import fcntl
 import hashlib
 import json
+import math
 import re
 import threading
 import time
@@ -102,6 +103,97 @@ class TelegramState:
                 for value in self._data.setdefault("jobs", {}).values()
                 if _is_pending(value)
             )
+
+    @property
+    def heartbeat_path(self) -> Path:
+        """Small liveness record kept separate from the potentially large queue."""
+        return self.path.with_name("heartbeat.json")
+
+    def mark_worker_started(self, *, now: float | None = None) -> None:
+        """Record a new daemon lifetime without persisting process identifiers."""
+        timestamp = _worker_timestamp(now)
+        with self._lock:
+            write_json_atomic(self.heartbeat_path, {
+                "started_at": timestamp,
+                "heartbeat_at": timestamp,
+            })
+
+    def mark_worker_heartbeat(self, *, now: float | None = None) -> None:
+        """Refresh the daemon liveness marker used by local health checks."""
+        timestamp = _worker_timestamp(now)
+        with self._lock:
+            worker = self._read_worker_status()
+            worker.setdefault("started_at", timestamp)
+            worker["heartbeat_at"] = timestamp
+            worker.pop("stopped_at", None)
+            write_json_atomic(self.heartbeat_path, worker)
+
+    def mark_worker_stopped(self, *, now: float | None = None) -> None:
+        """Record a clean daemon stop while preserving the prior lifetime."""
+        timestamp = _worker_timestamp(now)
+        with self._lock:
+            worker = self._read_worker_status()
+            worker.setdefault("started_at", timestamp)
+            worker.setdefault("heartbeat_at", timestamp)
+            worker["stopped_at"] = timestamp
+            write_json_atomic(self.heartbeat_path, worker)
+
+    def worker_status(
+        self,
+        *,
+        now: float | None = None,
+        stale_after_seconds: float = 90.0,
+    ) -> dict[str, float | bool | None]:
+        """Return a secret-free daemon heartbeat summary."""
+        timestamp = _worker_timestamp(now)
+        if (
+            isinstance(stale_after_seconds, bool)
+            or not isinstance(stale_after_seconds, (int, float))
+            or not math.isfinite(float(stale_after_seconds))
+            or stale_after_seconds <= 0
+        ):
+            raise ValueError("stale_after_seconds must be a positive finite number")
+        with self._lock:
+            worker = self._read_worker_status()
+            started_at = _optional_worker_timestamp(worker.get("started_at"))
+            heartbeat_at = _optional_worker_timestamp(worker.get("heartbeat_at"))
+            stopped_at = _optional_worker_timestamp(worker.get("stopped_at"))
+        age = max(0.0, timestamp - heartbeat_at) if heartbeat_at is not None else None
+        fresh = bool(
+            heartbeat_at is not None
+            and stopped_at is None
+            and age is not None
+            and age <= float(stale_after_seconds)
+        )
+        return {
+            "started_at": started_at,
+            "heartbeat_at": heartbeat_at,
+            "stopped_at": stopped_at,
+            "heartbeat_age_seconds": age,
+            "heartbeat_fresh": fresh,
+        }
+
+    def _read_worker_status(self) -> dict[str, Any]:
+        if not self.heartbeat_path.exists():
+            return {}
+        try:
+            worker = json.loads(self.heartbeat_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise TelegramStateError(
+                f"Cannot read Telegram heartbeat at {self.heartbeat_path}"
+            ) from exc
+        if not isinstance(worker, dict):
+            raise TelegramStateError(
+                f"Invalid Telegram heartbeat at {self.heartbeat_path}"
+            )
+        try:
+            for name in ("started_at", "heartbeat_at", "stopped_at"):
+                _optional_worker_timestamp(worker.get(name))
+        except ValueError as exc:
+            raise TelegramStateError(
+                f"Invalid Telegram heartbeat at {self.heartbeat_path}"
+            ) from exc
+        return worker
 
     def enqueue(self, update_id: int, request: dict[str, Any]) -> tuple[bool, int]:
         """Durably enqueue one Telegram request and advance its polling offset.
@@ -1489,3 +1581,43 @@ class InstanceLock:
             fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
             self._file.close()
             self._file = None
+
+
+def instance_lock_is_held(path: Path) -> bool:
+    """Return whether an existing worker owns the lock without creating files."""
+    lock_path = Path(path)
+    try:
+        lock_file = lock_path.open("r", encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise TelegramStateError(f"Cannot read Telegram lock at {lock_path}") from exc
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        return False
+    except OSError as exc:
+        raise TelegramStateError(f"Cannot inspect Telegram lock at {lock_path}") from exc
+    finally:
+        lock_file.close()
+
+
+def _worker_timestamp(value: float | None = None) -> float:
+    timestamp = time.time() if value is None else value
+    if (
+        isinstance(timestamp, bool)
+        or not isinstance(timestamp, (int, float))
+        or not math.isfinite(float(timestamp))
+        or timestamp < 0
+    ):
+        raise ValueError("worker timestamp must be a non-negative finite number")
+    return float(timestamp)
+
+
+def _optional_worker_timestamp(value: Any) -> float | None:
+    if value is None:
+        return None
+    return _worker_timestamp(value)

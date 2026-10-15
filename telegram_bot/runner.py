@@ -11,6 +11,7 @@ from telegram_bot.service import TelegramBotService, TelegramUpdatePendingError
 from telegram_bot.state import TelegramState
 
 _MAX_HANDLER_ATTEMPTS = 3
+_HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
 class TelegramUpdateRetryError(RuntimeError):
@@ -295,8 +296,15 @@ class TelegramRunner:
             name="mondayos-telegram-worker",
             daemon=False,
         )
+        heartbeat_thread = threading.Thread(
+            target=self._heartbeat_main,
+            name="mondayos-telegram-heartbeat",
+            daemon=False,
+        )
+        self._state.mark_worker_started()
         self._wake.set()  # Recover jobs already durable before this process.
         worker_thread.start()
+        heartbeat_thread.start()
         backoff = 1
         try:
             while not self._stop.is_set():
@@ -319,6 +327,8 @@ class TelegramRunner:
         finally:
             self.stop()
             worker_thread.join()
+            heartbeat_thread.join()
+            self._state.mark_worker_stopped()
         if self._worker_error is not None:
             raise self._worker_error
 
@@ -333,6 +343,16 @@ class TelegramRunner:
         except BaseException as exc:
             self._worker_error = exc
             self._stop.set()
+
+    def _heartbeat_main(self) -> None:
+        while not self._stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
+            try:
+                self._state.mark_worker_heartbeat()
+            except BaseException as exc:
+                self._worker_error = exc
+                self._stop.set()
+                self._wake.set()
+                return
 
     def _normalize(self, update: dict[str, Any]) -> dict[str, Any] | None:
         normalizer = getattr(self._service, "normalize_update", None)
