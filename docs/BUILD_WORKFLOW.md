@@ -9,8 +9,10 @@ approval before it creates the commit, branch, or pull request.
 
 ```text
 task
+  → bounded canonical task-content and eligible-status admission
   → tool and authentication preflight
   → exact remote-base commit
+  → task-locked fresh reread, start, and exact post-start reread
   → isolated, job-owned Git worktree
   → implementation patch
       MondayOS itself: bounded-context Claude Code, then bounded-context Codex fallback
@@ -19,7 +21,8 @@ task
   → exact staged-artifact fingerprint
   → fresh sterile ChatGPT/Codex review of the exact staged diff
       needs changes → restore exact base → replacement patch (maximum three attempts)
-      high-confidence pass → commit → non-force push → pull request
+      high-confidence pass → final task/revision gates → prepared local commit
+                           → post-commit gate → non-force push → pull request
       block/failure → stop without pushing
 
 open pull request
@@ -52,7 +55,10 @@ receive only the controller-derived check name and exit code. Tracked project
 configuration cannot alter the session.
 A pass is valid only with high confidence. Monday recomputes the artifact
 fingerprint immediately before committing; one changed byte makes the review
-stale and stops delivery.
+stale and stops delivery. The canonical task title, objective, and acceptance
+criteria are also one immutable review input. Credential-like content is
+rejected, and content longer than 50,000 characters is rejected explicitly
+rather than silently truncated into a different reviewed specification.
 
 ## Supported targets and trust boundary
 
@@ -98,6 +104,14 @@ path or arbitrary Git remote. A delivery ID is permanently bound to its task,
 canonical project, local target identity, and expected GitHub repository; it
 cannot be reused to redirect an interrupted or completed delivery.
 
+Admission accepts only tasks in `backlog`, `assigned`, or `in-progress`.
+Immediately before task start, and before creating a worktree or invoking a
+builder, Monday takes the TaskManager lock, rereads the task, revalidates its
+target and exact canonical content, starts it, and rereads it again. The second
+read must be exactly `in-progress` with the same target and content. A concurrent
+move to `blocked`, `review`, a terminal state, or an unknown state therefore
+cannot be reopened by the build workflow.
+
 Publication is guarded by both the task lock and a repository-wide workflow
 lease. The push and pull-request creation processes inherit those guards, so a
 controller exit cannot let another worker publish concurrently. If an exit
@@ -106,16 +120,28 @@ that the remote branch still equals the approved commit and then reconciles the
 exact pull request without pushing twice. A different delivery ID for the same
 task and repository is rejected while that state remains unresolved.
 
-If a worker instead exits during implementation, validation, review, commit, or
-the final pre-publication checkpoint, Monday first reopens the controller-owned
-worktree and proves that its unique branch is absent from the still-pinned
-remote. Only that exact negative proof marks the interruption safe for a fresh
-successor identity. The terminal record preserves the phase where the worker
-stopped and a SHA-256 proof digest bound to that source phase, delivery lineage,
-task and repository identity, base and branch, owned worktree, and any local
-commit. A later field change invalidates that proof. A local commit may remain
-as diagnostic state; it is never reused. Missing ownership evidence, a changed
-remote, an existing remote branch, or any uncertain publication state fails
+If a worker instead exits in an eligible pre-publication state, Monday first
+reopens the controller-owned worktree and proves that its unique branch is
+absent from the still-pinned remote. Only that exact negative proof marks the
+interruption safe for a fresh successor identity. The terminal record preserves
+the phase where the worker stopped and a SHA-256 proof digest bound to that
+source phase, delivery lineage, task and repository identity, base and branch,
+owned worktree, and any local commit checkpoint. A later field change invalidates
+that proof. A local commit is diagnostic state and is never reused.
+
+Every new record carries a durable `deferred_commit_authorization` marker before
+the final callbacks begin; legacy records default to unmarked. A marked crash in
+`publication-ready` is proven unpublished only when the staged and reviewed
+artifact digests still match, the owned worktree HEAD equals the base, and the
+unique remote branch is absent. A marked `pushing` record with both SHA fields
+empty additionally covers a death inside `commit()` after HEAD moved but before
+the SHA checkpoint; worktree ownership, owned-ref consistency, and exact remote
+absence prove push was still unreachable. After Monday stores the returned SHA
+as `prepared_commit_sha`, recovery requires HEAD to equal that SHA plus the same
+remote-absence proof. An unmarked legacy or malformed
+publication-ready/pushing record missing the identity required by its original
+ordering remains conservative. Missing ownership evidence, a changed remote, an
+existing remote branch, or any uncertain publication state likewise fails
 closed and keeps the original identity for inspection or reconciliation.
 
 Every automatic successor durably records the controller-derived immediate
@@ -123,21 +149,77 @@ predecessor, root delivery, and retry attempt. Those values must form the exact
 deterministic `ROOT-rN` identity; omitting or replacing the caller's lineage
 cannot bypass the sole retry source derived from durable history. While holding
 the repository workflow lock, Monday rechecks the complete bounded chain before
-reserving the successor. It repeats that proof under the task lock and, after
-each untrusted publication progress callback, immediately adjacent to the push
-and pull-request operations. If an older branch appears, any other matching live
-pull request exists regardless of its timestamps, or any predecessor changes
-task or repository identity, the successor stops before the next irreversible
-operation.
+reserving the successor. It repeats that proof under the task lock after all
+untrusted pre-push progress callbacks, immediately adjacent to the push. If an
+older branch appears, any other matching live pull request exists regardless of
+its timestamps, or any predecessor changes task or repository identity, the
+successor stops before push. Once the exact successor branch is pushed, opening
+or recovering its pull request is reconciliation and a later lineage change
+cannot veto it.
+
+A typed transient outage while proving remote-branch absence still stops the
+current attempt, but it is not converted into a permanent unsafe verdict. At
+new retry admission it produces a transient deterministic child, allowing the
+next `ROOT-rN` identity to continue once proof recovers. During exact stale-job
+recovery it leaves that nonterminal identity unchanged for a later proof retry.
+Typed transient predecessor-record read failures receive the same lineage
+treatment instead of being hidden inside a policy error. A missing or malformed
+record, nontransient proof failure, or definitive branch-present result remains
+unsafe and never gains retry authority.
+
+A no-commit task-policy stop can retire retry history only for a changed task,
+terminal task, or project mismatch. Once an exact `prepared_commit_sha` exists,
+safe nonpublication instead depends on the complete structural record, not its
+failure label: the failed delivery must keep
+`commit_sha` and every push, PR, observation, reconciliation, and interruption
+field pristine, retain the exact reviewed artifact and owned-worktree identity,
+and repeatedly prove the old branch absent. When the refusal belongs to a retry
+child, Monday revalidates its complete predecessor chain before treating that
+child as having safely retired the retry leaf. A structurally valid transient
+prepared failure remains the retry leaf for its deterministic successor;
+nontransient prepared failures can permit a fresh ordinary identity. Malformed
+or changed history blocks either path.
 
 Immediately before publication, while still holding the task lock, Monday
-captures a SHA-256 revision of the complete canonical persisted task record.
-That digest covers status history, work log, metadata, and targeting as well as
-the displayed timestamp, so even two edits within the same second cannot share
-mutation authority. Once GitHub confirms the exact reviewed pull request, Monday
-durably records the delivery as `pr-open` and separately records
-`review_reconciliation=review-pending` before attempting the local task move.
-The pull request is therefore never downgraded to a failed delivery merely
+requires the task to be exactly `in-progress`, verifies the target, and requires
+the canonical title, objective, and acceptance criteria to equal the content
+that ChatGPT reviewed. It then captures a SHA-256 revision of the complete
+canonical persisted task record. That digest covers status history, work log,
+metadata, and targeting as well as the displayed timestamp, so even two edits
+within the same second cannot share mutation authority. After the untrusted
+`pushing` progress callback, Monday repeats the status, target, and reviewed
+content checks and requires the exact same task revision. All pre-push progress
+callbacks therefore finish before the local commit is created.
+
+Monday then writes and durably records that local commit as
+`prepared_commit_sha`, rereads the task once more, and requires the same exact
+canonical content, status, target, and captured revision. Monday then rederives
+the required retry predecessor from all durable history and revalidates the
+full chain while the SHA is still only prepared. Only those successful checks
+promote the SHA into `commit_sha`; that checkpoint is immediately adjacent to
+push, with no controller callback or other extension point in between. If the
+promotion checkpoint fails, the controller restores and persists the prepared
+shape, because push was still unreachable.
+
+Any terminal history containing a commit, prepared commit, push, PR,
+observation, or reconciliation signal fails closed unless it matches one of the
+explicit safe unpublished shapes above or a complete observed terminal PR.
+That resolved-PR exception requires the exact reviewed artifact, repository,
+base, branch, commit, PR URL/number, and internally consistent terminal
+lifecycle/check summary from a successful remote observation. A later
+task-reconciliation outage is recorded separately and does not erase that
+successful GitHub proof; a failed later remote refresh does erase its authority
+to settle history until GitHub can be observed successfully again.
+
+Once the exact branch has been pushed, pull-request creation is reconciliation,
+not a new task-authority or predecessor-history decision. The same run and
+exact-ID recovery therefore finish the exact PR even if a later callback or the
+live task changes. Existing-ID lookup occurs before live task-content
+redaction/size checks, and recovery uses a fixed generic title instead of
+exporting unreviewed live task content. Once GitHub confirms the exact reviewed
+pull request, Monday durably records the delivery as `pr-open` and separately
+records `review_reconciliation=review-pending` before attempting the local task
+move. The pull request is therefore never downgraded to a failed delivery merely
 because the task store is temporarily unavailable.
 
 External projects use only the controlled-context Codex patch builder. Claude

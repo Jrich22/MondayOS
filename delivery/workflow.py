@@ -32,7 +32,14 @@ from delivery.backends import (
     _redact,
     _run_process,
 )
-from delivery.git import BaseRevision, ChangedPath, GitRepository, GitValidationError, Worktree
+from delivery.git import (
+    BaseRevision,
+    ChangedPath,
+    GitCommandError,
+    GitRepository,
+    GitValidationError,
+    Worktree,
+)
 from delivery.github import GhCliClient
 from delivery.security import (
     ArtifactSecurityError,
@@ -55,6 +62,9 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 CheckpointCallback = Callable[[dict[str, Any]], None]
 _MAX_PREDECESSOR_DEPTH = 10
 _DELIVERY_ID = re.compile(r"^delivery-[A-Za-z0-9-]{1,80}$")
+_FINAL_TASK_FAILURE_CODES = frozenset(
+    {"project-mismatch", "task-changed", "terminal-task"}
+)
 
 
 class _WorkflowLeaseTimeoutError(TimeoutError):
@@ -375,11 +385,11 @@ class DeliveryWorkflow:
             except Exception:
                 # The exact GitHub state remains useful, but task-store
                 # unavailability is retryable and must not crash the observer.
-                job.observation_success = False
                 job.task_reconciliation = "failed"
+                job.task_reconciled_at = ""
                 job.observation_message = (
                     f"{self._observation_message(job)} Task reconciliation is "
-                    "temporarily unavailable; retry observation."
+                    "temporarily unavailable; retry task reconciliation."
                 )
             job.updated_at = _now()
             self.store.persist(job)
@@ -398,6 +408,8 @@ class DeliveryWorkflow:
     ) -> DeliveryJob:
         """Run or idempotently retrieve one delivery identity."""
         delivery_id = delivery_id or f"delivery-{uuid.uuid4().hex[:16]}"
+        if not _DELIVERY_ID.fullmatch(delivery_id):
+            raise ValueError("Invalid delivery identity")
         (
             predecessor_delivery_id,
             retry_root_delivery_id,
@@ -408,19 +420,11 @@ class DeliveryWorkflow:
             retry_root_delivery_id=retry_root_delivery_id,
             retry_attempt=retry_attempt,
         )
-        task_response = self.monday.task("get", task_id=task_id)
-        task_data = dict(getattr(task_response, "data", {}) or {})
-        raw_objective = _objective(task_id, task_data)
-        if _redact(raw_objective) != raw_objective:
-            raise ArtifactSecurityError(
-                "task title, objective, or acceptance criteria contains credential-like material"
-            )
-        objective = raw_objective[:50_000]
         now = _now()
         job = DeliveryJob(
             delivery_id=delivery_id,
             task_id=task_id,
-            objective=objective,
+            objective="",
             repo_root=str(self.repository_root),
             project_name=self.project_name,
             expected_repository=self.expected_repository,
@@ -432,6 +436,7 @@ class DeliveryWorkflow:
             predecessor_delivery_id=predecessor_delivery_id,
             retry_root_delivery_id=retry_root_delivery_id,
             retry_attempt=retry_attempt,
+            deferred_commit_authorization=True,
         )
         existing = self._existing_job(delivery_id)
         if existing is not None:
@@ -448,6 +453,22 @@ class DeliveryWorkflow:
                 existing,
                 progress_callback=progress_callback,
             )
+
+        # Live task content authorizes only a genuinely new delivery. Exact-ID
+        # recovery is bound to its durable reviewed artifact and must remain
+        # reachable even if the task is later edited after publication.
+        task_response = self.monday.task("get", task_id=task_id)
+        task_data = dict(getattr(task_response, "data", {}) or {})
+        raw_objective = _objective(task_id, task_data)
+        if _redact(raw_objective) != raw_objective:
+            raise ArtifactSecurityError(
+                "task title, objective, or acceptance criteria contains credential-like material"
+            )
+        if len(raw_objective) > 50_000:
+            raise ArtifactSecurityError(
+                "canonical task content exceeds the 50,000-character delivery limit"
+            )
+        job.objective = raw_objective
 
         reservation_owned = False
         try:
@@ -482,6 +503,8 @@ class DeliveryWorkflow:
                                 job.predecessor_delivery_id
                             )
                         except (FileNotFoundError, OSError, ValueError) as exc:
+                            if _exception_failure_class(exc) == "transient":
+                                raise
                             raise ArtifactSecurityError(
                                 "delivery retry predecessor is unavailable"
                             ) from exc
@@ -521,11 +544,18 @@ class DeliveryWorkflow:
                             "task-not-found",
                             getattr(task_response, "message", ""),
                         )
-                    if task_data.get("status") in {"completed", "cancelled"}:
+                    task_status = str(task_data.get("status") or "")
+                    if task_status in {"completed", "cancelled"}:
                         return self._fail(
                             job,
                             "terminal-task",
                             "Completed or cancelled tasks cannot run",
+                        )
+                    if task_status not in {"backlog", "assigned", "in-progress"}:
+                        return self._fail(
+                            job,
+                            "task-changed",
+                            "Only backlog, assigned, or in-progress tasks can start a build",
                         )
                     target_error = self._task_target_error(task_data)
                     if target_error:
@@ -816,11 +846,11 @@ class DeliveryWorkflow:
         with task_manager.lock(job.task_id):
             task = self.monday.task("get", task_id=job.task_id)
             if not getattr(task, "success", False):
-                job.observation_success = False
                 job.task_reconciliation = "failed"
+                job.task_reconciled_at = ""
                 job.observation_message = (
                     f"{self._observation_message(job)} The task could not be read; "
-                    "retry observation."
+                    "retry task reconciliation."
                 )
                 return
             task_data = dict(getattr(task, "data", {}) or {})
@@ -916,11 +946,11 @@ class DeliveryWorkflow:
                     )
                     return
 
-        job.observation_success = False
         job.task_reconciliation = "failed"
+        job.task_reconciled_at = ""
         job.observation_message = (
             f"{self._observation_message(job)} Task reconciliation failed; "
-            "retry observation."
+            "retry task reconciliation."
         )
 
     def _newer_open_delivery(self, job: DeliveryJob) -> DeliveryJob | None:
@@ -1044,6 +1074,8 @@ class DeliveryWorkflow:
 
     @staticmethod
     def _terminal_delivery_blocks_successor(job: DeliveryJob) -> bool:
+        if _resolved_pull_request(job):
+            return False
         live_pr = (
             job.status == "pr-open"
             and job.success
@@ -1052,17 +1084,22 @@ class DeliveryWorkflow:
         unproven_interruption = (
             job.status == "interrupted" and job.failure_class != "transient"
         )
-        uncertain_failed_publication = (
-            job.status == "failed"
-            and (bool(job.commit_sha) or job.pushed or bool(job.pr_url) or job.pr_number > 0)
+        unresolved_publication = _publication_evidence(job) and not (
+            _prepared_commit_failure_shape(job) or _retry_source_shape(job)
         )
-        return live_pr or unproven_interruption or uncertain_failed_publication
+        return (
+            live_pr
+            or unproven_interruption
+            or unresolved_publication
+        )
 
     def _required_retry_predecessor(self, requested: DeliveryJob) -> str:
         """Derive the only permissible retry source from durable target history."""
         records = self._matching_deliveries(requested)
         children: set[str] = set()
         retry_sources: list[DeliveryJob] = []
+        terminal_retry_children: list[DeliveryJob] = []
+        prepared_terminal_failures: list[DeliveryJob] = []
         for record in records:
             if not _stored_retry_identity_is_valid(record):
                 raise ArtifactSecurityError("delivery retry lineage is malformed")
@@ -1082,17 +1119,15 @@ class DeliveryWorkflow:
                 retry_sources.append(record)
             elif _retry_source_shape(record):
                 retry_sources.append(record)
-            elif (
-                record.status == "failed"
-                and (
-                    bool(record.commit_sha)
-                    or record.pushed
-                    or bool(record.pr_url)
-                    or record.pr_number > 0
-                )
-            ):
+            elif _retry_terminal_child_shape(record):
+                terminal_retry_children.append(record)
+            elif _prepared_commit_failure_shape(record):
+                prepared_terminal_failures.append(record)
+            elif _resolved_pull_request(record):
+                continue
+            elif _publication_evidence(record):
                 raise ArtifactSecurityError(
-                    "a failed delivery has unresolved publication evidence"
+                    "a delivery has unresolved publication evidence"
                 )
 
         for source in retry_sources:
@@ -1106,12 +1141,83 @@ class DeliveryWorkflow:
                 # unsafe terminal child cannot erase the safe lineage leaf and
                 # thereby authorize an unrelated fresh delivery.
                 children.add(source.predecessor_delivery_id)
+        retry_sources_by_id = {
+            source.delivery_id: source for source in retry_sources
+        }
+        for failure in prepared_terminal_failures:
+            if not self._stopped_delivery_is_safe(failure):
+                raise ArtifactSecurityError(
+                    "a prepared delivery failure is no longer unpublished"
+                )
+        for child in terminal_retry_children:
+            predecessor = retry_sources_by_id.get(child.predecessor_delivery_id)
+            if predecessor is None:
+                raise ArtifactSecurityError(
+                    "a terminal retry child has no safe predecessor"
+                )
+            self._require_retry_predecessor_binding(predecessor, child)
+            self._require_retry_predecessor_chain(child)
+            if not self._stopped_delivery_is_safe(child):
+                raise ArtifactSecurityError(
+                    "a terminal retry child is not proven unpublished"
+                )
+            children.add(child.predecessor_delivery_id)
         leaves = [source for source in retry_sources if source.delivery_id not in children]
         if len(leaves) > 1:
             raise ArtifactSecurityError(
                 "multiple delivery retry sources require operator reconciliation"
             )
         return leaves[0].delivery_id if leaves else ""
+
+    def _stopped_delivery_is_safe(self, job: DeliveryJob) -> bool:
+        """Prove that a terminal prepublication delivery stayed unpublished."""
+        if not (
+            _prepared_commit_failure_shape(job)
+            or _retry_terminal_child_shape(job)
+        ):
+            return False
+        worktree_state = (
+            job.base_sha,
+            job.repository,
+            job.branch,
+            job.worktree,
+            job.worktree_owner_token,
+        )
+        if not any(worktree_state):
+            return not job.prepared_commit_sha
+        if (
+            not all(worktree_state)
+            or re.fullmatch(
+                r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+                job.base_sha,
+            )
+            is None
+            or re.fullmatch(r"[0-9a-f]{64}", job.worktree_owner_token) is None
+        ):
+            return False
+        try:
+            if self.repository.github_slug().casefold() != job.repository.casefold():
+                return False
+            worktree = self.repository.recover_worktree(
+                path=Path(job.worktree),
+                branch=job.branch,
+                base_sha=job.base_sha,
+                owner_token=job.worktree_owner_token,
+            )
+            return self.repository.remote_branch_is_absent(
+                worktree,
+                expected_local_sha=job.prepared_commit_sha or job.base_sha,
+            )
+        except Exception as exc:
+            # An unavailable proof service is not evidence that a branch is
+            # absent, so publication still stops. Preserve the typed transient
+            # error, however, so the canonical retry child becomes the next
+            # durable lineage leaf instead of permanently consuming its ID as
+            # a policy refusal. Definitive false results and nontransient proof
+            # failures remain unsafe.
+            if _exception_failure_class(exc) == "transient":
+                raise
+            return False
 
     def _require_retry_predecessor_chain(self, successor: DeliveryJob) -> None:
         """Re-prove every predecessor is still unpublished before retry work."""
@@ -1123,6 +1229,8 @@ class DeliveryWorkflow:
             try:
                 predecessor = self.store.get(predecessor_id)
             except (FileNotFoundError, OSError, ValueError) as exc:
+                if _exception_failure_class(exc) == "transient":
+                    raise
                 raise ArtifactSecurityError(
                     "delivery retry predecessor is unavailable"
                 ) from exc
@@ -1214,8 +1322,13 @@ class DeliveryWorkflow:
             job.status == "failed"
             and job.phase == "failed"
             and not job.commit_sha
+            and not job.prepared_commit_sha
             and not job.interrupted_from_phase
             and not job.interruption_proof_sha256
+        )
+        prepared_transient = (
+            job.failure_class == "transient"
+            and _prepared_commit_failure_shape(job)
         )
         interruption_phase = job.interrupted_from_phase
         proven_interruption = (
@@ -1230,6 +1343,7 @@ class DeliveryWorkflow:
                 "reviewing",
                 "committing",
                 "publication-ready",
+                "pushing",
             }
             and re.fullmatch(r"[0-9a-f]{64}", job.interruption_proof_sha256)
             is not None
@@ -1244,15 +1358,43 @@ class DeliveryWorkflow:
                 is not None
             )
         )
-        if not (ordinary_transient or proven_interruption):
+        if not (ordinary_transient or prepared_transient or proven_interruption):
             return False
 
         if proven_interruption:
-            if interruption_phase in {"implementing", "validating", "reviewing"}:
+            if interruption_phase == "pushing":
+                if (
+                    not job.deferred_commit_authorization
+                    or job.commit_sha
+                    or (
+                        job.prepared_commit_sha
+                        and re.fullmatch(
+                            r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+                            job.prepared_commit_sha,
+                        )
+                        is None
+                    )
+                    or job.artifact_sha256 != job.reviewed_artifact_sha256
+                    or re.fullmatch(r"[0-9a-f]{64}", job.artifact_sha256)
+                    is None
+                ):
+                    return False
+            elif job.prepared_commit_sha:
+                return False
+            elif interruption_phase in {"implementing", "validating", "reviewing"}:
                 if job.commit_sha:
                     return False
-            elif interruption_phase == "publication-ready" and not job.commit_sha:
-                return False
+            elif interruption_phase == "publication-ready":
+                if job.deferred_commit_authorization:
+                    if (
+                        job.commit_sha
+                        or job.artifact_sha256 != job.reviewed_artifact_sha256
+                        or re.fullmatch(r"[0-9a-f]{64}", job.artifact_sha256)
+                        is None
+                    ):
+                        return False
+                elif not job.commit_sha:
+                    return False
 
         worktree_state = (
             job.base_sha,
@@ -1282,22 +1424,42 @@ class DeliveryWorkflow:
                 base_sha=job.base_sha,
                 owner_token=job.worktree_owner_token,
             )
-            expected_local_sha = (
-                job.commit_sha
-                if job.commit_sha
-                else (
-                    job.base_sha
-                    if ordinary_transient
-                    or interruption_phase
-                    in {"implementing", "validating", "reviewing"}
-                    else None
+            expected_local_sha: str | None = None
+            if prepared_transient:
+                expected_local_sha = job.prepared_commit_sha
+            elif (
+                interruption_phase == "pushing"
+                and job.deferred_commit_authorization
+            ):
+                # An empty prepared checkpoint can mean the worker died inside
+                # commit(), after HEAD moved but before the SHA was returned.
+                expected_local_sha = job.prepared_commit_sha or None
+            elif job.commit_sha:
+                expected_local_sha = job.commit_sha
+            elif (
+                ordinary_transient
+                or interruption_phase
+                in {"implementing", "validating", "reviewing"}
+                or (
+                    interruption_phase == "committing"
+                    and job.deferred_commit_authorization
                 )
-            )
+                or (
+                    interruption_phase == "publication-ready"
+                    and job.deferred_commit_authorization
+                )
+            ):
+                expected_local_sha = job.base_sha
             return self.repository.remote_branch_is_absent(
                 worktree,
                 expected_local_sha=expected_local_sha,
             )
-        except Exception:
+        except Exception as exc:
+            # Stop publication on an unavailable proof, but preserve typed
+            # transient outages so admission or the final chain gate records a
+            # retryable lineage outcome rather than a permanent policy refusal.
+            if _exception_failure_class(exc) == "transient":
+                raise
             return False
 
     @staticmethod
@@ -1314,6 +1476,7 @@ class DeliveryWorkflow:
             "reviewing",
             "committing",
             "publication-ready",
+            "pushing",
         }
         if (
             job.status != "running"
@@ -1340,14 +1503,42 @@ class DeliveryWorkflow:
             or not re.fullmatch(r"[0-9a-f]{64}", job.worktree_owner_token)
         ):
             return False
-        if job.phase in {"implementing", "validating", "reviewing"}:
+        if job.phase == "pushing":
+            if (
+                not job.deferred_commit_authorization
+                or job.commit_sha
+                or (
+                    job.prepared_commit_sha
+                    and re.fullmatch(
+                        r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+                        job.prepared_commit_sha,
+                    )
+                    is None
+                )
+                or job.artifact_sha256 != job.reviewed_artifact_sha256
+                or re.fullmatch(r"[0-9a-f]{64}", job.artifact_sha256) is None
+            ):
+                return False
+        elif job.prepared_commit_sha:
+            return False
+        elif job.phase == "publication-ready":
+            if job.deferred_commit_authorization:
+                if (
+                    job.commit_sha
+                    or job.artifact_sha256 != job.reviewed_artifact_sha256
+                    or re.fullmatch(r"[0-9a-f]{64}", job.artifact_sha256) is None
+                ):
+                    return False
+            elif not job.commit_sha:
+                # Legacy publication-ready records were created only after a
+                # local commit. Missing identity remains ambiguous forever.
+                return False
+        elif job.phase in {"implementing", "validating", "reviewing"}:
             if job.commit_sha:
                 return False
         elif job.commit_sha and not re.fullmatch(
             r"[0-9a-f]{40}(?:[0-9a-f]{24})?", job.commit_sha
         ):
-            return False
-        elif job.phase == "publication-ready" and not job.commit_sha:
             return False
         try:
             if self.repository.github_slug().casefold() != job.repository.casefold():
@@ -1358,16 +1549,38 @@ class DeliveryWorkflow:
                 base_sha=job.base_sha,
                 owner_token=job.worktree_owner_token,
             )
-            expected_local_sha = job.commit_sha or (
-                job.base_sha
-                if job.phase in {"implementing", "validating", "reviewing"}
-                else None
-            )
+            expected_local_sha: str | None = None
+            if job.prepared_commit_sha:
+                expected_local_sha = job.prepared_commit_sha
+            elif job.commit_sha:
+                expected_local_sha = job.commit_sha
+            elif (
+                job.phase in {"implementing", "validating", "reviewing"}
+                or (
+                    job.phase == "committing"
+                    and job.deferred_commit_authorization
+                )
+                or (
+                    job.phase == "publication-ready"
+                    and job.deferred_commit_authorization
+                )
+            ):
+                expected_local_sha = job.base_sha
+            # For a marked pushing record with both SHA fields empty, a crash
+            # may have happened inside commit() after HEAD moved. The ordering
+            # marker proves push was still unreachable, so ownership plus exact
+            # remote absence is sufficient without guessing the local SHA.
             return self.repository.remote_branch_is_absent(
                 worktree,
                 expected_local_sha=expected_local_sha,
             )
-        except Exception:
+        except Exception as exc:
+            # Keep the exact nonterminal identity recoverable when the proof
+            # dependency is temporarily unavailable. It cannot be marked safe
+            # without the proof, but it also must not be terminalized as a
+            # permanent ambiguity solely because of a typed transient outage.
+            if _exception_failure_class(exc) == "transient":
+                raise
             return False
 
     def _recover_publication_worktree(self, job: DeliveryJob) -> Worktree:
@@ -1425,19 +1638,12 @@ class DeliveryWorkflow:
                 message="Reconciling the exact published branch with GitHub",
             )
             self._notify(job, progress_callback)
-            current_task = self.monday.task("get", task_id=job.task_id)
-            current_task_data = dict(getattr(current_task, "data", {}) or {})
-            title = str(current_task_data.get("title", "Autonomous build"))
-            if job.predecessor_delivery_id:
-                # No callback or other controller extension point may run
-                # between this proof and the irreversible PR operation.
-                self._require_retry_predecessor_chain(job)
             result = self.github.ensure_pull_request(
                 repo_root=self.repository_root,
                 repository=job.repository,
                 base=job.base_branch,
                 branch=job.branch,
-                title=_pr_title(job.task_id, title),
+                title=_pr_title(job.task_id, "Autonomous build"),
                 body=_pr_body(job),
                 expected_sha=job.commit_sha,
                 inherited_guard_fds=(publication_guard_fd, workflow_guard_fd),
@@ -1510,6 +1716,35 @@ class DeliveryWorkflow:
                 "registered GitHub repository does not match the target origin"
             )
         base = self.repository.resolve_base()
+        task_manager = TaskManager(self.controller_root)
+        with task_manager.lock(job.task_id):
+            current_task = self.monday.task("get", task_id=job.task_id)
+            current_task_data = dict(getattr(current_task, "data", {}) or {})
+            task_failure = self._build_start_task_failure(
+                job,
+                current_task,
+                current_task_data,
+            )
+            if task_failure is not None:
+                return self._fail(job, *task_failure)
+            started = self.monday.task("start", task_id=job.task_id)
+            if not getattr(started, "success", False):
+                return self._fail(
+                    job,
+                    "task-changed",
+                    "Task no longer authorizes the build start",
+                )
+            started_task = self.monday.task("get", task_id=job.task_id)
+            started_task_data = dict(getattr(started_task, "data", {}) or {})
+            task_failure = self._publication_task_failure(
+                job,
+                started_task,
+                started_task_data,
+            )
+            if task_failure is not None:
+                return self._fail(job, *task_failure)
+            task_data = started_task_data
+
         worktree = self.repository.create_worktree(job.task_id, base)
         job.base_ref = base.ref
         job.base_branch = base.branch
@@ -1519,10 +1754,6 @@ class DeliveryWorkflow:
         job.worktree = str(worktree.path)
         job.worktree_owner_token = worktree.owner_token
         self.store.persist(job)
-
-        started = self.monday.task("start", task_id=job.task_id)
-        if not getattr(started, "success", False):
-            raise RuntimeError(getattr(started, "message", "Could not start task"))
 
         feedback = ""
         builder_index = 0
@@ -1783,14 +2014,6 @@ class DeliveryWorkflow:
     ) -> DeliveryJob:
         self._update(job, phase="committing", message="Committing the approved artifact")
         self._notify(job, progress_callback)
-        commit = self.repository.commit(
-            worktree,
-            changed_files,
-            f"{job.task_id}: autonomous build ({job.delivery_id})",
-            expected_diff_sha256=expected_diff_sha256,
-        )
-        job.commit_sha = commit
-        self.store.persist(job)
 
         # A task can be completed or cancelled while models and validation run.
         # Serialize the last persisted-state check with the irreversible push/PR
@@ -1807,21 +2030,13 @@ class DeliveryWorkflow:
         with task_manager.lock(job.task_id) as publication_guard_fd:
             current_task = self.monday.task("get", task_id=job.task_id)
             current_task_data = dict(getattr(current_task, "data", {}) or {})
-            if not getattr(current_task, "success", False):
-                return self._fail(
-                    job,
-                    "task-not-found",
-                    getattr(current_task, "message", "Task is unavailable"),
-                )
-            if current_task_data.get("status") in {"completed", "cancelled"}:
-                return self._fail(
-                    job,
-                    "terminal-task",
-                    "Task became completed or cancelled before publication; nothing was pushed",
-                )
-            target_error = self._task_target_error(current_task_data)
-            if target_error:
-                return self._fail(job, "project-mismatch", target_error)
+            task_failure = self._publication_task_failure(
+                job,
+                current_task,
+                current_task_data,
+            )
+            if task_failure is not None:
+                return self._fail(job, *task_failure)
             if job.predecessor_delivery_id:
                 # The retry delay and implementation work leave time for an
                 # older branch or a newer PR to appear. Revalidate the entire
@@ -1834,10 +2049,87 @@ class DeliveryWorkflow:
             self._update(job, phase="pushing", message="Pushing the approved branch")
             self._notify(job, progress_callback)
             inherited_guard_fds = (publication_guard_fd, workflow_guard_fd)
+            final_task = self.monday.task("get", task_id=job.task_id)
+            final_task_data = dict(getattr(final_task, "data", {}) or {})
+            task_failure = self._publication_task_failure(
+                job,
+                final_task,
+                final_task_data,
+            )
+            if task_failure is not None:
+                return self._fail(job, *task_failure)
+            try:
+                current_revision = task_manager.revision(job.task_id)
+            except Exception:
+                return self._fail(
+                    job,
+                    "task-changed",
+                    "Task state could not be revalidated before publication; "
+                    "nothing was pushed",
+                )
+            if current_revision != job.review_expected_task_revision:
+                return self._fail(
+                    job,
+                    "task-changed",
+                    "Task changed after final publication authorization; "
+                    "nothing was pushed",
+                )
+            commit = self.repository.commit(
+                worktree,
+                changed_files,
+                f"{job.task_id}: autonomous build ({job.delivery_id})",
+                expected_diff_sha256=expected_diff_sha256,
+            )
+            job.prepared_commit_sha = commit
+            self.store.persist(job)
+            post_commit_task = self.monday.task("get", task_id=job.task_id)
+            post_commit_task_data = dict(
+                getattr(post_commit_task, "data", {}) or {}
+            )
+            task_failure = self._publication_task_failure(
+                job,
+                post_commit_task,
+                post_commit_task_data,
+            )
+            if task_failure is not None:
+                return self._fail(job, *task_failure)
+            try:
+                post_commit_revision = task_manager.revision(job.task_id)
+            except Exception:
+                return self._fail(
+                    job,
+                    "task-changed",
+                    "Task state could not be revalidated after preparing the commit; "
+                    "nothing was pushed",
+                )
+            if post_commit_revision != job.review_expected_task_revision:
+                return self._fail(
+                    job,
+                    "task-changed",
+                    "Task changed while preparing the approved commit; "
+                    "nothing was pushed",
+                )
+            required_predecessor = self._required_retry_predecessor(job)
+            if required_predecessor != job.predecessor_delivery_id:
+                raise ArtifactSecurityError(
+                    "delivery retry predecessor changed before publication"
+                )
             if job.predecessor_delivery_id:
                 # Progress callbacks run before this final proof. Keep the
                 # proof immediately adjacent to the irreversible push.
                 self._require_retry_predecessor_chain(job)
+            job.commit_sha = commit
+            job.prepared_commit_sha = ""
+            try:
+                self.store.persist(job)
+            except Exception:
+                # Promotion is the durable publication boundary. If its
+                # checkpoint fails, push is still unreachable; restore the
+                # in-memory prepared shape so the outer failure checkpoint
+                # cannot misclassify this reversible window as publication.
+                job.commit_sha = ""
+                job.prepared_commit_sha = commit
+                raise
             pushed_sha = self.repository.push(
                 worktree,
                 commit,
@@ -1851,11 +2143,6 @@ class DeliveryWorkflow:
 
             self._update(job, phase="pull-request", message="Opening the GitHub pull request")
             self._notify(job, progress_callback)
-            if job.predecessor_delivery_id:
-                # The pull-request callback is also untrusted timing-wise. If
-                # predecessor evidence changed, leave this exact pushed branch
-                # pending and never open a second PR.
-                self._require_retry_predecessor_chain(job)
             result = self.github.ensure_pull_request(
                 repo_root=self.repository_root,
                 repository=job.repository,
@@ -1885,6 +2172,83 @@ class DeliveryWorkflow:
         if pending is not None:
             return pending
         return self._finish_published(job, worktree, progress_callback)
+
+    def _build_start_task_failure(
+        self,
+        job: DeliveryJob,
+        task_response: Any,
+        task_data: dict[str, Any],
+    ) -> tuple[str, str] | None:
+        """Return why the latest task state cannot authorize a build start."""
+        if not getattr(task_response, "success", False):
+            return (
+                "task-not-found",
+                getattr(task_response, "message", "Task is unavailable"),
+            )
+        status = str(task_data.get("status") or "")
+        if status in {"completed", "cancelled"}:
+            return "terminal-task", "Completed or cancelled tasks cannot run"
+        if status not in {"backlog", "assigned", "in-progress"}:
+            return (
+                "task-changed",
+                "Task no longer authorizes the build start",
+            )
+        target_error = self._task_target_error(task_data)
+        if target_error:
+            return "project-mismatch", target_error
+        try:
+            current_content = _objective(job.task_id, task_data)
+        except Exception:
+            return "task-changed", "Task content cannot authorize the build start"
+        if current_content != job.objective:
+            return (
+                "task-changed",
+                "Task title, objective, or acceptance criteria changed before build start",
+            )
+        return None
+
+    def _publication_task_failure(
+        self,
+        job: DeliveryJob,
+        task_response: Any,
+        task_data: dict[str, Any],
+    ) -> tuple[str, str] | None:
+        """Return a fail-closed reason when a task no longer authorizes push."""
+        if not getattr(task_response, "success", False):
+            return (
+                "task-not-found",
+                getattr(task_response, "message", "Task is unavailable"),
+            )
+        status = str(task_data.get("status") or "")
+        if status in {"completed", "cancelled"}:
+            return (
+                "terminal-task",
+                "Task became completed or cancelled before publication; "
+                "nothing was pushed",
+            )
+        if status != "in-progress":
+            return (
+                "task-changed",
+                "Task is no longer in progress; nothing was pushed",
+            )
+        target_error = self._task_target_error(task_data)
+        if target_error:
+            return "project-mismatch", target_error
+        try:
+            reviewed_content = _objective(job.task_id, task_data)
+        except Exception:
+            return (
+                "task-changed",
+                "Task content could not be revalidated before publication; "
+                "nothing was pushed",
+            )
+        if reviewed_content != job.objective:
+            return (
+                "task-changed",
+                "Task title, objective, or acceptance criteria changed after review; "
+                "nothing was pushed",
+            )
+        return None
 
     def _record_pr_success(self, job: DeliveryJob, url: str, number: int) -> DeliveryJob:
         job.pr_url = url
@@ -2695,6 +3059,154 @@ def _expected_retry_predecessors(successor: DeliveryJob) -> list[str]:
     ]
 
 
+def _publication_evidence(job: DeliveryJob) -> bool:
+    """Return whether a record contains any durable publication lifecycle state."""
+    return bool(
+        job.commit_sha
+        or job.prepared_commit_sha
+        or job.pushed
+        or job.pr_url
+        or job.pr_number != 0
+        or job.review_reconciliation
+        or job.review_reconciled_at
+        or job.merge_commit_sha
+        or job.pr_state != "unobserved"
+        or job.checks_status != "unobserved"
+        or job.check_counts
+        or job.pr_observed_at
+        or job.observation_success
+        or job.observation_message
+        or job.task_reconciliation
+        or job.task_reconciled_at
+    )
+
+
+def _resolved_pull_request(job: DeliveryJob) -> bool:
+    """Accept only a complete, observed terminal PR as settled history."""
+    sha_pattern = r"[0-9a-f]{40}(?:[0-9a-f]{24})?"
+    repository_pattern = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+    expected_url = (
+        f"https://github.com/{job.repository}/pull/{job.pr_number}"
+        if job.repository and job.pr_number > 0
+        else ""
+    )
+    merge_identity_is_valid = (
+        re.fullmatch(sha_pattern, job.merge_commit_sha) is not None
+        if job.pr_state == "merged"
+        else not job.merge_commit_sha
+    )
+    return (
+        job.status == "pr-open"
+        and job.phase == "completed"
+        and job.success
+        and job.pushed
+        and not job.prepared_commit_sha
+        and not job.failure_code
+        and not job.failure_class
+        and job.retry_after_seconds == 0
+        and re.fullmatch(repository_pattern, job.repository) is not None
+        and bool(job.base_branch)
+        and re.fullmatch(sha_pattern, job.base_sha) is not None
+        and bool(job.branch)
+        and re.fullmatch(sha_pattern, job.commit_sha) is not None
+        and re.fullmatch(r"[0-9a-f]{64}", job.artifact_sha256) is not None
+        and job.artifact_sha256 == job.reviewed_artifact_sha256
+        and job.pr_number > 0
+        and job.pr_url.casefold() == expected_url.casefold()
+        and job.pr_state in {"merged", "closed", "diverged"}
+        and job.checks_status in {"pending", "passed", "failed", "no-checks"}
+        and _validated_check_counts(job.check_counts, job.checks_status) is not None
+        and merge_identity_is_valid
+        and bool(job.pr_observed_at)
+        and job.observation_success
+    )
+
+
+def _prepared_commit_failure_shape(job: DeliveryJob) -> bool:
+    """Accept only a pristine failed record from the prepared-commit window."""
+    return (
+        job.status == "failed"
+        and job.phase == "failed"
+        and not job.success
+        and job.deferred_commit_authorization
+        and not job.commit_sha
+        and re.fullmatch(
+            r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+            job.prepared_commit_sha,
+        )
+        is not None
+        and not job.pushed
+        and not job.pr_url
+        and job.pr_number == 0
+        and not job.review_reconciliation
+        and not job.review_reconciled_at
+        and not job.merge_commit_sha
+        and job.pr_state == "unobserved"
+        and job.checks_status == "unobserved"
+        and not job.check_counts
+        and not job.pr_observed_at
+        and not job.observation_success
+        and not job.observation_message
+        and not job.task_reconciliation
+        and not job.task_reconciled_at
+        and not job.interrupted_from_phase
+        and not job.interruption_proof_sha256
+        and re.fullmatch(r"[0-9a-f]{64}", job.review_expected_task_revision)
+        is not None
+        and re.fullmatch(r"[0-9a-f]{64}", job.artifact_sha256) is not None
+        and job.artifact_sha256 == job.reviewed_artifact_sha256
+        and re.fullmatch(
+            r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+            job.base_sha,
+        )
+        is not None
+        and bool(job.repository)
+        and bool(job.branch)
+        and bool(job.worktree)
+        and re.fullmatch(r"[0-9a-f]{64}", job.worktree_owner_token) is not None
+    )
+
+
+def _retry_terminal_child_shape(job: DeliveryJob) -> bool:
+    """Return whether a terminal retry child can retire a safe lineage."""
+    return (
+        _stored_retry_identity_is_valid(job)
+        and job.retry_attempt >= 2
+        and (
+            (
+                not job.prepared_commit_sha
+                and job.status == "failed"
+                and job.phase == "failed"
+                and not job.success
+                and job.failure_code in _FINAL_TASK_FAILURE_CODES
+                and job.failure_class == "policy"
+                and job.retry_after_seconds == 0
+                and not job.commit_sha
+            )
+            or (
+                job.failure_class != "transient"
+                and _prepared_commit_failure_shape(job)
+            )
+        )
+        and not job.pushed
+        and not job.pr_url
+        and job.pr_number == 0
+        and not job.review_reconciliation
+        and not job.review_reconciled_at
+        and not job.merge_commit_sha
+        and job.pr_state == "unobserved"
+        and job.checks_status == "unobserved"
+        and not job.check_counts
+        and not job.pr_observed_at
+        and not job.observation_success
+        and not job.observation_message
+        and not job.task_reconciliation
+        and not job.task_reconciled_at
+        and not job.interrupted_from_phase
+        and not job.interruption_proof_sha256
+    )
+
+
 def _retry_source_shape(job: DeliveryJob) -> bool:
     if (
         not job.terminal
@@ -2720,6 +3232,11 @@ def _retry_source_shape(job: DeliveryJob) -> bool:
         job.status == "failed"
         and job.phase == "failed"
         and not job.commit_sha
+        and not job.prepared_commit_sha
+    )
+    prepared = (
+        job.failure_class == "transient"
+        and _prepared_commit_failure_shape(job)
     )
     interrupted = (
         job.status == "interrupted"
@@ -2735,7 +3252,7 @@ def _retry_source_shape(job: DeliveryJob) -> bool:
             is not None
         )
     )
-    return ordinary or interrupted
+    return ordinary or prepared or interrupted
 
 
 def _interruption_proof(job: DeliveryJob, source_phase: str) -> str:
@@ -2761,6 +3278,14 @@ def _interruption_proof(job: DeliveryJob, source_phase: str) -> str:
         "retry_attempt": job.retry_attempt,
         "source_phase": source_phase,
     }
+    if job.prepared_commit_sha:
+        # Preserve every legacy proof digest byte-for-byte. Only the new
+        # prepared-commit crash window adds this field.
+        payload["prepared_commit_sha"] = job.prepared_commit_sha
+    if job.deferred_commit_authorization:
+        # Preserve every legacy proof digest byte-for-byte. New deferred-commit
+        # records bind their explicit ordering marker into the proof.
+        payload["deferred_commit_authorization"] = True
     serialized = json.dumps(
         payload,
         ensure_ascii=False,
@@ -2793,6 +3318,7 @@ def _failure_class_for_code(code: str) -> str:
         "git-validation",
         "project-mismatch",
         "review-blocked",
+        "task-changed",
         "terminal-task",
         "unresolved-delivery",
     }:
@@ -2837,6 +3363,12 @@ def _exception_failure_class(exc: BaseException) -> str:
             current,
             (subprocess.TimeoutExpired, TimeoutError, ConnectionError),
         ) and not classified:
+            classified = "transient"
+        if (
+            isinstance(current, GitCommandError)
+            and current.result.timed_out
+            and not classified
+        ):
             classified = "transient"
         if (
             isinstance(current, OSError)

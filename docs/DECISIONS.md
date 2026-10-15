@@ -1687,3 +1687,147 @@ process downtime cannot create a new recovery window.
   leave an interruption terminal for manual inspection.
 - Abandoned controller-owned local branches may remain until a separate bounded
   cleanup policy is implemented.
+
+---
+
+## ADR-032: Push Authority Is Bound to the Reviewed Task Revision
+
+**Date:** 2026-10-15
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+The delivery workflow checked for a completed or cancelled task before push,
+then invoked a progress callback while holding the task lock. Task locks are
+intentionally reentrant inside the controller process, so that callback could
+block, complete, or otherwise mutate the same task before the push. The workflow
+did not reread the task or compare its persisted revision after the callback.
+The pre-publication check also accepted nonterminal states other than
+`in-progress` and did not prove that the title, objective, and acceptance
+criteria still matched the content reviewed by ChatGPT.
+
+The old ordering created the local commit before the last callback and recorded
+it as the publication commit even when a later task-policy check refused the
+push. That permanent publication evidence prevented a corrected fresh delivery,
+although the unique branch had never left the machine. Conversely, simply
+ignoring every locally prepared commit would allow a malformed record or a
+late-arriving remote branch to bypass retry-history safety. Build-start races
+could also reopen `blocked` or `review` work, and silently truncating oversized
+canonical task content could make the implemented input differ from the task.
+
+### Decision
+
+Task content is one canonical string containing the title, objective, and
+acceptance criteria. Monday rejects it rather than truncating it when it exceeds
+50,000 characters. Initial admission accepts only `backlog`, `assigned`, or
+`in-progress`. Immediately before start and before creating a worktree or
+invoking a builder, Monday takes the TaskManager lock, freshly rereads and
+revalidates the eligible status, project target, and exact canonical content,
+starts the task, and requires a second exact `in-progress` read.
+
+Push authority likewise requires a successful task read whose status is exactly
+`in-progress`, whose project target is unchanged, and whose canonical content
+exactly equals the reviewed build input. Under the task lock, Monday captures
+the complete TaskManager revision only after that check. It invokes the
+`pushing` callback, rereads and revalidates the task, and requires the exact same
+revision. The actual local commit is deferred until every pre-push progress
+callback has completed.
+
+Every new delivery durably sets `deferred_commit_authorization=true` before the
+final callbacks; missing legacy fields default false. Monday first persists the
+new local SHA as `prepared_commit_sha`, with `commit_sha` still empty. It then
+repeats the exact task-content, status, target, and complete-revision checks.
+Monday next rederives the required retry predecessor from durable history and
+proves the complete chain while the SHA is still prepared. Only success
+promotes the SHA into `commit_sha`; that durable checkpoint is immediately
+adjacent to the irreversible push, with no callback or controller extension
+point in between. If the promotion checkpoint raises, the in-memory record is
+restored to the prepared shape before the outer failure checkpoint, because
+push was still unreachable.
+
+A marked crash in `publication-ready` authorizes a fresh successor only when the
+record remains bound to the exact reviewed artifact, the controller-owned
+worktree HEAD equals the base, and the unique branch is absent from the pinned
+remote. In `pushing`, empty SHA fields can also mean death inside `commit()`
+after HEAD moved but before its return value was checkpointed; owned worktree
+and ref consistency plus remote absence are then sufficient because the marker
+proves push was unreachable. Once `prepared_commit_sha` exists, HEAD must equal
+that SHA. Unmarked legacy or malformed publication-ready/pushing
+records that lack the identity required by their original ordering remain
+unresolved; the marker and optional prepared SHA are included in new proof
+digests without changing legacy proof bytes.
+
+A no-commit policy failure is nonblocking only for the narrow changed-task,
+terminal-task, and project-mismatch outcomes. A failure after preparation is
+classified structurally: it must retain a full prepared SHA, an empty
+publication SHA, pristine push, PR, observation, reconciliation, and
+interruption fields, matching full artifact digests, the captured task revision,
+and complete base, repository, branch, worktree, and ownership evidence. Monday
+freshly proves the remote branch absent when admitting a later build and again
+in its final history check. A structurally valid transient prepared failure
+remains a deterministic retry source; a nontransient prepared retry child may
+retire its safe leaf only after the entire predecessor chain and bindings are
+revalidated. Tampered evidence or unavailable remote proof remains conservative.
+
+All other terminal records fail closed when they contain any durable commit,
+prepared-commit, push, pull-request, observation, or reconciliation evidence.
+The sole settled-publication exception is a successful completed PR record with
+a full reviewed artifact and repository/base/branch/commit/PR identity plus an
+internally valid terminal lifecycle and check summary from a successful remote
+observation. Terminal GitHub truth remains settled when only the later task
+reconciliation failed, which is recorded independently. A failed later GitHub
+refresh clears the successful-observation proof, so stale terminal fields cannot
+authorize a successor; malformed `rejected` or `pr-open` shells likewise cannot
+suppress publication evidence.
+
+Remote-absence proof has three outcomes: absent, present/unsafe, or temporarily
+indeterminate. Typed transient proof exceptions remain fail-closed for the
+current publication, but retain their transient classification. Before a retry
+is reserved they create the canonical transient retry child, so the next
+deterministic lineage identity remains reachable after recovery. During exact
+nonterminal crash recovery they leave the original record unchanged. A false
+absence result or nontransient proof failure remains conservative and cannot
+authorize publication. Typed transient predecessor-store reads are likewise
+preserved before any missing/malformed-record policy wrapper; genuinely absent,
+malformed, or nontransient records remain policy failures.
+
+Once an exact approved commit is present on the remote branch, opening or
+locating its pull request is recovery of an irreversible transition rather than
+a new task authorization. Recovery must therefore continue under the original
+delivery identity even if the task or old lineage later changes. Exact-ID lookup
+precedes every live task-content redaction and size check. Recovery uses a fixed
+generic PR title so live, post-review task content is not exported during reconciliation.
+The ordinary first-pass PR may use the task title that passed the final pre-push
+authorization.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Check only for terminal task states | `blocked`, `review`, malformed, and unknown states do not authorize autonomous publication. |
+| Trust the task lock without a second check | Reentrant in-process callers can mutate the task from the progress callback. |
+| Compare only the displayed update time | Same-second edits and changes outside that field can share the timestamp. |
+| Commit before running the final callbacks | A policy refusal would retain publication evidence and unnecessarily strand a safe fresh build. |
+| Treat every prepared local commit as harmless | A branch may already exist remotely, or the durable record may no longer describe the reviewed artifact and owned worktree. |
+| Truncate oversized canonical task content | The builder and reviewer would act on a specification different from the persisted task. |
+| Recheck the task after push and suppress the PR | The branch may already be public; abandoning its exact PR would leave an unresolved irreversible side effect. |
+| Read the latest task title during recovery | That title was not part of the authorization that permitted the already-completed push. |
+
+### Consequences
+
+- A status, specification, target, metadata, history, or work-log change before
+  push invalidates the captured revision or explicit authorization checks and
+  stops publication.
+- A concurrent move to a blocked, review, terminal, or unknown state cannot be
+  reopened by task start, and oversized task content never reaches a model.
+- Task mutation from a reentrant progress callback cannot race the final push.
+- A strictly proven unpublished prepared commit or policy-stopped retry child
+  does not permanently block a corrected fresh delivery; missing or changed
+  proof still blocks it.
+- Post-push task changes cannot strand an exact approved remote branch without
+  PR reconciliation or leak newly edited task text into the recovered PR title.
+- Operators must start a fresh reviewed delivery after a legitimate pre-push
+  task edit.

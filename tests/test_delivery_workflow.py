@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -18,12 +20,13 @@ import pytest
 
 import tasks.manager as task_manager_module
 from delivery.backends import PatchProposal, ReviewDecision, ToolAvailability
+from delivery.git import CommandResult, GitCommandError
 from delivery.github import PullRequestResult
 from delivery.security import ArtifactSecurityError
 from delivery.types import DeliveryJob
 from delivery.validation import MondayValidationRunner, ValidationResult
 from delivery.workflow import DeliveryWorkflow
-from tasks import TaskManager, TaskPriority, TaskType
+from tasks import TaskManager, TaskPriority, TaskStatus, TaskType
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -1595,7 +1598,91 @@ def test_controller_death_after_push_is_reconciled_without_a_second_push(
     assert github.calls == 1
 
 
-def test_controller_death_after_entering_push_never_authorizes_a_successor(
+def test_published_retry_recovery_ignores_later_predecessor_publication(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-recovery-lineage-root",
+    )
+    push_calls = 0
+    original_push = workflow.repository.push
+
+    def recording_push(*args: Any, **kwargs: Any) -> str:
+        nonlocal push_calls
+        push_calls += 1
+        return original_push(*args, **kwargs)
+
+    workflow.repository.push = recording_push
+    original_persist = workflow.store.persist
+    crash_armed = True
+
+    def crash_before_pushed_persistence(job: DeliveryJob) -> None:
+        nonlocal crash_armed
+        if crash_armed and job.phase == "pushing" and job.pushed:
+            crash_armed = False
+            raise SystemExit("simulated retry controller death after push")
+        original_persist(job)
+
+    workflow.store.persist = crash_before_pushed_persistence  # type: ignore[method-assign]
+    successor_id = f"{predecessor.delivery_id}-r2"
+    with pytest.raises(SystemExit, match="retry controller death after push"):
+        workflow.run(
+            task_id=predecessor.task_id,
+            delivery_id=successor_id,
+            predecessor_delivery_id=predecessor.delivery_id,
+            retry_root_delivery_id=predecessor.delivery_id,
+            retry_attempt=2,
+        )
+    workflow.store.persist = original_persist  # type: ignore[method-assign]
+    durable = workflow.get(successor_id)
+
+    assert durable.phase == "pushing"
+    assert durable.pushed is False
+    assert _git(remote, "show", f"{durable.branch}:app.py") == "VALUE = 2"
+    predecessor_published = False
+
+    def publish_predecessor_during_recovery(snapshot: dict[str, Any]) -> None:
+        nonlocal predecessor_published
+        if snapshot["phase"] == "pull-request" and not predecessor_published:
+            predecessor_published = True
+            _git(
+                root,
+                "push",
+                "origin",
+                f"{predecessor.base_sha}:refs/heads/{predecessor.branch}",
+            )
+
+    recovered = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id=successor_id,
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+        progress_callback=publish_predecessor_during_recovery,
+    )
+
+    assert predecessor_published is True
+    assert recovered.success is True
+    assert recovered.status == "pr-open"
+    assert recovered.pushed is True
+    assert push_calls == 1
+    assert github.calls == 1
+    assert _git(remote, "rev-parse", f"refs/heads/{predecessor.branch}") == (
+        predecessor.base_sha
+    )
+
+
+def test_controller_death_before_deferred_commit_is_proven_safe_for_successor(
     tmp_path: Path,
 ) -> None:
     root, remote = _repository(tmp_path)
@@ -1624,6 +1711,9 @@ def test_controller_death_after_entering_push_never_authorizes_a_successor(
 
     durable = workflow.get("delivery-crash-before-push")
     assert durable.phase == "pushing"
+    assert durable.deferred_commit_authorization is True
+    assert durable.prepared_commit_sha == ""
+    assert durable.commit_sha == ""
     assert durable.pushed is False
     assert _git(
         remote,
@@ -1640,7 +1730,8 @@ def test_controller_death_after_entering_push_never_authorizes_a_successor(
 
     assert recovered.status == "interrupted"
     assert recovered.failure_code == "interrupted-run"
-    assert recovered.failure_class == "permanent"
+    assert recovered.failure_class == "transient"
+    assert recovered.interruption_proof_sha256
     assert (builder.calls, reviewer.calls, validator.calls, github.calls) == calls
 
 
@@ -1743,7 +1834,7 @@ def test_unverified_pr_failure_stays_recoverable_and_retries_exact_identity(
 
     root, remote = _repository(tmp_path)
     unavailable = _UnavailablePr()
-    workflow, _ = _workflow(
+    workflow, monday = _workflow(
         root,
         builder=_Builder([_patch(1, 2)]),
         reviewer=_Reviewer([_pass()]),
@@ -1765,6 +1856,8 @@ def test_unverified_pr_failure_stays_recoverable_and_retries_exact_identity(
 
     recovered_github = _GitHub()
     workflow.github = recovered_github
+    monday.title = "A later title that was never reviewed"
+    monday._touch()
     recovered = workflow.run(
         task_id="TASK-0001",
         delivery_id="delivery-pr-temporarily-unverified",
@@ -1774,6 +1867,55 @@ def test_unverified_pr_failure_stays_recoverable_and_retries_exact_identity(
     assert recovered.status == "pr-open"
     assert unavailable.calls == 1
     assert recovered_github.calls == 1
+    assert recovered_github.requests[0]["title"] == "TASK-0001: Autonomous build"
+
+
+@pytest.mark.parametrize(
+    "later_objective",
+    [
+        "x" * 50_001,
+        "A later credential-like edit sk-abcdefghijklmnopqrst",
+    ],
+    ids=["oversized", "credential-like"],
+)
+def test_exact_publication_recovery_precedes_live_task_content_validation(
+    tmp_path: Path,
+    later_objective: str,
+) -> None:
+    class _UnavailablePr(_GitHub):
+        def ensure_pull_request(self, **kwargs: Any) -> PullRequestResult:
+            self.calls += 1
+            self.requests.append(dict(kwargs))
+            return PullRequestResult(False, message="temporary GitHub query failure")
+
+    root, remote = _repository(tmp_path)
+    workflow, monday = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_UnavailablePr(),
+    )
+    pending = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=f"delivery-recovery-after-{len(later_objective)}-edit",
+    )
+    assert pending.status == "publication-pending"
+    assert _git(remote, "show", f"{pending.branch}:app.py") == "VALUE = 2"
+
+    monday.objective = later_objective
+    monday._touch()
+    recovered_github = _GitHub()
+    workflow.github = recovered_github
+    recovered = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=pending.delivery_id,
+    )
+
+    assert recovered.success is True
+    assert recovered.status == "pr-open"
+    assert recovered_github.calls == 1
+    assert recovered_github.requests[0]["title"] == "TASK-0001: Autonomous build"
 
 
 def test_failure_is_persisted_before_repository_lease_is_released(
@@ -2353,6 +2495,8 @@ def test_task_becoming_terminal_after_review_stops_before_push_or_pr(
     assert job.success is False
     assert job.status == "failed"
     assert job.failure_code == "terminal-task"
+    assert job.commit_sha == ""
+    assert re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", job.prepared_commit_sha)
     assert job.pushed is False
     assert github.calls == 0
     assert _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/codex") == ""
@@ -2941,7 +3085,7 @@ def test_pushing_progress_callback_cannot_publish_predecessor_before_successor_p
     )
 
 
-def test_pull_request_progress_callback_cannot_open_successor_pr_after_predecessor(
+def test_pull_request_progress_callback_cannot_strand_pushed_successor(
     tmp_path: Path,
 ) -> None:
     root, _ = _repository(tmp_path)
@@ -2989,9 +3133,10 @@ def test_pull_request_progress_callback_cannot_open_successor_pr_after_predecess
     )
 
     assert callback_opened_predecessor is True
-    assert successor.success is False
+    assert successor.success is True
     assert successor.pushed is True
-    assert github.calls == 0
+    assert successor.status == "pr-open"
+    assert github.calls == 1
 
 
 @pytest.mark.parametrize("tamper", ["truncate", "rebind"])
@@ -3635,7 +3780,9 @@ def test_structured_temporary_reviewer_outage_is_durable_and_idempotent(
     assert same.failure_class == "transient"
     assert same.retry_after_seconds == 45
     assert builder.calls == github.calls == 0
-    assert monday.calls == ["get", "get"]
+    # Exact-ID terminal replay is resolved from its durable binding before any
+    # second live task read.
+    assert monday.calls == ["get"]
 
 
 def test_typed_github_availability_timeout_is_transient(tmp_path: Path) -> None:
@@ -4044,3 +4191,1642 @@ def test_all_model_and_validation_output_is_redacted_before_job_persistence(
         assert secret not in stored
     assert stored.count("[REDACTED]") >= 5
     assert "Raw successful output withheld by the delivery controller." in stored
+
+
+@pytest.mark.parametrize("task_status", ["blocked", "review"])
+def test_publication_ready_rejects_task_that_is_no_longer_in_progress(
+    tmp_path: Path,
+    task_status: str,
+) -> None:
+    root, remote = _repository(tmp_path)
+    github = _GitHub()
+    workflow, monday = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    state_changed = False
+
+    def change_task_state(snapshot: dict[str, Any]) -> None:
+        nonlocal state_changed
+        if snapshot["phase"] == "publication-ready" and not state_changed:
+            state_changed = True
+            monday.status = task_status
+            monday._touch()
+
+    job = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=f"delivery-publication-ready-{task_status}",
+        progress_callback=change_task_state,
+    )
+
+    assert state_changed is True
+    assert job.success is False
+    assert job.status == "failed"
+    assert job.failure_code == "task-changed"
+    assert job.failure_class == "policy"
+    assert job.commit_sha == ""
+    assert job.pushed is False
+    assert github.calls == 0
+    assert _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/codex") == ""
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("title", "A different task title"),
+        ("objective", "A different reviewed objective."),
+        ("acceptance_criteria", ["A different acceptance criterion"]),
+    ],
+)
+def test_publication_ready_rejects_changed_reviewed_task_specification(
+    tmp_path: Path,
+    field: str,
+    changed_value: object,
+) -> None:
+    root, remote = _repository(tmp_path)
+    github = _GitHub()
+    workflow, monday = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    spec_changed = False
+
+    def change_task_specification(snapshot: dict[str, Any]) -> None:
+        nonlocal spec_changed
+        if snapshot["phase"] == "publication-ready" and not spec_changed:
+            spec_changed = True
+            setattr(monday, field, changed_value)
+            monday._touch()
+
+    job = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=f"delivery-publication-ready-changed-{field.replace('_', '-')}",
+        progress_callback=change_task_specification,
+    )
+
+    assert spec_changed is True
+    assert job.success is False
+    assert job.status == "failed"
+    assert job.failure_code == "task-changed"
+    assert job.failure_class == "policy"
+    assert job.commit_sha == ""
+    assert job.pushed is False
+    assert github.calls == 0
+    assert _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/codex") == ""
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_status", "expected_failure_code", "expected_failure_class"),
+    [
+        ("block", TaskStatus.BLOCKED, "task-changed", "policy"),
+        ("complete", TaskStatus.COMPLETED, "terminal-task", "policy"),
+        ("work-log", TaskStatus.IN_PROGRESS, "task-changed", "policy"),
+    ],
+)
+def test_pushing_callback_cannot_publish_after_reentrant_task_mutation(
+    tmp_path: Path,
+    mutation: str,
+    expected_status: TaskStatus,
+    expected_failure_code: str,
+    expected_failure_class: str,
+) -> None:
+    root, remote = _repository(tmp_path)
+    github = _GitHub()
+    workflow, monday = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    task_manager = TaskManager(root)
+    task_manager.assign("TASK-0001", "agent:test", "human:test")
+    task_manager.update_status(
+        "TASK-0001",
+        TaskStatus.IN_PROGRESS,
+        "agent:test",
+        "prepare publication race fixture",
+    )
+    task_changed = False
+
+    def mutate_real_task(snapshot: dict[str, Any]) -> None:
+        nonlocal task_changed
+        if snapshot["phase"] != "pushing" or task_changed:
+            return
+        task_changed = True
+        if mutation == "block":
+            task_manager.block("TASK-0001", "human intervened", "human:test")
+            monday.status = "blocked"
+            monday._touch()
+        elif mutation == "complete":
+            task_manager.update_status(
+                "TASK-0001",
+                TaskStatus.COMPLETED,
+                "human:test",
+                "human completed task",
+            )
+            monday.status = "completed"
+            monday._touch()
+        else:
+            task_manager.append_work_log(
+                "TASK-0001",
+                "human changed the task while publication was pending",
+                "human:test",
+            )
+
+    job = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=f"delivery-pushing-task-{mutation}",
+        progress_callback=mutate_real_task,
+    )
+
+    assert task_changed is True
+    assert task_manager.get("TASK-0001").status == expected_status
+    assert job.success is False
+    assert job.status == "failed"
+    assert job.failure_code == expected_failure_code
+    assert job.failure_class == expected_failure_class
+    assert job.commit_sha == ""
+    assert job.pushed is False
+    assert github.calls == 0
+    assert _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/codex") == ""
+
+
+def test_unchanged_in_progress_task_still_publishes_after_final_authorization(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    observed_phases: list[str] = []
+
+    job = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-final-task-authorization-control",
+        progress_callback=lambda snapshot: observed_phases.append(snapshot["phase"]),
+    )
+
+    assert "publication-ready" in observed_phases
+    assert "pushing" in observed_phases
+    assert job.success is True
+    assert job.status == "pr-open"
+    assert job.pushed is True
+    assert github.calls == 1
+    assert _git(remote, "show", f"{job.branch}:app.py") == "VALUE = 2"
+
+
+@pytest.mark.parametrize("task_status", ["blocked", "review", "unknown"])
+def test_ineligible_task_admission_never_starts_or_builds(
+    tmp_path: Path,
+    task_status: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    monday = _Monday()
+    monday.status = task_status
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+        monday=monday,
+    )
+
+    with mock.patch.object(
+        workflow.repository,
+        "create_worktree",
+        wraps=workflow.repository.create_worktree,
+    ) as create_worktree:
+        job = workflow.run(
+            task_id="TASK-0001",
+            delivery_id=f"delivery-ineligible-{task_status}",
+        )
+
+    assert job.status == "failed"
+    assert job.failure_code == "task-changed"
+    assert job.failure_class == "policy"
+    assert "start" not in monday.calls
+    assert builder.calls == 0
+    create_worktree.assert_not_called()
+
+
+def test_assigned_task_remains_eligible_for_build(tmp_path: Path) -> None:
+    root, _ = _repository(tmp_path)
+    monday = _Monday()
+    monday.status = "assigned"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+        monday=monday,
+    )
+
+    job = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-assigned-admission",
+    )
+
+    assert job.success is True
+    assert job.status == "pr-open"
+    assert "start" in monday.calls
+
+
+@pytest.mark.parametrize("task_status", ["blocked", "review"])
+def test_task_change_between_admission_and_start_never_reopens_task(
+    tmp_path: Path,
+    task_status: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    workflow, monday = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+
+    def intervene(snapshot: dict[str, Any]) -> None:
+        if snapshot["phase"] == "preparing":
+            monday.status = task_status
+            monday._touch()
+
+    with mock.patch.object(
+        workflow.repository,
+        "create_worktree",
+        wraps=workflow.repository.create_worktree,
+    ) as create_worktree:
+        job = workflow.run(
+            task_id="TASK-0001",
+            delivery_id=f"delivery-before-start-{task_status}",
+            progress_callback=intervene,
+        )
+
+    assert job.status == "failed"
+    assert job.failure_code == "task-changed"
+    assert job.failure_class == "policy"
+    assert monday.status == task_status
+    assert "start" not in monday.calls
+    assert builder.calls == 0
+    create_worktree.assert_not_called()
+
+
+def test_post_commit_task_refusal_keeps_audit_sha_and_allows_fresh_build(
+    tmp_path: Path,
+) -> None:
+    class _BlockAfterCommit:
+        def __init__(self, repository: Any, monday: _Monday) -> None:
+            self._repository = repository
+            self._monday = monday
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._repository, name)
+
+        def commit(self, *args: Any, **kwargs: Any) -> str:
+            commit = self._repository.commit(*args, **kwargs)
+            self._monday.status = "blocked"
+            self._monday._touch()
+            return commit
+
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    github = _GitHub()
+    workflow, monday = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    repository = workflow.repository
+    workflow.repository = _BlockAfterCommit(repository, monday)
+
+    refused = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-post-commit-task-refusal",
+    )
+
+    assert refused.status == "failed"
+    assert refused.failure_code == "task-changed"
+    assert refused.failure_class == "policy"
+    assert refused.commit_sha == ""
+    assert re.fullmatch(
+        r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+        refused.prepared_commit_sha,
+    )
+    assert github.calls == 0
+    from telegram_bot.service import _safe_delivery_retry_result
+
+    retry_snapshot = refused.to_dict()
+    retry_snapshot["publication_uncertain"] = False
+    assert _safe_delivery_retry_result(retry_snapshot) is False
+
+    workflow.repository = repository
+    monday.status = "in-progress"
+    monday._touch()
+    recovered = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-after-post-commit-task-refusal",
+    )
+
+    assert recovered.success is True
+    assert recovered.status == "pr-open"
+    assert github.calls == 1
+    assert _git(remote, "show", f"{recovered.branch}:app.py") == "VALUE = 2"
+
+
+@pytest.mark.parametrize("publish_prepared_branch", [False, True])
+def test_post_commit_task_lookup_failure_uses_structural_absence_proof(
+    tmp_path: Path,
+    publish_prepared_branch: bool,
+) -> None:
+    class _UnavailableMonday(_Monday):
+        unavailable = False
+
+        def task(self, action: str, **kwargs: Any) -> SimpleNamespace:
+            if action == "get" and self.unavailable:
+                self.calls.append(action)
+                return SimpleNamespace(success=False, message="task store unavailable", data={})
+            return super().task(action, **kwargs)
+
+    class _DisableTaskReadsAfterCommit:
+        def __init__(self, repository: Any, monday: _UnavailableMonday) -> None:
+            self._repository = repository
+            self._monday = monday
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._repository, name)
+
+        def commit(self, *args: Any, **kwargs: Any) -> str:
+            commit = self._repository.commit(*args, **kwargs)
+            self._monday.unavailable = True
+            return commit
+
+    root, remote = _repository(tmp_path)
+    monday = _UnavailableMonday()
+    builder = _Builder([_patch(1, 2)])
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+        monday=monday,
+    )
+    repository = workflow.repository
+    workflow.repository = _DisableTaskReadsAfterCommit(repository, monday)
+    refused = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=(
+            "delivery-post-commit-lookup-published"
+            if publish_prepared_branch
+            else "delivery-post-commit-lookup-restored"
+        ),
+    )
+
+    assert refused.status == "failed"
+    assert refused.failure_code == "task-not-found"
+    assert refused.commit_sha == ""
+    assert re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", refused.prepared_commit_sha)
+    if publish_prepared_branch:
+        _git(
+            root,
+            "push",
+            "origin",
+            f"{refused.prepared_commit_sha}:refs/heads/{refused.branch}",
+        )
+    workflow.repository = repository
+    monday.unavailable = False
+    calls = builder.calls
+
+    fresh = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=(
+            "delivery-after-published-lookup-failure"
+            if publish_prepared_branch
+            else "delivery-after-restored-lookup-failure"
+        ),
+    )
+
+    if publish_prepared_branch:
+        assert fresh.status == "failed"
+        assert fresh.failure_code == "artifact-security"
+        assert builder.calls == calls
+        assert _git(remote, "rev-parse", f"refs/heads/{refused.branch}") == (
+            refused.prepared_commit_sha
+        )
+    else:
+        assert fresh.success is True
+        assert fresh.status == "pr-open"
+        assert builder.calls == calls + 1
+
+
+def test_transient_prepared_failure_remains_retry_lineage_leaf(tmp_path: Path) -> None:
+    class _TimeoutMonday(_Monday):
+        unavailable = False
+
+        def task(self, action: str, **kwargs: Any) -> SimpleNamespace:
+            if action == "get" and self.unavailable:
+                raise TimeoutError("task store timeout")
+            return super().task(action, **kwargs)
+
+    class _TimeoutAfterCommit:
+        def __init__(self, repository: Any, monday: _TimeoutMonday) -> None:
+            self._repository = repository
+            self._monday = monday
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._repository, name)
+
+        def commit(self, *args: Any, **kwargs: Any) -> str:
+            commit = self._repository.commit(*args, **kwargs)
+            self._monday.unavailable = True
+            return commit
+
+    root, _ = _repository(tmp_path)
+    monday = _TimeoutMonday()
+    builder = _Builder([_patch(1, 2)])
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+        monday=monday,
+    )
+    repository = workflow.repository
+    workflow.repository = _TimeoutAfterCommit(repository, monday)
+    predecessor = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-transient-prepared-root",
+    )
+
+    assert predecessor.status == "failed"
+    assert predecessor.failure_class == "transient"
+    assert predecessor.commit_sha == ""
+    assert predecessor.prepared_commit_sha
+    workflow.repository = repository
+    monday.unavailable = False
+    retry = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id=f"{predecessor.delivery_id}-r2",
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+    )
+
+    assert retry.success is True
+    assert retry.status == "pr-open"
+
+
+@pytest.mark.parametrize("publish_prepared_branch", [False, True])
+def test_nontransient_prepared_retry_child_retires_only_unpublished_lineage(
+    tmp_path: Path,
+    publish_prepared_branch: bool,
+) -> None:
+    class _UnavailableMonday(_Monday):
+        unavailable = False
+
+        def task(self, action: str, **kwargs: Any) -> SimpleNamespace:
+            if action == "get" and self.unavailable:
+                self.calls.append(action)
+                return SimpleNamespace(success=False, message="task store unavailable", data={})
+            return super().task(action, **kwargs)
+
+    class _DisableTaskReadsAfterCommit:
+        def __init__(self, repository: Any, monday: _UnavailableMonday) -> None:
+            self._repository = repository
+            self._monday = monday
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._repository, name)
+
+        def commit(self, *args: Any, **kwargs: Any) -> str:
+            commit = self._repository.commit(*args, **kwargs)
+            self._monday.unavailable = True
+            return commit
+
+    root, remote = _repository(tmp_path)
+    monday = _UnavailableMonday()
+    builder = _Builder([_patch(1, 2)])
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+        monday=monday,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-prepared-child-lineage-root",
+    )
+    repository = workflow.repository
+    workflow.repository = _DisableTaskReadsAfterCommit(repository, monday)
+    child = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id=f"{predecessor.delivery_id}-r2",
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+    )
+
+    assert child.status == "failed"
+    assert child.failure_code == "task-not-found"
+    assert child.failure_class == "permanent"
+    assert child.prepared_commit_sha
+    if publish_prepared_branch:
+        _git(
+            root,
+            "push",
+            "origin",
+            f"{child.prepared_commit_sha}:refs/heads/{child.branch}",
+        )
+    workflow.repository = repository
+    monday.unavailable = False
+    calls = builder.calls
+    fresh = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id=(
+            "delivery-after-published-prepared-child"
+            if publish_prepared_branch
+            else "delivery-after-unpublished-prepared-child"
+        ),
+    )
+
+    if publish_prepared_branch:
+        assert fresh.status == "failed"
+        assert fresh.failure_code == "artifact-security"
+        assert builder.calls == calls
+        assert _git(remote, "rev-parse", f"refs/heads/{child.branch}") == (
+            child.prepared_commit_sha
+        )
+    else:
+        assert fresh.success is True
+        assert fresh.status == "pr-open"
+        assert builder.calls == calls + 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("review_reconciliation", "reviewed"), ("status", "rejected")],
+)
+def test_tampered_prepared_policy_failure_blocks_a_fresh_build(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    class _BlockAfterCommit:
+        def __init__(self, repository: Any, monday: _Monday) -> None:
+            self._repository = repository
+            self._monday = monday
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._repository, name)
+
+        def commit(self, *args: Any, **kwargs: Any) -> str:
+            commit = self._repository.commit(*args, **kwargs)
+            self._monday.status = "blocked"
+            self._monday._touch()
+            return commit
+
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    workflow, monday = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    repository = workflow.repository
+    workflow.repository = _BlockAfterCommit(repository, monday)
+    refused = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=f"delivery-tampered-prepared-{field.replace('_', '-')}",
+    )
+    setattr(refused, field, value)
+    workflow.store.persist(refused)
+    workflow.repository = repository
+    monday.status = "in-progress"
+    monday._touch()
+    calls = builder.calls
+
+    blocked = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=f"delivery-after-tampered-prepared-{field.replace('_', '-')}",
+    )
+
+    assert blocked.status == "failed"
+    assert blocked.failure_code == "unresolved-delivery"
+    assert builder.calls == calls
+
+
+def test_prepared_status_tamper_during_pushing_blocks_before_successor_push(
+    tmp_path: Path,
+) -> None:
+    class _BlockAfterCommit:
+        def __init__(self, repository: Any, monday: _Monday) -> None:
+            self._repository = repository
+            self._monday = monday
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._repository, name)
+
+        def commit(self, *args: Any, **kwargs: Any) -> str:
+            commit = self._repository.commit(*args, **kwargs)
+            self._monday.status = "blocked"
+            self._monday._touch()
+            return commit
+
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    github = _GitHub()
+    workflow, monday = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    repository = workflow.repository
+    workflow.repository = _BlockAfterCommit(repository, monday)
+    refused = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-prepared-status-race-root",
+    )
+    workflow.repository = repository
+    monday.status = "in-progress"
+    monday._touch()
+    tampered = False
+
+    def tamper_old_status(snapshot: dict[str, Any]) -> None:
+        nonlocal tampered
+        if snapshot["phase"] == "pushing" and not tampered:
+            tampered = True
+            refused.status = "rejected"
+            workflow.store.persist(refused)
+
+    with mock.patch.object(
+        workflow.repository,
+        "push",
+        wraps=workflow.repository.push,
+    ) as successor_push:
+        successor = workflow.run(
+            task_id="TASK-0001",
+            delivery_id="delivery-after-prepared-status-race",
+            progress_callback=tamper_old_status,
+        )
+
+    assert tampered is True
+    assert successor.status == "failed"
+    assert successor.failure_code == "artifact-security"
+    assert successor.failure_class == "policy"
+    assert successor.commit_sha == ""
+    assert successor.prepared_commit_sha
+    assert successor.pushed is False
+    assert github.calls == 0
+    successor_push.assert_not_called()
+    assert _git(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)",
+        f"refs/heads/{successor.branch}",
+    ) == ""
+
+
+def test_published_prepared_policy_branch_blocks_a_fresh_build(
+    tmp_path: Path,
+) -> None:
+    class _BlockAfterCommit:
+        def __init__(self, repository: Any, monday: _Monday) -> None:
+            self._repository = repository
+            self._monday = monday
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._repository, name)
+
+        def commit(self, *args: Any, **kwargs: Any) -> str:
+            commit = self._repository.commit(*args, **kwargs)
+            self._monday.status = "blocked"
+            self._monday._touch()
+            return commit
+
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    workflow, monday = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    repository = workflow.repository
+    workflow.repository = _BlockAfterCommit(repository, monday)
+    refused = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-published-prepared-policy-refusal",
+    )
+    _git(
+        root,
+        "push",
+        "origin",
+        f"{refused.prepared_commit_sha}:refs/heads/{refused.branch}",
+    )
+    workflow.repository = repository
+    monday.status = "in-progress"
+    monday._touch()
+    calls = builder.calls
+
+    blocked = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-after-published-prepared-policy-refusal",
+    )
+
+    assert blocked.status == "failed"
+    assert blocked.failure_code == "artifact-security"
+    assert builder.calls == calls
+    assert _git(remote, "rev-parse", f"refs/heads/{refused.branch}") == (
+        refused.prepared_commit_sha
+    )
+
+
+def test_task_policy_retry_child_retires_safe_lineage_for_fresh_build(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    workflow, monday = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-task-policy-lineage-root",
+    )
+    monday.status = "blocked"
+    monday._touch()
+    policy_child = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=f"{predecessor.delivery_id}-r2",
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+    )
+
+    assert policy_child.status == "failed"
+    assert policy_child.failure_code == "task-changed"
+    assert policy_child.failure_class == "policy"
+    assert builder.calls == 0
+
+    monday.status = "in-progress"
+    monday._touch()
+    fresh = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-after-task-policy-lineage",
+    )
+
+    assert fresh.success is True
+    assert fresh.status == "pr-open"
+    assert builder.calls == 1
+
+
+def test_legacy_unmarked_policy_retry_child_can_retire_safe_lineage(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-legacy-policy-lineage-root",
+    )
+    legacy_child = DeliveryJob(
+        delivery_id=f"{predecessor.delivery_id}-r2",
+        task_id=predecessor.task_id,
+        objective=predecessor.objective,
+        repo_root=predecessor.repo_root,
+        project_name=predecessor.project_name,
+        expected_repository=predecessor.expected_repository,
+        root_device=predecessor.root_device,
+        root_inode=predecessor.root_inode,
+        status="failed",
+        phase="failed",
+        failure_code="task-changed",
+        failure_class="policy",
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+        created_at="2026-10-15T00:01:00+00:00",
+        updated_at="2026-10-15T00:01:00+00:00",
+    )
+    assert legacy_child.deferred_commit_authorization is False
+    assert workflow.store.reserve(legacy_child) is None
+
+    fresh = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id="delivery-after-legacy-policy-lineage",
+    )
+
+    assert fresh.success is True
+    assert fresh.status == "pr-open"
+    assert builder.calls == 1
+
+
+def test_closed_policy_retry_lineage_is_revalidated_after_pushing_callback(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    github = _GitHub()
+    workflow, monday = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-closed-policy-lineage-root",
+    )
+    monday.status = "blocked"
+    monday._touch()
+    policy_child = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=f"{predecessor.delivery_id}-r2",
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+    )
+    assert policy_child.failure_code == "task-changed"
+    monday.status = "in-progress"
+    monday._touch()
+    ancestor_published = False
+
+    def publish_retired_ancestor(snapshot: dict[str, Any]) -> None:
+        nonlocal ancestor_published
+        if snapshot["phase"] == "pushing" and not ancestor_published:
+            ancestor_published = True
+            _git(
+                root,
+                "push",
+                "origin",
+                f"{predecessor.base_sha}:refs/heads/{predecessor.branch}",
+            )
+
+    with mock.patch.object(
+        workflow.repository,
+        "push",
+        wraps=workflow.repository.push,
+    ) as successor_push:
+        successor = workflow.run(
+            task_id="TASK-0001",
+            delivery_id="delivery-after-closed-policy-lineage-race",
+            progress_callback=publish_retired_ancestor,
+        )
+
+    assert ancestor_published is True
+    assert successor.success is False
+    assert successor.pushed is False
+    assert successor.status == "failed"
+    assert successor.failure_code == "artifact-security"
+    assert successor.failure_class == "policy"
+    assert successor.commit_sha == ""
+    assert re.fullmatch(
+        r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+        successor.prepared_commit_sha,
+    )
+    assert github.calls == 0
+    successor_push.assert_not_called()
+    assert _git(remote, "rev-parse", f"refs/heads/{predecessor.branch}") == (
+        predecessor.base_sha
+    )
+
+
+def test_prepared_commit_crash_is_proven_safe_for_retry(tmp_path: Path) -> None:
+    root, remote = _repository(tmp_path)
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    original_persist = workflow.store.persist
+    crash_armed = True
+
+    def crash_after_prepared_checkpoint(job: DeliveryJob) -> None:
+        nonlocal crash_armed
+        original_persist(job)
+        if (
+            crash_armed
+            and job.phase == "pushing"
+            and job.prepared_commit_sha
+            and not job.commit_sha
+        ):
+            crash_armed = False
+            raise SystemExit("simulated crash after prepared commit")
+
+    workflow.store.persist = crash_after_prepared_checkpoint  # type: ignore[method-assign]
+    with pytest.raises(SystemExit, match="prepared commit"):
+        workflow.run(
+            task_id="TASK-0001",
+            delivery_id="delivery-crash-after-prepared-commit",
+        )
+    workflow.store.persist = original_persist  # type: ignore[method-assign]
+    durable = workflow.get("delivery-crash-after-prepared-commit")
+
+    assert durable.phase == "pushing"
+    assert durable.commit_sha == ""
+    assert re.fullmatch(
+        r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+        durable.prepared_commit_sha,
+    )
+    assert _git(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)",
+        f"refs/heads/{durable.branch}",
+    ) == ""
+
+    recovered = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=durable.delivery_id,
+    )
+
+    assert recovered.status == "interrupted"
+    assert recovered.failure_class == "transient"
+    assert recovered.interrupted_from_phase == "pushing"
+    assert recovered.interruption_proof_sha256
+    assert recovered.prepared_commit_sha == durable.prepared_commit_sha
+
+
+def test_publication_ready_crash_uses_explicit_deferred_commit_proof(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+
+    def crash_before_final_task_lock(snapshot: dict[str, Any]) -> None:
+        if snapshot["phase"] == "publication-ready":
+            raise SystemExit("simulated crash at publication-ready")
+
+    with pytest.raises(SystemExit, match="publication-ready"):
+        workflow.run(
+            task_id="TASK-0001",
+            delivery_id="delivery-publication-ready-precommit-crash",
+            progress_callback=crash_before_final_task_lock,
+        )
+    durable = workflow.get("delivery-publication-ready-precommit-crash")
+
+    assert durable.phase == "publication-ready"
+    assert durable.deferred_commit_authorization is True
+    assert durable.prepared_commit_sha == durable.commit_sha == ""
+    assert _git(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)",
+        f"refs/heads/{durable.branch}",
+    ) == ""
+
+    recovered = workflow.run(task_id=durable.task_id, delivery_id=durable.delivery_id)
+
+    assert recovered.status == "interrupted"
+    assert recovered.failure_class == "transient"
+    assert recovered.interrupted_from_phase == "publication-ready"
+    assert recovered.interruption_proof_sha256
+
+
+def test_commit_internal_crash_is_proven_safe_before_sha_checkpoint(
+    tmp_path: Path,
+) -> None:
+    class _CrashAfterCommit:
+        def __init__(self, repository: Any) -> None:
+            self._repository = repository
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._repository, name)
+
+        def commit(self, *args: Any, **kwargs: Any) -> str:
+            self._repository.commit(*args, **kwargs)
+            raise SystemExit("simulated crash inside commit checkpoint window")
+
+    root, remote = _repository(tmp_path)
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    repository = workflow.repository
+    workflow.repository = _CrashAfterCommit(repository)
+
+    with pytest.raises(SystemExit, match="commit checkpoint window"):
+        workflow.run(
+            task_id="TASK-0001",
+            delivery_id="delivery-commit-internal-crash",
+        )
+    workflow.repository = repository
+    durable = workflow.get("delivery-commit-internal-crash")
+
+    assert durable.phase == "pushing"
+    assert durable.deferred_commit_authorization is True
+    assert durable.prepared_commit_sha == durable.commit_sha == ""
+    assert _git(Path(durable.worktree), "rev-parse", "HEAD") != durable.base_sha
+    assert _git(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)",
+        f"refs/heads/{durable.branch}",
+    ) == ""
+
+    recovered = workflow.run(task_id=durable.task_id, delivery_id=durable.delivery_id)
+
+    assert recovered.status == "interrupted"
+    assert recovered.failure_class == "transient"
+    assert recovered.interruption_proof_sha256
+
+
+@pytest.mark.parametrize("phase", ["publication-ready", "pushing"])
+def test_legacy_unmarked_precommit_publication_shape_stays_conservative(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    stale = _persist_owned_stale_delivery(
+        workflow,
+        delivery_id=f"delivery-legacy-unmarked-{phase}",
+        phase=phase,
+    )
+    stale.artifact_sha256 = "a" * 64
+    stale.reviewed_artifact_sha256 = stale.artifact_sha256
+    assert stale.deferred_commit_authorization is False
+    workflow.store.persist(stale)
+
+    recovered = workflow.run(task_id=stale.task_id, delivery_id=stale.delivery_id)
+
+    assert recovered.status == "interrupted"
+    assert recovered.failure_class == "permanent"
+    assert recovered.interruption_proof_sha256 == ""
+
+
+def test_legacy_uncheckpointed_committing_head_preserves_remote_absence_proof(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    stale = _persist_owned_stale_delivery(
+        workflow,
+        delivery_id="delivery-legacy-uncheckpointed-commit",
+        phase="committing",
+        local_commit=True,
+    )
+    local_head = stale.commit_sha
+    stale.commit_sha = ""
+    assert stale.deferred_commit_authorization is False
+    workflow.store.persist(stale)
+    assert _git(remote, "for-each-ref", "--format=%(refname)", stale.branch) == ""
+
+    recovered = workflow.run(task_id=stale.task_id, delivery_id=stale.delivery_id)
+
+    assert recovered.status == "interrupted"
+    assert recovered.failure_class == "transient"
+    assert recovered.interruption_proof_sha256
+    assert _git(Path(stale.worktree), "rev-parse", "HEAD") == local_head
+
+
+def test_published_prepared_branch_keeps_crash_recovery_conservative(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    original_persist = workflow.store.persist
+    crash_armed = True
+
+    def crash_after_prepared_checkpoint(job: DeliveryJob) -> None:
+        nonlocal crash_armed
+        original_persist(job)
+        if crash_armed and job.prepared_commit_sha and not job.commit_sha:
+            crash_armed = False
+            raise SystemExit("simulated crash after prepared commit")
+
+    workflow.store.persist = crash_after_prepared_checkpoint  # type: ignore[method-assign]
+    with pytest.raises(SystemExit, match="prepared commit"):
+        workflow.run(
+            task_id="TASK-0001",
+            delivery_id="delivery-published-prepared-commit",
+        )
+    workflow.store.persist = original_persist  # type: ignore[method-assign]
+    durable = workflow.get("delivery-published-prepared-commit")
+    _git(
+        root,
+        "push",
+        "origin",
+        f"{durable.prepared_commit_sha}:refs/heads/{durable.branch}",
+    )
+
+    recovered = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=durable.delivery_id,
+    )
+
+    assert recovered.status == "interrupted"
+    assert recovered.failure_class == "permanent"
+    assert recovered.interruption_proof_sha256 == ""
+
+
+@pytest.mark.parametrize(
+    ("status", "success", "evidence_field", "evidence_value"),
+    [
+        ("rejected", False, "commit_sha", "3" * 40),
+        ("pr-open", False, "commit_sha", "4" * 40),
+        ("rejected", False, "task_reconciliation", "reopened"),
+    ],
+)
+def test_malformed_terminal_publication_evidence_blocks_a_fresh_build(
+    tmp_path: Path,
+    status: str,
+    success: bool,
+    evidence_field: str,
+    evidence_value: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    metadata = root.resolve().stat()
+    malformed = DeliveryJob(
+        delivery_id=(
+            f"delivery-malformed-evidence-{status}-{evidence_field.replace('_', '-')}"
+        ),
+        task_id="TASK-0001",
+        objective="Set VALUE to the reviewed target.",
+        repo_root=str(root.resolve()),
+        project_name=workflow.project_name,
+        expected_repository=workflow.expected_repository,
+        root_device=metadata.st_dev,
+        root_inode=metadata.st_ino,
+        status=status,
+        phase="completed" if status == "pr-open" else "review-blocked",
+        success=success,
+        failure_code="review-blocked",
+        failure_class="policy",
+        created_at="2026-10-15T00:00:00+00:00",
+        updated_at="2026-10-15T00:00:00+00:00",
+    )
+    setattr(malformed, evidence_field, evidence_value)
+    assert workflow.store.reserve(malformed) is None
+
+    blocked = workflow.run(
+        task_id=malformed.task_id,
+        delivery_id=f"delivery-after-{malformed.delivery_id.removeprefix('delivery-')}",
+    )
+
+    assert blocked.status == "failed"
+    assert blocked.failure_code == "unresolved-delivery"
+    assert builder.calls == 0
+
+
+@pytest.mark.parametrize("task_outage", ["response", "exception"])
+def test_verified_terminal_pull_request_with_task_outage_is_settled_history(
+    tmp_path: Path,
+    task_outage: str,
+) -> None:
+    class _TaskOutageMonday(_Monday):
+        unavailable = False
+
+        def task(self, action: str, **kwargs: Any) -> SimpleNamespace:
+            if action == "get" and self.unavailable:
+                self.calls.append(action)
+                if task_outage == "exception":
+                    raise OSError("task store unavailable")
+                return SimpleNamespace(
+                    success=False,
+                    message="task store unavailable",
+                    data={},
+                )
+            return super().task(action, **kwargs)
+
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    github = _ObserverGitHub(lifecycle="closed", checks="failed")
+    monday = _TaskOutageMonday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    prior = _observable_delivery(workflow, root)
+    monday.unavailable = True
+    settled = workflow.observe(prior.delivery_id)
+
+    assert settled.pr_state == "closed"
+    assert settled.observation_success is True
+    assert settled.task_reconciliation == "failed"
+    monday.unavailable = False
+    monday.status = "in-progress"
+    monday._touch()
+    fresh = workflow.run(
+        task_id=prior.task_id,
+        delivery_id="delivery-after-verified-closed-pr",
+    )
+
+    assert fresh.success is True
+    assert fresh.status == "pr-open"
+    assert builder.calls == 1
+
+
+def test_failed_remote_refresh_cannot_settle_stale_terminal_pr_state(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    github = _ObserverGitHub(lifecycle="closed", checks="failed")
+    monday = _Monday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    prior = _observable_delivery(workflow, root)
+    closed = workflow.observe(prior.delivery_id)
+
+    assert closed.pr_state == "closed"
+    assert closed.observation_success is True
+    assert monday.status == "in-progress"
+
+    github.lifecycle = "open"
+    github.checks = "pending"
+    github.observation_success = False
+    github.observation_message = "GitHub state is temporarily unavailable"
+    uncertain = workflow.observe(prior.delivery_id)
+
+    assert uncertain.pr_state == "closed"
+    assert uncertain.observation_success is False
+    blocked = workflow.run(
+        task_id=prior.task_id,
+        delivery_id="delivery-after-uncertain-reopened-pr",
+    )
+
+    assert blocked.status == "failed"
+    assert blocked.failure_code == "unresolved-delivery"
+    assert builder.calls == 0
+
+
+def test_promotion_checkpoint_failure_restores_prepared_state_before_failure(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    original_persist = workflow.store.persist
+    failure_armed = True
+
+    def fail_after_promotion_checkpoint(job: DeliveryJob) -> None:
+        nonlocal failure_armed
+        original_persist(job)
+        if (
+            failure_armed
+            and job.phase == "pushing"
+            and job.commit_sha
+            and not job.prepared_commit_sha
+            and not job.pushed
+        ):
+            failure_armed = False
+            raise OSError(errno.EIO, "simulated promotion checkpoint failure")
+
+    workflow.store.persist = fail_after_promotion_checkpoint  # type: ignore[method-assign]
+    with mock.patch.object(
+        workflow.repository,
+        "push",
+        wraps=workflow.repository.push,
+    ) as push:
+        failed = workflow.run(
+            task_id="TASK-0001",
+            delivery_id="delivery-promotion-checkpoint-failure",
+        )
+    workflow.store.persist = original_persist  # type: ignore[method-assign]
+
+    assert failure_armed is False
+    assert failed.status == "failed"
+    assert failed.commit_sha == ""
+    assert re.fullmatch(
+        r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+        failed.prepared_commit_sha,
+    )
+    assert failed.pushed is False
+    assert github.calls == 0
+    push.assert_not_called()
+    assert _git(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)",
+        f"refs/heads/{failed.branch}",
+    ) == ""
+    durable = workflow.get(failed.delivery_id)
+    assert durable.commit_sha == ""
+    assert durable.prepared_commit_sha == failed.prepared_commit_sha
+
+    fresh = workflow.run(
+        task_id=failed.task_id,
+        delivery_id="delivery-after-promotion-checkpoint-failure",
+    )
+
+    assert fresh.success is True
+    assert fresh.status == "pr-open"
+
+
+def test_transient_predecessor_proof_outage_advances_retry_lineage(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-proof-outage-lineage-root",
+    )
+    retry_two_id = f"{predecessor.delivery_id}-r2"
+    proof_timeout = GitCommandError(
+        CommandResult(
+            argv=("git", "ls-remote", "origin"),
+            returncode=-9,
+            stdout="",
+            stderr="",
+            timed_out=True,
+        )
+    )
+
+    with mock.patch.object(
+        workflow.repository,
+        "remote_branch_is_absent",
+        side_effect=proof_timeout,
+    ):
+        retry_two = workflow.run(
+            task_id=predecessor.task_id,
+            delivery_id=retry_two_id,
+            predecessor_delivery_id=predecessor.delivery_id,
+            retry_root_delivery_id=predecessor.delivery_id,
+            retry_attempt=2,
+        )
+
+    assert retry_two.status == "failed"
+    assert retry_two.failure_code == "git-command"
+    assert retry_two.failure_class == "transient"
+    assert retry_two.predecessor_delivery_id == predecessor.delivery_id
+    assert retry_two.retry_root_delivery_id == predecessor.delivery_id
+    assert retry_two.retry_attempt == 2
+    assert builder.calls == github.calls == 0
+
+    retry_three = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id=f"{predecessor.delivery_id}-r3",
+        predecessor_delivery_id=retry_two.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=3,
+    )
+
+    assert retry_three.success is True
+    assert retry_three.status == "pr-open"
+    assert builder.calls == github.calls == 1
+
+
+def test_transient_stale_recovery_proof_outage_preserves_exact_identity(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    stale = _persist_owned_stale_delivery(
+        workflow,
+        delivery_id="delivery-stale-proof-outage",
+        phase="reviewing",
+    )
+    proof_timeout = GitCommandError(
+        CommandResult(
+            argv=("git", "ls-remote", "origin"),
+            returncode=-9,
+            stdout="",
+            stderr="",
+            timed_out=True,
+        )
+    )
+
+    with mock.patch.object(
+        workflow.repository,
+        "remote_branch_is_absent",
+        side_effect=proof_timeout,
+    ):
+        with pytest.raises(GitCommandError, match="timed out"):
+            workflow.run(task_id=stale.task_id, delivery_id=stale.delivery_id)
+
+    durable = workflow.get(stale.delivery_id)
+    assert durable.status == "running"
+    assert durable.phase == "reviewing"
+
+    recovered = workflow.run(task_id=stale.task_id, delivery_id=stale.delivery_id)
+
+    assert recovered.status == "interrupted"
+    assert recovered.failure_class == "transient"
+    successor = workflow.run(
+        task_id=stale.task_id,
+        delivery_id=f"{stale.delivery_id}-r2",
+        predecessor_delivery_id=stale.delivery_id,
+        retry_root_delivery_id=stale.delivery_id,
+        retry_attempt=2,
+    )
+    assert successor.success is True
+    assert successor.status == "pr-open"
+    assert builder.calls == 1
+
+
+def test_non_timeout_predecessor_proof_failure_remains_policy(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-proof-error-lineage-root",
+    )
+    proof_failure = GitCommandError(
+        CommandResult(
+            argv=("git", "ls-remote", "origin"),
+            returncode=128,
+            stdout="",
+            stderr="remote rejected the request",
+        )
+    )
+
+    with mock.patch.object(
+        workflow.repository,
+        "remote_branch_is_absent",
+        side_effect=proof_failure,
+    ):
+        retry_two = workflow.run(
+            task_id=predecessor.task_id,
+            delivery_id=f"{predecessor.delivery_id}-r2",
+            predecessor_delivery_id=predecessor.delivery_id,
+            retry_root_delivery_id=predecessor.delivery_id,
+            retry_attempt=2,
+        )
+
+    assert retry_two.status == "failed"
+    assert retry_two.failure_code == "artifact-security"
+    assert retry_two.failure_class == "policy"
+    assert retry_two.pushed is False
+    assert builder.calls == github.calls == 0
+
+
+@pytest.mark.parametrize(
+    "failed_predecessor_read",
+    [2, 4],
+    ids=["asserted-binding-read", "full-chain-read"],
+)
+def test_transient_predecessor_store_outage_advances_retry_lineage(
+    tmp_path: Path,
+    failed_predecessor_read: int,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id=f"delivery-store-outage-root-{failed_predecessor_read}",
+    )
+    original_get = workflow.store.get
+    predecessor_reads = 0
+
+    def flaky_get(delivery_id: str) -> DeliveryJob:
+        nonlocal predecessor_reads
+        if delivery_id == predecessor.delivery_id:
+            predecessor_reads += 1
+            if predecessor_reads == failed_predecessor_read:
+                cause = OSError(errno.EAGAIN, "delivery store temporarily unavailable")
+                raise ValueError("delivery record could not be read") from cause
+        return original_get(delivery_id)
+
+    retry_two_id = f"{predecessor.delivery_id}-r2"
+    with mock.patch.object(workflow.store, "get", side_effect=flaky_get):
+        retry_two = workflow.run(
+            task_id=predecessor.task_id,
+            delivery_id=retry_two_id,
+            predecessor_delivery_id=predecessor.delivery_id,
+            retry_root_delivery_id=predecessor.delivery_id,
+            retry_attempt=2,
+        )
+
+    assert predecessor_reads == failed_predecessor_read
+    assert retry_two.status == "failed"
+    assert retry_two.failure_class == "transient"
+    assert builder.calls == 0
+
+    retry_three = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id=f"{predecessor.delivery_id}-r3",
+        predecessor_delivery_id=retry_two.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=3,
+    )
+
+    assert retry_three.success is True
+    assert retry_three.status == "pr-open"
+    assert builder.calls == 1
