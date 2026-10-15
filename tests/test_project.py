@@ -397,7 +397,9 @@ class TestProjectRegistry:
         proj = _fake_project(tmp_path, "wb")
         registry = _make_registry(tmp_path)
         registry.register("weatherbot", proj, delivery_repository="acme/weather")
-        proj.rmdir()
+        # Retain the original directory so eager inode reuse on Linux cannot
+        # make the replacement appear to have the pinned identity.
+        proj.rename(tmp_path / "wb-original")
         proj.mkdir()
 
         with pytest.raises(ProjectRegistryError, match="identity changed"):
