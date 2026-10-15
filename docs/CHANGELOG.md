@@ -128,6 +128,16 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - Automatic dashboard discovery of all configured hosted and local providers,
   allowing Claude, OpenAI, DeepSeek, and Ollama to operate as one model pool.
 
+### Fixed
+
+- Automatic Telegram delivery recovery now reconstructs the deterministic
+  first retry when a crash or power loss occurs after a safe transient result
+  is saved but before its request-free scheduler checkpoint is written. Resume
+  never reruns the root delivery, remains idempotent across repeated restarts,
+  preserves the original 24-hour deadline across downtime, and still refuses
+  fresh identities after policy, permanent, committed, pushed, or
+  publication-uncertain outcomes.
+
 ## [1.0.0] — 2026-09-14 — Verifiable Answers
 
 The release that makes MondayOS's answers checkable. No new surface area: one
