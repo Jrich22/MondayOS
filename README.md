@@ -177,6 +177,9 @@ monday build capabilities
 monday build run TASK-0001
 monday build observe DELIVERY-ID
 
+# Telegram daemon health (secret-free; add --json for monitoring)
+monday telegram --health
+
 # External delivery uses a registered project, never an ad hoc path
 monday project register customer-portal /path/to/customer-portal \
   --delivery-repository acme/customer-portal
@@ -189,7 +192,9 @@ monday build observe DELIVERY-ID --project customer-portal
 
 Full command reference: [docs/CLI.md](docs/CLI.md).
 
-Telegram setup and the always-on Mac mini service are documented in
+Start with the [operator setup guide](docs/SETUP_GUIDE.md), then use the
+[operations runbook](docs/RUNBOOK.md) for routine health, backup, recovery, and
+incident handling. The command-level Telegram reference remains in
 [docs/TELEGRAM.md](docs/TELEGRAM.md). Accepted requests are atomically persisted
 to a local, Git-ignored FIFO queue before Telegram is acknowledged; one
 background worker runs Monday/model jobs while intake continues polling. After

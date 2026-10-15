@@ -23,6 +23,8 @@ from typing import Any
 SECRET_ENV_KEYS: tuple[str, ...] = (
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "TELEGRAM_BOT_TOKEN",
     "CONFLUENCE_API_TOKEN",
     "CONFLUENCE_EMAIL",
     "CONFLUENCE_BASE_URL",

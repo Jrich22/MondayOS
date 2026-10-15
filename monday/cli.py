@@ -319,7 +319,11 @@ def _cmd_learn(args: argparse.Namespace) -> int:
         return 1
 
     tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else []
-    components = [c.strip() for c in args.components.split(",") if c.strip()] if args.components else []
+    components = (
+        [c.strip() for c in args.components.split(",") if c.strip()]
+        if args.components
+        else []
+    )
 
     monday = _monday(args)
     r = monday.learn(
@@ -380,10 +384,18 @@ def _register_task(subparsers: Any) -> None:
     # create
     p_create = task_sub.add_parser("create", help="Create a new task.")
     p_create.add_argument("--title", required=True, metavar="TEXT", help="Task title.")
-    p_create.add_argument("--objective", required=True, metavar="TEXT", help="What the task must achieve.")
+    p_create.add_argument(
+        "--objective",
+        required=True,
+        metavar="TEXT",
+        help="What the task must achieve.",
+    )
     p_create.add_argument(
         "--type", dest="task_type", metavar="TYPE", default="feature",
-        help="Task type (default: feature). One of: feature, fix, refactor, docs, research, ops, review.",
+        help=(
+            "Task type (default: feature). One of: feature, fix, refactor, "
+            "docs, research, ops, review."
+        ),
     )
     p_create.add_argument(
         "--priority", metavar="PRIORITY", default="P2",
@@ -615,7 +627,11 @@ def _cmd_workflow_show(args: argparse.Namespace) -> int:
     if d.get("inputs"):
         print("Inputs:")
         for k, spec in d["inputs"].items():
-            req_label = "(required)" if spec["required"] else f"(default: {spec['default'] or 'none'})"
+            req_label = (
+                "(required)"
+                if spec["required"]
+                else f"(default: {spec['default'] or 'none'})"
+            )
             print(f"  {k}  {req_label}")
             if spec.get("description"):
                 print(f"    {spec['description']}")
@@ -874,8 +890,6 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _print_doctor_report(r: Any, *, verbose: bool) -> int:
-    from doctor.finding import Severity
-
     report = r.data
     fbs_raw = {
         "critical": [f for f in _all_findings(report) if f["severity"] == "critical"],
@@ -1121,7 +1135,7 @@ def _print_advisory(r: Any) -> int:
     print("═" * _WIDE)
     sources_label = " + ".join(sources) if sources else "doctor"
     print(f"  Confidence: {conf_pct}  ·  Sources: {sources_label}")
-    print(f"  Run `monday advise --json` for machine-readable output.")
+    print("  Run `monday advise --json` for machine-readable output.")
     print("═" * _WIDE)
     print()
 
@@ -1191,7 +1205,8 @@ def _register_project(subparsers: Any) -> None:
             "Register external repositories so MondayOS can run doctor,\n"
             "migrate, and advise against them.\n\n"
             "examples:\n"
-            "  monday project register weatherbot /path/to/WeatherBot --description \"Weather CLI\"\n"
+            "  monday project register weatherbot /path/to/WeatherBot "
+            "--description \"Weather CLI\"\n"
             "  monday project list\n"
             "  monday project get weatherbot\n"
             "  monday project remove weatherbot\n"
@@ -1353,7 +1368,7 @@ def _cmd_onboard(args: argparse.Namespace) -> int:
         return 1
 
     print(f"  Step 2/3: Migration — {r.migrate_summary}")
-    print(f"  Step 3/3: Analysis complete")
+    print("  Step 3/3: Analysis complete")
     print()
     print("═" * 64)
     print(f"  ONBOARDING COMPLETE — {r.project_name.upper()}")
@@ -1521,8 +1536,18 @@ def _register_agent(subparsers: Any) -> None:
     p_reg = agent_sub.add_parser("register", help="Register a new agent.")
     p_reg.add_argument("--name", required=True, metavar="TEXT", help="Agent name.")
     p_reg.add_argument("--role", required=True, metavar="ROLE", help="Role slug.")
-    p_reg.add_argument("--provider", metavar="NAME", default="", help="Provider (default: role default).")
-    p_reg.add_argument("--default", dest="is_default", action="store_true", help="Make this the role's default agent.")
+    p_reg.add_argument(
+        "--provider",
+        metavar="NAME",
+        default="",
+        help="Provider (default: role default).",
+    )
+    p_reg.add_argument(
+        "--default",
+        dest="is_default",
+        action="store_true",
+        help="Make this the role's default agent.",
+    )
     p_reg.add_argument("--description", metavar="TEXT", default="", help="Optional description.")
     p_reg.set_defaults(func=_cmd_agent_register)
 
@@ -1530,7 +1555,12 @@ def _register_agent(subparsers: Any) -> None:
     p_assign = agent_sub.add_parser("assign", help="Assign a task to a role.")
     p_assign.add_argument("task_id", metavar="TASK-ID", help="Task to assign.")
     p_assign.add_argument("--role", required=True, metavar="ROLE", help="Role slug to assign to.")
-    p_assign.add_argument("--assigned-by", metavar="WHO", default="human:cli", help="Who is assigning (default: human:cli).")
+    p_assign.add_argument(
+        "--assigned-by",
+        metavar="WHO",
+        default="human:cli",
+        help="Who is assigning (default: human:cli).",
+    )
     p_assign.set_defaults(func=_cmd_agent_assign)
 
     # run
@@ -1555,14 +1585,34 @@ def _register_agent(subparsers: Any) -> None:
             "lowest-cost, or highest-capability (default: ordered-failover)."
         ),
     )
-    p_run.add_argument("--mode", metavar="MODE", default="review", help="dry-run | review | autonomous (default: review).")
+    p_run.add_argument(
+        "--mode",
+        metavar="MODE",
+        default="review",
+        help="dry-run | review | autonomous (default: review).",
+    )
     p_run.add_argument("--dry-run", "-n", action="store_true", help="Shortcut for --mode dry-run.")
     p_run.add_argument("--autonomous", action="store_true", help="Shortcut for --mode autonomous.")
-    p_run.add_argument("--enable-autonomous", action="store_true", help="Explicitly permit autonomous mode.")
-    p_run.add_argument("--approve", action="store_true", help="Provide human approval for this run.")
     p_run.add_argument(
-        "--action", dest="actions", metavar="ACTION", action="append", default=None,
-        help="Declare an intended action (commit, push, secrets, live_trade, destructive). Repeatable; gated ones require --approve.",
+        "--enable-autonomous",
+        action="store_true",
+        help="Explicitly permit autonomous mode.",
+    )
+    p_run.add_argument(
+        "--approve",
+        action="store_true",
+        help="Provide human approval for this run.",
+    )
+    p_run.add_argument(
+        "--action",
+        dest="actions",
+        metavar="ACTION",
+        action="append",
+        default=None,
+        help=(
+            "Declare an intended action (commit, push, secrets, live_trade, "
+            "destructive). Repeatable; gated ones require --approve."
+        ),
     )
     p_run.add_argument("--json", "-j", action="store_true", help="Output the run record as JSON.")
     p_run.set_defaults(func=_cmd_agent_run)
@@ -1573,7 +1623,12 @@ def _register_agent(subparsers: Any) -> None:
     g = p_review.add_mutually_exclusive_group(required=True)
     g.add_argument("--approve", dest="approve", action="store_true", help="Approve the run.")
     g.add_argument("--reject", dest="approve", action="store_false", help="Reject the run.")
-    p_review.add_argument("--by", metavar="WHO", default="human:cli", help="Reviewer (default: human:cli).")
+    p_review.add_argument(
+        "--by",
+        metavar="WHO",
+        default="human:cli",
+        help="Reviewer (default: human:cli).",
+    )
     p_review.add_argument("--note", metavar="TEXT", default="", help="Optional review note.")
     p_review.set_defaults(func=_cmd_agent_review)
 
@@ -1581,7 +1636,13 @@ def _register_agent(subparsers: Any) -> None:
     p_hist = agent_sub.add_parser("history", help="List past agent runs.")
     p_hist.add_argument("--role", metavar="ROLE", help="Filter by role.")
     p_hist.add_argument("--task", dest="task_id", metavar="TASK-ID", help="Filter by task.")
-    p_hist.add_argument("--limit", type=int, default=20, metavar="N", help="Max runs to show (default: 20).")
+    p_hist.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Max runs to show (default: 20).",
+    )
     p_hist.set_defaults(func=_cmd_agent_history)
 
 
@@ -1709,7 +1770,12 @@ def _cmd_agent_review(args: argparse.Namespace) -> int:
 
 def _cmd_agent_history(args: argparse.Namespace) -> int:
     monday = _monday(args)
-    r = monday.agent("history", role=getattr(args, "role", None), task_id=getattr(args, "task_id", None), limit=args.limit)
+    r = monday.agent(
+        "history",
+        role=getattr(args, "role", None),
+        task_id=getattr(args, "task_id", None),
+        limit=args.limit,
+    )
     if not r.success:
         print(f"Error: {r.message}", file=sys.stderr)
         return 1
@@ -1721,7 +1787,10 @@ def _cmd_agent_history(args: argparse.Namespace) -> int:
     _hr()
     for run in runs:
         decision = run.get("approval", {}).get("decision", "")
-        print(f"  {run['run_id']}  {run.get('role', ''):<14} {run.get('status', ''):<10} {decision:<10} {run.get('task_id', '')}")
+        print(
+            f"  {run['run_id']}  {run.get('role', ''):<14} "
+            f"{run.get('status', ''):<10} {decision:<10} {run.get('task_id', '')}"
+        )
     return 0
 
 
@@ -1761,13 +1830,29 @@ def _register_team(subparsers: Any) -> None:
             "OpenAI (use fake only for offline testing)."
         ),
     )
-    p_run.add_argument("--mode", metavar="MODE", default="review", help="review (default) | dry-run.")
-    p_run.add_argument("--json", "-j", action="store_true", help="Output the team run record as JSON.")
+    p_run.add_argument(
+        "--mode",
+        metavar="MODE",
+        default="review",
+        help="review (default) | dry-run.",
+    )
+    p_run.add_argument(
+        "--json",
+        "-j",
+        action="store_true",
+        help="Output the team run record as JSON.",
+    )
     p_run.set_defaults(func=_cmd_team_run)
 
     p_hist = team_sub.add_parser("history", help="List past team runs.")
     p_hist.add_argument("--task", dest="task_id", metavar="TASK-ID", help="Filter by task.")
-    p_hist.add_argument("--limit", type=int, default=20, metavar="N", help="Max runs to show (default: 20).")
+    p_hist.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Max runs to show (default: 20).",
+    )
     p_hist.set_defaults(func=_cmd_team_history)
 
 
@@ -1789,11 +1874,11 @@ def _cmd_team_run(args: argparse.Namespace) -> int:
     print(f"  Mode    : {r.data.get('mode', args.mode)}")
     print(f"  Status  : {r.status}")
     _hr()
-    _VERDICT_MARK = {"pass": "✓", "needs_changes": "⚠", "block": "✗"}
+    verdict_mark = {"pass": "✓", "needs_changes": "⚠", "block": "✗"}
     for st in r.stages:
         verdict = st.get("verdict", "")
         is_dry_stage = r.status == "dry-run" or st.get("status") == "dry-run"
-        mark = "•" if is_dry_stage else _VERDICT_MARK.get(verdict, "✗")
+        mark = "•" if is_dry_stage else verdict_mark.get(verdict, "✗")
         role = st.get("role", "")
         prov = st.get("provider_used", "") or "—"
         model = st.get("provider_model", "")
@@ -2092,11 +2177,22 @@ def _register_telegram(subparsers: Any) -> None:
             "to autonomous PR delivery, and report progress."
         ),
     )
-    p.add_argument("--once", action="store_true", help="Process one poll and exit.")
-    p.add_argument(
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="Process one poll and exit.")
+    mode.add_argument(
         "--identify",
         action="store_true",
         help="Show Telegram user/chat IDs from pending messages, then exit.",
+    )
+    mode.add_argument(
+        "--health",
+        action="store_true",
+        help="Check local daemon readiness without contacting Telegram.",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Return machine-readable output with --health.",
     )
     p.add_argument(
         "--provider",
@@ -2129,6 +2225,10 @@ def _cmd_telegram(args: argparse.Namespace) -> int:
 
     root = Path(args.project_root).resolve()
     load_env_file(root / ".env")
+    if getattr(args, "json", False) and not getattr(args, "health", False):
+        raise ValueError("--json requires --health")
+    if getattr(args, "health", False):
+        return _cmd_telegram_health(args, root)
     if args.identify:
         lock_path = root / "logs" / "telegram" / "bot.lock"
         with InstanceLock(lock_path):
@@ -2190,6 +2290,9 @@ def _cmd_telegram(args: argparse.Namespace) -> int:
             f"using {chosen or 'role defaults with automatic fallback'}."
         )
         if args.once:
+            # One-shot mode drains work synchronously but does not run the
+            # background retry/follow-up loops represented by daemon health.
+            state.mark_worker_stopped()
             count = runner.run_once()
             print(f"Processed {count} update(s).")
             return 0
@@ -2201,6 +2304,104 @@ def _cmd_telegram(args: argparse.Namespace) -> int:
         signal.signal(signal.SIGINT, stop)
         runner.run_forever()
     return 0
+
+
+def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:
+    """Report local Telegram control-plane health without network side effects."""
+    from core.redaction import redact_text
+    from telegram_bot.client import HttpTelegramClient
+    from telegram_bot.config import TelegramConfig
+    from telegram_bot.state import (
+        TelegramState,
+        TelegramStateError,
+        instance_lock_is_held,
+    )
+
+    report: dict[str, Any] = {
+        "healthy": False,
+        "configuration": {"ready": False},
+        "service": {
+            "running": False,
+            "state_exists": False,
+            "state_readable": False,
+            "heartbeat_fresh": False,
+        },
+        "build": {"required": False, "ready": None},
+    }
+    try:
+        config = TelegramConfig.from_env(root)
+        # Construction validates token syntax but performs no HTTP request.
+        HttpTelegramClient(config.token)
+    except (OSError, ValueError) as exc:
+        report["configuration"]["reason"] = redact_text(str(exc))
+        return _print_telegram_health(report, as_json=bool(getattr(args, "json", False)))
+
+    report["configuration"] = {"ready": True, **config.safe_summary()}
+    service = report["service"]
+    state_exists = config.state_path.is_file()
+    service["state_exists"] = state_exists
+    try:
+        state = TelegramState(config.state_path)
+        worker = state.worker_status(
+            stale_after_seconds=max(60.0, float(config.poll_timeout * 3)),
+        )
+        service.update(worker)
+        service["state_readable"] = True
+        service["pending_jobs"] = state.pending_count
+        service["running"] = instance_lock_is_held(config.lock_path)
+    except (OSError, TelegramStateError, ValueError) as exc:
+        service["reason"] = redact_text(str(exc))
+
+    build = report["build"]
+    build["required"] = config.live_build
+    if config.live_build:
+        try:
+            response = _monday(args).build("capabilities")
+            build["ready"] = bool(response.success and response.data.get("ready"))
+            if not build["ready"]:
+                build["reason"] = redact_text(
+                    response.message or "Build capabilities are not ready"
+                )
+        except Exception as exc:
+            build["ready"] = False
+            build["reason"] = redact_text(str(exc)) or "Build capability check failed"
+
+    report["healthy"] = bool(
+        report["configuration"].get("ready")
+        and service.get("running")
+        and service.get("state_exists")
+        and service.get("state_readable")
+        and service.get("heartbeat_fresh")
+        and (not config.live_build or build.get("ready"))
+    )
+    return _print_telegram_health(report, as_json=bool(getattr(args, "json", False)))
+
+
+def _print_telegram_health(report: dict[str, Any], *, as_json: bool) -> int:
+    """Render one stable health report and return its monitoring exit code."""
+    import json as _json
+
+    healthy = bool(report.get("healthy"))
+    if as_json:
+        print(_json.dumps(report, indent=2, sort_keys=True))
+        return 0 if healthy else 1
+
+    configuration = report.get("configuration", {})
+    service = report.get("service", {})
+    build = report.get("build", {})
+    print(f"Telegram health: {'healthy' if healthy else 'UNHEALTHY'}")
+    print(f"  Configuration: {'ready' if configuration.get('ready') else 'not ready'}")
+    print(f"  Service      : {'running' if service.get('running') else 'not running'}")
+    print(
+        "  Heartbeat    : "
+        f"{'fresh' if service.get('heartbeat_fresh') else 'missing or stale'}"
+    )
+    if build.get("required"):
+        print(f"  Live builds  : {'ready' if build.get('ready') else 'not ready'}")
+    reason = configuration.get("reason") or service.get("reason") or build.get("reason")
+    if reason:
+        print(f"  Reason       : {reason}")
+    return 0 if healthy else 1
 
 
 # ---------------------------------------------------------------------------

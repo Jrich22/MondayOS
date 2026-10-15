@@ -39,6 +39,13 @@ from delivery.validation import MondayValidationRunner, _sandbox_profile
 _TEST_CLI = os.fspath(Path(sys.executable).resolve())
 
 
+@pytest.fixture(autouse=True)
+def _trust_test_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let fake CLI tests use the CI Python without weakening production roots."""
+    roots = (*backend_module._TRUSTED_EXECUTABLE_ROOTS, Path(_TEST_CLI).parent)
+    monkeypatch.setattr(backend_module, "_TRUSTED_EXECUTABLE_ROOTS", roots)
+
+
 def _patch() -> str:
     return (
         "diff --git a/app.py b/app.py\n"
@@ -194,7 +201,9 @@ def test_pinned_cli_inode_replacement_is_rejected_before_launch(
     monkeypatch.setattr(backend_module, "_TRUSTED_EXECUTABLE_ROOTS", (tmp_path,))
     builder = CodexPatchBuilder(os.fspath(executable))
 
-    executable.unlink()
+    # Keep the original inode allocated so filesystems that eagerly reuse
+    # deleted inode numbers cannot make the replacement look unchanged.
+    executable.rename(installation / "codex-original")
     executable.write_text(
         f"#!/bin/sh\ntouch '{marker!s}'\n",
         encoding="utf-8",
