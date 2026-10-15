@@ -119,6 +119,14 @@ class DeliveryJob:
     review_reconciliation: str = ""
     review_reconciled_at: str = ""
     review_expected_task_revision: str = ""
+    # A successor delivery may run only while every controller-proved
+    # predecessor remains unpublished. Persisting the immediate predecessor
+    # makes that authorization chain auditable and restart-safe.
+    predecessor_delivery_id: str = ""
+    retry_root_delivery_id: str = ""
+    retry_attempt: int = 0
+    interrupted_from_phase: str = ""
+    interruption_proof_sha256: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -201,6 +209,13 @@ class DeliveryJob:
             review_expected_task_revision=normalize_task_revision(
                 data.get("review_expected_task_revision")
             ),
+            predecessor_delivery_id=str(data.get("predecessor_delivery_id", "")),
+            retry_root_delivery_id=str(data.get("retry_root_delivery_id", "")),
+            retry_attempt=_stored_retry_attempt(data.get("retry_attempt", 0)),
+            interrupted_from_phase=str(data.get("interrupted_from_phase", "")),
+            interruption_proof_sha256=str(
+                data.get("interruption_proof_sha256", "")
+            ),
         )
 
 
@@ -209,6 +224,13 @@ def normalize_delivery_failure_class(value: object) -> str:
     if isinstance(value, str) and value in DELIVERY_FAILURE_CLASSES:
         return value
     return ""
+
+
+def _stored_retry_attempt(value: object) -> int:
+    """Preserve malformed lineage as invalid instead of coercing it into authority."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return -1
+    return value
 
 
 def normalize_review_reconciliation(value: object) -> str:

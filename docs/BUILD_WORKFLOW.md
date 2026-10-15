@@ -106,6 +106,30 @@ that the remote branch still equals the approved commit and then reconciles the
 exact pull request without pushing twice. A different delivery ID for the same
 task and repository is rejected while that state remains unresolved.
 
+If a worker instead exits during implementation, validation, review, commit, or
+the final pre-publication checkpoint, Monday first reopens the controller-owned
+worktree and proves that its unique branch is absent from the still-pinned
+remote. Only that exact negative proof marks the interruption safe for a fresh
+successor identity. The terminal record preserves the phase where the worker
+stopped and a SHA-256 proof digest bound to that source phase, delivery lineage,
+task and repository identity, base and branch, owned worktree, and any local
+commit. A later field change invalidates that proof. A local commit may remain
+as diagnostic state; it is never reused. Missing ownership evidence, a changed
+remote, an existing remote branch, or any uncertain publication state fails
+closed and keeps the original identity for inspection or reconciliation.
+
+Every automatic successor durably records the controller-derived immediate
+predecessor, root delivery, and retry attempt. Those values must form the exact
+deterministic `ROOT-rN` identity; omitting or replacing the caller's lineage
+cannot bypass the sole retry source derived from durable history. While holding
+the repository workflow lock, Monday rechecks the complete bounded chain before
+reserving the successor. It repeats that proof under the task lock and, after
+each untrusted publication progress callback, immediately adjacent to the push
+and pull-request operations. If an older branch appears, any other matching live
+pull request exists regardless of its timestamps, or any predecessor changes
+task or repository identity, the successor stops before the next irreversible
+operation.
+
 Immediately before publication, while still holding the task lock, Monday
 captures a SHA-256 revision of the complete canonical persisted task record.
 That digest covers status history, work log, metadata, and targeting as well as
@@ -342,12 +366,14 @@ is not queued.
 Queued, running, waiting, and retrying work is recovered after restart with
 stable Telegram job, task, run, and delivery identities. Unexpected poison work
 is bounded to three handler attempts. A controller-classified transient failure
-before commit or push instead creates a request-free, deterministic delivery
-retry outside the FIFO. It uses increasing delays, at most six delivery runs,
-and a 24-hour lifetime; policy, permanent, unclassified, and publication-started
-failures never receive a fresh identity. A graceful stop finishes the active
-build and leaves later work queued; `monday telegram --once` instead ingests one
-poll response and drains its accepted work synchronously before exiting.
+before remote publication instead creates a request-free, deterministic delivery
+retry outside the FIFO. A worker interruption is eligible only when its source
+phase and proof digest remain valid and the controller re-proves that its branch
+is absent. It uses increasing delays, at most six delivery runs, and a 24-hour
+lifetime; policy, permanent, unclassified, and publication-started failures
+never receive a fresh identity. A graceful stop finishes the active build and
+leaves later work queued; `monday telegram --once` instead ingests one poll
+response and drains its accepted work synchronously before exiting.
 
 ## Records and GitHub truth
 

@@ -1803,7 +1803,10 @@ class Monday:
         Actions:
             run          — execute one delivery. Requires ``task_id``. Optional:
                            registered ``project``, ``delivery_id``, ``progress_callback``, and
-                           ``checkpoint_callback``.
+                           ``checkpoint_callback``. Controller-owned recovery may also bind
+                           an exact ``predecessor_delivery_id``,
+                           ``retry_root_delivery_id``, and ``retry_attempt`` bundle; the
+                           controller validates the deterministic lineage against history.
             get          — retrieve one durable delivery. Requires ``delivery_id``.
                            Optional: ``project`` identity assertion.
             observe      — read the exact pull request and checks, repair an explicitly
@@ -1858,12 +1861,22 @@ class Monday:
             workflow = DeliveryWorkflow(**workflow_kwargs)
 
             if action == "run":
-                job = workflow.run(
-                    task_id=str(kwargs.get("task_id", "")),
-                    delivery_id=(kwargs.get("delivery_id") or None),
-                    progress_callback=kwargs.get("progress_callback"),
-                    checkpoint_callback=kwargs.get("checkpoint_callback"),
-                )
+                run_kwargs: dict[str, Any] = {
+                    "task_id": str(kwargs.get("task_id", "")),
+                    "delivery_id": (kwargs.get("delivery_id") or None),
+                    "progress_callback": kwargs.get("progress_callback"),
+                    "checkpoint_callback": kwargs.get("checkpoint_callback"),
+                }
+                predecessor_delivery_id = kwargs.get("predecessor_delivery_id")
+                if predecessor_delivery_id:
+                    run_kwargs["predecessor_delivery_id"] = (
+                        predecessor_delivery_id
+                    )
+                    run_kwargs["retry_root_delivery_id"] = kwargs.get(
+                        "retry_root_delivery_id"
+                    )
+                    run_kwargs["retry_attempt"] = kwargs.get("retry_attempt", 0)
+                job = workflow.run(**run_kwargs)
                 return _build_response_from_job("run", job, run_outcome=True)
 
             if action == "get":

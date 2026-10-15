@@ -714,6 +714,13 @@ class TelegramBotService:
         kwargs: dict[str, Any] = {
             "task_id": task_id,
             "delivery_id": delivery_id,
+            "predecessor_delivery_id": (
+                root_delivery_id
+                if attempt == 2
+                else _retry_delivery_id(root_delivery_id, attempt - 1)
+            ),
+            "retry_root_delivery_id": root_delivery_id,
+            "retry_attempt": attempt,
             "progress_callback": self._retry_delivery_progress,
         }
         if project_name:
@@ -764,7 +771,7 @@ class TelegramBotService:
             )
             return
 
-        if _safe_transient_delivery_failure(result) and attempt < maximum:
+        if _safe_delivery_retry_result(result) and attempt < maximum:
             next_attempt = attempt + 1
             delay = _delivery_retry_delay(
                 next_attempt,
@@ -1038,7 +1045,7 @@ class TelegramBotService:
             if (
                 not retry
                 and not isinstance(job.get("delivery_retry"), dict)
-                and _safe_transient_delivery_failure(saved_result)
+                and _safe_delivery_retry_result(saved_result)
             ):
                 # The terminal result and scheduler checkpoint are separate
                 # durable writes. Reconstruct the deterministic first retry if
@@ -1065,6 +1072,11 @@ class TelegramBotService:
             )
             return
 
+        retry_expires_at = _finite_timestamp(
+            job.get("delivery_retry_expires_at")
+        )
+        if retry_expires_at <= 0:
+            retry_expires_at = time.time() + _DELIVERY_RETRY_WINDOW_SECONDS
         self._state.set_job(
             update_id,
             task_id=task_id,
@@ -1072,6 +1084,7 @@ class TelegramBotService:
             workflow="live-build",
             delivery_id=stable_id,
             delivery_reserved=True,
+            delivery_retry_expires_at=retry_expires_at,
         )
         build_kwargs: dict[str, Any] = {
             "task_id": task_id,
@@ -1088,8 +1101,8 @@ class TelegramBotService:
             raise RuntimeError("MondayOS did not honor the reserved delivery identity")
         terminal = _delivery_terminal(str(result.get("status") or ""))
         retry_expires_at = (
-            time.time() + _DELIVERY_RETRY_WINDOW_SECONDS
-            if terminal and _safe_transient_delivery_failure(result)
+            retry_expires_at
+            if not terminal or _safe_delivery_retry_result(result)
             else 0.0
         )
         self._state.set_job(
@@ -1103,7 +1116,7 @@ class TelegramBotService:
             delivery_retry_expires_at=retry_expires_at,
         )
         if terminal:
-            if _safe_transient_delivery_failure(result):
+            if _safe_delivery_retry_result(result):
                 retry, _retry_unavailable = self._schedule_initial_delivery_retry(
                     update_id,
                     chat_id,
@@ -1669,6 +1682,7 @@ def _delivery_snapshot(response: Any, *, fallback_id: str) -> dict[str, Any]:
     )
     raw_pr_url = value("pr_url", "")
     pr_url = _github_pr_url(raw_pr_url)
+    raw_publication_uncertain = value("publication_uncertain", False)
     return {
         "delivery_id": str(value("delivery_id", fallback_id) or fallback_id),
         "success": success,
@@ -1677,7 +1691,10 @@ def _delivery_snapshot(response: Any, *, fallback_id: str) -> dict[str, Any]:
         "branch": _bounded_text(value("branch", ""), 160),
         "commit_sha": _bounded_text(value("commit_sha", ""), 64),
         "pr_url": pr_url,
-        "publication_uncertain": bool(str(raw_pr_url or "").strip()) and not pr_url,
+        "publication_uncertain": (
+            raw_publication_uncertain is not False
+            or (bool(str(raw_pr_url or "").strip()) and not pr_url)
+        ),
         "pushed": bool(value("pushed", False)),
         "changed_files": changed_files,
         "attempts": attempts,
@@ -1704,16 +1721,30 @@ def _has_explicit_delivery_snapshot(response: Any) -> bool:
     )
 
 
-def _safe_transient_delivery_failure(result: dict[str, Any]) -> bool:
-    """Authorize a fresh identity only before publication can have begun."""
-    return (
-        str(result.get("status") or "").lower() == "failed"
+def _safe_delivery_retry_result(result: dict[str, Any]) -> bool:
+    """Authorize a fresh identity only from a controller-proved safe result."""
+    status = str(result.get("status") or "").lower()
+    commit_sha = str(result.get("commit_sha") or "")
+    common = (
+        result.get("success") is False
         and str(result.get("failure_class") or "") == "transient"
         and not bool(result.get("pushed"))
-        and not str(result.get("commit_sha") or "")
         and not str(result.get("pr_url") or "")
         and not bool(result.get("publication_uncertain"))
     )
+    ordinary_transient = (
+        status == "failed"
+        and str(result.get("phase") or "").lower() == "failed"
+        and not commit_sha
+    )
+    proven_interruption = (
+        status == "interrupted"
+        and str(result.get("phase") or "").lower() == "interrupted"
+        and str(result.get("failure_code") or "") == "interrupted-run"
+        and result.get("retry_after_seconds") == 0
+        and (not commit_sha or _FULL_COMMIT_SHA.fullmatch(commit_sha) is not None)
+    )
+    return common and (ordinary_transient or proven_interruption)
 
 
 def _retry_delivery_id(root_delivery_id: str, attempt: int) -> str:
@@ -1942,8 +1973,8 @@ def _delivery_retry_notice(
     else:
         wait = f"about {max(2, round(delay_seconds / 3_600))} hours"
     return (
-        f"{task_id} hit a temporary model or tool outage. Monday saved the "
-        f"checkpoint and will try automatically in {wait} "
+        f"{task_id} needs automatic delivery recovery. Monday saved the "
+        f"checkpoint and will try again in {wait} "
         f"(delivery run {attempt}/{maximum}). New requests can continue meanwhile."
     )
 
@@ -1959,7 +1990,7 @@ def _delivery_retry_unavailable_notice(value: Any) -> str:
         )
     if phase == "not-started-deadline":
         return (
-            "The provider retry window was outside Monday's 24-hour recovery "
+            "The next attempt was outside Monday's 24-hour recovery "
             "window, so no automatic retry was started."
         )
     return ""
@@ -1981,8 +2012,8 @@ def _delivery_retry_result(
         return f"Monday recovered automatically on delivery run {attempt}.\n{base}"
     if str(result.get("failure_class") or "") == "transient":
         return (
-            f"Monday made {attempt} delivery runs, but the temporary outage did "
-            f"not recover within the retry limit.\n{base}"
+            f"Monday made {attempt} delivery runs, but automatic recovery did "
+            f"not complete within the retry limit.\n{base}"
         )
     return f"Monday retried the delivery automatically.\n{base}"
 
@@ -2004,7 +2035,7 @@ def _delivery_retry_outcome_notice(
         )
     if outcome_phase == "expired":
         return (
-            f"{task_id} could not recover from the temporary outage within "
+            f"{task_id} could not recover the delivery within "
             "24 hours. Monday preserved every delivery checkpoint."
         )
     return _delivery_retry_result(

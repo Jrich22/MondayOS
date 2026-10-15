@@ -1155,6 +1155,62 @@ class GitRepository:
             self._assert_owned_ref(worktree, root, expected_sha)
             return True
 
+    def remote_branch_is_absent(
+        self,
+        worktree: Worktree,
+        remote: str = "origin",
+        *,
+        expected_local_sha: str | None = None,
+    ) -> bool:
+        """Prove that this controller-owned branch was never published.
+
+        The local branch may still be at its base or may contain a commit made
+        immediately before a worker crash.  A fresh successor is safe only when
+        the exact unique branch is absent from the still-pinned remote.
+        """
+        root = self._validate_owned_worktree(worktree)
+        self._validate_remote(remote)
+        if not _BRANCH_RE.fullmatch(worktree.branch):
+            raise GitValidationError("worktree branch is invalid")
+        if expected_local_sha is not None and not _SHA_RE.fullmatch(
+            expected_local_sha
+        ):
+            raise GitValidationError("expected local commit must be an exact SHA")
+        with self.lock():
+            trusted_root = self.validate_trusted_root()
+            snapshot = self._validated_remote_identity(trusted_root, remote)
+            push_url = snapshot[1][0]
+            local_head = self.current_head(worktree)
+            if expected_local_sha is not None and local_head != expected_local_sha:
+                raise GitValidationError(
+                    "owned worktree HEAD does not match its delivery checkpoint"
+                )
+            self._assert_owned_ref(worktree, root, local_head)
+            remote_ref = f"refs/heads/{worktree.branch}"
+            result = self._git(
+                root,
+                "ls-remote",
+                "--refs",
+                push_url,
+                remote_ref,
+                check=True,
+            )
+            if result.stdout_truncated or result.stdout_invalid_utf8:
+                raise GitValidationError(
+                    "remote branch response is oversized or not valid UTF-8"
+                )
+            records = [line.split("\t", 1) for line in result.stdout.splitlines() if line]
+            if records and (
+                len(records) != 1
+                or len(records[0]) != 2
+                or not _SHA_RE.fullmatch(records[0][0])
+                or records[0][1] != remote_ref
+            ):
+                raise GitValidationError("remote branch response is invalid")
+            self._assert_remote_identity_unchanged(trusted_root, remote, snapshot)
+            self._assert_owned_ref(worktree, root, local_head)
+            return not records
+
     def _assert_remote_base(
         self,
         root: Path,

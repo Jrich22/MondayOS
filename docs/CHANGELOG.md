@@ -187,6 +187,23 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Proven pre-publication worker interruptions now enter the same deterministic,
+  request-free Telegram recovery chain as other safe delivery failures. MondayOS
+  revalidates the crashed job's owned worktree and pinned remote, requires the
+  unique branch to be absent, and records a digest bound to the interruption's
+  source phase and publication identity before creating at most one successor.
+  Every successor durably binds its controller-derived predecessor, retry root,
+  and attempt as one deterministic lineage. It rechecks the full bounded chain
+  before reservation, under the task lock, and after progress callbacks directly
+  beside push and pull-request creation. Reappearing branches, any matching live
+  pull request regardless of timestamps, changed targets, pushes, uncertain
+  publication, missing ownership evidence, changed proof fields, and malformed
+  lineage fail closed. The six-run budget and 24-hour deadline are durable before
+  the root build begins, and nonterminal snapshots cannot reset either limit
+  after restart. Telegram state schema v10 preserves the strict deadline binding
+  while migrating an absent source deadline from the already-validated active
+  retry expiry exactly once for pre-v10 state; present invalid or mismatched
+  values still fail closed.
 - Terminal and expired Telegram pull-request watchers now retain the same
   authoritative source-binding guarantee as active watchers after notices are
   removed. Restart rejects deleted, malformed, or mismatched bindings on the

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -396,6 +397,124 @@ def _persist_delivery(
     )
     assert workflow.store.reserve(job) is None
     return job
+
+
+def _persist_owned_stale_delivery(
+    workflow: DeliveryWorkflow,
+    *,
+    delivery_id: str,
+    phase: str,
+    local_commit: bool = False,
+) -> DeliveryJob:
+    """Persist a running delivery backed by a real controller-owned worktree."""
+    base = workflow.repository.resolve_base()
+    worktree = workflow.repository.create_worktree("TASK-0001", base)
+    commit_sha = ""
+    if local_commit:
+        (worktree.path / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        workflow.repository.stage(worktree, ["app.py"])
+        staged_diff = workflow.repository.staged_diff(worktree)
+        commit_sha = workflow.repository.commit(
+            worktree,
+            ["app.py"],
+            "TASK-0001: interrupted delivery fixture",
+            expected_diff_sha256=hashlib.sha256(
+                staged_diff.encode("utf-8")
+            ).hexdigest(),
+        )
+    job = DeliveryJob(
+        delivery_id=delivery_id,
+        task_id="TASK-0001",
+        objective="Set VALUE to the reviewed target.",
+        repo_root=str(workflow.repository_root),
+        project_name=workflow.project_name,
+        expected_repository=workflow.expected_repository,
+        root_device=workflow.root_device,
+        root_inode=workflow.root_inode,
+        status="running",
+        phase=phase,
+        base_ref=base.ref,
+        base_branch=base.branch,
+        base_sha=base.sha,
+        repository="owner/project",
+        branch=worktree.branch,
+        worktree=str(worktree.path),
+        worktree_owner_token=worktree.owner_token,
+        commit_sha=commit_sha,
+        created_at="2026-10-15T00:00:00+00:00",
+        updated_at="2026-10-15T00:00:00+00:00",
+    )
+    assert workflow.store.reserve(job) is None
+    return job
+
+
+def _safe_retry_predecessor(
+    workflow: DeliveryWorkflow,
+    *,
+    delivery_id: str,
+    predecessor_delivery_id: str = "",
+    retry_root_delivery_id: str = "",
+    retry_attempt: int = 0,
+) -> DeliveryJob:
+    """Persist and reconcile one owned, provably unpublished predecessor."""
+    stale = _persist_owned_stale_delivery(
+        workflow,
+        delivery_id=delivery_id,
+        phase="reviewing",
+    )
+    stale.predecessor_delivery_id = predecessor_delivery_id
+    stale.retry_root_delivery_id = retry_root_delivery_id
+    stale.retry_attempt = retry_attempt
+    workflow.store.persist(stale)
+    recovered = workflow.run(
+        task_id=stale.task_id,
+        delivery_id=delivery_id,
+        predecessor_delivery_id=predecessor_delivery_id or None,
+        retry_root_delivery_id=retry_root_delivery_id or None,
+        retry_attempt=retry_attempt,
+    )
+    assert recovered.status == "interrupted"
+    assert recovered.failure_class == "transient"
+    return recovered
+
+
+def _permanent_pushing_interruption(
+    workflow: DeliveryWorkflow,
+    *,
+    delivery_id: str,
+) -> DeliveryJob:
+    stale = _persist_owned_stale_delivery(
+        workflow,
+        delivery_id=delivery_id,
+        phase="pushing",
+        local_commit=True,
+    )
+    stale.artifact_sha256 = "a" * 64
+    stale.reviewed_artifact_sha256 = stale.artifact_sha256
+    workflow.store.persist(stale)
+    recovered = workflow.run(
+        task_id=stale.task_id,
+        delivery_id=delivery_id,
+    )
+    assert recovered.status == "interrupted"
+    assert recovered.failure_class == "permanent"
+    assert recovered.interrupted_from_phase == "pushing"
+    return recovered
+
+
+def _miss_initial_delivery_lookup(workflow: DeliveryWorkflow) -> Any:
+    """Model a contender that checked before another worker reserved the ID."""
+    original = workflow._existing_job
+    calls = 0
+
+    def lookup(delivery_id: str) -> DeliveryJob | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return original(delivery_id)
+
+    return mock.patch.object(workflow, "_existing_job", side_effect=lookup)
 
 
 def _observable_delivery(workflow: DeliveryWorkflow, root: Path) -> DeliveryJob:
@@ -1476,6 +1595,55 @@ def test_controller_death_after_push_is_reconciled_without_a_second_push(
     assert github.calls == 1
 
 
+def test_controller_death_after_entering_push_never_authorizes_a_successor(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+
+    def crash_before_push(event: dict[str, Any]) -> None:
+        if event.get("phase") == "pushing":
+            raise SystemExit("simulated controller death before push")
+
+    with pytest.raises(SystemExit, match="before push"):
+        workflow.run(
+            task_id="TASK-0001",
+            delivery_id="delivery-crash-before-push",
+            progress_callback=crash_before_push,
+        )
+
+    durable = workflow.get("delivery-crash-before-push")
+    assert durable.phase == "pushing"
+    assert durable.pushed is False
+    assert _git(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)",
+        f"refs/heads/{durable.branch}",
+    ) == ""
+    calls = (builder.calls, reviewer.calls, validator.calls, github.calls)
+
+    recovered = workflow.run(
+        task_id="TASK-0001",
+        delivery_id="delivery-crash-before-push",
+    )
+
+    assert recovered.status == "interrupted"
+    assert recovered.failure_code == "interrupted-run"
+    assert recovered.failure_class == "permanent"
+    assert (builder.calls, reviewer.calls, validator.calls, github.calls) == calls
+
+
 def test_controller_death_after_pr_creation_is_reconciled_exactly(
     tmp_path: Path,
 ) -> None:
@@ -2224,6 +2392,1011 @@ def test_stale_nonterminal_delivery_is_interrupted_under_free_lease(
     assert "new delivery identity" in recovered.message
     assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
     assert workflow.get("delivery-stale-worker").status == "interrupted"
+
+
+@pytest.mark.parametrize(
+    ("phase", "local_commit"),
+    [
+        ("implementing", False),
+        ("validating", False),
+        ("reviewing", False),
+        ("committing", False),
+        ("committing", True),
+        ("publication-ready", True),
+    ],
+)
+def test_owned_stale_prepublication_delivery_is_retryable_only_after_remote_absence(
+    tmp_path: Path,
+    phase: str,
+    local_commit: bool,
+) -> None:
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    delivery_id = f"delivery-stale-{phase}-{int(local_commit)}"
+    stale = _persist_owned_stale_delivery(
+        workflow,
+        delivery_id=delivery_id,
+        phase=phase,
+        local_commit=local_commit,
+    )
+    prior_commit = stale.commit_sha
+    assert _git(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)",
+        f"refs/heads/{stale.branch}",
+    ) == ""
+
+    recovered = workflow.run(task_id=stale.task_id, delivery_id=delivery_id)
+
+    assert recovered.status == "interrupted"
+    assert recovered.phase == "interrupted"
+    assert recovered.failure_code == "interrupted-run"
+    assert recovered.failure_class == "transient"
+    assert recovered.commit_sha == prior_commit
+    assert "not published" in recovered.message
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+def test_successor_fails_closed_if_predecessor_branch_appears_before_run(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-chain-root-before-run",
+    )
+    _git(
+        root,
+        "push",
+        "origin",
+        f"{predecessor.base_sha}:refs/heads/{predecessor.branch}",
+    )
+
+    with mock.patch.object(
+        workflow.repository,
+        "push",
+        wraps=workflow.repository.push,
+    ) as push:
+        successor = workflow.run(
+            task_id=predecessor.task_id,
+            delivery_id=f"{predecessor.delivery_id}-r2",
+            predecessor_delivery_id=predecessor.delivery_id,
+            retry_root_delivery_id=predecessor.delivery_id,
+            retry_attempt=2,
+        )
+
+    assert successor.status == "failed"
+    assert successor.success is False
+    assert successor.failure_class == "policy"
+    assert successor.failure_code == "artifact-security"
+    assert successor.predecessor_delivery_id == predecessor.delivery_id
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+    push.assert_not_called()
+    assert _git(remote, "rev-parse", f"refs/heads/{predecessor.branch}") == (
+        predecessor.base_sha
+    )
+
+
+def test_final_prepublication_chain_recheck_blocks_successor_push(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+
+    class PublishingPredecessorBuilder(_Builder):
+        predecessor: DeliveryJob
+
+        def propose(self, **kwargs: Any) -> PatchProposal:
+            _git(
+                root,
+                "push",
+                "origin",
+                f"{self.predecessor.base_sha}:refs/heads/"
+                f"{self.predecessor.branch}",
+            )
+            return super().propose(**kwargs)
+
+    builder = PublishingPredecessorBuilder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-chain-root-during-build",
+    )
+    builder.predecessor = predecessor
+
+    with mock.patch.object(
+        workflow.repository,
+        "push",
+        wraps=workflow.repository.push,
+    ) as push:
+        successor = workflow.run(
+            task_id=predecessor.task_id,
+            delivery_id=f"{predecessor.delivery_id}-r2",
+            predecessor_delivery_id=predecessor.delivery_id,
+            retry_root_delivery_id=predecessor.delivery_id,
+            retry_attempt=2,
+        )
+
+    assert successor.status == "failed"
+    assert successor.phase == "failed"
+    assert successor.success is False
+    assert successor.pushed is False
+    assert successor.failure_class == "policy"
+    assert successor.failure_code == "artifact-security"
+    assert builder.calls == reviewer.calls == validator.calls == 1
+    assert github.calls == 0
+    push.assert_not_called()
+    assert _git(remote, "rev-parse", f"refs/heads/{predecessor.branch}") == (
+        predecessor.base_sha
+    )
+    assert _git(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)",
+        f"refs/heads/{successor.branch}",
+    ) == ""
+
+
+def test_r3_checks_full_chain_when_root_branch_reappears(tmp_path: Path) -> None:
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    root_predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-chain-root-r3",
+    )
+    retry_two = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-chain-root-r3-r2",
+        predecessor_delivery_id=root_predecessor.delivery_id,
+        retry_root_delivery_id=root_predecessor.delivery_id,
+        retry_attempt=2,
+    )
+    _git(
+        root,
+        "push",
+        "origin",
+        f"{root_predecessor.base_sha}:refs/heads/{root_predecessor.branch}",
+    )
+    assert _git(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)",
+        f"refs/heads/{retry_two.branch}",
+    ) == ""
+
+    retry_three = workflow.run(
+        task_id=root_predecessor.task_id,
+        delivery_id="delivery-chain-root-r3-r3",
+        predecessor_delivery_id=retry_two.delivery_id,
+        retry_root_delivery_id=root_predecessor.delivery_id,
+        retry_attempt=3,
+    )
+
+    assert retry_three.status == "failed"
+    assert retry_three.failure_class == "policy"
+    assert retry_three.predecessor_delivery_id == retry_two.delivery_id
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("task_id", "TASK-0002"),
+        ("expected_repository", "owner/other-project"),
+    ],
+)
+def test_successor_fails_closed_on_predecessor_binding_tamper(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    field_slug = field.replace("_", "-")
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id=f"delivery-chain-tampered-{field_slug}",
+    )
+    setattr(predecessor, field, value)
+    workflow.store.persist(predecessor)
+
+    successor = workflow.run(
+        task_id="TASK-0001",
+        delivery_id=f"{predecessor.delivery_id}-r2",
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+    )
+
+    assert successor.status == "failed"
+    assert successor.success is False
+    assert successor.failure_class == "policy"
+    assert "changed task or repository identity" in successor.message
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+def test_valid_predecessor_allows_deterministic_successor_and_survives_reload(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, monday = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-chain-valid-root",
+    )
+    successor_id = f"{predecessor.delivery_id}-r2"
+
+    successor = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id=successor_id,
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+    )
+
+    assert successor.success is True
+    assert successor.status == "pr-open"
+    assert successor.predecessor_delivery_id == predecessor.delivery_id
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 1
+
+    replay_builder = _Builder([_patch(1, 9)])
+    replay_reviewer = _Reviewer([_pass("must not run")])
+    replay_validator = _Validator([True])
+    replay_github = _GitHub()
+    restarted, _ = _workflow(
+        root,
+        builder=replay_builder,
+        reviewer=replay_reviewer,
+        validator=replay_validator,
+        github=replay_github,
+        monday=monday,
+    )
+    reloaded = restarted.get(successor_id)
+    replayed = restarted.run(
+        task_id=predecessor.task_id,
+        delivery_id=successor_id,
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+    )
+
+    assert reloaded.predecessor_delivery_id == predecessor.delivery_id
+    assert replayed.to_dict() == reloaded.to_dict()
+    assert replay_builder.calls == 0
+    assert replay_reviewer.calls == replay_validator.calls == replay_github.calls == 0
+
+
+@pytest.mark.parametrize("lineage", ["omitted", "wrong"])
+def test_safe_predecessor_requires_exact_successor_lineage_before_builder(
+    tmp_path: Path,
+    lineage: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-adversarial-lineage-root",
+    )
+    lineage_kwargs: dict[str, object] = {}
+    if lineage == "wrong":
+        lineage_kwargs = {
+            "predecessor_delivery_id": "delivery-adversarial-wrong",
+            "retry_root_delivery_id": predecessor.delivery_id,
+            "retry_attempt": 2,
+        }
+
+    try:
+        successor = workflow.run(
+            task_id=predecessor.task_id,
+            delivery_id=f"{predecessor.delivery_id}-r2",
+            **lineage_kwargs,
+        )
+    except (ArtifactSecurityError, ValueError):
+        successor = None
+
+    if successor is not None:
+        assert successor.status == "failed"
+        assert successor.success is False
+        assert successor.failure_class == "policy"
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+def test_unsafe_retry_child_cannot_consume_safe_root_lineage(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+
+    class PublishingRootBuilder(_Builder):
+        predecessor: DeliveryJob
+
+        def propose(self, **kwargs: Any) -> PatchProposal:
+            _git(
+                root,
+                "push",
+                "origin",
+                f"{self.predecessor.base_sha}:refs/heads/"
+                f"{self.predecessor.branch}",
+            )
+            return super().propose(**kwargs)
+
+    builder = PublishingRootBuilder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-adversarial-consumed-root",
+    )
+    builder.predecessor = predecessor
+
+    unsafe_child = DeliveryJob.from_dict(
+        predecessor.to_dict(include_private=True)
+    )
+    unsafe_child.delivery_id = f"{predecessor.delivery_id}-r2"
+    unsafe_child.predecessor_delivery_id = predecessor.delivery_id
+    unsafe_child.retry_root_delivery_id = predecessor.delivery_id
+    unsafe_child.retry_attempt = 2
+    unsafe_child.status = "failed"
+    unsafe_child.phase = "failed"
+    unsafe_child.success = False
+    unsafe_child.base_ref = ""
+    unsafe_child.base_branch = ""
+    unsafe_child.base_sha = ""
+    unsafe_child.repository = ""
+    unsafe_child.branch = ""
+    unsafe_child.worktree = ""
+    unsafe_child.worktree_owner_token = ""
+    unsafe_child.commit_sha = ""
+    unsafe_child.failure_code = "builder-unavailable"
+    unsafe_child.failure_class = "permanent"
+    unsafe_child.interrupted_from_phase = ""
+    unsafe_child.interruption_proof_sha256 = ""
+    assert workflow.store.reserve(unsafe_child) is None
+
+    with mock.patch.object(
+        workflow.repository,
+        "push",
+        wraps=workflow.repository.push,
+    ) as successor_push:
+        fresh = workflow.run(
+            task_id=predecessor.task_id,
+            delivery_id="delivery-adversarial-unbound-after-unsafe-child",
+        )
+
+    assert fresh.status == "failed"
+    assert fresh.success is False
+    assert fresh.failure_class == "policy"
+    assert fresh.failure_code == "artifact-security"
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+    successor_push.assert_not_called()
+    assert _git(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)",
+        f"refs/heads/{predecessor.branch}",
+    ) == ""
+
+
+def test_fresh_identity_cannot_bypass_permanent_pushing_interruption(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    predecessor = _permanent_pushing_interruption(
+        workflow,
+        delivery_id="delivery-adversarial-pushing-root",
+    )
+
+    successor = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id=f"{predecessor.delivery_id}-r2",
+    )
+
+    assert successor.status == "failed"
+    assert successor.success is False
+    assert successor.failure_class == "policy"
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+def test_pushing_progress_callback_cannot_publish_predecessor_before_successor_push(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-adversarial-pushing-callback-root",
+    )
+    callback_published = False
+
+    def publish_predecessor(snapshot: dict[str, Any]) -> None:
+        nonlocal callback_published
+        if snapshot["phase"] == "pushing" and not callback_published:
+            callback_published = True
+            _git(
+                root,
+                "push",
+                "origin",
+                f"{predecessor.base_sha}:refs/heads/{predecessor.branch}",
+            )
+
+    with mock.patch.object(
+        workflow.repository,
+        "push",
+        wraps=workflow.repository.push,
+    ) as successor_push:
+        successor = workflow.run(
+            task_id=predecessor.task_id,
+            delivery_id=f"{predecessor.delivery_id}-r2",
+            predecessor_delivery_id=predecessor.delivery_id,
+            retry_root_delivery_id=predecessor.delivery_id,
+            retry_attempt=2,
+            progress_callback=publish_predecessor,
+        )
+
+    assert callback_published is True
+    assert successor.success is False
+    assert successor.pushed is False
+    assert github.calls == 0
+    successor_push.assert_not_called()
+    assert _git(remote, "rev-parse", f"refs/heads/{predecessor.branch}") == (
+        predecessor.base_sha
+    )
+
+
+def test_pull_request_progress_callback_cannot_open_successor_pr_after_predecessor(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-adversarial-pr-callback-root",
+    )
+    callback_opened_predecessor = False
+
+    def open_predecessor(snapshot: dict[str, Any]) -> None:
+        nonlocal callback_opened_predecessor
+        if snapshot["phase"] == "pull-request" and not callback_opened_predecessor:
+            callback_opened_predecessor = True
+            predecessor.status = "pr-open"
+            predecessor.phase = "completed"
+            predecessor.success = True
+            predecessor.pushed = True
+            predecessor.commit_sha = predecessor.base_sha
+            predecessor.pr_number = 91
+            predecessor.pr_url = "https://github.com/owner/project/pull/91"
+            predecessor.pr_state = "open"
+            predecessor.checks_status = "pending"
+            predecessor.failure_code = ""
+            predecessor.failure_class = ""
+            workflow.store.persist(predecessor)
+
+    successor = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id=f"{predecessor.delivery_id}-r2",
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+        progress_callback=open_predecessor,
+    )
+
+    assert callback_opened_predecessor is True
+    assert successor.success is False
+    assert successor.pushed is True
+    assert github.calls == 0
+
+
+@pytest.mark.parametrize("tamper", ["truncate", "rebind"])
+def test_r3_rejects_tampered_middle_lineage_link(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    root_predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-adversarial-middle-root",
+    )
+    retry_two = _safe_retry_predecessor(
+        workflow,
+        delivery_id=f"{root_predecessor.delivery_id}-r2",
+        predecessor_delivery_id=root_predecessor.delivery_id,
+        retry_root_delivery_id=root_predecessor.delivery_id,
+        retry_attempt=2,
+    )
+    if tamper == "truncate":
+        retry_two.predecessor_delivery_id = ""
+    else:
+        alternate = DeliveryJob.from_dict(
+            root_predecessor.to_dict(include_private=True)
+        )
+        alternate.delivery_id = "delivery-adversarial-alternate-root"
+        alternate.status = "failed"
+        alternate.phase = "failed"
+        alternate.success = False
+        alternate.base_ref = ""
+        alternate.base_branch = ""
+        alternate.base_sha = ""
+        alternate.repository = ""
+        alternate.branch = ""
+        alternate.worktree = ""
+        alternate.worktree_owner_token = ""
+        alternate.commit_sha = ""
+        alternate.failure_code = "provider-timeout"
+        alternate.failure_class = "transient"
+        alternate.predecessor_delivery_id = ""
+        alternate.retry_root_delivery_id = ""
+        alternate.retry_attempt = 0
+        alternate.interrupted_from_phase = ""
+        alternate.interruption_proof_sha256 = ""
+        assert workflow.store.reserve(alternate) is None
+        retry_two.predecessor_delivery_id = alternate.delivery_id
+    workflow.store.persist(retry_two)
+
+    retry_three = workflow.run(
+        task_id=root_predecessor.task_id,
+        delivery_id=f"{root_predecessor.delivery_id}-r3",
+        predecessor_delivery_id=retry_two.delivery_id,
+        retry_root_delivery_id=root_predecessor.delivery_id,
+        retry_attempt=3,
+    )
+
+    assert retry_three.status == "failed"
+    assert retry_three.success is False
+    assert retry_three.failure_class == "policy"
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+def test_transient_flip_cannot_authorize_permanent_pushing_interruption(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    predecessor = _permanent_pushing_interruption(
+        workflow,
+        delivery_id="delivery-adversarial-transient-flip-root",
+    )
+    predecessor.failure_class = "transient"
+    workflow.store.persist(predecessor)
+
+    successor = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id=f"{predecessor.delivery_id}-r2",
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+    )
+
+    assert successor.status == "failed"
+    assert successor.success is False
+    assert successor.failure_class == "policy"
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+def test_older_timestamp_cannot_hide_any_matching_live_pull_request(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-adversarial-timestamp-root",
+    )
+    hidden_open_pr = DeliveryJob.from_dict(
+        predecessor.to_dict(include_private=True)
+    )
+    hidden_open_pr.delivery_id = "delivery-adversarial-hidden-open-pr"
+    hidden_open_pr.status = "pr-open"
+    hidden_open_pr.phase = "completed"
+    hidden_open_pr.success = True
+    hidden_open_pr.pushed = True
+    hidden_open_pr.commit_sha = predecessor.base_sha
+    hidden_open_pr.pr_number = 92
+    hidden_open_pr.pr_url = "https://github.com/owner/project/pull/92"
+    hidden_open_pr.pr_state = "open"
+    hidden_open_pr.checks_status = "pending"
+    hidden_open_pr.failure_code = ""
+    hidden_open_pr.failure_class = ""
+    hidden_open_pr.predecessor_delivery_id = ""
+    hidden_open_pr.retry_root_delivery_id = ""
+    hidden_open_pr.retry_attempt = 0
+    hidden_open_pr.interrupted_from_phase = ""
+    hidden_open_pr.interruption_proof_sha256 = ""
+    hidden_open_pr.created_at = "2000-01-01T00:00:00+00:00"
+    hidden_open_pr.updated_at = hidden_open_pr.created_at
+    assert hidden_open_pr.created_at < predecessor.created_at
+    assert workflow.store.reserve(hidden_open_pr) is None
+
+    successor = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id=f"{predecessor.delivery_id}-r2",
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+    )
+
+    assert successor.status == "failed"
+    assert successor.success is False
+    assert successor.failure_class == "policy"
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+def test_same_id_reservation_race_uses_prepublication_absence_proof(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    stale = _persist_owned_stale_delivery(
+        workflow,
+        delivery_id="delivery-raced-prepublication",
+        phase="reviewing",
+    )
+    assert _git(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)",
+        f"refs/heads/{stale.branch}",
+    ) == ""
+
+    with _miss_initial_delivery_lookup(workflow):
+        recovered = workflow.run(
+            task_id=stale.task_id,
+            delivery_id=stale.delivery_id,
+        )
+
+    assert recovered.status == "interrupted"
+    assert recovered.phase == "interrupted"
+    assert recovered.failure_code == "interrupted-run"
+    assert recovered.failure_class == "transient"
+    assert "not published" in recovered.message
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+def test_same_id_reservation_race_reconciles_exact_remote_publication(
+    tmp_path: Path,
+) -> None:
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _GitHub()
+    monday = _Monday()
+    monday.status = "in-progress"
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+        monday=monday,
+    )
+    stale = _persist_owned_stale_delivery(
+        workflow,
+        delivery_id="delivery-raced-publication",
+        phase="pushing",
+        local_commit=True,
+    )
+    stale.artifact_sha256 = "a" * 64
+    stale.reviewed_artifact_sha256 = stale.artifact_sha256
+    stale.review_expected_task_revision = _task_revision(root)
+    workflow.store.persist(stale)
+    _git(
+        root,
+        "push",
+        "origin",
+        f"{stale.commit_sha}:refs/heads/{stale.branch}",
+    )
+    assert _git(remote, "rev-parse", f"refs/heads/{stale.branch}") == stale.commit_sha
+
+    with (
+        _miss_initial_delivery_lookup(workflow),
+        mock.patch.object(
+            workflow.repository,
+            "push",
+            side_effect=AssertionError("publication reconciliation must not push twice"),
+        ),
+    ):
+        recovered = workflow.run(
+            task_id=stale.task_id,
+            delivery_id=stale.delivery_id,
+        )
+
+    assert recovered.status == "pr-open"
+    assert recovered.phase == "completed"
+    assert recovered.success is True
+    assert recovered.pushed is True
+    assert recovered.commit_sha == stale.commit_sha
+    assert github.calls == 1
+    assert monday.status == "review"
+    assert builder.calls == reviewer.calls == validator.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("phase", "local_commit"),
+    [
+        ("reviewing", False),
+        ("publication-ready", True),
+    ],
+)
+def test_owned_stale_delivery_with_remote_branch_stays_permanent(
+    tmp_path: Path,
+    phase: str,
+    local_commit: bool,
+) -> None:
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    delivery_id = f"delivery-remote-{phase}"
+    stale = _persist_owned_stale_delivery(
+        workflow,
+        delivery_id=delivery_id,
+        phase=phase,
+        local_commit=local_commit,
+    )
+    published_sha = stale.commit_sha or stale.base_sha
+    _git(
+        root,
+        "push",
+        "origin",
+        f"{published_sha}:refs/heads/{stale.branch}",
+    )
+    assert _git(remote, "rev-parse", f"refs/heads/{stale.branch}") == published_sha
+
+    recovered = workflow.run(task_id=stale.task_id, delivery_id=delivery_id)
+
+    assert recovered.status == "interrupted"
+    assert recovered.failure_code == "interrupted-run"
+    assert recovered.failure_class == "permanent"
+    assert "new build request" in recovered.message
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+@pytest.mark.parametrize("ownership_failure", ["missing", "tampered"])
+def test_owned_stale_delivery_with_unproven_ownership_stays_permanent(
+    tmp_path: Path,
+    ownership_failure: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 9)])
+    reviewer = _Reviewer([_pass("must not run")])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    delivery_id = f"delivery-owner-{ownership_failure}"
+    stale = _persist_owned_stale_delivery(
+        workflow,
+        delivery_id=delivery_id,
+        phase="validating",
+    )
+    owner_marker = (
+        workflow.store.root
+        / "owners"
+        / f"{Path(stale.worktree).name}.owner.json"
+    )
+    if ownership_failure == "missing":
+        owner_marker.unlink()
+    else:
+        marker = json.loads(owner_marker.read_text(encoding="utf-8"))
+        marker["owner_token"] = "0" * 64
+        owner_marker.write_text(
+            json.dumps(marker, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    recovered = workflow.run(task_id=stale.task_id, delivery_id=delivery_id)
+
+    assert recovered.status == "interrupted"
+    assert recovered.failure_code == "interrupted-run"
+    assert recovered.failure_class == "permanent"
+    assert "new build request" in recovered.message
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+
+def test_stale_reviewing_delivery_with_changed_local_head_stays_permanent(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 9)]),
+        reviewer=_Reviewer([_pass("must not run")]),
+        validator=_Validator([True]),
+        github=_GitHub(),
+    )
+    stale = _persist_owned_stale_delivery(
+        workflow,
+        delivery_id="delivery-changed-head",
+        phase="reviewing",
+    )
+    worktree = workflow.repository.recover_worktree(
+        path=Path(stale.worktree),
+        branch=stale.branch,
+        base_sha=stale.base_sha,
+        owner_token=stale.worktree_owner_token,
+    )
+    (worktree.path / "app.py").write_text("VALUE = 7\n", encoding="utf-8")
+    workflow.repository.stage(worktree, ["app.py"])
+    staged_diff = workflow.repository.staged_diff(worktree)
+    workflow.repository.commit(
+        worktree,
+        ["app.py"],
+        "Unexpected local commit",
+        expected_diff_sha256=hashlib.sha256(
+            staged_diff.encode("utf-8")
+        ).hexdigest(),
+    )
+
+    recovered = workflow.run(
+        task_id=stale.task_id,
+        delivery_id=stale.delivery_id,
+    )
+
+    assert recovered.status == "interrupted"
+    assert recovered.failure_class == "permanent"
+    assert "new build request" in recovered.message
 
 
 def test_live_nonterminal_delivery_is_returned_when_lease_is_busy(

@@ -1407,6 +1407,84 @@ new file mode 100644
             ):
                 fixture.repository.remote_branch_is_exact(worktree, commit_sha)
 
+    def test_remote_branch_absence_is_true_at_fresh_base(self):
+        with TemporaryDirectory() as tmp:
+            fixture = GitFixture(Path(tmp))
+            worktree = fixture.worktree("TASK-ABSENT-BASE")
+
+            self.assertTrue(fixture.repository.remote_branch_is_absent(worktree))
+
+    def test_remote_branch_absence_is_true_after_unpublished_local_commit(self):
+        with TemporaryDirectory() as tmp:
+            fixture = GitFixture(Path(tmp))
+            worktree = fixture.worktree("TASK-ABSENT-COMMIT")
+            (worktree.path / "feature.txt").write_text("ready\n", encoding="utf-8")
+            fixture.repository.stage(worktree, ["feature.txt"])
+            commit_sha = fixture.repository.commit(
+                worktree,
+                ["feature.txt"],
+                "Add unpublished feature",
+                expected_diff_sha256=_approved_diff(fixture.repository, worktree),
+            )
+
+            self.assertEqual(commit_sha, fixture.repository.current_head(worktree))
+            self.assertTrue(fixture.repository.remote_branch_is_absent(worktree))
+
+    def test_remote_branch_absence_is_false_after_push(self):
+        with TemporaryDirectory() as tmp:
+            fixture = GitFixture(Path(tmp))
+            worktree = fixture.worktree("TASK-PRESENT-REMOTE")
+            (worktree.path / "feature.txt").write_text("ready\n", encoding="utf-8")
+            fixture.repository.stage(worktree, ["feature.txt"])
+            commit_sha = fixture.repository.commit(
+                worktree,
+                ["feature.txt"],
+                "Add published feature",
+                expected_diff_sha256=_approved_diff(fixture.repository, worktree),
+            )
+            fixture.repository.push(worktree, commit_sha)
+
+            self.assertFalse(fixture.repository.remote_branch_is_absent(worktree))
+
+    def test_remote_branch_absence_rejects_malformed_remote_response(self):
+        with TemporaryDirectory() as tmp:
+            fixture = GitFixture(Path(tmp))
+            worktree = fixture.worktree("TASK-MALFORMED-REMOTE")
+            remote_ref = f"refs/heads/{worktree.branch}"
+            original_git = fixture.repository._git
+
+            malformed = (
+                f"{'a' * 40}\trefs/heads/another-branch\n",
+                (
+                    f"{'a' * 40}\t{remote_ref}\n"
+                    f"{'b' * 40}\t{remote_ref}\n"
+                ),
+            )
+            for response in malformed:
+                with self.subTest(response=response):
+                    def malformed_git(
+                        cwd: Path,
+                        *args: str,
+                        response_text: str = response,
+                        **kwargs: object,
+                    ) -> CommandResult:
+                        if args[:2] == ("ls-remote", "--refs") and args[-1] == remote_ref:
+                            return CommandResult(
+                                argv=("git", *args),
+                                returncode=0,
+                                stdout=response_text,
+                                stderr="",
+                            )
+                        return original_git(cwd, *args, **kwargs)  # type: ignore[arg-type]
+
+                    fixture.repository._git = malformed_git  # type: ignore[method-assign]
+                    with self.assertRaisesRegex(
+                        GitValidationError,
+                        "remote branch response is invalid",
+                    ):
+                        fixture.repository.remote_branch_is_absent(worktree)
+            fixture.repository._git = original_git  # type: ignore[method-assign]
+
     def test_push_forwards_guard_only_to_irreversible_git_command(self):
         with TemporaryDirectory() as tmp:
             fixture = GitFixture(Path(tmp))

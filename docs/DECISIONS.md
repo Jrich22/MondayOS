@@ -1,6 +1,6 @@
 # MondayOS — Architectural Decision Records
 
-**Last Updated:** 2026-10-13
+**Last Updated:** 2026-10-15
 
 This file is the canonical log of all architectural decisions made for MondayOS. Decisions are recorded in the format described in [DOCUMENTATION_STANDARDS.md](DOCUMENTATION_STANDARDS.md).
 
@@ -1609,3 +1609,81 @@ idempotent.
 - The normal daemon remains required for continuous observation and outbox
   delivery; one-shot mode neither observes nor delivers lifecycle state, so it
   cannot send a saved status without first reconciling GitHub.
+
+---
+
+## ADR-031: Interrupted Builds Need Proof Before a Successor
+
+**Date:** 2026-10-15
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+The delivery controller already reconciled an exact identity after a crash, but
+an interruption before publication became a permanent result. Telegram could
+therefore recover a temporary provider outage automatically while an ordinary
+worker or host restart required a second user request. Treating every
+`interrupted` label as retryable would be unsafe because a push may have crossed
+the remote boundary before the local checkpoint was written.
+
+### Decision
+
+An interrupted delivery authorizes a fresh identity only in the controller's
+implementation, validation, review, commit, or final pre-publication phases.
+MondayOS revalidates the durable target and controller-owned worktree, pins the
+remote identity, and queries the exact unique delivery branch. Only a
+well-formed empty remote result permits the interruption to carry the structured
+retryable classification. The terminal record also preserves the interruption's
+source phase and a SHA-256 proof digest over that phase, the delivery lineage,
+task and repository identity, base and branch, controller-owned worktree, and
+any local commit. A retained local commit is diagnostic state and is never
+reused by the successor; changing a proof-bound field invalidates the record.
+
+If the branch exists, ownership evidence is missing, the remote changes, the
+query is malformed or unavailable, or publication may have started, no
+successor is authorized. A pre-publication record without sufficient proof
+remains permanently terminal for inspection. If publication started or may have
+crossed the remote boundary, reconciliation continues only under the original
+identity.
+
+Telegram reuses its existing deterministic `-r2` through `-r6` scheduler,
+write-ahead attempt checkpoints, capacity bound, and request-free outbox. Each
+successor durably identifies the controller-derived immediate predecessor,
+retry root, and attempt, which must produce the exact deterministic `ROOT-rN`
+delivery ID. The controller independently derives the sole permissible retry
+source from durable history, so omitted or caller-substituted lineage cannot
+authorize a successor. It re-proves the complete bounded chain under its
+repository workflow lock before reserving work, under the task lock, and after
+each untrusted publication progress callback immediately adjacent to push and
+pull-request creation. A reappearing predecessor branch, any other matching live
+pull request regardless of its timestamps, changed task or target identity,
+malformed lineage or proof, or unavailable verification stops the successor
+before the next irreversible operation. The single 24-hour deadline is saved
+before the root build invocation and survives nonterminal reconciliation, so
+process downtime cannot create a new recovery window.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Retry every interrupted record with empty publication fields | A crash can occur between a remote side effect and its local checkpoint. |
+| Resume the old model or worktree mutation in place | Provider sessions and partially applied mutations are not replay-safe. |
+| Require another Telegram request | It leaves a safely recoverable host crash dependent on human availability. |
+| Delete the old worktree before retrying | Retained controller-owned state is useful for diagnosis, and cleanup is a separate destructive lifecycle. |
+
+### Consequences
+
+- A proven pre-publication crash recovers without user action and cannot create
+  more than one deterministic successor per attempt.
+- A delayed successor cannot rely on stale absence evidence; every predecessor
+  remains part of the final publication authorization.
+- Delivery creation timestamps cannot suppress a matching live pull request;
+  publication state, not record age, controls the gate.
+- Push and pull-request uncertainty never authorizes a new identity.
+- Remote verification availability is part of the safety proof; an outage may
+  leave an interruption terminal for manual inspection.
+- Abandoned controller-owned local branches may remain until a separate bounded
+  cleanup policy is implemented.
