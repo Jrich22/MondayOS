@@ -28,7 +28,9 @@ outbound long polling, so it does not open a public port or require a tunnel.
   stable `JOB-<Telegram update ID>` handle. Receipt delivery retries with
   bounded backoff from local state, rechecks the current allowlists, and remains
   independent of Telegram update retention. A full inbox is refused durably,
-  without retaining the rejected request text.
+  without retaining the rejected request text. Its bounded, request-free notice
+  outbox advances the update offset immediately, so a send outage cannot block
+  later `/queue` or `/cancel` controls.
 - Keeps private, allowlisted `/queue` and queued-only `/cancel JOB-ID` controls
   responsive on the polling path while model/build work is busy. These controls
   expose only job handles, phases, and positions—not saved request text.
@@ -256,14 +258,20 @@ pristine version 5 queued jobs receive pending receipts; already-started or
 checkpointed work remains eligible so recovery is never discarded.
 
 When it is full, the original update becomes a request-free refusal tombstone.
-Its Telegram offset stays unacknowledged until the refusal notice is delivered
-or Telegram reports a permanent destination failure. A transient send failure
-or restart therefore retries the notice directly from durable local state,
-without relying on Telegram to redeliver the original update and without ever
-re-admitting or retaining the rejected request. A retry also rechecks the
-current user and group
-allowlists; a revoked destination is not contacted. The user is told that the
-request was not saved and can use `/queue` or `/cancel` before trying again.
+The same atomic write advances its Telegram offset and creates a minimal notice
+outbox, so refusal delivery never gates later polling. A transient failure or
+rate limit records bounded backoff and survives restart; `/queue`, `/cancel`,
+and other updates continue through the control plane while the notice waits.
+Recovery does not rely on Telegram redelivering the original update and never
+re-admits or retains the rejected request. A retry also rechecks the current
+user and group allowlists and verifies that the minimal saved route is still
+bound to the original update and request digest; a revoked, malformed, or
+redirected destination is not contacted. Because pre-v7 capacity notices have
+no trustworthy route binding, migration terminalizes and scrubs them while
+advancing their offset. The user is told that the request was not saved and can
+use `/queue` or `/cancel` before trying again. At most 500 unresolved refusal
+notices are retained; after that bound, newer refusals are safely terminalized
+without retaining their route.
 Existing state with more than 25 pending jobs remains loadable and drains
 normally; the cap applies to new admission. `monday telegram --health` reports
 the current usage, unresolved acceptance receipts, and unresolved refusal

@@ -13,18 +13,18 @@ from telegram_bot.state import TelegramState
 
 _MAX_HANDLER_ATTEMPTS = 3
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
-_MAX_ACCEPTANCE_RECEIPT_PAUSE_SECONDS = 86_400
+_MAX_TELEGRAM_NOTICE_PAUSE_SECONDS = 86_400
 
 
 class TelegramUpdateRetryError(RuntimeError):
     """A queued handler failed but its durable checkpoint remains retryable."""
 
 
-def _acceptance_receipt_rate_limit_delay(value: Any) -> float:
+def _telegram_notice_rate_limit_delay(value: Any) -> float:
     """Bound an untrusted Bot API retry hint before float/time arithmetic."""
     if isinstance(value, bool) or not isinstance(value, int):
         return 1.0
-    return float(min(max(value, 1), _MAX_ACCEPTANCE_RECEIPT_PAUSE_SECONDS))
+    return float(min(max(value, 1), _MAX_TELEGRAM_NOTICE_PAUSE_SECONDS))
 
 
 class TelegramJobWorker:
@@ -225,6 +225,7 @@ class TelegramRunner:
         )
         self._worker_error: BaseException | None = None
         self._acceptance_receipts_paused_until = 0.0
+        self._capacity_notices_paused_until = 0.0
 
     def start(self) -> dict[str, object]:
         identity = self._client.get_me()
@@ -259,9 +260,7 @@ class TelegramRunner:
             if update_id < 0:
                 continue
             if self._state.is_terminal(update_id):
-                if self._state.queue_full_notice(update_id):
-                    self._deliver_queue_full_notice(update_id, update)
-                else:
+                if not self._state.queue_full_notice(update_id):
                     self._state.reaffirm_terminal(update_id)
                 handled += 1
                 continue
@@ -326,9 +325,12 @@ class TelegramRunner:
                 self._wake.set()
             elif position == 0:
                 tombstone = self._state.completed_job(update_id)
-                if tombstone.get("phase") == "queue-full":
-                    self._deliver_queue_full_notice(update_id, normalized)
+                if tombstone.get("phase") != "queue-full":
+                    self._state.reaffirm_terminal(update_id)
             handled += 1
+        # Process state-only controls before attempting a newly-created
+        # capacity notice, so a slow send cannot hold a later /cancel behind it.
+        self._drain_queue_full_notices()
         self._drain_acceptance_receipts()
         return handled
 
@@ -445,7 +447,7 @@ class TelegramRunner:
         try:
             delivered = announcer(notice)
         except TelegramRateLimitError as exc:
-            delay = _acceptance_receipt_rate_limit_delay(exc.retry_after)
+            delay = _telegram_notice_rate_limit_delay(exc.retry_after)
             self._acceptance_receipts_paused_until = time.time() + delay
             self._state.defer_acceptance_receipts(
                 defer_scope,
@@ -495,13 +497,25 @@ class TelegramRunner:
         self,
         update_id: int,
         update: dict[str, Any] | None = None,
-    ) -> None:
+        *,
+        rate_limit_scope: list[int] | None = None,
+    ) -> float | None:
         """Deliver and checkpoint one request-free capacity refusal notice."""
+        due = self._state.due_queue_full_notice_ids()
+        if update_id not in due:
+            return None
+        defer_scope = rate_limit_scope or [update_id]
+        paused_for = self._capacity_notices_paused_until - time.time()
+        if paused_for > 0:
+            self._state.defer_queue_full_notices(
+                defer_scope,
+                delay_seconds=paused_for,
+            )
+            return paused_for
         try:
             notice = self._state.queue_full_notice(update_id)
             if not notice:
-                self._state.reaffirm_terminal(update_id)
-                return
+                return None
             announcer = getattr(self._service, "announce_queue_full_notice", None)
             legacy_announcer = getattr(self._service, "announce_queue_full", None)
             if callable(announcer):
@@ -511,7 +525,7 @@ class TelegramRunner:
                         update_id,
                         delivered=False,
                     )
-                    return
+                    return None
             elif callable(legacy_announcer):
                 legacy_announcer(update or {
                     "update_id": update_id,
@@ -528,21 +542,41 @@ class TelegramRunner:
                 })
             else:
                 self._state.complete_queue_full_notice(update_id, delivered=False)
-                return
+                return None
+        except TelegramRateLimitError as exc:
+            delay = _telegram_notice_rate_limit_delay(exc.retry_after)
+            self._capacity_notices_paused_until = time.time() + delay
+            self._state.defer_queue_full_notices(
+                defer_scope,
+                delay_seconds=delay,
+            )
+            return delay
         except TelegramAPIError as exc:
             if exc.retryable:
-                # The durable tombstone deliberately leaves the Telegram
-                # offset behind this update so a restart/redelivery retries
-                # the same request-free notice without re-admitting the job.
-                raise
-            self._state.complete_queue_full_notice(update_id, delivered=False)
+                self._state.defer_queue_full_notice(
+                    update_id,
+                    delay_seconds=30,
+                )
+            else:
+                self._state.complete_queue_full_notice(update_id, delivered=False)
         except Exception:
             print("Could not send Telegram queue-full notice.", file=sys.stderr)
-            self._state.complete_queue_full_notice(update_id, delivered=False)
+            self._state.defer_queue_full_notice(
+                update_id,
+                delay_seconds=60,
+            )
         else:
             self._state.complete_queue_full_notice(update_id, delivered=True)
+        return None
 
     def _drain_queue_full_notices(self) -> None:
         """Retry durable refusal notices without relying on Telegram replay."""
-        for update_id in self._state.pending_queue_full_notice_ids():
-            self._deliver_queue_full_notice(update_id)
+        due = self._state.due_queue_full_notice_ids()
+        for index, update_id in enumerate(due):
+            self._deliver_queue_full_notice(
+                update_id,
+                rate_limit_scope=due[index:],
+            )
+            # Bound pre-poll work even when Telegram is healthy. Remaining
+            # notices stay durable and another loop will drain the next one.
+            break

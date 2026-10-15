@@ -291,12 +291,15 @@ and retry without blocking Telegram intake or retaining raw GitHub diagnostics.
 Allowlisted group `/build` commands continue to use the advisory team workflow;
 groups can never start terminal code execution.
 
-Telegram atomically persists each accepted minimal request together with its
-advanced offset in `logs/telegram/state.json`, immediately returns a saved
-receipt with the FIFO position, and continues polling. One non-daemon worker
-exclusively performs Monday/model jobs, including `Monday.build()`, so build
-concurrency remains one even while intake stays responsive. Unauthorized and
-otherwise ignored content is not queued.
+Telegram atomically persists each accepted minimal request, its request-free
+acceptance receipt, and its advanced offset in `logs/telegram/state.json`. The
+worker cannot claim the request until the stable `JOB-ID` receipt is durably
+sent. A full inbox instead stores a bounded request-free refusal notice and
+advances the offset in the same checkpoint; notice backoff therefore cannot
+block a later `/cancel`. One non-daemon worker exclusively performs
+Monday/model jobs, including `Monday.build()`, so build concurrency remains one
+even while intake stays responsive. Unauthorized and otherwise ignored content
+is not queued.
 
 Queued, running, waiting, and retrying work is recovered after restart with
 stable Telegram job, task, run, and delivery identities. Unexpected poison work

@@ -14,14 +14,18 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - A bounded Telegram inbox with a 25-pending-job admission limit, stable
   `JOB-ID` receipts, private ownership-bound `/queue`, and queued-only
   `/cancel JOB-ID`. Capacity refusals and cancellations are durable,
-  request-free, restart-safe replay tombstones; a transient refusal-notice
-  failure retries from durable state before its Telegram offset advances,
-  without depending on Telegram retaining the original update, and rechecks
-  current allowlists before sending. Private controls include the same user's
-  allowed-group submissions, persisted requests are semantically revalidated
-  before execution, and health fails at inbox capacity. Controls remain
-  responsive while the single build worker is busy, and running or
-  side-effectful work cannot be interrupted.
+  request-free, restart-safe replay tombstones. A capacity refusal now advances
+  the Telegram offset in the same atomic write as its bounded notice outbox, so
+  transient send failures and rate limits back off durably without blocking a
+  later `/cancel` or any other polling. Retries do not depend on Telegram
+  retaining the original update, bind their minimal route to the refused update,
+  and recheck current allowlists before sending; at most 500 unresolved refusal
+  notices are retained. Unbound pre-v7 notices fail closed during migration
+  instead of trusting legacy routing fields. Private controls include
+  the same user's allowed-group submissions, persisted requests are
+  semantically revalidated before execution, and health fails at inbox
+  capacity. Controls remain responsive while the single build worker is busy,
+  and running or side-effectful work cannot be interrupted.
 - A secret-free `monday telegram --health [--json]` probe backed by a durable,
   independent daemon heartbeat and the existing single-worker lock. It validates
   local configuration and state without contacting Telegram, includes live-build

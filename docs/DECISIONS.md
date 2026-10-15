@@ -1176,3 +1176,68 @@ work.
   continues until its existing terminal or recovery path.
 - Rejected and cancelled jobs preserve replay identity without preserving the
   request that caused them.
+
+---
+
+## ADR-025: Capacity-Notice Delivery Must Not Gate Telegram Intake
+
+**Date:** 2026-10-14
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+ADR-024 originally kept the Telegram offset behind a capacity-refused update
+until its user notice resolved. That made the notice restart-safe, but it also
+made `sendMessage` availability a prerequisite for `getUpdates`: the daemon
+retried the refusal before polling and propagated every transient failure. A
+full inbox plus a temporary send outage could therefore prevent the operator's
+later `/cancel JOB-ID` from entering the control plane, even though that command
+was the intended way to free capacity.
+
+### Decision
+
+A capacity refusal is now one atomic checkpoint containing a request-free
+terminal tombstone, a bounded notice-outbox entry, and the advanced Telegram
+offset. Durable local state—not Telegram redelivery—owns notice recovery.
+Transient failures use validated retry metadata and bounded backoff across
+restart. Telegram rate limits defer the complete due cohort in one atomic state
+write. Notice failure never propagates into polling, and state-only controls are
+processed before a newly-created refusal notice is attempted.
+
+The outbox retains at most 500 unresolved refusal notices. Once that bound is
+reached, a newer refusal is terminalized and its temporary route is scrubbed;
+the rejected request body is never retained. Every retry rechecks current user
+and group allowlists and verifies a deterministic binding between the update,
+request digest, and minimal route. Permanent failures and revoked, malformed,
+or redirected destinations terminalize and scrub the notice without contacting
+a different destination. Pre-v7 pending notices have no such binding, so
+migration fails them closed, scrubs their legacy route, and advances their held
+offset rather than turning mutable legacy fields into authority to message
+someone. Local health remains unhealthy while any refusal notice is unresolved.
+
+This supersedes only ADR-024's rule that a capacity-refused update must hold the
+Telegram offset behind its notice. The 25-job inbox cap, request-free
+tombstones, private ownership boundary, queued-only cancellation, and semantic
+request validation remain unchanged.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Continue relying on Telegram redelivery | A notification outage would still block the very control needed to free capacity. |
+| Retry notices in memory after advancing the offset | A process restart could silently lose the refusal notification. |
+| Let unresolved notices grow without a bound | A sustained full-inbox flood could turn the liveness fix into local state exhaustion. |
+| Drop every failed notice immediately | Temporary outages would become silent permanent notification loss. |
+
+### Consequences
+
+- `/queue`, `/cancel`, and later updates remain reachable during refusal-notice
+  outages and rate limits.
+- A crash may duplicate the same fixed notice at the remote/local checkpoint
+  boundary, but it cannot re-admit the rejected request or execute it.
+- Refusal delivery can lag behind intake; health exposes that unresolved state.
+- Under extreme sustained refusal volume, the bounded outbox deliberately
+  favors control-plane availability over notifying every rejected update.

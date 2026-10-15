@@ -147,7 +147,7 @@ mode and does not run delayed delivery retries or pull-request monitoring.
 For a full delivery smoke test after enabling live builds, send a narrowly
 scoped documentation request to the bot. Confirm that it:
 
-1. acknowledges the durable queue position;
+1. returns a durable `JOB-ID` before the request can start;
 2. reports build progress;
 3. opens one pull request with a validation and ChatGPT review summary; and
 4. stops without merging or deploying.

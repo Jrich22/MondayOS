@@ -58,6 +58,7 @@ Then send `/status` in the allowlisted private Telegram chat. Healthy means:
 - launchd reports the service instead of `service not found`;
 - `monday telegram --health` reports a held worker lock and fresh heartbeat;
 - the inbox line reports fewer than 25 pending jobs and `accepting work`;
+- the receipts line reports `0 pending`;
 - the refusals line reports `0 pending`;
 - MondayOS status is healthy;
 - build capabilities reports `ready: True` for subscription-based Codex review;
@@ -73,8 +74,8 @@ monday telegram --health --json
 
 The command never contacts Telegram, never prints the bot token, and exits
 nonzero when the local configuration, worker lock, heartbeat, state, inbox
-capacity, unresolved refusal notices, or required live-build capabilities are
-not ready.
+capacity, unresolved acceptance receipts or refusal notices, or required
+live-build capabilities are not ready.
 
 Use `monday build history --limit 20` to review recent deliveries. For a known
 delivery ID:
@@ -117,6 +118,11 @@ cannot interrupt running, waiting, retrying, or side-effectful work. Do not edit
 completion release capacity safely and preserve replay protection. For a job
 submitted in an allowed group, open Monday's private chat: the same submitting
 user can see and cancel it there, while other users cannot.
+
+Capacity-refusal notices retry from a bounded local outbox. A Telegram send
+outage or rate limit may delay that notice, but it does not stop polling; a
+later `/cancel` can still arrive and free capacity. Health remains nonzero while
+any refusal notice is unresolved.
 
 ## Logs and safe rotation
 
