@@ -20,15 +20,15 @@ outbound long polling, so it does not open a public port or require a tunnel.
   change. Observation failures back off without exposing remote diagnostics.
 - Supports task/system status, active-task listing, and explicit run commands.
 - Supports idempotent approval and rejection of reviewed runs.
-- Atomically saves each accepted, minimal request and the advanced Telegram
-  offset in `logs/telegram/state.json`, then immediately confirms that it was
-  saved and reports its FIFO queue position. Unauthorized or otherwise ignored
-  content is never queued.
+- Atomically saves each accepted, minimal request, its request-free acceptance
+  receipt, and the advanced Telegram offset in `logs/telegram/state.json`.
+  The worker cannot execute that request until Telegram receipt delivery is
+  durably confirmed. Unauthorized or otherwise ignored content is never queued.
 - Bounds the durable inbox at 25 pending jobs. Every accepted request receives a
-  stable `JOB-<Telegram update ID>` handle; a full inbox is refused durably,
-  without retaining the rejected request text. The request-free refusal notice
-  retries from local durable state after a transient Telegram failure or
-  restart, even if Telegram no longer retains the original update.
+  stable `JOB-<Telegram update ID>` handle. Receipt delivery retries with
+  bounded backoff from local state, rechecks the current allowlists, and remains
+  independent of Telegram update retention. A full inbox is refused durably,
+  without retaining the rejected request text.
 - Keeps private, allowlisted `/queue` and queued-only `/cancel JOB-ID` controls
   responsive on the polling path while model/build work is busy. These controls
   expose only job handles, phases, and positions—not saved request text.
@@ -45,9 +45,12 @@ outbound long polling, so it does not open a public port or require a tunnel.
 - Removes active request text when a job becomes a terminal replay tombstone.
   A graceful stop finishes the current job and leaves the rest durably queued.
 
-Telegram is the transport only until an accepted request is saved. After that
-atomic checkpoint, the local queue—not Telegram's temporary update retention—is
-the source of truth for pending work.
+Telegram is the transport until an accepted request and its receipt outbox are
+saved. After that atomic checkpoint, the local queue—not Telegram's temporary
+update retention—is the source of truth for pending work. Receipt sends are
+at-least-once: a crash after Telegram accepts the message but before the local
+checkpoint can produce the same fixed receipt twice, while the job still runs
+only once.
 
 ## Create the bot
 
@@ -128,8 +131,9 @@ monday telegram --health --json
 
 The JSON form is suitable for monitoring and exits nonzero when configuration,
 durable state, the worker lock, heartbeat freshness, or required live-build
-capabilities are unhealthy, or when the inbox is not accepting new work. Full
-installation and recovery procedures are in
+capabilities are unhealthy, when the inbox is not accepting new work, or while
+an accepted-job receipt remains unresolved. Full installation and recovery
+procedures are in
 [SETUP_GUIDE.md](SETUP_GUIDE.md) and [RUNBOOK.md](RUNBOOK.md).
 
 At startup MondayOS verifies the bot identity and removes any prior webhook
@@ -240,6 +244,17 @@ never merges or deploys it.
 ## Bounded inbox and cancellation
 
 MondayOS accepts at most 25 pending Telegram jobs across the durable inbox.
+Admission atomically creates a request-free receipt record containing only the
+stable request digest and minimal destination identity. Receipt text is derived
+from the stable `JOB-ID`, never from the request. Transient Telegram failures
+back off durably across restart without blocking `/queue` or `/cancel`, and an
+older unresolved receipt prevents newer work from bypassing FIFO. Current user
+and group allowlists are checked on every attempt. Revocation or a permanent
+destination failure scrubs the unstarted request and releases capacity rather
+than executing work the user cannot identify or cancel. On schema migration,
+pristine version 5 queued jobs receive pending receipts; already-started or
+checkpointed work remains eligible so recovery is never discarded.
+
 When it is full, the original update becomes a request-free refusal tombstone.
 Its Telegram offset stays unacknowledged until the refusal notice is delivered
 or Telegram reports a permanent destination failure. A transient send failure
@@ -251,15 +266,17 @@ allowlists; a revoked destination is not contacted. The user is told that the
 request was not saved and can use `/queue` or `/cancel` before trying again.
 Existing state with more than 25 pending jobs remains loadable and drains
 normally; the cap applies to new admission. `monday telegram --health` reports
-the current usage and unresolved refusal notices, and is unhealthy at or above
-the cap or while a refusal remains unresolved.
+the current usage, unresolved acceptance receipts, and unresolved refusal
+notices. It is unhealthy at or above the cap or while either kind of notice
+remains unresolved.
 
 `/queue` lists only jobs owned by the same allowlisted user: requests from that
 private chat plus requests that user submitted in an allowed group. `/cancel
 JOB-ID` uses the same ownership rule and intentionally gives no indication that
 another user's handle exists. Cancellation is allowed only while a job is still
-queued and has no side-effect checkpoint. Running,
-waiting, retrying, delivered, or otherwise started work is not interrupted.
+queued and has no side-effect checkpoint, including after its acceptance
+receipt is sent but before work is claimed. Running, waiting, retrying, or
+otherwise started work is not interrupted.
 Cancellation is durable, survives restart, releases inbox capacity, and removes
 the saved request text. A replay receives the same safe confirmation without
 executing the job twice.

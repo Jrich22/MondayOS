@@ -114,20 +114,44 @@ class TelegramBotService:
             normalized_message["voice"] = {"queued": True}
         return {"update_id": update_id, "message": normalized_message}
 
-    def announce_queued(self, update: dict[str, Any], position: int) -> None:
-        """Confirm durable intake without invoking Monday or a model."""
-        message = update.get("message")
-        if not isinstance(message, dict):
-            return
-        context = self._authorized_context(message)
-        if context is None:
-            return
-        handle = job_id(_integer(update.get("update_id"), -1))
-        if position <= 1:
-            text = f"Request saved as {handle}. Monday is starting it automatically."
-        else:
-            text = f"Request saved as {handle}. Queue position: {position}."
-        self._client.send_message(context[0], text)
+    def announce_acceptance_receipt(self, notice: dict[str, Any]) -> bool:
+        """Reauthorize and deliver one fixed, request-free job receipt."""
+        handle = str(notice.get("job_id") or "").upper()
+        try:
+            parse_job_id(handle)
+        except ValueError as exc:
+            raise ValueError("Invalid Telegram acceptance receipt job id") from exc
+        user_id = notice.get("user_id")
+        chat_id = notice.get("chat_id")
+        chat_type = str(notice.get("chat_type") or "")
+        if (
+            isinstance(user_id, bool)
+            or not isinstance(user_id, int)
+            or user_id <= 0
+            or isinstance(chat_id, bool)
+            or not isinstance(chat_id, int)
+            or chat_id == 0
+            or chat_type not in {"private", "group", "supergroup"}
+            or (chat_type == "private" and chat_id != user_id)
+            or (chat_type in {"group", "supergroup"} and chat_id > 0)
+        ):
+            raise ValueError("Invalid Telegram acceptance receipt destination")
+        if user_id not in self._config.allowed_user_ids:
+            return False
+        if (
+            chat_type in {"group", "supergroup"}
+            and chat_id not in self._config.allowed_chat_ids
+        ):
+            return False
+        text = (
+            f"Request saved as {handle}. Use /queue to view it or "
+            f"/cancel {handle} before it starts."
+            if chat_type == "private"
+            else f"Request saved as {handle}. Open Monday's private chat to "
+            "view or cancel your queued requests."
+        )
+        self._client.send_message(chat_id, text)
+        return True
 
     def announce_queue_full(self, update: dict[str, Any]) -> None:
         """Report a durable capacity refusal without repeating request text."""

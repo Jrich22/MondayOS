@@ -24,6 +24,7 @@ _FOLLOW_UP_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 _DELIVERY_RETRY_MAX_AGE_SECONDS = 24 * 60 * 60
 _MAX_DELIVERY_RETRY_RUNS = 6
 _MAX_DELIVERY_RETRY_NOTIFICATION_FAILURES = 3
+_MAX_ACCEPTANCE_RECEIPT_RETRY_SECONDS = 86_400.0
 _DELIVERY_ID = re.compile(r"^delivery-[A-Za-z0-9-]{1,80}$")
 _TASK_ID = re.compile(r"^TASK-\d{1,64}(?:-[a-z0-9]{1,12})?$", re.IGNORECASE)
 _PROJECT_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -37,6 +38,7 @@ _ORIGIN_FIELDS = frozenset({
 _PRISTINE_QUEUE_FIELDS = frozenset({
     "phase", "request", "request_digest", *_ORIGIN_FIELDS,
 })
+_ACCEPTANCE_RECEIPT_PHASES = frozenset({"pending", "retrying", "sent"})
 _TERMINAL_DELIVERY_STATUSES = frozenset({
     "blocked", "cancelled", "completed", "failed", "interrupted", "pr-open",
     "publication-pending", "rejected", "succeeded",
@@ -100,6 +102,7 @@ class TelegramState:
                     "completed_jobs": {},
                     "failed_jobs": {},
                     "delivery_retries": {},
+                    "acceptance_receipts": {},
                 })
 
             needs_write = (
@@ -107,10 +110,10 @@ class TelegramState:
                 or legacy_with_state
                 or current_id != normalized_id
                 or self._data.get("bot_username") != normalized_username
-                or self._data.get("version") != 5
+                or self._data.get("version") != 6
             )
             self._data.update({
-                "version": 5,
+                "version": 6,
                 "bot_id": normalized_id,
                 "bot_username": normalized_username,
             })
@@ -143,6 +146,169 @@ class TelegramState:
                 for value in self._data.setdefault("completed_jobs", {}).values()
                 if _queue_full_notice_pending(value)
             )
+
+    @property
+    def pending_acceptance_receipt_count(self) -> int:
+        """Return accepted jobs whose stable handle is not yet delivered."""
+        with self._lock:
+            return sum(
+                1
+                for value in self._data.setdefault(
+                    "acceptance_receipts", {}
+                ).values()
+                if _acceptance_receipt_pending(value)
+            )
+
+    def due_acceptance_receipt_ids(
+        self,
+        *,
+        now: float | None = None,
+    ) -> list[int]:
+        """Return request-free receipt work that is due in update order."""
+        current = time.time() if now is None else _finite_nonnegative(now, time.time())
+        with self._lock:
+            receipts = self._data.setdefault("acceptance_receipts", {})
+            due: list[int] = []
+            for key, value in receipts.items():
+                update_id = _receipt_key(key)
+                receipt = _normalized_acceptance_receipt(value)
+                if _acceptance_receipt_pending(receipt) and (
+                    _finite_nonnegative(receipt.get("next_attempt_at"), 0.0)
+                    <= current
+                ):
+                    due.append(update_id)
+            return sorted(due)
+
+    def acceptance_receipt_notice(self, update_id: int) -> dict[str, object]:
+        """Return the safe, source-bound destination for one due receipt."""
+        normalized_id = _update_id(update_id)
+        key = str(normalized_id)
+        with self._lock:
+            record = self._data.setdefault("jobs", {}).get(key)
+            receipt = self._data.setdefault("acceptance_receipts", {}).get(key)
+            if not isinstance(record, dict) or not isinstance(receipt, dict):
+                return {}
+            normalized = _normalized_acceptance_receipt(receipt)
+            _require_acceptance_receipt_binding(
+                normalized,
+                record,
+                normalized_id,
+                retry=self._data.setdefault("delivery_retries", {}).get(key),
+            )
+            if not _acceptance_receipt_pending(normalized):
+                return {}
+            return {
+                "job_id": job_id(normalized_id),
+                "user_id": normalized["origin_user_id"],
+                "chat_id": normalized["origin_chat_id"],
+                "chat_type": normalized["origin_chat_type"],
+            }
+
+    def defer_acceptance_receipt(
+        self,
+        update_id: int,
+        *,
+        delay_seconds: float,
+        now: float | None = None,
+    ) -> None:
+        """Persist bounded backoff without retaining Telegram diagnostics."""
+        self.defer_acceptance_receipts(
+            [update_id],
+            delay_seconds=delay_seconds,
+            now=now,
+        )
+
+    def defer_acceptance_receipts(
+        self,
+        update_ids: list[int],
+        *,
+        delay_seconds: float,
+        now: float | None = None,
+    ) -> None:
+        """Atomically persist one bounded backoff across a due receipt set."""
+        normalized_ids = sorted({_update_id(value) for value in update_ids})
+        current = time.time() if now is None else _finite_nonnegative(now, time.time())
+        delay = _bounded_delay(
+            delay_seconds,
+            _MAX_ACCEPTANCE_RECEIPT_RETRY_SECONDS,
+        )
+        with self._lock:
+            pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            jobs = self._data.setdefault("jobs", {})
+            receipts = self._data.setdefault("acceptance_receipts", {})
+            retries = self._data.setdefault("delivery_retries", {})
+            for normalized_id in normalized_ids:
+                key = str(normalized_id)
+                record = jobs.get(key)
+                receipt = receipts.get(key)
+                if not isinstance(record, dict) or not isinstance(receipt, dict):
+                    continue
+                normalized = _normalized_acceptance_receipt(receipt)
+                _require_acceptance_receipt_binding(
+                    normalized,
+                    record,
+                    normalized_id,
+                    retry=retries.get(key),
+                )
+                if _acceptance_receipt_pending(normalized):
+                    pending.append((receipt, normalized))
+            for receipt, normalized in pending:
+                receipt.update({
+                    "phase": "retrying",
+                    "failure_count": int(normalized["failure_count"]) + 1,
+                    "deferred_at": current,
+                    "next_attempt_at": current + delay,
+                })
+            if pending:
+                self._write()
+
+    def complete_acceptance_receipt(
+        self,
+        update_id: int,
+        *,
+        delivered: bool,
+    ) -> None:
+        """Permit execution after delivery, or scrub work that cannot notify."""
+        normalized_id = _update_id(update_id)
+        key = str(normalized_id)
+        with self._lock:
+            jobs = self._data.setdefault("jobs", {})
+            receipts = self._data.setdefault("acceptance_receipts", {})
+            record = jobs.get(key)
+            receipt = receipts.get(key)
+            if not isinstance(record, dict) or not isinstance(receipt, dict):
+                # Cancellation can win after the remote send but before its
+                # checkpoint. Never resurrect or recreate cancelled work.
+                return
+            normalized = _normalized_acceptance_receipt(receipt)
+            _require_acceptance_receipt_binding(
+                normalized,
+                record,
+                normalized_id,
+                retry=self._data.setdefault("delivery_retries", {}).get(key),
+            )
+            if not _acceptance_receipt_pending(normalized):
+                return
+            if delivered:
+                receipt.update({
+                    "phase": "sent",
+                    "deferred_at": 0.0,
+                    "next_attempt_at": 0.0,
+                })
+                self._write()
+                return
+
+            digest = str(record.get("request_digest") or "")
+            jobs.pop(key)
+            receipts.pop(key)
+            failed = self._data.setdefault("failed_jobs", {})
+            failed[key] = {
+                "phase": "receipt-failed",
+                "request_digest": digest,
+            }
+            self._advance(normalized_id)
+            _bound(failed, 500)
+            self._write()
 
     def pending_queue_full_notice_ids(self) -> list[int]:
         """Return durable capacity notices in Telegram update order."""
@@ -274,6 +440,7 @@ class TelegramState:
                 self._data
             )
             jobs.pop(key)
+            self._data.setdefault("acceptance_receipts", {}).pop(key, None)
             completed[key] = tombstone
             self._advance(update_id)
             _bound_completed(
@@ -429,9 +596,35 @@ class TelegramState:
                     # Version 2 checkpoints had no request envelope. Preserve
                     # their delivery/run fields and attach the replayed update
                     # so the new worker can resume them safely.
+                    if origin is None:
+                        raise TelegramStateError(
+                            "Telegram queue request has no valid receipt destination"
+                        )
                     existing["request"] = normalized_request
                     existing["request_digest"] = digest
                     existing.setdefault("phase", "queued")
+                    _save_origin(existing, origin)
+                    receipt_phase = (
+                        "pending"
+                        if _queued_job_is_cancellable(
+                            existing,
+                            retry=self._data.setdefault(
+                                "delivery_retries", {}
+                            ).get(key),
+                        )
+                        else "sent"
+                    )
+                    self._data.setdefault("acceptance_receipts", {})[key] = {
+                        "kind": "acceptance-receipt",
+                        "phase": receipt_phase,
+                        "request_digest": digest,
+                        "origin_user_id": origin[0],
+                        "origin_chat_id": origin[1],
+                        "origin_chat_type": origin[2],
+                        "failure_count": 0,
+                        "deferred_at": 0.0,
+                        "next_attempt_at": 0.0,
+                    }
                     created = True
                 self._advance(normalized_id)
                 self._write()
@@ -457,12 +650,28 @@ class TelegramState:
                 self._write()
                 return False, 0
 
+            if origin is None:
+                raise TelegramStateError(
+                    "Telegram queue request has no valid receipt destination"
+                )
             record = {
                 "phase": "queued",
                 "request": normalized_request,
                 "request_digest": digest,
             }
+            _save_origin(record, origin)
             jobs[key] = record
+            self._data.setdefault("acceptance_receipts", {})[key] = {
+                "kind": "acceptance-receipt",
+                "phase": "pending",
+                "request_digest": digest,
+                "origin_user_id": origin[0],
+                "origin_chat_id": origin[1],
+                "origin_chat_type": origin[2],
+                "failure_count": 0,
+                "deferred_at": 0.0,
+                "next_attempt_at": 0.0,
+            }
             self._advance(normalized_id)
             self._write()
             return True, self._queue_position(normalized_id)
@@ -492,6 +701,24 @@ class TelegramState:
                 return None
             update_id = min(candidates)
             record = jobs[str(update_id)]
+            receipt = self._data.setdefault("acceptance_receipts", {}).get(
+                str(update_id)
+            )
+            if not isinstance(receipt, dict):
+                raise TelegramStateError(
+                    f"Telegram update {update_id} lost its acceptance receipt"
+                )
+            normalized_receipt = _normalized_acceptance_receipt(receipt)
+            _require_acceptance_receipt_binding(
+                normalized_receipt,
+                record,
+                update_id,
+                retry=self._data.setdefault("delivery_retries", {}).get(
+                    str(update_id)
+                ),
+            )
+            if normalized_receipt["phase"] != "sent":
+                return None
             record["phase"] = "running"
             self._write()
             return update_id, copy.deepcopy(candidates[update_id])
@@ -537,6 +764,7 @@ class TelegramState:
             key = str(update_id)
             jobs = self._data.setdefault("jobs", {})
             record = copy.deepcopy(jobs.pop(key, {}))
+            self._data.setdefault("acceptance_receipts", {}).pop(key, None)
             record.pop("request", None)
             record["phase"] = "dead-letter"
             retry = self._data.setdefault("delivery_retries", {}).pop(key, None)
@@ -1295,6 +1523,7 @@ class TelegramState:
             key = str(update_id)
             jobs = self._data.setdefault("jobs", {})
             record = copy.deepcopy(jobs.pop(key, {}))
+            self._data.setdefault("acceptance_receipts", {}).pop(key, None)
             record.pop("request", None)
             for name in _ORIGIN_FIELDS:
                 record.pop(name, None)
@@ -1361,7 +1590,7 @@ class TelegramState:
         with self._lock:
             if not self.path.exists():
                 return {
-                    "version": 5,
+                    "version": 6,
                     "bot_id": None,
                     "bot_username": "",
                     "last_update_id": -1,
@@ -1370,6 +1599,7 @@ class TelegramState:
                     "completed_jobs": {},
                     "failed_jobs": {},
                     "delivery_retries": {},
+                    "acceptance_receipts": {},
                 }
             try:
                 payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -1381,6 +1611,7 @@ class TelegramState:
                 not isinstance(payload.get(name, {}), dict)
                 for name in (
                     "jobs", "completed_jobs", "failed_jobs", "delivery_retries",
+                    "acceptance_receipts",
                 )
             ):
                 raise TelegramStateError(f"Invalid Telegram state at {self.path}")
@@ -1395,6 +1626,7 @@ class TelegramState:
             if not isinstance(payload.get("bot_username", ""), str):
                 raise TelegramStateError(f"Invalid Telegram state at {self.path}")
             try:
+                _validate_loaded_acceptance_receipts(payload)
                 _validate_loaded_delivery_retries(payload)
             except (TelegramStateError, TypeError, ValueError) as exc:
                 raise TelegramStateError(
@@ -1404,7 +1636,7 @@ class TelegramState:
 
     def _write(self) -> None:
         with self._lock:
-            self._data["version"] = 5
+            self._data["version"] = 6
             write_json_atomic(self.path, self._data)
 
 
@@ -1460,6 +1692,197 @@ def _follow_up_active(value: Any) -> TypeGuard[dict[str, Any]]:
         and value.get("kind") == "pr-lifecycle"
         and value.get("phase") in {"pending", "polling", "retrying"}
     )
+
+
+def _acceptance_receipt_pending(value: Any) -> TypeGuard[dict[str, Any]]:
+    return (
+        isinstance(value, dict)
+        and value.get("kind") == "acceptance-receipt"
+        and value.get("phase") in {"pending", "retrying"}
+    )
+
+
+def _receipt_key(value: Any) -> int:
+    try:
+        update_id = _update_id(int(value))
+    except (TelegramStateError, TypeError, ValueError) as exc:
+        raise TelegramStateError("Invalid Telegram acceptance receipt key") from exc
+    if value != str(update_id):
+        raise TelegramStateError("Invalid Telegram acceptance receipt key")
+    return update_id
+
+
+def _normalized_acceptance_receipt(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("kind") != "acceptance-receipt":
+        raise TelegramStateError("Invalid Telegram acceptance receipt")
+    phase = value.get("phase")
+    digest = value.get("request_digest")
+    failure_count = value.get("failure_count")
+    if (
+        phase not in _ACCEPTANCE_RECEIPT_PHASES
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or isinstance(failure_count, bool)
+        or not isinstance(failure_count, int)
+        or failure_count < 0
+    ):
+        raise TelegramStateError("Invalid Telegram acceptance receipt")
+    origin = _validated_origin(
+        value.get("origin_user_id"),
+        value.get("origin_chat_id"),
+        value.get("origin_chat_type"),
+    )
+    deferred_at = _strict_timestamp(
+        value.get("deferred_at"),
+        allow_zero=True,
+    )
+    next_attempt_at = _strict_timestamp(
+        value.get("next_attempt_at"),
+        allow_zero=True,
+    )
+    if (
+        next_attempt_at < deferred_at
+        or next_attempt_at - deferred_at
+        > _MAX_ACCEPTANCE_RECEIPT_RETRY_SECONDS + 1
+        or (phase == "pending" and (failure_count or deferred_at or next_attempt_at))
+        or (phase == "retrying" and (
+            failure_count < 1 or deferred_at <= 0 or next_attempt_at <= deferred_at
+        ))
+        or (phase == "sent" and (deferred_at or next_attempt_at))
+    ):
+        raise TelegramStateError("Invalid Telegram acceptance receipt retry state")
+    return {
+        "kind": "acceptance-receipt",
+        "phase": phase,
+        "request_digest": digest,
+        "origin_user_id": origin[0],
+        "origin_chat_id": origin[1],
+        "origin_chat_type": origin[2],
+        "failure_count": failure_count,
+        "deferred_at": deferred_at,
+        "next_attempt_at": next_attempt_at,
+    }
+
+
+def _require_acceptance_receipt_binding(
+    receipt: dict[str, Any],
+    record: dict[str, Any],
+    update_id: int,
+    *,
+    retry: Any,
+) -> None:
+    request = _validated_saved_request(update_id, record)
+    origin = _request_origin(request)
+    expected = {
+        "request_digest": record.get("request_digest"),
+        "origin_user_id": origin[0] if origin else None,
+        "origin_chat_id": origin[1] if origin else None,
+        "origin_chat_type": origin[2] if origin else None,
+    }
+    if any(receipt.get(name) != value for name, value in expected.items()):
+        raise TelegramStateError(
+            f"Telegram update {update_id} acceptance receipt changed source binding"
+        )
+    if _acceptance_receipt_pending(receipt) and not _queued_job_is_cancellable(
+        record,
+        retry=retry,
+    ):
+        raise TelegramStateError(
+            f"Telegram update {update_id} acceptance receipt changed job phase"
+        )
+
+
+def _validate_loaded_acceptance_receipts(payload: dict[str, Any]) -> None:
+    jobs = payload.setdefault("jobs", {})
+    receipts = payload.setdefault("acceptance_receipts", {})
+    version = payload.get("version", 0)
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or not 0 <= version <= 6
+    ):
+        raise TelegramStateError("Invalid Telegram state version")
+
+    if version < 6:
+        for key, record in sorted(jobs.items(), key=lambda item: int(item[0])):
+            update_id = _receipt_key(key)
+            if not isinstance(record, dict):
+                raise TelegramStateError("Invalid legacy Telegram queued job")
+            request = record.get("request")
+            if not isinstance(request, dict):
+                continue
+            if not _is_pending(record):
+                raise TelegramStateError("Invalid legacy Telegram queued job")
+            normalized, digest = _canonical_request(request)
+            if _update_id(normalized.get("update_id")) != update_id:
+                raise TelegramStateError(
+                    f"Telegram update {update_id} changed its saved identity"
+                )
+            stored_digest = record.get("request_digest")
+            if stored_digest and stored_digest != digest:
+                raise TelegramStateError(
+                    f"Telegram update {update_id} does not match its saved request"
+                )
+            origin = _request_origin(normalized)
+            if origin is None:
+                raise TelegramStateError(
+                    f"Telegram update {update_id} lost its receipt destination"
+                )
+            if any(name in record for name in _ORIGIN_FIELDS):
+                if _saved_origin(record) != origin:
+                    raise TelegramStateError(
+                        f"Telegram update {update_id} changed its saved origin"
+                    )
+            record["request"] = normalized
+            record["request_digest"] = digest
+            _save_origin(record, origin)
+            # Only pristine legacy work is safe to gate on a newly synthesized
+            # receipt. A running/waiting/retrying or checkpointed v5 job may
+            # already own external effects; grandfather it as receipt-sent so
+            # revocation or a permanent send failure cannot discard recovery.
+            receipt_phase = (
+                "pending"
+                if _queued_job_is_cancellable(
+                    record,
+                    retry=payload.setdefault("delivery_retries", {}).get(key),
+                )
+                else "sent"
+            )
+            receipts.setdefault(key, {
+                "kind": "acceptance-receipt",
+                "phase": receipt_phase,
+                "request_digest": digest,
+                "origin_user_id": origin[0],
+                "origin_chat_id": origin[1],
+                "origin_chat_type": origin[2],
+                "failure_count": 0,
+                "deferred_at": 0.0,
+                "next_attempt_at": 0.0,
+            })
+
+    for key, value in receipts.items():
+        update_id = _receipt_key(key)
+        record = jobs.get(key)
+        if not isinstance(record, dict) or not _is_pending(record):
+            raise TelegramStateError(
+                f"Telegram update {update_id} acceptance receipt lost its job"
+            )
+        normalized = _normalized_acceptance_receipt(value)
+        _require_acceptance_receipt_binding(
+            normalized,
+            record,
+            update_id,
+            retry=payload.setdefault("delivery_retries", {}).get(key),
+        )
+        receipts[key] = normalized
+
+    for key, record in jobs.items():
+        update_id = _receipt_key(key)
+        if isinstance(record, dict) and isinstance(record.get("request"), dict):
+            if key not in receipts:
+                raise TelegramStateError(
+                    f"Telegram update {update_id} lost its acceptance receipt"
+                )
 
 
 def _delivery_retry_active(value: Any) -> TypeGuard[dict[str, Any]]:
@@ -1882,6 +2305,7 @@ def _validated_origin(
         or not isinstance(chat_type, str)
         or chat_type not in {"private", "group", "supergroup"}
         or (chat_type == "private" and chat_id <= 0)
+        or (chat_type == "private" and chat_id != user_id)
         or (chat_type in {"group", "supergroup"} and chat_id >= 0)
     ):
         raise TelegramStateError("Invalid Telegram request origin")
@@ -1992,7 +2416,7 @@ def _validated_saved_request(
             f"Telegram update {update_id} has no valid saved request"
         )
     normalized, digest = _canonical_request(request)
-    if normalized.get("update_id") != update_id:
+    if _update_id(normalized.get("update_id")) != update_id:
         raise TelegramStateError(
             f"Telegram update {update_id} changed its saved identity"
         )
@@ -2104,6 +2528,7 @@ def _has_update_state(data: dict[str, Any]) -> bool:
         return True
     return any(bool(data.get(name)) for name in (
         "jobs", "completed_jobs", "failed_jobs", "delivery_retries",
+        "acceptance_receipts",
     ))
 
 

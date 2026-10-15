@@ -78,13 +78,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
   are retained or sent. The normal daemon provides this monitoring; `--once`
   only ingests and drains queued requests and does not keep watching afterward.
 - Durable Telegram intake and a single background execution worker. Authorized
-  minimal requests are atomically queued with the advanced offset in
-  `logs/telegram/state.json` and receive an immediate saved/position receipt;
-  unauthorized or ignored content is not queued. Intake remains responsive
-  during Monday/model work while concurrency stays one. Restart recovers
-  queued, running, waiting, and retrying jobs with stable identities, poison
-  work is bounded to three attempts, graceful stop drains only the active job,
-  and terminal tombstones remove request text. `--once` ingests and drains
+  minimal requests are atomically queued with the advanced offset and a
+  request-free acceptance-receipt outbox in `logs/telegram/state.json`;
+  unauthorized or ignored content is not queued. The worker cannot execute a
+  job until its stable `JOB-ID` receipt is durably sent. Transient sends back
+  off across restart without blocking controls, duplicate sends have identical
+  fixed content, current allowlists are rechecked, and permanent or revoked
+  destinations scrub unstarted work. Intake remains responsive during
+  Monday/model work while concurrency stays one. Restart recovers queued,
+  running, waiting, and retrying jobs with stable identities, poison work is
+  bounded to three attempts, graceful stop drains only the active job, and
+  terminal tombstones remove request text. `--once` ingests and drains
   synchronously.
 - A strict Git delivery layer with bounded argv-only processes, repository
   leases, owned worktrees, path and file policy, exact staging/fingerprinting,
