@@ -38,7 +38,16 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from brain.providers.base import AIProvider, ProviderError
+from brain.providers.base import (
+    AIProvider,
+    ProviderAvailability,
+    ProviderResponse,
+    provider_availability_message,
+    provider_failure_message,
+    safe_provider_availability,
+    safe_provider_identifier,
+)
+from growth.errors import GrowthError
 from growth.generation.models import BrandContext, PlannedPost
 
 # What the model must return. Anything missing is a refusal, not a default.
@@ -78,13 +87,16 @@ GENERATION_METHOD_TEMPLATE = "template"
 GENERATION_MODES: frozenset[str] = frozenset({GENERATION_METHOD_MODEL, GENERATION_METHOD_TEMPLATE})
 
 
-class ModelGenerationError(RuntimeError):
+class ModelGenerationError(GrowthError):
     """Raised when model drafting could not produce a usable, validated draft."""
 
     def __init__(self, detail: str, provider: str = "") -> None:
-        self.provider = provider
+        self.provider = (
+            safe_provider_identifier(provider, fallback="custom") if provider else ""
+        )
         super().__init__(
-            f"Model content generation failed{f' on provider {provider!r}' if provider else ''}: "
+            f"Model content generation failed"
+            f"{f' on provider {self.provider!r}' if self.provider else ''}: "
             f"{detail} No template fallback was applied: generation was requested from a "
             "model, and silently substituting template output would leave the reviewer "
             "unable to tell what they are reading."
@@ -220,13 +232,61 @@ def parse_response(content: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ModelOutputInvalidError(f"expected a JSON object, got {type(payload).__name__}.")
 
-    missing = [f for f in REQUIRED_FIELDS if not str(payload.get(f, "")).strip()]
+    invalid_required = [
+        field
+        for field in REQUIRED_FIELDS
+        if field in payload and type(payload[field]) is not str
+    ]
+    if invalid_required:
+        raise ModelOutputInvalidError(
+            "required field(s) must be strings: "
+            f"{', '.join(invalid_required)}."
+        )
+
+    missing = [
+        field
+        for field in REQUIRED_FIELDS
+        if field not in payload or not payload[field].strip()
+    ]
     if missing:
         raise ModelOutputInvalidError(
             f"the response is missing required field(s): {', '.join(missing)}."
         )
 
-    body = str(payload["body"])
+    string_fields = {
+        "asset_brief",
+        "campaign_id",
+        "content_type",
+        "destination",
+        "platform",
+    }
+    list_fields = {
+        "experiment_ids",
+        "recommendation_ids",
+        "themes",
+        "warnings",
+    }
+    invalid_strings = sorted(
+        field
+        for field in string_fields
+        if field in payload and type(payload[field]) is not str
+    )
+    invalid_lists = sorted(
+        field
+        for field in list_fields
+        if field in payload
+        and (
+            type(payload[field]) is not list
+            or any(type(item) is not str for item in payload[field])
+        )
+    )
+    if invalid_strings or invalid_lists:
+        invalid = ", ".join((*invalid_strings, *invalid_lists))
+        raise ModelOutputInvalidError(
+            f"the response contains invalid field type(s): {invalid}."
+        )
+
+    body = payload["body"]
     if len(body) > MAX_BODY_CHARS:
         raise ModelOutputInvalidError(
             f"the body is {len(body)} characters, past the {MAX_BODY_CHARS} limit; "
@@ -271,7 +331,20 @@ class ModelContentWriter:
     @property
     def provider_name(self) -> str:
         """The provider identifier, for provenance. Never branched on."""
-        return self._provider.name
+        try:
+            name = self._provider.name
+        except Exception:  # noqa: BLE001 - provider metadata is untrusted input
+            name = ""
+        return safe_provider_identifier(name, fallback="custom")
+
+    def _availability(self) -> ProviderAvailability:
+        """Read provider readiness without exposing provider-controlled prose."""
+        provider_name = self.provider_name
+        try:
+            availability = self._provider.availability()
+        except Exception as exc:  # noqa: BLE001 - readiness is a provider boundary
+            return safe_provider_availability(None, provider=provider_name, error=exc)
+        return safe_provider_availability(availability, provider=provider_name)
 
     def write(self, post: PlannedPost, brand: BrandContext, angle: str) -> tuple[str, str]:
         """
@@ -284,21 +357,36 @@ class ModelContentWriter:
         """
         brand.validate()
 
-        availability = self._provider.availability()
+        availability = self._availability()
         if not availability.available:
-            raise ModelGenerationError(availability.instructions(), provider=self._provider.name)
+            raise ModelGenerationError(
+                provider_availability_message(availability),
+                provider=availability.provider,
+            )
 
         prompt = build_prompt(post, brand, angle)
+        failure_message = ""
+        response: ProviderResponse | None = None
+        content: Any = None
         try:
             response = self._provider.ask(prompt, max_tokens=self._max_tokens)
-        except ProviderError as exc:
-            raise ModelGenerationError(str(exc), provider=self._provider.name) from exc
+            content = response.content
         except Exception as exc:  # noqa: BLE001 - a provider bug must surface, not vanish
-            raise ModelGenerationError(
-                f"{type(exc).__name__}: {exc}", provider=self._provider.name
-            ) from exc
+            failure_message = provider_failure_message(exc)
 
-        payload = parse_response(response.content)
+        if failure_message:
+            raise ModelGenerationError(
+                failure_message,
+                provider=availability.provider,
+            )
+
+        if type(response) is not ProviderResponse or type(content) is not str:
+            raise ModelGenerationError(
+                "Provider returned an invalid response.",
+                provider=availability.provider,
+            )
+
+        payload = parse_response(content)
         self.last_draft = ModelDraft(
             title=str(payload["title"]).strip(),
             body=str(payload["body"]).strip(),
@@ -309,7 +397,7 @@ class ModelContentWriter:
             themes=[str(t) for t in (payload.get("themes") or [])],
             warnings=[str(w) for w in (payload.get("warnings") or [])],
             asset_brief=str(payload.get("asset_brief", "")),
-            provider=response.provider or self._provider.name,
-            model=response.model,
+            provider=availability.provider,
+            model=availability.model,
         )
         return self.last_draft.title, self.last_draft.body

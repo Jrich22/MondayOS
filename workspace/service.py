@@ -595,6 +595,8 @@ class WorkspaceService:
             snapshot_id=snapshot.id,
             tokens_used=reply.tokens_used,
             error=reply.error,
+            incomplete=reply.incomplete,
+            stop_reason=str(reply.metadata.get("stop_reason", "") or ""),
         )
         conversation.messages.append(assistant_message)
         conversation.updated_at = assistant_message.created_at

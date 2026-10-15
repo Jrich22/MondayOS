@@ -8,6 +8,8 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
+from agents.types import is_agent_run_id
+from brain.providers.base import safe_provider_identifier
 from telegram_bot.client import TelegramAPIError, TelegramClient
 from telegram_bot.config import TelegramConfig
 from telegram_bot.state import TelegramState, job_id, parse_job_id
@@ -16,7 +18,6 @@ _TASK_ID = re.compile(
     r"^TASK-\d{1,64}(?:-[a-z0-9]{1,12})?$",
     re.IGNORECASE,
 )
-_RUN_ID = re.compile(r"^run-[A-Za-z0-9-]{1,80}$")
 _DELIVERY_ID = re.compile(r"^delivery-[A-Za-z0-9-]{1,80}$")
 _PROJECT_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
@@ -1365,10 +1366,31 @@ class TelegramBotService:
             self._client.send_message(chat_id, "Agent team started.")
         elif kind == "stage_finished":
             role = str(event.get("role") or "agent")
-            label = _ROLE_NAMES.get(role, role.replace("-", " ").title())
-            verdict = str(event.get("verdict") or event.get("status") or "finished")
-            provider = str(event.get("provider") or "")
-            suffix = f" via {provider}" if provider else ""
+            label = _ROLE_NAMES.get(role, "Agent")
+            raw_verdict = str(event.get("verdict") or "")
+            raw_status = str(event.get("status") or "")
+            verdict = (
+                raw_verdict
+                if raw_verdict in {"block", "invalid", "needs_changes", "pass"}
+                else (
+                    raw_status
+                    if raw_status in {
+                        "blocked",
+                        "dry-run",
+                        "failed",
+                        "review",
+                        "skipped",
+                        "unavailable",
+                        "validation-failed",
+                    }
+                    else "finished"
+                )
+            )
+            provider = safe_provider_identifier(
+                event.get("provider"),
+                fallback="custom",
+            )
+            suffix = f" via {provider}" if provider != "custom" else ""
             self._client.send_message(chat_id, f"{label}: {verdict}{suffix}.")
 
     def _send_tasks(self, chat_id: int) -> None:
@@ -1413,7 +1435,7 @@ class TelegramBotService:
                 f"Use /{action} RUN-ID followed by an optional note.",
             )
             return
-        if not _RUN_ID.fullmatch(run_id):
+        if not is_agent_run_id(run_id):
             self._client.send_message(chat_id, f"No agent run {run_id} exists.")
             return
         # The public API does not currently expose an exact get action. An
@@ -1503,15 +1525,48 @@ def _external_project(task_data: Any) -> str:
 
 
 def _team_result(task_id: str, run: dict[str, Any]) -> str:
-    status = str(run.get("status") or "failed")
-    message = str(run.get("message") or "")
+    allowed_statuses = frozenset({
+        "awaiting-approval",
+        "blocked",
+        "changes-requested",
+        "completed",
+        "dry-run",
+        "failed",
+        "interrupted",
+        "invalid",
+        "invalid-verdict",
+        "needs-changes",
+        "rejected",
+    })
+    raw_status = str(run.get("status") or "failed")
+    status = raw_status if raw_status in allowed_statuses else "failed"
     lines = [f"{task_id} team run: {status}."]
-    if status == "awaiting-approval" and run.get("approval_run_id"):
-        lines.append(f"Review complete. Approve with /approve {run['approval_run_id']}")
-    elif run.get("stopped_at"):
-        lines.append(f"Stopped at {run['stopped_at']}.")
-    if message:
-        lines.append(message[:500])
+    approval_run_id = str(run.get("approval_run_id") or "")
+    if status == "awaiting-approval" and is_agent_run_id(approval_run_id):
+        lines.append(f"Review complete. Approve with /approve {approval_run_id}")
+    else:
+        stopped_at = str(run.get("stopped_at") or "")
+        if stopped_at in _ROLE_NAMES:
+            lines.append(f"Stopped at {_ROLE_NAMES[stopped_at]}.")
+        if status in {"failed", "interrupted"}:
+            lines.append(
+                "The agent team could not complete this run. Review the saved "
+                "run before retrying."
+            )
+        elif status in {
+            "blocked",
+            "invalid",
+            "invalid-verdict",
+            "needs-changes",
+            "rejected",
+        }:
+            lines.append("The agent team stopped before approval.")
+        elif status == "changes-requested":
+            lines.append("Changes were requested before completion.")
+        elif status == "dry-run":
+            lines.append("Dry run completed without making provider changes.")
+        elif status == "completed":
+            lines.append("The agent team completed this run.")
     return "\n".join(lines)
 
 

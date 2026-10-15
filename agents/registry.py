@@ -13,6 +13,7 @@ agents — or new roles — never requires touching runtime code.
 
 from __future__ import annotations
 
+import builtins
 import re
 import warnings
 from datetime import UTC, datetime
@@ -110,7 +111,11 @@ class AgentRegistry:
             raise AgentNotFoundError(f"No agent with id or name {agent_id_or_name!r}.")
         return found
 
-    def list(self, role: str | None = None, include_disabled: bool = True) -> list[Agent]:
+    def list(
+        self,
+        role: str | None = None,
+        include_disabled: bool = True,
+    ) -> builtins.list[Agent]:
         """Return all agents, optionally filtered by role / active status."""
         agents = self._read_all()
         if role is not None:
@@ -137,7 +142,7 @@ class AgentRegistry:
                 return agent
         return candidates[0]
 
-    def seed_defaults(self) -> list[Agent]:
+    def seed_defaults(self) -> builtins.list[Agent]:
         """
         Ensure every role has a default agent. Idempotent — creates a default
         only for roles that don't already have one. Returns the agents created.
@@ -178,7 +183,7 @@ class AgentRegistry:
     # Internal helpers (mirror tasks/manager.py + tasks/parser.py)
     # ------------------------------------------------------------------
 
-    def _migrate_seeded_defaults(self, agents: list[Agent]) -> None:
+    def _migrate_seeded_defaults(self, agents: builtins.list[Agent]) -> None:
         """Move only the legacy seeded Reviewer from Anthropic to OpenAI."""
         role = ROLES["reviewer"]
         for agent in agents:
@@ -197,7 +202,7 @@ class AgentRegistry:
             agent.metadata["provider_migration"] = "reviewer-openai-v1"
             self._write(agent)
 
-    def _read_all(self) -> list[Agent]:
+    def _read_all(self) -> builtins.list[Agent]:
         if not self._active_dir.exists():
             return []
         agents: list[Agent] = []

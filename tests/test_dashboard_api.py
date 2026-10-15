@@ -13,18 +13,21 @@ offline — no API keys, no network.
 from __future__ import annotations
 
 import os
+import stat
 import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 import httpx
 
-from monday import Monday, MondayConfig
 from dashboard_api import security
+from dashboard_api import service as service_module
 from dashboard_api.router import route
 from dashboard_api.server import create_server
 from dashboard_api.service import DashboardService
+from monday import Monday, MondayConfig
 
 
 def make_service(root: Path) -> DashboardService:
@@ -167,11 +170,93 @@ class TestWrites(DashboardApiBase):
         for path in ("/commit", "/push", "/deploy", "/tasks/T/merge"):
             self.assertEqual(self.POST(path)[0], 404)
 
+    def test_write_log_is_private_and_tightens_an_existing_log(self):
+        log_path = self.root / "logs" / "dashboard_api.jsonl"
+
+        self.service._log_write("first", {}, True)
+        self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+
+        log_path.chmod(0o644)
+        self.service._log_write("second", {}, True)
+        self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+        self.assertEqual(len(log_path.read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_write_log_does_not_follow_a_symlink(self):
+        logs_dir = self.root / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        target = self.root / "outside.jsonl"
+        target.write_text("do not touch\n", encoding="utf-8")
+        target.chmod(0o644)
+        log_path = logs_dir / "dashboard_api.jsonl"
+        log_path.symlink_to(target)
+
+        self.service._log_write("blocked", {"secret": "value"}, True)
+
+        self.assertTrue(log_path.is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), "do not touch\n")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+
+    def test_write_log_rejects_a_nonregular_path(self):
+        log_path = self.root / "logs" / "dashboard_api.jsonl"
+        log_path.mkdir(parents=True)
+
+        self.service._log_write("blocked", {}, True)
+
+        self.assertTrue(log_path.is_dir())
+
+    def test_write_log_does_not_modify_a_hard_link_target(self):
+        logs_dir = self.root / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        target = self.root / "outside.jsonl"
+        target.write_text("do not touch\n", encoding="utf-8")
+        target.chmod(0o644)
+        (logs_dir / "dashboard_api.jsonl").hardlink_to(target)
+
+        self.service._log_write("blocked", {"secret": "value"}, True)
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "do not touch\n")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+
+    def test_write_log_does_not_follow_a_linked_parent_directory(self):
+        logs_dir = self.root / "logs"
+        if logs_dir.exists():
+            logs_dir.rmdir()
+        outside = self.root / "outside-logs"
+        outside.mkdir()
+        logs_dir.symlink_to(outside, target_is_directory=True)
+
+        self.service._log_write("blocked", {"secret": "value"}, True)
+
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_write_log_revalidates_its_path_after_waiting_for_the_lock(self):
+        log_path = self.root / "logs" / "dashboard_api.jsonl"
+        log_path.parent.mkdir(parents=True)
+        log_path.write_text("original\n", encoding="utf-8")
+        detached = self.root / "detached.jsonl"
+        real_flock = service_module.fcntl.flock
+        replaced = False
+
+        def replace_before_lock(descriptor: int, operation: int) -> None:
+            nonlocal replaced
+            if operation == service_module.fcntl.LOCK_EX and not replaced:
+                replaced = True
+                log_path.replace(detached)
+                log_path.write_text("replacement\n", encoding="utf-8")
+            real_flock(descriptor, operation)
+
+        with mock.patch.object(service_module.fcntl, "flock", replace_before_lock):
+            self.service._log_write("blocked", {"secret": "must-not-escape"}, True)
+
+        self.assertTrue(replaced)
+        self.assertEqual(detached.read_text(encoding="utf-8"), "original\n")
+        self.assertEqual(log_path.read_text(encoding="utf-8"), "replacement\n")
+
 
 class TestApprovals(DashboardApiBase):
     def _await_approval(self):
         tid = self._new_task()
-        tr = self._run_team(tid)
+        self._run_team(tid)
         s, _, approvals = self.GET("/approvals")
         self.assertEqual(s, 200)
         opens = [a for a in approvals if a["status"] == "open"]

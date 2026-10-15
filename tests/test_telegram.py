@@ -684,6 +684,21 @@ class TestTelegramService(TelegramFixture):
 
         self.assertEqual(operations, ["team-stage"])
 
+    def test_team_progress_reduces_hostile_provider_metadata(self):
+        secret = "PRIVATEPROMPT123456"
+
+        self.service._progress(7, {
+            "event": "stage_finished",
+            "role": secret,
+            "verdict": secret,
+            "provider": "sk-proj-LEAKME123456",
+        })
+
+        message = self.client.sent[-1][1]
+        self.assertEqual(message, "Agent: finished.")
+        self.assertNotIn(secret, message)
+        self.assertNotIn("LEAKME", message)
+
     def test_private_build_can_explicitly_target_a_registered_project(self):
         config = TelegramConfig(
             token=_fake_token(),

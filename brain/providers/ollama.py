@@ -107,6 +107,7 @@ class OllamaProvider(AIProvider):
                 provider=_PROVIDER_NAME,
                 model=self._model,
                 reason=f"Ollama service is unavailable at {self._base_url}: {type(exc).__name__}",
+                code="service-unreachable",
             )
 
         rows = payload.get("models") if isinstance(payload, dict) else None
@@ -124,12 +125,14 @@ class OllamaProvider(AIProvider):
                     f"Ollama model {self._model!r} is not installed at "
                     f"{self._base_url}; run `ollama pull {self._model}`"
                 ),
+                code="model-missing",
             )
         return ProviderAvailability(
             available=True,
             provider=_PROVIDER_NAME,
             model=self._model,
             reason=f"ready at {self._base_url}",
+            code="ready",
         )
 
     def ask(

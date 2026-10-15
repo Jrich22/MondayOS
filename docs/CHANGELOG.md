@@ -11,6 +11,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A provider-error confidentiality boundary that reduces provider and SDK
+  failures to fixed diagnostic codes before they enter events, execution
+  reports, agent/team checkpoints, Workspace and Growth responses, API output,
+  or Telegram messages. Provider readiness now retains fixed cause codes so
+  missing SDKs, credentials, local services, and models remain actionable while
+  provider/model provenance is reduced to supported fixed labels. Execution
+  reports and dashboard audit logs are private; legacy execution, Agent, Team,
+  and Workspace records are sanitized lazily through descriptor-bound,
+  no-follow migration paths; approval, team, task-lease, and Workspace sequence
+  locks reject linked paths and use private permissions; Workspace record IDs,
+  counters, deletion, and project discovery stay descriptor-bound and fail
+  closed on linked entries; and Telegram team output renders only fixed
+  statuses, roles, provider labels, and validated approval handles.
 - A bounded, request-free Telegram delivery-notice outbox for terminal
   live-build results and retry-scheduled messages. The notice is durable before
   its source job is acknowledged, so completed request text is scrubbed and the

@@ -27,7 +27,65 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
+from brain.providers.base import (
+    safe_provider_identifier,
+    safe_provider_model,
+    safe_provider_stop_reason,
+    safe_provider_token_count,
+)
 from core.identity import require_slug
+
+_SAFE_PROVIDER_LABELS = (
+    "anthropic",
+    "custom",
+    "deepseek",
+    "fake",
+    "ollama",
+    "openai",
+)
+_SAFE_PERSISTED_ERRORS = frozenset({
+    "Configured provider model is not installed (anthropic).",
+    "Configured provider model is not installed (custom).",
+    "Configured provider model is not installed (deepseek).",
+    "Configured provider model is not installed (fake).",
+    "Configured provider model is not installed (ollama).",
+    "Configured provider model is not installed (openai).",
+    "Provider authentication failed. Check the configured credential and retry.",
+    "Provider credential is missing (anthropic); set ANTHROPIC_API_KEY and retry.",
+    "Provider credential is missing (deepseek); set DEEPSEEK_API_KEY and retry.",
+    "Provider credential is missing (openai); set OPENAI_API_KEY and retry.",
+    "Provider request failed. Retry later.",
+    "Provider request was rate-limited. Retry later.",
+    "Provider returned an invalid response.",
+    "Requested provider is unsupported or not configured.",
+    "Provider service is unavailable. Retry later.",
+    "Generation was stopped before any response arrived.",
+    "The response stream ended unexpectedly.",
+    (
+        "No AI provider is configured for this MondayOS instance, so the workspace "
+        "cannot answer. Configure a provider in MondayConfig."
+    ),
+    "The provider returned an empty response.",
+    "unverified evidence in generated answer",
+    "unverified evidence: unsupported reasoning score in generated answer",
+} | {
+    message
+    for provider in _SAFE_PROVIDER_LABELS
+    for message in (
+        f"Provider component is not installed ({provider}).",
+        f"Provider service is unreachable ({provider}). Retry later.",
+        f"Provider readiness response was invalid ({provider}).",
+        f"Provider is unavailable ({provider}). Check its configuration and retry.",
+    )
+})
+
+
+def _safe_persisted_error(value: Any) -> str:
+    if type(value) is not str or not value:
+        return ""
+    if value in _SAFE_PERSISTED_ERRORS:
+        return value
+    return "Provider request failed. Retry later."
 
 
 # The visible roles. `EVENT` records something that happened *to* the
@@ -146,18 +204,33 @@ class Message:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Message:
+        role = MessageRole(str(data.get("role", "user")))
+        provider_value = data.get("provider", "")
+        provider = ""
+        if role is MessageRole.ASSISTANT and not (
+            type(provider_value) is str and not provider_value
+        ):
+            provider = safe_provider_identifier(provider_value, fallback="custom")
+        stop_reason = safe_provider_stop_reason(data.get("stop_reason", ""))
         return cls(
             id=str(data.get("id", "")),
-            role=MessageRole(str(data.get("role", "user"))),
+            role=role,
             content=str(data.get("content", "")),
             created_at=parse_iso(str(data.get("created_at", ""))),
-            provider=str(data.get("provider", "")),
-            model=str(data.get("model", "")),
+            provider=provider,
+            model=safe_provider_model(provider),
             snapshot_id=str(data.get("snapshot_id", "")),
-            tokens_used=int(data.get("tokens_used", 0) or 0),
-            error=str(data.get("error", "")),
-            incomplete=bool(data.get("incomplete", False)),
-            stop_reason=str(data.get("stop_reason", "") or ""),
+            tokens_used=safe_provider_token_count(data.get("tokens_used", 0)),
+            error=(
+                _safe_persisted_error(data.get("error", ""))
+                if role is MessageRole.ASSISTANT
+                else ""
+            ),
+            incomplete=(
+                data.get("incomplete") is True
+                or stop_reason in {"length", "max_tokens"}
+            ),
+            stop_reason=stop_reason,
             artifact_refs=[ArtifactRef.from_dict(a) for a in data.get("artifact_refs") or []],
         )
 

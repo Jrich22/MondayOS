@@ -113,6 +113,7 @@ class AnthropicProvider(AIProvider):
                 reason="anthropic SDK not installed",
                 env_var="ANTHROPIC_API_KEY",
                 install_hint="pip install anthropic",
+                code="missing-sdk",
             )
         if not self._api_key:
             return ProviderAvailability(
@@ -121,6 +122,7 @@ class AnthropicProvider(AIProvider):
                 model=self._model,
                 reason="ANTHROPIC_API_KEY is not set",
                 env_var="ANTHROPIC_API_KEY",
+                code="missing-credential",
             )
         return ProviderAvailability(
             available=True,
@@ -128,6 +130,7 @@ class AnthropicProvider(AIProvider):
             model=self._model,
             reason="ready",
             env_var="ANTHROPIC_API_KEY",
+            code="ready",
         )
 
     @property

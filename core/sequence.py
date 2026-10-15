@@ -45,6 +45,12 @@ from enum import Enum
 from pathlib import Path
 
 from core.atomic import write_json_atomic
+from core.secure_io import (
+    open_private_lock_file_at,
+    read_json_at,
+    validate_private_lock_file,
+    write_json_atomic_at,
+)
 
 # Crockford-style lowercase base32 without the ambiguous letters i, l, o, u.
 # Readable when a human has to compare two ids by eye, which is the only time
@@ -183,10 +189,30 @@ class SequenceAllocator:
         self,
         namespace: Namespace,
         suffix_source: Callable[[], str] = random_suffix,
+        *,
+        directory_fd: int | None = None,
     ) -> None:
+        """Bind one namespace.
+
+        ``directory_fd`` is borrowed, not duplicated. The caller must keep it
+        open for every allocator operation. Descriptor-bound allocation is
+        intentionally limited to a flat namespace whose counter shares the
+        records directory.
+        """
         self._ns = namespace
         # Injected so a test can force two allocators to draw the same suffix.
         self._suffix_source = suffix_source
+        self._directory_fd = directory_fd
+        if directory_fd is not None:
+            if namespace.recursive:
+                raise ValueError(
+                    "descriptor-bound allocation requires a flat namespace"
+                )
+            if namespace.counter.parent != namespace.records:
+                raise ValueError(
+                    "descriptor-bound allocation requires the counter and records "
+                    "to share one directory"
+                )
 
     @property
     def namespace(self) -> Namespace:
@@ -201,6 +227,15 @@ class SequenceAllocator:
         Reads filenames rather than contents: the filename is the record of which
         ids are taken, so a record whose body is unreadable still reserves its id.
         """
+        if self._directory_fd is not None:
+            names = os.listdir(self._directory_fd)
+            highest = 0
+            for name in names:
+                number = self._ns.parse(Path(name).stem)
+                if number is not None:
+                    highest = max(highest, number)
+            return highest
+
         directory = self._ns.records
         if not directory.is_dir():
             return 0
@@ -282,6 +317,12 @@ class SequenceAllocator:
         guard, and a guard that only looks where it expects trouble is not one.
         A record filed in an unexpected subdirectory still holds its id.
         """
+        if self._directory_fd is not None:
+            return any(
+                name.startswith(f"{identifier}.")
+                for name in os.listdir(self._directory_fd)
+            )
+
         directory = self._ns.records
         if not directory.is_dir():
             return False
@@ -296,14 +337,22 @@ class SequenceAllocator:
         """
         The stored hint, or 0.
 
-        Anything unreadable — missing, truncated, not JSON, wrong type, negative —
-        is treated as absent rather than fatal. Disk is the floor either way, so a
-        corrupt counter costs a directory scan, not an incident.
+        Missing, truncated, non-JSON, wrong-type, and negative values are treated
+        as absent. Descriptor-bound mode deliberately propagates filesystem
+        safety errors so an unsafe counter leaf cannot be replaced or ignored.
         """
-        try:
-            data = json.loads(self._ns.counter.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return 0
+        if self._directory_fd is not None:
+            try:
+                data = read_json_at(self._directory_fd, self._ns.counter.name)
+            except FileNotFoundError:
+                return 0
+            except (UnicodeError, json.JSONDecodeError):
+                return 0
+        else:
+            try:
+                data = json.loads(self._ns.counter.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return 0
         if not isinstance(data, dict):
             return 0
         value = data.get(self._ns.prefix, 0)
@@ -315,11 +364,19 @@ class SequenceAllocator:
 
     def _write_counter(self, sequence: int) -> None:
         """Persist the hint, preserving other prefixes in the same file."""
-        try:
-            data = json.loads(self._ns.counter.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
+        if self._directory_fd is not None:
+            try:
+                data = read_json_at(self._directory_fd, self._ns.counter.name)
+            except FileNotFoundError:
                 data = {}
-        except (OSError, json.JSONDecodeError):
+            except (UnicodeError, json.JSONDecodeError):
+                data = {}
+        else:
+            try:
+                data = json.loads(self._ns.counter.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                data = {}
+        if not isinstance(data, dict):
             data = {}
         # Never lower a sibling prefix, and never lower our own.
         existing = data.get(self._ns.prefix, 0)
@@ -328,12 +385,18 @@ class SequenceAllocator:
         except (TypeError, ValueError):
             existing = 0
         data[self._ns.prefix] = max(existing, sequence)
-        write_json_atomic(self._ns.counter, data)
+        if self._directory_fd is not None:
+            write_json_atomic_at(self._directory_fd, self._ns.counter.name, data)
+        else:
+            write_json_atomic(self._ns.counter, data)
 
     # ------------------------------------------------------------------- lock
 
     def _locked(self) -> _NamespaceLock:
-        return _NamespaceLock(self._ns.lock_path)
+        return _NamespaceLock(
+            self._ns.lock_path,
+            directory_fd=self._directory_fd,
+        )
 
 
 class _NamespaceLock:
@@ -348,27 +411,62 @@ class _NamespaceLock:
     dependency buys Windows support nobody needs.
     """
 
-    def __init__(self, path: Path, timeout: float = LOCK_TIMEOUT_SECONDS) -> None:
+    def __init__(
+        self,
+        path: Path,
+        timeout: float = LOCK_TIMEOUT_SECONDS,
+        *,
+        directory_fd: int | None = None,
+    ) -> None:
         self._path = path
         self._timeout = timeout
         self._handle: int | None = None
+        self._directory_fd = directory_fd
+        self._owned_directory_fd: int | None = None
 
     def __enter__(self) -> _NamespaceLock:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = os.open(str(self._path), os.O_CREAT | os.O_RDWR, 0o644)
+        active_directory_fd = self._directory_fd
+        if active_directory_fd is None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            active_directory_fd = os.open(self._path.parent, flags)
+            self._owned_directory_fd = active_directory_fd
+        try:
+            self._handle = open_private_lock_file_at(
+                active_directory_fd,
+                self._path.name,
+            )
+        except BaseException:
+            self._close_owned_directory()
+            raise
         deadline = time.monotonic() + self._timeout
         while True:
             try:
                 fcntl.flock(self._handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                validate_private_lock_file(
+                    active_directory_fd,
+                    self._handle,
+                    self._path.name,
+                )
                 return self
-            except OSError:
+            except BlockingIOError:
                 if time.monotonic() >= deadline:
                     os.close(self._handle)
                     self._handle = None
+                    self._close_owned_directory()
                     raise SequenceLockTimeoutError(
                         f"another process held {self._path} for more than {self._timeout}s"
                     ) from None
                 time.sleep(_LOCK_POLL_SECONDS)
+            except BaseException:
+                try:
+                    fcntl.flock(self._handle, fcntl.LOCK_UN)
+                finally:
+                    os.close(self._handle)
+                    self._handle = None
+                    self._close_owned_directory()
+                raise
 
     def __exit__(self, *_exc: object) -> None:
         if self._handle is not None:
@@ -377,3 +475,9 @@ class _NamespaceLock:
             finally:
                 os.close(self._handle)
                 self._handle = None
+                self._close_owned_directory()
+
+    def _close_owned_directory(self) -> None:
+        if self._owned_directory_fd is not None:
+            os.close(self._owned_directory_fd)
+            self._owned_directory_fd = None

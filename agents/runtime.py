@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import fcntl
 import json
-import re
+import os
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,17 +22,30 @@ from agents.adapters import build_provider_for, build_provider_pool
 from agents.gates import ApprovalGate, GateDecision
 from agents.registry import AgentRegistry
 from agents.roles import get_role, normalize_role
-from agents.types import Agent, AgentRun
+from agents.types import Agent, AgentRun, is_agent_run_id, sanitize_team_record
 from agents.verdicts import parse_verdict
-from brain.providers.base import ProviderAvailability
-from core.atomic import write_json_atomic
+from brain.providers.base import (
+    ProviderAvailability,
+    provider_availability_message,
+    safe_provider_availability,
+    safe_provider_identifier,
+    safe_provider_model,
+)
+from core.secure_io import (
+    ConcurrentRecordChangeError,
+    open_directory_beneath,
+    open_private_lock_file,
+    read_json_with_identity_at,
+    validate_private_lock_file,
+    write_json_atomic_at,
+)
 from orchestrator.report import ExecutionMode
 from tasks.manager import TaskManager
 from tasks.task import TaskStatus
 
-_RUN_ID = re.compile(r"^run-[A-Za-z0-9][A-Za-z0-9-]{0,79}$")
 _APPROVAL_COMPLETION_PREFIX = "monday-agent-approval-v1:"
 _ALLOWED_REVIEWER_PROVIDERS = frozenset({"openai", "fake"})
+_LEGACY_MIGRATION_ATTEMPTS = 3
 
 
 class AgentRuntime:
@@ -141,11 +154,15 @@ class AgentRuntime:
         agent = self._registry.resolve_by_role(role_slug)
         provider_override = (provider or "").strip()
         if provider_instance is not None:
-            provider_requested = provider_instance.name
+            provider_requested = safe_provider_identifier(
+                provider_instance,
+                fallback="custom",
+            )
         else:
-            provider_requested = (
-                provider_override or (agent.provider if agent else "")
-            ).strip()
+            provider_requested = safe_provider_identifier(
+                provider_override or (agent.provider if agent else ""),
+                fallback="custom",
+            )
 
         run = AgentRun(
             run_id=_new_run_id(),
@@ -179,12 +196,13 @@ class AgentRuntime:
         # direct agent call or advanced provider injection cannot bypass it.
         # ``fake`` remains an explicit, offline-only test harness.
         reviewer_override = ""
-        if role_slug == "reviewer":
-            reviewer_override = str(
-                getattr(provider_instance, "name", "")
-                if provider_instance is not None
-                else provider_override
-            ).strip().lower()
+        if role_slug == "reviewer" and (
+            provider_instance is not None or provider_override
+        ):
+            reviewer_override = safe_provider_identifier(
+                provider_instance if provider_instance is not None else provider_override,
+                fallback="custom",
+            )
         if reviewer_override and reviewer_override not in _ALLOWED_REVIEWER_PROVIDERS:
             run.status = "blocked"
             run.success = False
@@ -210,7 +228,7 @@ class AgentRuntime:
         if provider_instance is not None:
             prov = provider_instance
             providers = [prov]
-            manual_name = prov.name
+            manual_name = safe_provider_identifier(prov, fallback="custom")
             effective_policy = policy or "manual"
         elif provider_override:
             prov = build_provider_for(
@@ -219,7 +237,11 @@ class AgentRuntime:
                 configured_providers=self._configured_providers,
             )
             providers = [prov] if prov is not None else []
-            manual_name = prov.name if prov is not None else provider_requested
+            manual_name = (
+                safe_provider_identifier(prov, fallback="custom")
+                if prov is not None
+                else provider_requested
+            )
             effective_policy = policy or "manual"
         else:
             providers = build_provider_pool(
@@ -233,16 +255,33 @@ class AgentRuntime:
 
         # ── Provider availability gate (graceful, key-aware) ─────────────
         # A run that will actually call a provider (not dry-run) must have a
-        # ready provider. A missing SDK or API key stops here with clear
-        # instructions instead of a raw failure mid-execution.
+        # ready provider. A missing SDK or API key stops here with bounded
+        # configuration guidance instead of raw provider or SDK prose.
         if mode_enum is not ExecutionMode.DRY_RUN:
-            availability = [candidate.availability() for candidate in providers]
+            availability: list[ProviderAvailability] = []
+            for candidate in providers:
+                candidate_name = safe_provider_identifier(candidate, fallback="custom")
+                try:
+                    status = safe_provider_availability(
+                        candidate.availability(),
+                        provider=candidate_name,
+                    )
+                except Exception as exc:
+                    status = safe_provider_availability(
+                        None,
+                        provider=candidate_name,
+                        error=exc,
+                    )
+                availability.append(status)
             if not availability:
                 availability = [
-                    ProviderAvailability(
-                        available=False,
+                    safe_provider_availability(
+                        ProviderAvailability(
+                            available=False,
+                            provider=provider_requested,
+                            code="provider-not-configured",
+                        ),
                         provider=provider_requested,
-                        reason=f"unknown or unconstructable provider {provider_requested!r}",
                     )
                 ]
             if not any(item.available for item in availability):
@@ -257,20 +296,10 @@ class AgentRuntime:
                     "at": "",
                     "note": "",
                 }
-                if len(availability) == 1:
-                    run.message = (
-                        "Provider unavailable — "
-                        f"{primary_availability.instructions()}"
-                    )
-                else:
-                    detail = " ".join(
-                        f"{item.provider}: {item.instructions()}"
-                        for item in availability
-                    )
-                    run.message = (
-                        "No provider in the fallback pool is available — "
-                        f"{detail}"
-                    )
+                guidance = list(dict.fromkeys(
+                    provider_availability_message(item) for item in availability
+                ))
+                run.message = " ".join(guidance)
                 self._persist(run)
                 return run
 
@@ -292,8 +321,13 @@ class AgentRuntime:
             update_task=update_task,
         )
 
-        run.provider_used = resp.provider_used
-        run.provider_model = resp.data.get("model_used", "") or run.provider_model
+        raw_provider_used = resp.provider_used
+        run.provider_used = (
+            safe_provider_identifier(raw_provider_used, fallback="custom")
+            if type(raw_provider_used) is str and raw_provider_used
+            else ""
+        )
+        run.provider_model = safe_provider_model(run.provider_used)
         run.status = resp.status
         run.success = resp.success
         run.duration_ms = resp.duration_ms
@@ -336,7 +370,7 @@ class AgentRuntime:
         the task is left at REVIEW for rework. Returns the updated AgentRun.
         Raises FileNotFoundError if the run does not exist.
         """
-        with _ApprovalLock(self._runs_dir / ".approval.lock"):
+        with _ApprovalLock(self._root):
             return self._review_locked(run_id, approve=approve, by=by, note=note)
 
     def _review_locked(
@@ -434,18 +468,24 @@ class AgentRuntime:
 
     def get_run(self, run_id: str) -> AgentRun:
         _validate_run_id(run_id)
-        path = self._run_path(run_id)
-        if path.is_symlink():
-            raise ValueError(f"Agent run path for {run_id!r} must not be a symlink.")
-        if not path.exists():
-            raise FileNotFoundError(f"No agent run {run_id!r} in {self._runs_dir}.")
-        run = AgentRun.from_dict(json.loads(path.read_text(encoding="utf-8")))
-        if run.run_id != run_id:
-            raise ValueError(
-                f"Agent run record {path.name!r} identifies itself as "
-                f"{run.run_id!r}; expected {run_id!r}."
+        name = f"{run_id}.json"
+        try:
+            directory_fd = open_directory_beneath(
+                self._root,
+                Path("logs") / "agents",
             )
-        return run
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"No agent run {run_id!r} in {self._runs_dir}."
+            ) from exc
+        try:
+            return _load_agent_run_record_at(
+                directory_fd,
+                name,
+                expected_run_id=run_id,
+            )
+        finally:
+            os.close(directory_fd)
 
     def history(
         self,
@@ -454,14 +494,27 @@ class AgentRuntime:
         limit: int = 20,
     ) -> list[AgentRun]:
         """Return past runs (most recent first), optionally filtered."""
-        if not self._runs_dir.exists():
+        try:
+            directory_fd = open_directory_beneath(
+                self._root,
+                Path("logs") / "agents",
+            )
+        except FileNotFoundError:
             return []
         runs: list[AgentRun] = []
-        for path in self._runs_dir.glob("run-*.json"):
-            try:
-                runs.append(AgentRun.from_dict(json.loads(path.read_text(encoding="utf-8"))))
-            except Exception:
-                continue
+        try:
+            names = sorted(
+                name
+                for name in os.listdir(directory_fd)
+                if name.startswith("run-") and name.endswith(".json")
+            )
+            for name in names:
+                try:
+                    runs.append(_load_agent_run_record_at(directory_fd, name))
+                except Exception:
+                    continue
+        finally:
+            os.close(directory_fd)
         if role is not None:
             role_slug = normalize_role(role)
             runs = [r for r in runs if r.role == role_slug]
@@ -592,45 +645,35 @@ class AgentRuntime:
         Approval therefore stops until the record is repaired instead of silently
         treating the child as a standalone run.
         """
-        if not self._runs_dir.exists():
+        try:
+            directory_fd = open_directory_beneath(
+                self._root,
+                Path("logs") / "agents",
+            )
+        except FileNotFoundError:
             return []
 
         records: list[dict[str, Any]] = []
-        for path in sorted(self._runs_dir.glob("team-*.json")):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(data, dict):
-                    raise TypeError("team record must be a JSON object")
-
-                team_run_id = data.get("team_run_id")
-                task_id = data.get("task_id")
-                status = data.get("status")
-                child_run_ids = data.get("child_run_ids")
-                approval_run_id = data.get("approval_run_id")
-                if not isinstance(team_run_id, str) or not team_run_id:
-                    raise TypeError("team_run_id must be a non-empty string")
-                if team_run_id != path.stem:
-                    raise ValueError("team_run_id does not match its filename")
-                if not isinstance(task_id, str):
-                    raise TypeError("task_id must be a string")
-                if not isinstance(status, str) or not status:
-                    raise TypeError("status must be a non-empty string")
-                if not isinstance(child_run_ids, list) or not all(
-                    isinstance(item, str) and item for item in child_run_ids
-                ):
-                    raise TypeError("child_run_ids must be a list of run IDs")
-                if not isinstance(approval_run_id, str):
-                    raise TypeError("approval_run_id must be a string")
-                if approval_run_id and approval_run_id not in child_run_ids:
-                    raise ValueError("approval_run_id is not a child run")
-                if status == "awaiting-approval" and not approval_run_id:
-                    raise ValueError("awaiting team run has no approval_run_id")
-            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
-                raise ValueError(
-                    "Approval cannot safely determine team-run ancestry because "
-                    f"{path.name!r} is unreadable or malformed: {exc}"
-                ) from exc
-            records.append(data)
+        try:
+            names = sorted(
+                name
+                for name in os.listdir(directory_fd)
+                if name.startswith("team-") and name.endswith(".json")
+            )
+            for name in names:
+                try:
+                    sanitized = _load_team_approval_record_at(
+                        directory_fd,
+                        name,
+                    )
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Approval cannot safely determine team-run ancestry because "
+                        f"{name!r} is unreadable or malformed: {exc}"
+                    ) from exc
+                records.append(sanitized)
+        finally:
+            os.close(directory_fd)
         return records
 
     def _sync_parent_team_run(self, run: AgentRun) -> None:
@@ -664,7 +707,6 @@ class AgentRuntime:
                     f"Agent run {run.run_id!r} and team run "
                     f"{data['team_run_id']!r} have different task IDs."
                 )
-            path = self._runs_dir / f"{data['team_run_id']}.json"
             if data.get("approval_run_id") != run.run_id:
                 continue
             if data.get("status") != "awaiting-approval":
@@ -687,7 +729,7 @@ class AgentRuntime:
                 "note": child_approval.get("note", ""),
             }
             try:
-                write_json_atomic(path, data)
+                self._write_record(f"{data['team_run_id']}.json", data)
             except Exception as exc:
                 raise RuntimeError(
                     "Could not persist the parent team approval checkpoint"
@@ -699,39 +741,173 @@ class AgentRuntime:
 
     def _persist(self, run: AgentRun) -> None:
         try:
-            write_json_atomic(self._run_path(run.run_id), run.to_dict())
+            self._write_record(f"{run.run_id}.json", run.to_dict())
         except Exception as exc:
             raise RuntimeError("Could not persist the agent run checkpoint") from exc
+
+    def _write_record(self, name: str, data: dict[str, Any]) -> None:
+        directory_fd = open_directory_beneath(
+            self._root,
+            Path("logs") / "agents",
+            create=True,
+        )
+        try:
+            write_json_atomic_at(directory_fd, name, data)
+        finally:
+            os.close(directory_fd)
 
     def _persist_required(self, run: AgentRun) -> None:
         """Persist an approval decision before propagating it to its parent."""
         self._persist(run)
 
 
+def _load_agent_run_record_at(
+    directory_fd: int,
+    name: str,
+    *,
+    expected_run_id: str | None = None,
+) -> AgentRun:
+    """Load and opportunistically migrate a run without replacing newer state."""
+    for _attempt in range(_LEGACY_MIGRATION_ATTEMPTS):
+        payload, identity = read_json_with_identity_at(directory_fd, name)
+        run = _agent_run_from_payload(payload, name, expected_run_id)
+        migrated = run.to_dict()
+        if migrated == payload:
+            return run
+        try:
+            write_json_atomic_at(
+                directory_fd,
+                name,
+                migrated,
+                expected_identity=identity,
+            )
+        except ConcurrentRecordChangeError:
+            continue
+        return run
+
+    # Persistent contention should not turn a read into an unbounded retry.
+    # Return one final, current snapshot without attempting another migration.
+    payload, _identity = read_json_with_identity_at(directory_fd, name)
+    return _agent_run_from_payload(payload, name, expected_run_id)
+
+
+def _agent_run_from_payload(
+    payload: Any,
+    name: str,
+    expected_run_id: str | None,
+) -> AgentRun:
+    if not isinstance(payload, dict):
+        raise TypeError("agent run record must be a JSON object")
+    run = AgentRun.from_dict(payload)
+    if expected_run_id is not None and run.run_id != expected_run_id:
+        raise ValueError(
+            f"Agent run record {name!r} identifies itself as "
+            f"{run.run_id!r}; expected {expected_run_id!r}."
+        )
+    return run
+
+
+def _load_team_approval_record_at(
+    directory_fd: int,
+    name: str,
+) -> dict[str, Any]:
+    """Load and sanitize approval ancestry without clobbering team updates."""
+    for _attempt in range(_LEGACY_MIGRATION_ATTEMPTS):
+        payload, identity = read_json_with_identity_at(directory_fd, name)
+        data = _validated_team_approval_payload(payload, name)
+        migrated = sanitize_team_record(data)
+        if migrated == data:
+            return migrated
+        try:
+            write_json_atomic_at(
+                directory_fd,
+                name,
+                migrated,
+                expected_identity=identity,
+            )
+        except ConcurrentRecordChangeError:
+            continue
+        return migrated
+
+    payload, _identity = read_json_with_identity_at(directory_fd, name)
+    return sanitize_team_record(_validated_team_approval_payload(payload, name))
+
+
+def _validated_team_approval_payload(
+    payload: Any,
+    name: str,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise TypeError("team record must be a JSON object")
+
+    team_run_id = payload.get("team_run_id")
+    task_id = payload.get("task_id")
+    status = payload.get("status")
+    child_run_ids = payload.get("child_run_ids")
+    approval_run_id = payload.get("approval_run_id")
+    if not isinstance(team_run_id, str) or not team_run_id:
+        raise TypeError("team_run_id must be a non-empty string")
+    if team_run_id != Path(name).stem:
+        raise ValueError("team_run_id does not match its filename")
+    if not isinstance(task_id, str):
+        raise TypeError("task_id must be a string")
+    if not isinstance(status, str) or not status:
+        raise TypeError("status must be a non-empty string")
+    if not isinstance(child_run_ids, list) or not all(
+        isinstance(item, str) and item for item in child_run_ids
+    ):
+        raise TypeError("child_run_ids must be a list of run IDs")
+    if not isinstance(approval_run_id, str):
+        raise TypeError("approval_run_id must be a string")
+    if approval_run_id and approval_run_id not in child_run_ids:
+        raise ValueError("approval_run_id is not a child run")
+    if status == "awaiting-approval" and not approval_run_id:
+        raise ValueError("awaiting team run has no approval_run_id")
+    return payload
+
+
 class _ApprovalLock:
     """Serialize approval compare-and-set across CLI and Telegram processes."""
 
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._file: Any = None
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._file_fd: int | None = None
+        self._directory_fd: int | None = None
 
     def __enter__(self) -> _ApprovalLock:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self._path.open("a+", encoding="utf-8")
-        fcntl.flock(self._file.fileno(), fcntl.LOCK_EX)
+        file_fd, directory_fd = open_private_lock_file(
+            self._root,
+            Path("logs") / "agents",
+            ".approval.lock",
+        )
+        try:
+            fcntl.flock(file_fd, fcntl.LOCK_EX)
+            validate_private_lock_file(directory_fd, file_fd, ".approval.lock")
+        except BaseException:
+            try:
+                fcntl.flock(file_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(file_fd)
+                os.close(directory_fd)
+            raise
+        self._file_fd = file_fd
+        self._directory_fd = directory_fd
         return self
 
     def __exit__(self, *_args: Any) -> None:
-        if self._file is not None:
+        if self._file_fd is not None:
             try:
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(self._file_fd, fcntl.LOCK_UN)
             finally:
-                self._file.close()
-                self._file = None
+                os.close(self._file_fd)
+                self._file_fd = None
+                if self._directory_fd is not None:
+                    os.close(self._directory_fd)
+                    self._directory_fd = None
 
 
 def _validate_run_id(run_id: str) -> None:
-    if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
+    if not is_agent_run_id(run_id):
         raise ValueError(
             "run_id must begin with 'run-' and contain only letters, digits, "
             "or hyphens (maximum 84 characters)."

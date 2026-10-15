@@ -2,12 +2,19 @@
 from __future__ import annotations
 
 import json
+import stat
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from unittest import mock
 
-from brain.providers.base import AIProvider, ProviderResponse, ProviderUnavailableError
+from brain.providers.base import (
+    AIProvider,
+    ProviderAvailability,
+    ProviderResponse,
+    ProviderUnavailableError,
+)
 from monday import Monday, MondayConfig
 from orchestrator import (
     ExecutionMode,
@@ -22,7 +29,6 @@ from orchestrator import (
     select_provider,
 )
 from orchestrator.executor import ExecutionOrchestrator
-
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -183,6 +189,32 @@ class TestSelectProvider(unittest.TestCase):
     def test_manual_name_not_available_returns_none(self):
         chosen = select_provider(self.all, ProviderSelectionPolicy.PREFER_LOCAL, manual_name="cohere")
         self.assertIsNone(chosen)
+
+    def test_explicit_custom_selector_matches_noncanonical_provider_object(self):
+        custom = FakeProvider("cohere")
+        self.assertIs(
+            select_provider(
+                [custom],
+                ProviderSelectionPolicy.MANUAL,
+                manual_name="custom",
+            ),
+            custom,
+        )
+        self.assertEqual(
+            rank_providers(
+                [custom],
+                ProviderSelectionPolicy.MANUAL,
+                manual_name="custom",
+            ),
+            [custom],
+        )
+        self.assertIsNone(
+            select_provider(
+                [custom],
+                ProviderSelectionPolicy.MANUAL,
+                manual_name="cohere",
+            )
+        )
 
     def test_rank_providers_preserves_fallback_order(self):
         ranked = rank_providers(self.all, ProviderSelectionPolicy.HIGHEST_CAPABILITY)
@@ -364,9 +396,122 @@ class TestExecutionReport(unittest.TestCase):
             report = ExecutionReport(execution_id="exec-abc", task_id="TASK-0001", status="completed", success=True)
             path = report.write_log(Path(tmp))
             self.assertTrue(path.exists())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             data = json.loads(path.read_text())
             self.assertEqual(data["execution_id"], "exec-abc")
             self.assertEqual(data["task_id"], "TASK-0001")
+
+    def test_write_log_migrates_existing_reports_to_private_mode(self):
+        with TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            legacy = logs_dir / "legacy.json"
+            legacy.write_text(
+                '{"execution_id": "legacy", "status": "completed"}\n',
+                encoding="utf-8",
+            )
+            legacy.chmod(0o644)
+
+            report = ExecutionReport(execution_id="exec-new", task_id="TASK-0001")
+            new_path = report.write_log(logs_dir)
+
+            self.assertEqual(stat.S_IMODE(legacy.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(new_path.stat().st_mode), 0o600)
+
+    def test_write_log_migration_skips_symlinks_and_nonregular_entries(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logs_dir = root / "executions"
+            logs_dir.mkdir()
+            target = root / "outside.json"
+            target.write_text("do not touch\n", encoding="utf-8")
+            target.chmod(0o644)
+            link = logs_dir / "linked.json"
+            link.symlink_to(target)
+            nonregular = logs_dir / "directory.json"
+            nonregular.mkdir()
+
+            ExecutionReport(execution_id="exec-new", task_id="TASK-0001").write_log(logs_dir)
+
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(target.read_text(encoding="utf-8"), "do not touch\n")
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+            self.assertTrue(nonregular.is_dir())
+
+    def test_write_log_migration_skips_hard_links(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logs_dir = root / "executions"
+            logs_dir.mkdir()
+            target = root / "outside.json"
+            target.write_text("do not touch\n", encoding="utf-8")
+            target.chmod(0o644)
+            (logs_dir / "linked.json").hardlink_to(target)
+
+            ExecutionReport(execution_id="exec-new", task_id="TASK-0001").write_log(logs_dir)
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "do not touch\n")
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+
+    def test_write_log_rejects_a_linked_report_directory(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            outside.mkdir()
+            logs_dir = root / "executions"
+            logs_dir.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaises(OSError):
+                ExecutionReport(
+                    execution_id="exec-new",
+                    task_id="TASK-0001",
+                ).write_log(logs_dir)
+
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_write_log_rejects_a_linked_report_parent(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            executions = outside / "executions"
+            executions.mkdir(parents=True)
+            victim = executions / "legacy.json"
+            victim.write_text('{"secret": "unchanged"}\n', encoding="utf-8")
+            victim.chmod(0o644)
+            (root / "logs").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaises(OSError):
+                ExecutionReport(
+                    execution_id="exec-new",
+                    task_id="TASK-0001",
+                ).write_log(root / "logs" / "executions")
+
+            self.assertEqual(
+                victim.read_text(encoding="utf-8"),
+                '{"secret": "unchanged"}\n',
+            )
+            self.assertEqual(stat.S_IMODE(victim.stat().st_mode), 0o644)
+            self.assertFalse((executions / "exec-new.json").exists())
+
+    def test_write_log_failure_preserves_the_prior_complete_report(self):
+        with TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            report = ExecutionReport(
+                execution_id="exec-stable",
+                task_id="TASK-0001",
+                status="completed",
+            )
+            path = report.write_log(logs_dir)
+            before = path.read_bytes()
+
+            with mock.patch(
+                "orchestrator.report.os.replace",
+                side_effect=OSError("simulated write failure"),
+            ):
+                with self.assertRaises(OSError):
+                    report.write_log(logs_dir)
+
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(logs_dir.glob("*.tmp")), [])
 
     def test_to_dict_has_all_fields(self):
         report = ExecutionReport(execution_id="x", task_id="t")
@@ -463,6 +608,300 @@ class TestMondayExecute(unittest.TestCase):
         self.assertEqual(r.provider_used, "")
         self.assertIn("failed", r.message.lower())
 
+    def test_provider_exception_text_never_crosses_the_execution_boundary(self):
+        secret = "provider echoed credential and private prompt LEAK-ME-123456789"
+
+        class LeakingProvider(FakeProvider):
+            def ask(self, *args, **kwargs):
+                raise RuntimeError(secret)
+
+        r = self.monday.execute(
+            self.task_id,
+            mode="review",
+            providers=[LeakingProvider("openai")],
+        )
+
+        report_text = Path(r.report_path).read_text(encoding="utf-8")
+        response_text = json.dumps({
+            "message": r.message,
+            "attempts": r.provider_attempts,
+            "data": r.data,
+        })
+        bus = self.monday._Monday__bus
+        from events.types import EventType
+        failure_events = bus.history(EventType.MODEL_CALL_FAILED)
+        event_text = json.dumps([event.payload for event in failure_events])
+
+        self.assertFalse(r.success)
+        self.assertEqual(r.provider_attempts[0]["reason"], "provider-error")
+        self.assertEqual(failure_events[0].payload["error"], "provider-error")
+        self.assertNotIn(secret, report_text)
+        self.assertNotIn(secret, response_text)
+        self.assertNotIn(secret, event_text)
+
+    def test_hostile_provider_metadata_accessors_are_contained_and_fail_over(self):
+        secret = "SELECTION-METADATA-SECRET-92841"
+
+        class HostileProvider(FakeProvider):
+            @property
+            def name(self) -> str:
+                raise RuntimeError(secret)
+
+            @property
+            def is_local(self) -> bool:
+                raise RuntimeError(secret)
+
+            @property
+            def cost_tier(self) -> int:
+                raise RuntimeError(secret)
+
+            @property
+            def capability_tier(self) -> int:
+                raise RuntimeError(secret)
+
+            def availability(self) -> ProviderAvailability:
+                return ProviderAvailability(
+                    available=True,
+                    provider="PRIVATEPROMPT123456",
+                    model="sk-proj-LEAKME123456",
+                    code="ready",
+                )
+
+            def ask(self, *args: Any, **kwargs: Any) -> ProviderResponse:
+                raise RuntimeError(secret)
+
+        hostile = HostileProvider("openai")
+        healthy = FakeProvider("openai")
+        for policy in ProviderSelectionPolicy:
+            with self.subTest(policy=policy.value):
+                ranked = rank_providers([hostile, healthy], policy)
+                expected = 2 if policy is not ProviderSelectionPolicy.MANUAL else 1
+                self.assertEqual(len(ranked), expected)
+
+        result = self.monday.execute(
+            self.task_id,
+            mode="review",
+            policy="ordered-failover",
+            providers=[hostile, healthy],
+        )
+
+        report_text = Path(result.report_path).read_text(encoding="utf-8")
+        bus = self.monday._Monday__bus
+        rendered = json.dumps({
+            "response": result.data,
+            "attempts": result.provider_attempts,
+            "events": [event.payload for event in bus.history()],
+        })
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider_used, "openai")
+        self.assertEqual(result.provider_attempts[0]["provider"], "custom")
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn(secret, report_text)
+        self.assertNotIn("LEAKME", rendered)
+        self.assertNotIn("PRIVATEPROMPT", rendered)
+
+    def test_provider_response_metadata_is_reduced_to_fixed_values(self):
+        secret = "PRIVATEPROMPT123456"
+
+        class HostileResponseProvider(FakeProvider):
+            def ask(self, *args: Any, **kwargs: Any) -> ProviderResponse:
+                return ProviderResponse(
+                    content=(
+                        "A complete authentication result with enough detail "
+                        "to pass deterministic validation."
+                    ),
+                    provider="sk-proj-LEAKME123456",
+                    model=secret,
+                    tokens_used=secret,  # type: ignore[arg-type]
+                    metadata={"stop_reason": secret, "truncated": secret},
+                )
+
+        result = self.monday.execute(
+            self.task_id,
+            mode="review",
+            providers=[HostileResponseProvider("openai")],
+        )
+
+        report_text = Path(result.report_path).read_text(encoding="utf-8")
+        bus = self.monday._Monday__bus
+        rendered = json.dumps({
+            "response": result.data,
+            "events": [event.payload for event in bus.history()],
+        })
+        self.assertTrue(result.success)
+        self.assertEqual(result.data["model_used"], "openai-model")
+        self.assertEqual(result.data["stop_reason"], "")
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn(secret, report_text)
+        self.assertNotIn("LEAKME", rendered)
+
+    def test_malformed_provider_content_fails_over_without_leaking(self):
+        secret = "MALFORMED-CONTENT-SECRET-18642"
+
+        class HostileContent(str):
+            def __str__(self):
+                raise RuntimeError(secret)
+
+            def __getitem__(self, key):
+                raise RuntimeError(secret)
+
+        class MalformedContentProvider(FakeProvider):
+            def __init__(self, name: str, content: object):
+                super().__init__(name)
+                self._malformed_content = content
+
+            def ask(self, *args: Any, **kwargs: Any) -> ProviderResponse:
+                return ProviderResponse(
+                    content=self._malformed_content,  # type: ignore[arg-type]
+                    provider=self.name,
+                )
+
+        result = self.monday.execute(
+            self.task_id,
+            mode="review",
+            policy="ordered-failover",
+            providers=[
+                MalformedContentProvider("openai", secret.encode()),
+                MalformedContentProvider("anthropic", HostileContent(secret)),
+                FakeProvider("deepseek"),
+            ],
+        )
+
+        report_text = Path(result.report_path).read_text(encoding="utf-8")
+        rendered = json.dumps({
+            "response": result.data,
+            "attempts": result.provider_attempts,
+        })
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider_used, "deepseek")
+        self.assertEqual(
+            [
+                (attempt["provider"], attempt["status"], attempt["reason"])
+                for attempt in result.provider_attempts
+            ],
+            [
+                ("openai", "failed", "provider-error"),
+                ("anthropic", "failed", "provider-error"),
+                ("deepseek", "completed", ""),
+            ],
+        )
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn(secret, report_text)
+
+    def test_length_stop_reasons_force_truncated_reports(self):
+        class TruncatingProvider(FakeProvider):
+            def __init__(self, stop_reason: str):
+                super().__init__("openai")
+                self._stop_reason = stop_reason
+
+            def ask(self, *args: Any, **kwargs: Any) -> ProviderResponse:
+                return ProviderResponse(
+                    content=(
+                        "This complete authentication result contains enough "
+                        "detail for deterministic validation."
+                    ),
+                    provider="openai",
+                    metadata={
+                        "stop_reason": self._stop_reason,
+                        "truncated": False,
+                    },
+                )
+
+        for stop_reason in ("length", "max_tokens"):
+            with self.subTest(stop_reason=stop_reason):
+                created = self.monday.task(
+                    "create",
+                    title=f"Exercise {stop_reason} handling",
+                    objective="Implement authentication result handling.",
+                    task_type="feature",
+                    priority="P1",
+                )
+                result = self.monday.execute(
+                    created.task_id,
+                    mode="review",
+                    providers=[TruncatingProvider(stop_reason)],
+                )
+                persisted = json.loads(
+                    Path(result.report_path).read_text(encoding="utf-8")
+                )
+
+                self.assertTrue(result.success)
+                self.assertEqual(result.data["stop_reason"], stop_reason)
+                self.assertIs(result.data["truncated"], True)
+                self.assertEqual(persisted["stop_reason"], stop_reason)
+                self.assertIs(persisted["truncated"], True)
+
+    def test_metadata_dict_subclass_is_discarded_without_access(self):
+        secret = "HOSTILE-METADATA-DICT-95371"
+
+        class HostileMetadata(dict):
+            def get(self, *args: Any, **kwargs: Any):
+                raise RuntimeError(secret)
+
+            def items(self):
+                raise RuntimeError(secret)
+
+            def __iter__(self):
+                raise RuntimeError(secret)
+
+        class HostileMetadataProvider(FakeProvider):
+            def ask(self, *args: Any, **kwargs: Any) -> ProviderResponse:
+                return ProviderResponse(
+                    content=(
+                        "This complete authentication result contains enough "
+                        "detail for deterministic validation."
+                    ),
+                    provider="openai",
+                    metadata=HostileMetadata({"stop_reason": "length"}),
+                )
+
+        result = self.monday.execute(
+            self.task_id,
+            mode="review",
+            providers=[HostileMetadataProvider("openai")],
+        )
+
+        report_text = Path(result.report_path).read_text(encoding="utf-8")
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider_used, "openai")
+        self.assertEqual(result.data["stop_reason"], "")
+        self.assertIs(result.data["truncated"], False)
+        self.assertNotIn(secret, report_text)
+
+    def test_hostile_metadata_key_is_ignored_without_comparison_or_leak(self):
+        secret = "HOSTILE-METADATA-KEY-68423"
+
+        class HostileKey:
+            def __hash__(self):
+                return hash("stop_reason")
+
+            def __eq__(self, other):
+                raise RuntimeError(secret)
+
+        class HostileMetadataProvider(FakeProvider):
+            def ask(self, *args: Any, **kwargs: Any) -> ProviderResponse:
+                return ProviderResponse(
+                    content=(
+                        "This complete authentication result contains enough "
+                        "detail for deterministic validation."
+                    ),
+                    provider="openai",
+                    metadata={HostileKey(): "length"},  # type: ignore[dict-item]
+                )
+
+        result = self.monday.execute(
+            self.task_id,
+            mode="review",
+            providers=[HostileMetadataProvider("openai")],
+        )
+
+        report_text = Path(result.report_path).read_text(encoding="utf-8")
+        self.assertTrue(result.success)
+        self.assertEqual(result.provider_used, "openai")
+        self.assertEqual(result.data["stop_reason"], "")
+        self.assertIs(result.data["truncated"], False)
+        self.assertNotIn(secret, report_text)
+
     def test_provider_failure_falls_back_to_next_candidate(self):
         primary = FakeProvider(
             "anthropic", capability_tier=3, cost_tier=3, raise_on_call=True,
@@ -530,7 +969,7 @@ class TestMondayExecute(unittest.TestCase):
         prov = self._provider()
         self.monday.execute(self.task_id, mode="review", providers=[prov])
         # Access the shared bus through name-mangled attribute for verification.
-        bus = getattr(self.monday, "_Monday__bus")
+        bus = self.monday._Monday__bus
         from events.types import EventType
         started = bus.history(EventType.MODEL_CALL_STARTED)
         completed = bus.history(EventType.MODEL_CALL_COMPLETED)
