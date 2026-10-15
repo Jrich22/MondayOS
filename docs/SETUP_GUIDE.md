@@ -55,6 +55,8 @@ Homebrew/system locations.
    sign in. MondayOS self-builds prefer it as the implementation builder when
    available; registered external projects use Codex as their builder. Without
    Claude Code, the ChatGPT-authenticated Codex CLI handles self-builds too.
+   Both builders receive only bounded controller-selected files, have model
+   tools disabled, and run outside the target worktree.
 4. Confirm the exact environment MondayOS can use:
 
    ```bash

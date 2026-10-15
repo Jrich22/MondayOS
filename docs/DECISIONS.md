@@ -1241,3 +1241,59 @@ request validation remain unchanged.
 - Refusal delivery can lag behind intake; health exposes that unresolved state.
 - Under extreme sustained refusal volume, the bounded outbox deliberately
   favors control-plane availability over notifying every rejected update.
+
+---
+
+## ADR-026: Patch Builders Receive Only Controller-Selected Context
+
+**Date:** 2026-10-14
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+The Codex patch builder already selected from a filtered tracked-file manifest
+and ran outside the target repository. The preferred Claude Code self-builder
+instead launched inside the delivery worktree with read tools. That let its
+startup behavior and model browse tracked controller instructions, dependency
+manifests, CI workflows, deployment files, or credential-shaped files that the
+controller intentionally forbids from model context.
+
+### Decision
+
+Every patch builder uses the same two-stage, controller-owned context boundary.
+The first tool-free turn selects from a bounded manifest containing only safe
+tracked UTF-8 files. The controller validates those paths, securely re-reads the
+unchanged bytes, and supplies only the selected content to a second tool-free
+patch turn. Claude and Codex run in fresh temporary directories outside the
+target worktree, with a single deadline spanning manifest collection, selection,
+context capture, and patch generation. If the temporary runtime overlaps the
+target repository or sits anywhere inside a Git repository, the controller
+removes it and fails closed before launching the model. The child process's
+temporary-file directory is pinned to the same checked runtime. External targets
+remain Codex-only; this decision changes the
+confidentiality boundary, not builder routing or publication authority.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Keep Claude read-only inside the worktree | Read-only access still discloses protected files and lets repository configuration influence model startup. |
+| Send every non-secret source file in one prompt | It weakens relevance, exceeds deterministic context bounds, and increases disclosure without helping most changes. |
+| Remove Claude and always use Codex | Claude remains a useful subscription-authenticated primary builder once it has the same enforced boundary. |
+
+### Consequences
+
+- A builder can reason only over the objective, prior bounded feedback, safe
+  manifest names, and the exact controller-selected file contents.
+- Claude's default host-derived system prompt is replaced by a fixed
+  controller-owned policy, preventing cwd, environment, memory-path, or Git
+  status metadata from becoming implicit model context.
+- Protected paths, credentials, repository instructions, CI, deployment, and
+  dependency configuration never become builder prompt content.
+- Selection adds one model turn and shares the build timeout; exhaustion or an
+  invalid selection fails or falls back without granting broader access.
+- The controller, not either model CLI, remains the sole reader of the target
+  worktree and the sole owner of all Git and GitHub mutations.

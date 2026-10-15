@@ -296,6 +296,7 @@ def test_codex_builder_uses_read_only_ephemeral_structured_cli(
         assert "fix it" not in " ".join(argv)
         assert str(tmp_path) not in argv
         assert Path(call["cwd"]) == Path(argv[argv.index("--cd") + 1])
+        assert Path(call["env"]["TMPDIR"]) == Path(call["cwd"])
         assert call["runtime_was_directory"] is True
         assert Path(call["cwd"]).name.startswith("monday-delivery-codex-")
         assert "fix it; touch /tmp/never" in call["stdin"]
@@ -599,6 +600,7 @@ def test_codex_reviewer_is_fresh_read_only_and_schema_bound(
     assert "--skip-git-repo-check" in argv
     assert str(tmp_path) not in argv
     assert Path(calls[0]["cwd"]) == Path(argv[argv.index("--cd") + 1])
+    assert Path(calls[0]["env"]["TMPDIR"]) == Path(calls[0]["cwd"])
     assert Path(calls[0]["cwd"]).name.startswith("monday-delivery-codex-")
     assert argv[argv.index("--sandbox") + 1] == "read-only"
     assert "--strict-config" in argv
@@ -712,15 +714,50 @@ def test_reviewer_payload_is_redacted_and_bounded(
     assert len(decision.recommendations[0].encode("utf-8")) <= backend_module._MAX_REVIEW_ITEM_BYTES
 
 
-def test_claude_builder_exposes_read_tools_only(
+def test_claude_builder_uses_filtered_context_from_sterile_tool_free_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _context_repository(tmp_path)
+    protected_files = {
+        ".env.production": "INTERNAL_CODENAME=blue-orchid\n",
+        ".npmrc": "REGISTRY_ALIAS=violet-comet\n",
+        "credentials/session.json": '{"label":"quiet-river"}\n',
+        ".claude/CLAUDE.md": "PROJECT_INSTRUCTION=amber-sparrow\n",
+        "docs/AGENTS.md": "CONTROLLER_NOTE=golden-canyon\n",
+        ".github/workflows/release.yml": "RELEASE_ALIAS=silver-maple\n",
+        "deploy/worker.plist": "SERVICE_ALIAS=crimson-forest\n",
+        "pyproject.toml": "DEPENDENCY_ALIAS=indigo-harbor\n",
+    }
+    for relative, content in protected_files.items():
+        protected = tmp_path / relative
+        protected.parent.mkdir(parents=True, exist_ok=True)
+        protected.write_text(content, encoding="utf-8")
+    subprocess.run(
+        ["git", "add", *protected_files],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
     calls: list[dict[str, Any]] = []
+    schemas: list[dict[str, Any]] = []
+    real_run = backend_module._run_process
 
     def fake_run(argv: list[str], **kwargs: Any) -> _ProcessResult:
+        if "--json-schema" not in argv:
+            return real_run(argv, **kwargs)
         calls.append({"argv": argv, **kwargs})
-        payload = {"structured_output": {"summary": "done", "patch": _patch()}}
-        return _ProcessResult(0, json.dumps(payload), "")
+        schema = json.loads(argv[argv.index("--json-schema") + 1])
+        schemas.append(schema)
+        structured = (
+            {"paths": ["app.py"]}
+            if "paths" in schema["properties"]
+            else {"summary": "done", "patch": _patch()}
+        )
+        return _ProcessResult(
+            0,
+            json.dumps({"structured_output": structured}),
+            "",
+        )
 
     monkeypatch.setattr(backend_module, "_run_process", fake_run)
     result = ClaudeCodePatchBuilder(_TEST_CLI).propose(
@@ -731,17 +768,173 @@ def test_claude_builder_exposes_read_tools_only(
     )
 
     assert result.success is True
-    argv = calls[0]["argv"]
-    assert "--restricted" in argv
-    assert "--strict-mcp-config" in argv
-    assert "--disable-slash-commands" in argv
-    assert "--no-chrome" in argv
-    assert argv[argv.index("--permission-mode") + 1] == "plan"
-    assert argv[argv.index("--permission-prompts") + 1] == "none"
-    assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep"
-    assert "--dangerously-skip-permissions" not in argv
-    assert "change app" not in " ".join(argv)
-    assert "change app" in calls[0]["stdin"]
+    assert result.patch == _patch()
+    assert len(calls) == 2
+    for call in calls:
+        argv = call["argv"]
+        assert "--restricted" in argv
+        assert "--safe-mode" in argv
+        assert "--strict-mcp-config" in argv
+        assert "--disable-slash-commands" in argv
+        assert "--no-chrome" in argv
+        assert argv[argv.index("--permission-mode") + 1] == "plan"
+        assert argv[argv.index("--permission-prompts") + 1] == "none"
+        assert argv[argv.index("--system-prompt") + 1] == (
+            backend_module._CLAUDE_SYSTEM_PROMPT
+        )
+        assert "--append-system-prompt" not in argv
+        assert "--append-system-prompt-file" not in argv
+        assert "--system-prompt-file" not in argv
+        assert argv[argv.index("--tools") + 1] == ""
+        assert "Read,Glob,Grep" not in argv
+        assert "--dangerously-skip-permissions" not in argv
+        assert "change app" not in " ".join(argv)
+        assert str(tmp_path) not in argv
+        assert Path(call["cwd"]) != tmp_path
+        assert not Path(call["cwd"]).is_relative_to(tmp_path)
+        assert Path(call["env"]["TMPDIR"]) == Path(call["cwd"])
+        assert call["max_stdout_bytes"] == backend_module._MAX_MODEL_RESULT_BYTES
+        assert Path(call["cwd"]).name.startswith("monday-delivery-claude-")
+        assert not Path(call["cwd"]).exists()
+        assert "change app" in call["stdin"]
+
+    manifest_prompt = calls[0]["stdin"]
+    context_prompt = calls[1]["stdin"]
+    assert '"path":"app.py"' in manifest_prompt
+    assert '"content":"OLD = True\\n"' in context_prompt
+    for forbidden in (
+        ".env.production",
+        "blue-orchid",
+        ".npmrc",
+        "violet-comet",
+        "credentials/session.json",
+        "quiet-river",
+        ".claude/CLAUDE.md",
+        "amber-sparrow",
+        "docs/AGENTS.md",
+        "golden-canyon",
+        ".github/workflows/release.yml",
+        "silver-maple",
+        "deploy/worker.plist",
+        "crimson-forest",
+        "pyproject.toml",
+        "indigo-harbor",
+    ):
+        assert forbidden not in manifest_prompt
+        assert forbidden not in context_prompt
+    assert schemas[0]["properties"]["paths"]["maxItems"] == (
+        backend_module._MAX_SELECTED_FILES
+    )
+    assert schemas[1]["properties"]["patch"]["maxLength"] == (
+        backend_module._MAX_PATCH_BYTES
+    )
+
+
+def test_claude_rejects_selector_escape_before_patch_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _context_repository(tmp_path)
+    calls = 0
+    real_run = backend_module._run_process
+
+    def fake_run(argv: list[str], **kwargs: Any) -> _ProcessResult:
+        nonlocal calls
+        if "--json-schema" not in argv:
+            return real_run(argv, **kwargs)
+        calls += 1
+        return _ProcessResult(
+            0,
+            json.dumps({"structured_output": {"paths": ["../outside.py"]}}),
+            "",
+        )
+
+    monkeypatch.setattr(backend_module, "_run_process", fake_run)
+
+    proposal = ClaudeCodePatchBuilder(_TEST_CLI).propose(
+        worktree=tmp_path,
+        objective="change app",
+        feedback="",
+        timeout=30,
+    )
+
+    assert proposal.success is False
+    assert "unsafe path" in proposal.message
+    assert calls == 1
+
+
+def test_claude_fails_closed_when_temporary_runtime_overlaps_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _context_repository(tmp_path)
+    model_calls = 0
+    real_run = backend_module._run_process
+
+    def fake_run(argv: list[str], **kwargs: Any) -> _ProcessResult:
+        nonlocal model_calls
+        if "--json-schema" in argv:
+            model_calls += 1
+            return _ProcessResult(0, "{}", "")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(backend_module, "_run_process", fake_run)
+    monkeypatch.setattr(backend_module.tempfile, "tempdir", str(tmp_path))
+
+    proposal = ClaudeCodePatchBuilder(_TEST_CLI).propose(
+        worktree=tmp_path,
+        objective="change app",
+        feedback="",
+        timeout=30,
+    )
+
+    assert proposal.success is False
+    assert "runtime overlaps" in proposal.message
+    assert model_calls == 0
+    assert not list(tmp_path.glob("monday-delivery-claude-*"))
+
+
+def test_claude_fails_closed_when_temporary_runtime_is_in_parent_git_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = tmp_path / "controller"
+    controller.mkdir()
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=controller,
+        check=True,
+        capture_output=True,
+    )
+    worktree = controller / "logs" / "delivery" / "worktrees" / "job"
+    worktree.mkdir(parents=True)
+    _context_repository(worktree)
+    temp_base = controller / "model-temp"
+    temp_base.mkdir()
+    model_calls = 0
+    real_run = backend_module._run_process
+
+    def fake_run(argv: list[str], **kwargs: Any) -> _ProcessResult:
+        nonlocal model_calls
+        if "--json-schema" in argv:
+            model_calls += 1
+            return _ProcessResult(0, "{}", "")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(backend_module, "_run_process", fake_run)
+    monkeypatch.setattr(backend_module.tempfile, "tempdir", str(temp_base))
+
+    proposal = ClaudeCodePatchBuilder(_TEST_CLI).propose(
+        worktree=worktree,
+        objective="change app",
+        feedback="",
+        timeout=30,
+    )
+
+    assert proposal.success is False
+    assert "inside a Git repository" in proposal.message
+    assert model_calls == 0
+    assert not list(temp_base.glob("monday-delivery-claude-*"))
 
 
 def test_process_capture_drains_both_streams_with_a_hard_memory_bound(tmp_path: Path) -> None:
@@ -769,6 +962,66 @@ def test_process_capture_drains_both_streams_with_a_hard_memory_bound(tmp_path: 
     assert "[output truncated]" in result.stderr
     assert result.stdout.endswith("TAIL")
     assert result.stderr.endswith("TAIL")
+
+
+def test_process_capture_can_use_the_bounded_model_result_envelope(tmp_path: Path) -> None:
+    payload_bytes = 1_000_000
+    result = _run_process(
+        [sys.executable, "-c", f"import sys; sys.stdout.write('x' * {payload_bytes})"],
+        cwd=tmp_path,
+        timeout=10,
+        env=backend_module._controller_env(),
+        max_stdout_bytes=backend_module._MAX_MODEL_RESULT_BYTES,
+    )
+
+    assert result.returncode == 0
+    assert len(result.stdout.encode("utf-8")) == payload_bytes
+    assert "[output truncated]" not in result.stdout
+
+    oversized = _run_process(
+        [
+            sys.executable,
+            "-c",
+            f"import sys; sys.stdout.write('x' * {backend_module._MAX_MODEL_RESULT_BYTES + 1})",
+        ],
+        cwd=tmp_path,
+        timeout=10,
+        env=backend_module._controller_env(),
+        max_stdout_bytes=backend_module._MAX_MODEL_RESULT_BYTES,
+    )
+
+    assert oversized.returncode == 0
+    assert len(oversized.stdout.encode("utf-8")) <= backend_module._MAX_MODEL_RESULT_BYTES
+    assert "[output truncated]" in oversized.stdout
+
+    with pytest.raises(ValueError, match="stdout limit"):
+        _run_process(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            timeout=10,
+            env=backend_module._controller_env(),
+            max_stdout_bytes=backend_module._MAX_MODEL_RESULT_BYTES + 1,
+        )
+
+
+def test_claude_rejects_a_truncated_structured_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(argv: list[str], **kwargs: Any) -> _ProcessResult:
+        del argv, kwargs
+        return _ProcessResult(0, '{"structured_output":' + "\n[output truncated]", "")
+
+    monkeypatch.setattr(backend_module, "_run_process", fake_run)
+
+    with pytest.raises(ValueError, match="exceeded the safe output limit"):
+        backend_module._claude_json(
+            _TEST_CLI,
+            prompt="prompt",
+            schema=backend_module._patch_schema(),
+            forbidden_root=tmp_path,
+            timeout=30,
+        )
 
 
 def test_process_stdin_is_literal_and_not_shell_interpreted(tmp_path: Path) -> None:

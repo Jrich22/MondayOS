@@ -20,7 +20,9 @@ record.
 > controlled-context Codex builder, not Claude Code, and still require the
 > independent ChatGPT/Codex reviewer. The controller cannot merge or deploy,
 > although its branch push may start automation already configured in the target
-> GitHub repository.
+> GitHub repository. For MondayOS self-builds, both the preferred Claude builder
+> and Codex fallback receive only bounded controller-selected content and cannot
+> browse the worktree directly.
 
 ## How it fits together
 

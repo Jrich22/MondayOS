@@ -13,7 +13,7 @@ task
   → exact remote-base commit
   → isolated, job-owned Git worktree
   → implementation patch
-      MondayOS itself: Claude Code, then bounded-context Codex fallback
+      MondayOS itself: bounded-context Claude Code, then bounded-context Codex fallback
       registered external project: bounded-context Codex only
   → fixed controller validation
   → exact staged-artifact fingerprint
@@ -30,8 +30,9 @@ open pull request
       head changed → fail closed as diverged; return REVIEW to IN_PROGRESS
 ```
 
-Monday, not the coding model, owns every mutation. A builder can inspect the
-repository and return a structured unified patch, but it cannot edit the
+Monday, not the coding model, owns every mutation. A builder receives only the
+bounded tracked-file manifest and controller-selected file contents needed for
+the task, then returns a structured unified patch. It cannot browse or edit the
 worktree, choose validation commands, commit, push, open a pull request, merge,
 or deploy. The controller validates and applies the patch itself.
 
@@ -102,9 +103,11 @@ exact pull request without pushing twice. A different delivery ID for the same
 task and repository is rejected while that state remains unresolved.
 
 External projects use only the controlled-context Codex patch builder. Claude
-Code remains available as the first builder for MondayOS self-builds, with Codex
-as fallback. Both target types use a fresh, independent ChatGPT/Codex session as
-the mandatory final reviewer.
+Code remains available as the first builder for MondayOS self-builds, with
+controlled-context Codex as fallback. Both builders receive only bounded,
+controller-selected context and run tool-free from checked temporary directories
+that cannot overlap the target worktree or sit inside any Git repository. Both target types use a fresh,
+independent ChatGPT/Codex session as the mandatory final reviewer.
 
 The workflow:
 
@@ -114,8 +117,11 @@ The workflow:
   dependency manifests, CI workflows, service/deployment files, and AI/controller
   instruction files;
 - uses fixed argument arrays rather than shell commands;
-- runs Codex builders and reviewers outside the repository with MCP, shell,
-  browser, plugin, skill, hook, worktree, and host-automation features disabled;
+- runs Claude and Codex builders and Codex reviewers outside the repository with
+  model tools, MCP, shell, browser, plugin, skill, hook, worktree, and
+  host-automation features disabled, and pins their temporary-file directory to
+  that checked runtime; Claude's host-derived default prompt is replaced by a
+  fixed controller-owned system prompt;
 - runs `git diff --cached --check` with a fixed, root-owned Apple Git binary and
   runs the repository's sandbox-safe Python test suite with a controller-owned
   empty pytest configuration;
