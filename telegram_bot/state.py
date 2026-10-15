@@ -16,6 +16,7 @@ from typing import Any, TextIO, TypeGuard
 
 from core.atomic import write_json_atomic
 
+_STATE_VERSION = 10
 _MAX_OBSERVATION_RETRY_SECONDS = 300.0
 _MAX_TELEGRAM_RATE_LIMIT_SECONDS = 86_400.0
 MAX_PENDING_JOBS = 25
@@ -71,6 +72,7 @@ _DELIVERY_ID = re.compile(r"^delivery-[A-Za-z0-9-]{1,80}$")
 _TASK_ID = re.compile(r"^TASK-\d{1,64}(?:-[a-z0-9]{1,12})?$", re.IGNORECASE)
 _FAILURE_CODE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_FULL_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _GITHUB_PR_URL = re.compile(r"^https://github\.com/[^\s/]+/[^\s/]+/pull/\d+$")
 _JOB_ID = re.compile(r"^JOB-(0|[1-9]\d*)$", re.IGNORECASE)
 _ORIGIN_FIELDS = frozenset({
@@ -200,10 +202,10 @@ class TelegramState:
                 or legacy_with_state
                 or current_id != normalized_id
                 or self._data.get("bot_username") != normalized_username
-                or self._data.get("version") != 9
+                or self._data.get("version") != _STATE_VERSION
             )
             self._data.update({
-                "version": 9,
+                "version": _STATE_VERSION,
                 "bot_id": normalized_id,
                 "bot_username": normalized_username,
             })
@@ -2826,7 +2828,7 @@ class TelegramState:
         with self._lock:
             if not self.path.exists():
                 return {
-                    "version": 9,
+                    "version": _STATE_VERSION,
                     "bot_id": None,
                     "bot_username": "",
                     "last_update_id": -1,
@@ -2868,6 +2870,7 @@ class TelegramState:
                 raise TelegramStateError(f"Invalid Telegram state at {self.path}")
             try:
                 _migrate_legacy_delivery_results(payload)
+                _migrate_legacy_delivery_retry_deadlines(payload)
                 _validate_loaded_queue_full_notices(payload)
                 _validate_loaded_acceptance_receipts(payload)
                 _validate_loaded_delivery_retries(payload)
@@ -2882,7 +2885,7 @@ class TelegramState:
 
     def _write(self) -> None:
         with self._lock:
-            self._data["version"] = 9
+            self._data["version"] = _STATE_VERSION
             self._data.setdefault("delivery_notice_pause_until", 0.0)
             self._data.setdefault("lifecycle_notices", {})
             self._data.setdefault("lifecycle_notice_pause_until", 0.0)
@@ -3071,7 +3074,7 @@ def _validate_loaded_queue_full_notices(payload: dict[str, Any]) -> None:
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
-        or not 0 <= version <= 9
+        or not 0 <= version <= _STATE_VERSION
     ):
         raise TelegramStateError("Invalid Telegram state version")
     last_update_id = payload.get("last_update_id", -1)
@@ -3234,7 +3237,7 @@ def _delivery_notice_source_payload(
         if not isinstance(retry, dict):  # guarded by notice_kind
             raise TelegramStateError("Invalid Telegram delivery notice retry")
         normalized_retry = _normalize_delivery_retry(retry)
-        _require_retry_source_binding(normalized_retry, source, update_id)
+        _require_retry_source_binding(retry, source, update_id)
         retry_identity = {
             "root_delivery_id": normalized_retry["root_delivery_id"],
             "delivery_id": normalized_retry["delivery_id"],
@@ -3466,7 +3469,7 @@ def _validate_loaded_delivery_notices(payload: dict[str, Any]) -> None:
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
-        or not 0 <= version <= 9
+        or not 0 <= version <= _STATE_VERSION
     ):
         raise TelegramStateError("Invalid Telegram state version")
     notices = payload.setdefault("delivery_notices", {})
@@ -3668,7 +3671,7 @@ def _lifecycle_source_payload(
                 f"Telegram update {update_id} has an invalid lifecycle retry"
             )
         normalized_retry = _normalize_delivery_retry(retry)
-        _require_retry_source_binding(normalized_retry, source, update_id)
+        _require_retry_source_binding(retry, source, update_id)
         effective_result, outcome_phase = _staged_delivery_outcome(retry)
         if outcome_phase != "completed":
             raise TelegramStateError(
@@ -4191,7 +4194,7 @@ def _validate_loaded_follow_ups(payload: dict[str, Any]) -> None:
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
-        or not 0 <= version <= 9
+        or not 0 <= version <= _STATE_VERSION
     ):
         raise TelegramStateError("Invalid Telegram state version")
     current = time.time()
@@ -4338,7 +4341,7 @@ def _validate_loaded_lifecycle_notices(payload: dict[str, Any]) -> None:
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
-        or not 0 <= version <= 9
+        or not 0 <= version <= _STATE_VERSION
     ):
         raise TelegramStateError("Invalid Telegram state version")
     notices = payload.setdefault("lifecycle_notices", {})
@@ -4476,7 +4479,7 @@ def _validate_loaded_acceptance_receipts(payload: dict[str, Any]) -> None:
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
-        or not 0 <= version <= 9
+        or not 0 <= version <= _STATE_VERSION
     ):
         raise TelegramStateError("Invalid Telegram state version")
 
@@ -4709,6 +4712,53 @@ def _migrate_legacy_delivery_results(payload: dict[str, Any]) -> None:
             )
 
 
+def _migrate_legacy_delivery_retry_deadlines(payload: dict[str, Any]) -> None:
+    """Bind a pre-v10 retry to its already-persisted expiry deadline."""
+    version = payload.get("version", 0)
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or not 0 <= version < _STATE_VERSION
+    ):
+        return
+    jobs = payload.setdefault("jobs", {})
+    completed = payload.setdefault("completed_jobs", {})
+    for key, retry in payload.setdefault("delivery_retries", {}).items():
+        if not _delivery_retry_active(retry):
+            continue
+        try:
+            _normalize_delivery_retry(retry)
+            failure_count = retry.get("failure_count")
+            created_at = _strict_timestamp(
+                retry.get("created_at"),
+                allow_zero=True,
+            )
+            expires_at = _strict_timestamp(retry.get("expires_at"))
+            next_attempt_at = _strict_timestamp(
+                retry.get("next_attempt_at"),
+                allow_zero=True,
+            )
+        except (TelegramStateError, TypeError, ValueError):
+            continue
+        if (
+            isinstance(failure_count, bool)
+            or not isinstance(failure_count, int)
+            or failure_count < 0
+            or expires_at <= created_at
+            or expires_at - created_at > _DELIVERY_RETRY_MAX_AGE_SECONDS + 1
+            or next_attempt_at < created_at
+        ):
+            continue
+        source = jobs.get(key)
+        if not isinstance(source, dict):
+            source = completed.get(key)
+        if (
+            isinstance(source, dict)
+            and "delivery_retry_expires_at" not in source
+        ):
+            source["delivery_retry_expires_at"] = expires_at
+
+
 def _require_retry_binding(
     existing: dict[str, Any],
     candidate: dict[str, Any],
@@ -4730,31 +4780,81 @@ def _require_retry_source_binding(
     update_id: int,
 ) -> None:
     """Bind background work to the exact accepted task and root delivery."""
+    normalized_retry = _normalize_delivery_retry(retry)
     expected = {
         "root_delivery_id": str(source.get("delivery_id") or ""),
         "task_id": str(source.get("task_id") or "").upper(),
         "project_name": str(source.get("project_name") or ""),
         "chat_id": source.get("chat_id"),
     }
-    if any(retry.get(name) != value for name, value in expected.items()):
+    if any(normalized_retry.get(name) != value for name, value in expected.items()):
         raise TelegramStateError(
             f"Telegram update {update_id} delivery retry changed source binding"
         )
     result = source.get("delivery_result")
+    try:
+        retry_expires_at = _strict_timestamp(retry.get("expires_at"))
+        source_expires_at = _strict_timestamp(
+            source.get("delivery_retry_expires_at")
+        )
+        normalized_result = _normalize_delivery_outcome(result)
+        serialized_result = json.dumps(
+            result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        serialized_normalized = json.dumps(
+            normalized_result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TelegramStateError, TypeError, ValueError) as exc:
+        raise TelegramStateError(
+            f"Telegram update {update_id} delivery retry has an invalid source"
+        ) from exc
     if (
         source.get("delivery_terminal") is not True
         or not isinstance(result, dict)
-        or str(result.get("delivery_id") or "") != expected["root_delivery_id"]
-        or str(result.get("status") or "").lower() != "failed"
-        or str(result.get("failure_class") or "") != "transient"
-        or bool(result.get("pushed"))
-        or bool(result.get("commit_sha"))
-        or bool(result.get("pr_url"))
-        or bool(result.get("publication_uncertain"))
+        or retry_expires_at != source_expires_at
+        or serialized_result != serialized_normalized
+        or normalized_result["delivery_id"] != expected["root_delivery_id"]
+        or source.get("delivery_status") != normalized_result["status"]
+        or source.get("delivery_phase") != normalized_result["phase"]
+        or not _delivery_result_authorizes_retry(normalized_result)
     ):
         raise TelegramStateError(
             f"Telegram update {update_id} delivery retry is not authorized"
         )
+
+
+def _delivery_result_authorizes_retry(result: dict[str, Any]) -> bool:
+    """Mirror the service's narrow fresh-delivery authorization contract."""
+    status = str(result.get("status") or "").lower()
+    commit_sha = str(result.get("commit_sha") or "")
+    common = (
+        result.get("success") is False
+        and str(result.get("failure_class") or "") == "transient"
+        and not bool(result.get("pushed"))
+        and not bool(result.get("pr_url"))
+        and not bool(result.get("publication_uncertain"))
+    )
+    ordinary_transient = (
+        status == "failed"
+        and str(result.get("phase") or "").lower() == "failed"
+        and not commit_sha
+    )
+    proven_interruption = (
+        status == "interrupted"
+        and str(result.get("phase") or "").lower() == "interrupted"
+        and str(result.get("failure_code") or "") == "interrupted-run"
+        and result.get("retry_after_seconds") == 0
+        and (not commit_sha or _FULL_COMMIT_SHA.fullmatch(commit_sha) is not None)
+    )
+    return common and (ordinary_transient or proven_interruption)
 
 
 def _validate_loaded_delivery_retries(payload: dict[str, Any]) -> None:
@@ -4805,7 +4905,6 @@ def _validate_loaded_delivery_retries(payload: dict[str, Any]) -> None:
             source = completed.get(key)
             if not isinstance(source, dict) or "request" in source:
                 raise TelegramStateError("Telegram delivery retry lost its source")
-        _require_retry_source_binding(normalized, source, update_id)
         normalized.update({
             "phase": str(value.get("phase")),
             "failure_count": failure_count,
@@ -4813,6 +4912,7 @@ def _validate_loaded_delivery_retries(payload: dict[str, Any]) -> None:
             "created_at": created_at,
             "expires_at": expires_at,
         })
+        _require_retry_source_binding(normalized, source, update_id)
         if "outcome" in value or "outcome_phase" in value:
             normalized.update({
                 "outcome": _normalize_delivery_outcome(value.get("outcome")),

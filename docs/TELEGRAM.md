@@ -347,13 +347,23 @@ checkpoint boundary can duplicate the same fixed message, but cannot duplicate
 the build or retry scheduling.
 
 A live delivery can fail before commit or push because a model session, network
-connection, or required tool is temporarily unavailable. MondayOS retries only
-when the delivery controller provides the structured `transient` failure class;
-words such as "temporary" or "rate limit" in model, CLI, or remote diagnostic
-text never authorize a retry. Policy failures, validation/repair exhaustion,
-reviewer verdicts, missing setup, and unclassified failures remain terminal.
+connection, or required tool is temporarily unavailable. It can also be left
+incomplete when its worker exits during implementation, validation, review,
+commit, or the final pre-publication checkpoint. MondayOS retries only when the
+delivery controller provides the structured `transient` failure class. For an
+interruption, the controller first revalidates the owned worktree and proves
+that its unique branch is absent from the pinned remote. The interrupted record
+preserves the original source phase and a SHA-256 digest that binds that phase to
+the delivery lineage, task and repository target, owned worktree, base, branch,
+and any local commit. Changed or incomplete proof fields cannot authorize a
+retry. Words such as "temporary" or "rate limit" in model, CLI, or remote
+diagnostic text never authorize a retry. Policy failures, validation/repair
+exhaustion, reviewer verdicts, missing setup, unclassified failures, and
+interruptions without that remote-absence proof remain terminal.
 
-Before acknowledging the original Telegram job, MondayOS saves a request-free
+Before invoking the original live build, MondayOS saves its fixed 24-hour
+recovery deadline. Before acknowledging a retryable terminal Telegram job, it
+saves a request-free
 retry checkpoint containing the task, registered project, originating chat, and
 a deterministic next delivery identity. The original request text is then
 removed in the normal replay tombstone. A delayed retry runs outside the main
@@ -365,12 +375,25 @@ root delivery. Downtime never resets that deadline. A crash during a retry
 reconciles that exact identity instead of opening a duplicate pull request.
 
 Each retry is a new immutable delivery record linked by deterministic identity.
+The scheduler passes the exact controller-owned immediate predecessor, root
+delivery, and retry attempt. The controller validates the resulting `ROOT-rN`
+identity, derives the sole permissible predecessor from durable history, and
+rejects omitted, substituted, truncated, or rebound lineage. It re-proves the
+complete bounded chain before successor reservation, under the task lock, and
+after each publication progress callback immediately adjacent to push and
+pull-request creation. An older branch that appears during the delay or build,
+any other matching live pull request regardless of its timestamps, a changed
+target, or unavailable proof stops the successor before the next irreversible
+operation.
 MondayOS makes at most six delivery runs over a bounded 24-hour window, using
 increasing delays and any longer controller-provided retry hint. It never starts
-a fresh identity after a commit, push, pull request, or uncertain publication;
-those states must reconcile the original delivery. Telegram receives only
-generic scheduled, recovered, or exhausted notices—raw provider diagnostics and
-credentials are neither copied into retry state nor sent to the chat.
+a fresh identity after a remote branch, push, pull request, or uncertain
+publication; those states must reconcile the original delivery. A local commit
+from a crashed worker is eligible only after the controller proves the unique
+remote branch is absent, and the successor does not reuse that commit. Telegram
+receives only generic scheduled, recovered, or exhausted notices—raw provider
+diagnostics and credentials are neither copied into retry state nor sent to the
+chat.
 
 The 24-hour cutoff prevents an unstarted retry from beginning late. If an exact
 retry identity was already invoked before the cutoff, MondayOS still reconciles

@@ -1547,6 +1547,91 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
         return config, delivery_id
 
+    def _proven_interruption(
+        self,
+        delivery_id: str,
+        *,
+        commit_sha: str = "",
+        **overrides: object,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "delivery_id": delivery_id,
+            "task_id": "TASK-0001",
+            "status": "interrupted",
+            "phase": "interrupted",
+            "success": False,
+            "branch": "codex/task-0001-interrupted",
+            "commit_sha": commit_sha,
+            "pr_url": "",
+            "publication_uncertain": False,
+            "pushed": False,
+            "changed_files": ["app.py"],
+            "attempts": [],
+            "failure_code": "interrupted-run",
+            "failure_class": "transient",
+            "retry_after_seconds": 0,
+            "message": "The prior worker stopped before publication.",
+        }
+        result.update(overrides)
+        return result
+
+    def _seed_interrupted_live_build_checkpoint(
+        self,
+        update_id: int,
+        *,
+        commit_sha: str = "",
+        retry_expires_at: float = 86_500.0,
+    ) -> tuple[TelegramConfig, str]:
+        config, delivery_id = self._seed_terminal_live_build_checkpoint(
+            update_id,
+            retry_expires_at=retry_expires_at,
+        )
+        result = self._proven_interruption(
+            delivery_id,
+            commit_sha=commit_sha,
+        )
+        result.pop("task_id")
+        result["attempts"] = 0
+        result["message"] = ""
+        self.state.set_job(
+            update_id,
+            delivery_status="interrupted",
+            delivery_phase="interrupted",
+            delivery_result=result,
+        )
+        return config, delivery_id
+
+    def _seed_active_interrupted_retry(
+        self,
+        update_id: int,
+        *,
+        now: float = 200.0,
+        retry_expires_at: float = 86_500.0,
+    ) -> tuple[TelegramConfig, str]:
+        config, delivery_id = self._seed_interrupted_live_build_checkpoint(
+            update_id,
+            commit_sha="a" * 40,
+            retry_expires_at=retry_expires_at,
+        )
+        self.state.schedule_delivery_retry(
+            update_id,
+            {
+                "kind": "delivery-retry",
+                "root_delivery_id": delivery_id,
+                "delivery_id": f"{delivery_id}-r2",
+                "task_id": "TASK-0001",
+                "project_name": "",
+                "chat_id": 7,
+                "attempt": 2,
+                "max_attempts": 6,
+                "failure_code": "interrupted-run",
+            },
+            delay_seconds=60,
+            expires_at=retry_expires_at,
+            now=now,
+        )
+        return config, delivery_id
+
     def _seed_delivery_retry(
         self,
         update_id: int,
@@ -1556,6 +1641,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         project_name: str = "",
     ) -> str:
         root_delivery_id = f"delivery-test-{update_id}"
+        retry_expires_at = now + 24 * 60 * 60
         self.state.enqueue(update_id, _update(update_id=update_id, text="/help"))
         self.state.set_job(
             update_id,
@@ -1566,6 +1652,9 @@ class TestTelegramStateAndRunner(TelegramFixture):
             delivery_id=root_delivery_id,
             delivery_terminal=True,
             delivery_final_sent=False,
+            delivery_status="failed",
+            delivery_phase="failed",
+            delivery_retry_expires_at=retry_expires_at,
             delivery_result={
                 "delivery_id": root_delivery_id,
                 "success": False,
@@ -1574,6 +1663,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
                 "branch": "",
                 "commit_sha": "",
                 "pr_url": "",
+                "publication_uncertain": False,
                 "pushed": False,
                 "changed_files": [],
                 "attempts": 1,
@@ -1597,6 +1687,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
                 "failure_code": "provider-timeout",
             },
             delay_seconds=delay_seconds,
+            expires_at=retry_expires_at,
             now=now,
         )
         return root_delivery_id
@@ -2297,7 +2388,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         loaded.bind_bot_identity(99, "monday_test_bot")
         self.assertEqual(
             json.loads(self.config.state_path.read_text(encoding="utf-8"))["version"],
-            9,
+            10,
         )
 
     def test_transient_live_build_retries_after_restart_without_request_text(self):
@@ -2380,6 +2471,650 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
         self.assertIn("recovered automatically", self.client.sent[-1][1])
 
+    def test_proven_interruption_with_local_commit_schedules_deterministic_r2(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        service.bind_bot_identity(self.client.get_me())
+        update_id = 840
+        delivery_id = service._delivery_id(update_id)
+        self.monday.delivery_runs[delivery_id] = self._proven_interruption(
+            delivery_id,
+            commit_sha="c" * 40,
+        )
+        self.client.updates = [
+            _update(update_id=update_id, text="/build Resume after worker loss"),
+        ]
+        runner = TelegramRunner(
+            self.client,
+            service,
+            self.state,
+            poll_timeout=1,
+        )
+        started = 1_000.0
+
+        with (
+            patch("telegram_bot.service.time.time", return_value=started),
+            patch("telegram_bot.state.time.time", return_value=started),
+        ):
+            self.assertEqual(runner.run_once(), 1)
+
+        retry = self.state.delivery_retry(update_id)
+        tombstone = self.state.completed_job(update_id)
+        self.assertEqual(retry["root_delivery_id"], delivery_id)
+        self.assertEqual(retry["delivery_id"], f"{delivery_id}-r2")
+        self.assertEqual(retry["attempt"], 2)
+        self.assertEqual(retry["next_attempt_at"], started + 60)
+        self.assertEqual(retry["expires_at"], started + 86_400)
+        self.assertEqual(
+            tombstone["delivery_result"]["commit_sha"],
+            "c" * 40,
+        )
+        self.assertNotIn("request", tombstone)
+
+    def test_interrupted_retry_deadline_is_reserved_before_build_invocation(self):
+        clock = {"now": 2_000.0}
+
+        class AdvancingMonday(FakeMonday):
+            def build(self, action, **kwargs):
+                response = super().build(action, **kwargs)
+                if action == "run":
+                    clock["now"] = 2_100.0
+                return response
+
+        monday = AdvancingMonday()
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(monday, self.client, self.state, config)
+        service.bind_bot_identity(self.client.get_me())
+        update_id = 841
+        delivery_id = service._delivery_id(update_id)
+        monday.delivery_runs[delivery_id] = self._proven_interruption(delivery_id)
+        self.client.updates = [
+            _update(update_id=update_id, text="/build Preserve recovery budget"),
+        ]
+        runner = TelegramRunner(
+            self.client,
+            service,
+            self.state,
+            poll_timeout=1,
+        )
+
+        with (
+            patch(
+                "telegram_bot.service.time.time",
+                side_effect=lambda: clock["now"],
+            ),
+            patch(
+                "telegram_bot.state.time.time",
+                side_effect=lambda: clock["now"],
+            ),
+        ):
+            self.assertEqual(runner.run_once(), 1)
+
+        retry = self.state.delivery_retry(update_id)
+        self.assertEqual(retry["created_at"], 2_100.0)
+        self.assertEqual(retry["next_attempt_at"], 2_160.0)
+        self.assertEqual(retry["expires_at"], 2_000.0 + 86_400)
+        self.assertEqual(
+            self.state.completed_job(update_id)["delivery_retry_expires_at"],
+            2_000.0 + 86_400,
+        )
+
+    def test_nonterminal_restart_preserves_preinvocation_retry_deadline(self):
+        created = self.monday.task(
+            "create",
+            title="Existing",
+            objective="Resume the interrupted delivery",
+            priority="P2",
+        )
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        service.bind_bot_identity(self.client.get_me())
+        update_id = 844
+        delivery_id = service._delivery_id(update_id)
+        self.monday.delivery_runs[delivery_id] = {
+            "delivery_id": delivery_id,
+            "task_id": created.task_id,
+            "status": "running",
+            "phase": "validating",
+            "success": False,
+            "branch": "codex/task-0001-resume",
+            "commit_sha": "",
+            "pr_url": "",
+            "publication_uncertain": False,
+            "pushed": False,
+            "changed_files": ["app.py"],
+            "attempts": [{"number": 1, "status": "validating"}],
+            "failure_code": "",
+            "failure_class": "",
+            "retry_after_seconds": 0,
+            "message": "Validation was interrupted before publication.",
+        }
+        update = _update(
+            update_id=update_id,
+            text=f"/deliver {created.task_id}",
+        )
+        normalized = service.normalize_update(update)
+        self.assertIsNotNone(normalized)
+        self.state.enqueue(update_id, normalized)
+        self._complete_acceptance_receipt(update_id)
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        started = 2_000.0
+        original_deadline = started + 86_400
+
+        with (
+            patch("telegram_bot.service.time.time", return_value=started),
+            patch("telegram_bot.state.time.time", return_value=started),
+            self.assertRaises(TelegramUpdatePendingError),
+        ):
+            worker.run_once()
+
+        self.assertEqual(
+            self.state.job(update_id)["delivery_retry_expires_at"],
+            original_deadline,
+        )
+        self.monday.delivery_runs[delivery_id] = self._proven_interruption(
+            delivery_id,
+            commit_sha="b" * 40,
+        )
+
+        restarted_state = TelegramState(config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday,
+            self.client,
+            restarted_state,
+            config,
+        )
+        restarted_service.bind_bot_identity(self.client.get_me())
+        restarted_worker = TelegramJobWorker(
+            restarted_service,
+            restarted_state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        with (
+            patch("telegram_bot.service.time.time", return_value=3_000.0),
+            patch("telegram_bot.state.time.time", return_value=3_000.0),
+        ):
+            self.assertTrue(restarted_worker.run_once())
+
+        self.assertEqual(
+            restarted_state.delivery_retry(update_id)["expires_at"],
+            original_deadline,
+        )
+        self.assertEqual(
+            restarted_state.completed_job(update_id)["delivery_retry_expires_at"],
+            original_deadline,
+        )
+        self.assertEqual(
+            [kwargs["delivery_id"] for action, kwargs in self.monday.build_calls],
+            [delivery_id, delivery_id],
+        )
+
+    def test_restart_reconstructs_one_missing_interrupted_retry_without_root_rerun(self):
+        update_id = 842
+        config, delivery_id = self._seed_interrupted_live_build_checkpoint(
+            update_id,
+            commit_sha="d" * 40,
+        )
+        restarted_state = TelegramState(config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday,
+            self.client,
+            restarted_state,
+            config,
+        )
+        restarted_service.bind_bot_identity(self.client.get_me())
+        worker = TelegramJobWorker(
+            restarted_service,
+            restarted_state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        with patch("telegram_bot.state.time.time", return_value=100.0):
+            self.assertTrue(worker.run_once())
+
+        retry = restarted_state.delivery_retry(update_id)
+        self.assertEqual(retry["root_delivery_id"], delivery_id)
+        self.assertEqual(retry["delivery_id"], f"{delivery_id}-r2")
+        self.assertEqual(self.monday.build_calls, [])
+        self.assertEqual(restarted_state.job(update_id), {})
+        self.assertTrue(restarted_state.is_terminal(update_id))
+
+        resumed_state = TelegramState(config.state_path)
+        resumed_service = TelegramBotService(
+            self.monday,
+            self.client,
+            resumed_state,
+            config,
+        )
+        resumed_service.bind_bot_identity(self.client.get_me())
+        resumed_worker = TelegramJobWorker(
+            resumed_service,
+            resumed_state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        with patch("telegram_bot.state.time.time", return_value=101.0):
+            self.assertFalse(resumed_worker.run_once())
+
+        self.assertEqual(resumed_state.delivery_retry(update_id), retry)
+        self.assertEqual(self.monday.build_calls, [])
+        payload = json.loads(config.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(set(payload["delivery_retries"]), {str(update_id)})
+
+    def test_retry_interruption_advances_once_to_deterministic_r3(self):
+        update_id = 843
+        config, delivery_id = self._seed_interrupted_live_build_checkpoint(
+            update_id,
+        )
+        service = TelegramBotService(
+            self.monday,
+            self.client,
+            self.state,
+            config,
+        )
+        service.bind_bot_identity(self.client.get_me())
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        with patch("telegram_bot.state.time.time", return_value=100.0):
+            self.assertTrue(worker.run_once())
+
+        retry_two = f"{delivery_id}-r2"
+        self.monday.delivery_runs[retry_two] = self._proven_interruption(
+            retry_two,
+            commit_sha="e" * 40,
+        )
+        original_expiry = self.state.delivery_retry(update_id)["expires_at"]
+        with (
+            patch("telegram_bot.service.time.time", return_value=161.0),
+            patch("telegram_bot.state.time.time", return_value=161.0),
+        ):
+            self.assertTrue(worker.run_delivery_retry_once())
+
+        retry = self.state.delivery_retry(update_id)
+        self.assertEqual(retry["delivery_id"], f"{delivery_id}-r3")
+        self.assertEqual(retry["attempt"], 3)
+        self.assertEqual(retry["next_attempt_at"], 461.0)
+        self.assertEqual(retry["expires_at"], original_expiry)
+        self.assertEqual(
+            [
+                kwargs["delivery_id"]
+                for action, kwargs in self.monday.build_calls
+                if action == "run"
+            ],
+            [retry_two],
+        )
+
+        resumed_state = TelegramState(config.state_path)
+        resumed_service = TelegramBotService(
+            self.monday,
+            self.client,
+            resumed_state,
+            config,
+        )
+        resumed_worker = TelegramJobWorker(
+            resumed_service,
+            resumed_state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        with patch("telegram_bot.state.time.time", return_value=162.0):
+            self.assertFalse(resumed_worker.run_delivery_retry_once())
+        self.assertEqual(
+            resumed_state.delivery_retry(update_id)["delivery_id"],
+            f"{delivery_id}-r3",
+        )
+
+    def test_delivery_retry_passes_immediate_predecessor_identity(self):
+        update_id = 845
+        config, root_delivery_id = self._seed_interrupted_live_build_checkpoint(
+            update_id,
+        )
+        service = TelegramBotService(
+            self.monday,
+            self.client,
+            self.state,
+            config,
+        )
+        service.bind_bot_identity(self.client.get_me())
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        with patch("telegram_bot.state.time.time", return_value=100.0):
+            self.assertTrue(worker.run_once())
+
+        retry_two = f"{root_delivery_id}-r2"
+        self.monday.delivery_runs[retry_two] = self._proven_interruption(
+            retry_two,
+            commit_sha="c" * 40,
+        )
+        with (
+            patch("telegram_bot.service.time.time", return_value=161.0),
+            patch("telegram_bot.state.time.time", return_value=161.0),
+        ):
+            self.assertTrue(worker.run_delivery_retry_once())
+
+        retry_three = f"{root_delivery_id}-r3"
+        with (
+            patch("telegram_bot.service.time.time", return_value=462.0),
+            patch("telegram_bot.state.time.time", return_value=462.0),
+        ):
+            self.assertTrue(worker.run_delivery_retry_once())
+
+        run_calls = [
+            kwargs
+            for action, kwargs in self.monday.build_calls
+            if action == "run"
+        ]
+        self.assertEqual(
+            [
+                (
+                    call["delivery_id"],
+                    call["predecessor_delivery_id"],
+                )
+                for call in run_calls
+            ],
+            [
+                (retry_two, root_delivery_id),
+                (retry_three, retry_two),
+            ],
+        )
+
+    def test_unsafe_interruption_fields_never_schedule_fresh_identity(self):
+        cases = (
+            ("status", "failed"),
+            ("phase", "reviewing"),
+            ("success", True),
+            ("failure_code", "worker-stopped"),
+            ("failure_class", "permanent"),
+            ("retry_after_seconds", 60),
+            ("pushed", True),
+            ("pr_url", "https://github.com/example/mondayos/pull/99"),
+            ("publication_uncertain", True),
+            ("commit_sha", "abcdef0"),
+        )
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        service.bind_bot_identity(self.client.get_me())
+
+        for offset, (field, value) in enumerate(cases):
+            update_id = 850 + offset
+            with self.subTest(field=field, value=value):
+                delivery_id = service._delivery_id(update_id)
+                result = self._proven_interruption(
+                    delivery_id,
+                    commit_sha="f" * 40,
+                )
+                result[field] = value
+                self.monday.delivery_runs[delivery_id] = result
+                self.client.updates = [
+                    _update(
+                        update_id=update_id,
+                        text="/build Reject unsafe interruption evidence",
+                    ),
+                ]
+                runner = TelegramRunner(
+                    self.client,
+                    service,
+                    self.state,
+                    poll_timeout=1,
+                )
+
+                self.assertEqual(runner.run_once(), 1)
+                self.assertEqual(self.state.delivery_retry(update_id), {})
+                self.assertTrue(self.state.is_terminal(update_id))
+
+    def test_ordinary_transient_retry_requires_exact_failed_phase(self):
+        invalid_phases = ("pushing", "pull-request", "publication-ready")
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        service.bind_bot_identity(self.client.get_me())
+
+        for update_id, phase in enumerate(invalid_phases, start=870):
+            with self.subTest(boundary="live", phase=phase):
+                delivery_id = service._delivery_id(update_id)
+                self.monday.delivery_runs[delivery_id] = self._proven_interruption(
+                    delivery_id,
+                    status="failed",
+                    phase=phase,
+                    commit_sha="",
+                    failure_code="provider-timeout",
+                )
+                self.client.updates = [
+                    _update(
+                        update_id=update_id,
+                        text="/build Reject unsafe ordinary retry phase",
+                    ),
+                ]
+                runner = TelegramRunner(
+                    self.client,
+                    service,
+                    self.state,
+                    poll_timeout=1,
+                )
+
+                self.assertEqual(runner.run_once(), 1)
+                self.assertEqual(self.state.delivery_retry(update_id), {})
+                self.assertTrue(self.state.is_terminal(update_id))
+
+        restart_update_id = 873
+        restart_config, _delivery_id = self._seed_active_interrupted_retry(
+            restart_update_id,
+        )
+        original = json.loads(
+            restart_config.state_path.read_text(encoding="utf-8")
+        )
+        try:
+            for phase in invalid_phases:
+                with self.subTest(boundary="restart", phase=phase):
+                    payload = json.loads(json.dumps(original))
+                    source = payload["jobs"][str(restart_update_id)]
+                    source["delivery_status"] = "failed"
+                    source["delivery_phase"] = phase
+                    source["delivery_result"].update({
+                        "status": "failed",
+                        "phase": phase,
+                        "commit_sha": "",
+                        "failure_code": "provider-timeout",
+                    })
+                    restart_config.state_path.write_text(
+                        json.dumps(payload),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        TelegramStateError,
+                        "Invalid Telegram state",
+                    ):
+                        TelegramState(restart_config.state_path)
+        finally:
+            restart_config.state_path.write_text(
+                json.dumps(original),
+                encoding="utf-8",
+            )
+
+    def test_malformed_publication_uncertainty_never_authorizes_interrupted_retry(self):
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(self.monday, self.client, self.state, config)
+        service.bind_bot_identity(self.client.get_me())
+
+        for offset, value in enumerate((1, "true", 0), start=860):
+            with self.subTest(value=value):
+                delivery_id = service._delivery_id(offset)
+                self.monday.delivery_runs[delivery_id] = self._proven_interruption(
+                    delivery_id,
+                    commit_sha="f" * 40,
+                    publication_uncertain=value,
+                )
+                self.client.updates = [
+                    _update(
+                        update_id=offset,
+                        text="/build Reject malformed publication evidence",
+                    ),
+                ]
+                runner = TelegramRunner(
+                    self.client,
+                    service,
+                    self.state,
+                    poll_timeout=1,
+                )
+
+                self.assertEqual(runner.run_once(), 1)
+                self.assertEqual(self.state.delivery_retry(offset), {})
+                self.assertTrue(self.state.is_terminal(offset))
+
+    def test_retry_deadline_mismatch_fails_closed_on_restart(self):
+        config, _delivery_id = self._seed_active_interrupted_retry(863)
+        payload = json.loads(config.state_path.read_text(encoding="utf-8"))
+        payload["delivery_retries"]["863"]["expires_at"] = 86_501.0
+        config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with self.assertRaisesRegex(TelegramStateError, "Invalid Telegram state"):
+            TelegramState(config.state_path)
+
+    def test_v9_retry_deadline_migrates_once_and_v10_deletion_fails_closed(self):
+        config, _delivery_id = self._seed_active_interrupted_retry(8631)
+        self.state.acknowledge(8631)
+        payload = json.loads(config.state_path.read_text(encoding="utf-8"))
+        expected_expiry = payload["delivery_retries"]["8631"]["expires_at"]
+        payload["version"] = 9
+        payload["completed_jobs"]["8631"].pop("delivery_retry_expires_at")
+        config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        migrated = TelegramState(config.state_path)
+
+        self.assertEqual(
+            migrated.completed_job(8631)["delivery_retry_expires_at"],
+            expected_expiry,
+        )
+        self.assertEqual(
+            json.loads(config.state_path.read_text(encoding="utf-8"))["version"],
+            9,
+        )
+        migrated.bind_bot_identity(99, "monday_test_bot")
+        persisted = json.loads(config.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["version"], 10)
+        self.assertEqual(
+            persisted["completed_jobs"]["8631"]["delivery_retry_expires_at"],
+            expected_expiry,
+        )
+
+        restarted = TelegramState(config.state_path)
+        self.assertEqual(
+            restarted.completed_job(8631)["delivery_retry_expires_at"],
+            expected_expiry,
+        )
+        persisted["completed_jobs"]["8631"].pop("delivery_retry_expires_at")
+        config.state_path.write_text(json.dumps(persisted), encoding="utf-8")
+        with self.assertRaisesRegex(TelegramStateError, "Invalid Telegram state"):
+            TelegramState(config.state_path)
+
+    def test_v9_retry_deadline_migration_rejects_present_invalid_values(self):
+        config, _delivery_id = self._seed_active_interrupted_retry(8632)
+        original = json.loads(config.state_path.read_text(encoding="utf-8"))
+        for label, value in (
+            ("missing-value", None),
+            ("zero", 0.0),
+            ("mismatch", 86_501.0),
+        ):
+            with self.subTest(deadline=label):
+                payload = json.loads(json.dumps(original))
+                payload["version"] = 9
+                payload["jobs"]["8632"]["delivery_retry_expires_at"] = value
+                config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    TelegramStateError,
+                    "Invalid Telegram state",
+                ):
+                    TelegramState(config.state_path)
+
+    def test_active_retry_source_tampering_fails_closed_on_restart(self):
+        config, _delivery_id = self._seed_active_interrupted_retry(864)
+        original = json.loads(config.state_path.read_text(encoding="utf-8"))
+
+        def result_field(name, value):
+            def mutate(source):
+                source["delivery_result"][name] = value
+
+            return mutate
+
+        mutations = {
+            "publication_uncertain_integer": result_field(
+                "publication_uncertain",
+                0,
+            ),
+            "pushed_integer": result_field("pushed", 0),
+            "pr_url_list": result_field("pr_url", []),
+            "retry_after_boolean": result_field("retry_after_seconds", False),
+            "delivery_status_mismatch": lambda source: source.update(
+                delivery_status="pr-open"
+            ),
+            "delivery_phase_mismatch": lambda source: source.update(
+                delivery_phase="completed"
+            ),
+        }
+        try:
+            for label, mutate in mutations.items():
+                with self.subTest(field=label):
+                    payload = json.loads(json.dumps(original))
+                    mutate(payload["jobs"]["864"])
+                    config.state_path.write_text(
+                        json.dumps(payload),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        TelegramStateError,
+                        "Invalid Telegram state",
+                    ):
+                        TelegramState(config.state_path)
+        finally:
+            config.state_path.write_text(
+                json.dumps(original),
+                encoding="utf-8",
+            )
+
     def test_restart_recovers_missing_transient_retry_once_without_rerunning_root(self):
         config, delivery_id = self._seed_terminal_live_build_checkpoint(
             83,
@@ -2389,7 +3124,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
             fail_notice = True
 
             def send_message(self, chat_id, text):
-                if self.fail_notice and "temporary model or tool outage" in text:
+                if self.fail_notice and "automatic delivery recovery" in text:
                     raise TelegramAPIError("temporary outage", retryable=True)
                 return super().send_message(chat_id, text)
 
@@ -2670,7 +3405,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
         self.assertEqual(completed["delivery_id"], f"{root_delivery_id}-r2")
         self.assertFalse(any(
-            "will try automatically" in text
+            "will try again" in text
             for _chat_id, text in self.client.sent
         ))
 
@@ -2690,7 +3425,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(self.state.pending_delivery_notice_count, 1)
         self.assertTrue(self.state.delivery_retry(187))
         self.assertFalse(any(
-            "will try automatically" in text
+            "will try again" in text
             for _chat_id, text in self.client.sent
         ))
 
@@ -2903,7 +3638,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
         migrated.bind_bot_identity(99, "monday_test_bot")
         persisted = json.loads(config.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["version"], 9)
+        self.assertEqual(persisted["version"], 10)
         self.assertEqual(persisted["delivery_notices"], {})
         self.assertEqual(persisted["delivery_notice_pause_until"], 0.0)
         self.assertEqual(persisted["lifecycle_notices"], {})
@@ -2924,7 +3659,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
         migrated.bind_bot_identity(99, "monday_test_bot")
         persisted = json.loads(self.config.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["version"], 9)
+        self.assertEqual(persisted["version"], 10)
         self.assertEqual(persisted["lifecycle_notices"], {})
 
     def test_legacy_migration_scrubs_delivery_results_in_every_job_bucket(self):
@@ -3217,7 +3952,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertTrue(restarted.completed_job(198))
         self.assertEqual(restarted.pending_delivery_notice_count, 1)
 
-    def test_full_outbox_reschedule_scrubs_legacy_completed_source(self):
+    def test_full_outbox_reschedule_keeps_completed_source_canonical(self):
         self.state.bind_bot_identity(99, "monday_test_bot")
         root_delivery_id = self._seed_delivery_retry(207, now=100.0)
         self.state.acknowledge(207)
@@ -3231,11 +3966,6 @@ class TestTelegramStateAndRunner(TelegramFixture):
         with patch("telegram_bot.state._MAX_ACTIVE_DELIVERY_NOTICES", 1):
             config, _blocker_delivery = self._stage_terminal_notice(208)
 
-        payload = json.loads(config.state_path.read_text(encoding="utf-8"))
-        unsafe_result = payload["completed_jobs"]["207"]["delivery_result"]
-        unsafe_result["message"] = "reschedule private diagnostic 207"
-        unsafe_result["provider_context"] = "reschedule-extra-207"
-        config.state_path.write_text(json.dumps(payload), encoding="utf-8")
         legacy = TelegramState(config.state_path)
         claimed = legacy.claim_due_delivery_retry(now=161.0)
         self.assertIsNotNone(claimed)
@@ -3255,14 +3985,10 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertEqual(legacy.delivery_notice(207), {})
         source = legacy.completed_job(207)
         self.assertEqual(source["delivery_result"]["message"], "")
-        self.assertNotIn("provider_context", source["delivery_result"])
         self.assertEqual(
             source["delivery_notice"],
             {"phase": "not-started-capacity", "notice_kind": "retry-scheduled"},
         )
-        serialized = config.state_path.read_text(encoding="utf-8")
-        self.assertNotIn("reschedule private diagnostic 207", serialized)
-        self.assertNotIn("reschedule-extra-207", serialized)
         restarted = TelegramState(config.state_path)
         self.assertEqual(restarted.delivery_retry(207)["attempt"], 3)
 
@@ -3279,7 +4005,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
             fail_notice = True
 
             def send_message(self, chat_id, text):
-                if self.fail_notice and "temporary model or tool outage" in text:
+                if self.fail_notice and "automatic delivery recovery" in text:
                     raise TelegramAPIError("temporary outage", retryable=True)
                 return super().send_message(chat_id, text)
 
@@ -3358,7 +4084,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertTrue(restarted_state.delivery_retry(90))
         self.assertEqual(restarted_state.pending_delivery_notice_count, 0)
         self.assertEqual(len(self.monday.build_calls), 1)
-        self.assertIn("will try automatically", client.sent[-1][1])
+        self.assertIn("will try again", client.sent[-1][1])
 
     def test_retry_outcome_rate_limit_does_not_delay_pr_observation(self):
         config = TelegramConfig(
@@ -4279,7 +5005,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
         payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
         receipt = payload["acceptance_receipts"]["15"]
-        self.assertEqual(payload["version"], 9)
+        self.assertEqual(payload["version"], 10)
         self.assertEqual(payload["last_update_id"], 15)
         self.assertEqual(receipt["kind"], "acceptance-receipt")
         self.assertEqual(receipt["phase"], "pending")
@@ -4347,7 +5073,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertIsNone(migrated.claim_next())
         migrated.bind_bot_identity(99, "monday_test_bot")
         persisted = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["version"], 9)
+        self.assertEqual(persisted["version"], 10)
         self.assertIn("19", persisted["acceptance_receipts"])
 
     def test_legacy_replay_atomically_attaches_bound_receipt(self):
@@ -4374,7 +5100,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
 
         payload = json.loads(path.read_text(encoding="utf-8"))
         receipt = payload["acceptance_receipts"]["21"]
-        self.assertEqual(payload["version"], 9)
+        self.assertEqual(payload["version"], 10)
         self.assertEqual(receipt["phase"], "sent")
         self.assertEqual(
             receipt["request_digest"],
@@ -4648,7 +5374,7 @@ class TestTelegramStateAndRunner(TelegramFixture):
         )
         migrated.bind_bot_identity(99, "monday_test_bot")
         persisted = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["version"], 9)
+        self.assertEqual(persisted["version"], 10)
         self.assertEqual(persisted["last_update_id"], 19)
         self.assertEqual(
             persisted["completed_jobs"]["19"]["notice_status"],

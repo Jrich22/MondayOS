@@ -177,6 +177,37 @@ def test_build_run_passes_identity_and_callbacks_without_invoking_real_tools(
     )]
 
 
+def test_build_run_forwards_controller_owned_predecessor_identity(
+    tmp_path: Path,
+) -> None:
+    workflow = _Workflow()
+
+    response = _call_build(
+        _monday(tmp_path),
+        workflow,
+        "run",
+        task_id="TASK-0001",
+        delivery_id="delivery-test-2",
+        predecessor_delivery_id="delivery-test-1",
+        retry_root_delivery_id="delivery-test-1",
+        retry_attempt=2,
+    )
+
+    assert response.success is True
+    assert workflow.calls == [(
+        "run",
+        {
+            "task_id": "TASK-0001",
+            "delivery_id": "delivery-test-2",
+            "progress_callback": None,
+            "checkpoint_callback": None,
+            "predecessor_delivery_id": "delivery-test-1",
+            "retry_root_delivery_id": "delivery-test-1",
+            "retry_attempt": 2,
+        },
+    )]
+
+
 def test_build_run_uses_job_outcome_as_response_success(tmp_path: Path) -> None:
     workflow = _Workflow()
     workflow.job = _Job(success=False, status="failed", phase="preflight", message="No reviewer")
