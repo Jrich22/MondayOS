@@ -11,6 +11,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Request-free automatic delivery retries are now bound to the original
+  canonical task title, objective, and acceptance criteria across their complete
+  predecessor chain. Missing legacy content or a specification edit during
+  backoff stops the deterministic child as `task-changed` before builder, Git,
+  or GitHub work. Pre-reservation failures are terminalized before their identity
+  is atomically created, closing the crash window between a blank reservation
+  and its failure checkpoint. The unpublished policy child retires the stale
+  retry leaf so a fresh explicit request can proceed, while exact-ID recovery of
+  an already pushed reviewed artifact remains available.
 - After a Telegram live-build request has passed its durable acceptance-receipt
   gate, its starting, phase-progress, and nonterminal reconciliation messages
   are now best-effort. Retryable, rate-limit, or permanent Telegram delivery

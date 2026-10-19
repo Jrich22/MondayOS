@@ -43,6 +43,7 @@ from delivery.git import (
 from delivery.github import GhCliClient
 from delivery.security import (
     ArtifactSecurityError,
+    TaskChangedError,
     artifact_digest,
     proposed_paths,
     scan_staged_diff,
@@ -479,12 +480,7 @@ class DeliveryWorkflow:
                     # the only safe key for publication reconciliation.
                     blocking = self._blocking_delivery(job)
                     if blocking is not None:
-                        existing = self.store.reserve(job)
-                        if existing is not None:
-                            self._require_binding(existing, job)
-                            return existing
-                        reservation_owned = True
-                        return self._fail(
+                        return self._reserve_failure(
                             job,
                             "unresolved-delivery",
                             (
@@ -508,7 +504,7 @@ class DeliveryWorkflow:
                             raise ArtifactSecurityError(
                                 "delivery retry predecessor is unavailable"
                             ) from exc
-                        self._require_retry_predecessor_binding(
+                        self._require_retry_predecessor_content_binding(
                             asserted_predecessor,
                             job,
                         )
@@ -664,25 +660,21 @@ class DeliveryWorkflow:
             if current is not None:
                 self._require_binding(current, job)
                 return current
-            existing = self.store.reserve(job)
-            if existing is not None:
-                self._require_binding(existing, job)
-                return existing
-            return self._fail(
+            return self._reserve_failure(
                 job,
                 "workflow-busy",
                 _safe_message(exc),
                 failure_class="transient",
             )
         except Exception as exc:  # fail closed at the durable workflow boundary
-            existing = self.store.reserve(job)
-            if existing is not None:
-                self._require_binding(existing, job)
-                return existing
             failure_class = _exception_failure_class(exc)
             if not failure_class:
-                return self._fail(job, _failure_code(exc), _safe_message(exc))
-            return self._fail(
+                return self._reserve_failure(
+                    job,
+                    _failure_code(exc),
+                    _safe_message(exc),
+                )
+            return self._reserve_failure(
                 job,
                 _failure_code(exc),
                 _safe_message(exc),
@@ -1178,7 +1170,10 @@ class DeliveryWorkflow:
                     "a terminal retry child has no safe predecessor"
                 )
             self._require_retry_predecessor_binding(predecessor, child)
-            self._require_retry_predecessor_chain(child)
+            self._require_retry_predecessor_chain(
+                child,
+                require_same_specification=False,
+            )
             if not self._stopped_delivery_is_safe(child):
                 raise ArtifactSecurityError(
                     "a terminal retry child is not proven unpublished"
@@ -1241,7 +1236,12 @@ class DeliveryWorkflow:
                 raise
             return False
 
-    def _require_retry_predecessor_chain(self, successor: DeliveryJob) -> None:
+    def _require_retry_predecessor_chain(
+        self,
+        successor: DeliveryJob,
+        *,
+        require_same_specification: bool = True,
+    ) -> None:
         """Re-prove every predecessor is still unpublished before retry work."""
         if not successor.predecessor_delivery_id:
             return
@@ -1256,7 +1256,13 @@ class DeliveryWorkflow:
                 raise ArtifactSecurityError(
                     "delivery retry predecessor is unavailable"
                 ) from exc
-            self._require_retry_predecessor_binding(predecessor, successor)
+            if require_same_specification:
+                self._require_retry_predecessor_content_binding(
+                    predecessor,
+                    successor,
+                )
+            else:
+                self._require_retry_predecessor_binding(predecessor, successor)
             expected_predecessor = (
                 ""
                 if attempt == 1
@@ -1316,6 +1322,20 @@ class DeliveryWorkflow:
         ):
             raise ArtifactSecurityError(
                 "delivery retry predecessor changed task or repository identity"
+            )
+
+    @staticmethod
+    def _require_retry_predecessor_content_binding(
+        predecessor: DeliveryJob,
+        successor: DeliveryJob,
+    ) -> None:
+        DeliveryWorkflow._require_retry_predecessor_binding(
+            predecessor,
+            successor,
+        )
+        if not predecessor.objective or predecessor.objective != successor.objective:
+            raise TaskChangedError(
+                "delivery retry predecessor changed task specification"
             )
 
     def _retry_predecessor_is_safe(self, job: DeliveryJob) -> bool:
@@ -2666,6 +2686,48 @@ class DeliveryWorkflow:
         failure_class: str | None = None,
         retry_after_seconds: int = 0,
     ) -> DeliveryJob:
+        self._prepare_failure(
+            job,
+            code,
+            message,
+            failure_class=failure_class,
+            retry_after_seconds=retry_after_seconds,
+        )
+        self.store.persist(job)
+        return job
+
+    def _reserve_failure(
+        self,
+        job: DeliveryJob,
+        code: str,
+        message: str,
+        *,
+        failure_class: str | None = None,
+        retry_after_seconds: int = 0,
+    ) -> DeliveryJob:
+        """Atomically reserve a terminal failure or return a concurrent record."""
+        self._prepare_failure(
+            job,
+            code,
+            message,
+            failure_class=failure_class,
+            retry_after_seconds=retry_after_seconds,
+        )
+        existing = self.store.reserve(job)
+        if existing is not None:
+            self._require_binding(existing, job)
+            return existing
+        return job
+
+    @staticmethod
+    def _prepare_failure(
+        job: DeliveryJob,
+        code: str,
+        message: str,
+        *,
+        failure_class: str | None = None,
+        retry_after_seconds: int = 0,
+    ) -> None:
         job.status = "failed"
         job.phase = "failed"
         job.success = False
@@ -2682,8 +2744,6 @@ class DeliveryWorkflow:
         )
         job.message = _safe_text(message or code, 2_000)
         job.updated_at = _now()
-        self.store.persist(job)
-        return job
 
     def _reject(self, job: DeliveryJob, message: str) -> DeliveryJob:
         job.status = "rejected"
