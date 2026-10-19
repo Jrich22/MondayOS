@@ -50,6 +50,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A liveness-only Telegram watchdog and separate launchd example. It samples
+  the fixed daemon's lock and strict heartbeat/progress lanes, requires two
+  matching failures for the exact `started_at` generation and unchanged
+  progress evidence 45–150 seconds apart, rechecks before and after its durable
+  checkpoint, then uses a fixed-label `kickstart`. Recovery is verified only
+  after observing a new generation. A five-minute cooldown and
+  three-restarts-per-hour budget bound recovery. Queue pressure, message
+  outboxes, provider availability, and live-build readiness remain operator
+  health concerns and never trigger a watchdog restart. A missing worker lock,
+  missing or invalid heartbeat, or absent exact generation fails closed for
+  operator diagnosis instead of authorizing an unbound restart.
 - A bounded, request-free Telegram lifecycle-notice outbox that separates
   exact pull-request observation and task reconciliation from message delivery.
   Each verified observation atomically advances or completes its watcher and

@@ -2189,10 +2189,15 @@ def _register_telegram(subparsers: Any) -> None:
         action="store_true",
         help="Check local daemon readiness without contacting Telegram.",
     )
+    mode.add_argument(
+        "--watchdog",
+        action="store_true",
+        help="Check daemon liveness and restart one confirmed stuck generation.",
+    )
     p.add_argument(
         "--json",
         action="store_true",
-        help="Return machine-readable output with --health.",
+        help="Return machine-readable output with --health or --watchdog.",
     )
     p.add_argument(
         "--provider",
@@ -2224,9 +2229,13 @@ def _cmd_telegram(args: argparse.Namespace) -> int:
     from telegram_bot.state import InstanceLock, TelegramState
 
     root = Path(args.project_root).resolve()
+    if getattr(args, "json", False) and not (
+        getattr(args, "health", False) or getattr(args, "watchdog", False)
+    ):
+        raise ValueError("--json requires --health or --watchdog")
+    if getattr(args, "watchdog", False):
+        return _cmd_telegram_watchdog(args, root)
     load_env_file(root / ".env")
-    if getattr(args, "json", False) and not getattr(args, "health", False):
-        raise ValueError("--json requires --health")
     if getattr(args, "health", False):
         return _cmd_telegram_health(args, root)
     if args.identify:
@@ -2304,6 +2313,28 @@ def _cmd_telegram(args: argparse.Namespace) -> int:
         signal.signal(signal.SIGINT, stop)
         runner.run_forever()
     return 0
+
+
+def _cmd_telegram_watchdog(args: argparse.Namespace, root: Path) -> int:
+    """Run one local liveness sample without Telegram or provider calls."""
+    import json as _json
+
+    from telegram_bot.watchdog import TelegramWatchdog
+
+    report = TelegramWatchdog(project_root=root).run()
+    if bool(getattr(args, "json", False)):
+        print(_json.dumps(report, indent=2, sort_keys=True))
+    else:
+        action = str(report.get("action") or "state-unreadable")
+        reason = str(report.get("reason") or "none")
+        print(f"Telegram watchdog: {action}")
+        print(f"  Liveness: {'ready' if report.get('liveness_ready') else 'not ready'}")
+        print(f"  Reason  : {reason}")
+    return 0 if report.get("action") in {
+        "healthy",
+        "restart-requested",
+        "restart-verified",
+    } else 1
 
 
 def _cmd_telegram_health(args: argparse.Namespace, root: Path) -> int:

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, TextIO, TypeGuard
 
 from core.atomic import write_json_atomic
+from core.secure_io import read_text_at, validate_private_lock_file
 
 _STATE_VERSION = 10
 _MAX_OBSERVATION_RETRY_SECONDS = 300.0
@@ -701,50 +702,18 @@ class TelegramState:
         stale_after_seconds: float = 90.0,
     ) -> dict[str, Any]:
         """Return strict supervisor and progress-lane health."""
-        if (
-            isinstance(stale_after_seconds, bool)
-            or not isinstance(stale_after_seconds, (int, float))
-            or not math.isfinite(float(stale_after_seconds))
-            or stale_after_seconds <= 0
-        ):
-            raise ValueError("stale_after_seconds must be a positive finite number")
+        stale_after = _runtime_stale_after(stale_after_seconds)
         with self._lock:
             worker = self._read_worker_status()
             # Read first when using the wall clock so a separately constructed
             # health reader cannot reject a checkpoint atomically replaced a
             # few microseconds after it entered this method.
             timestamp = _worker_timestamp(now)
-            if not worker:
-                return _missing_runtime_status()
-            worker = _normalized_runtime_heartbeat(worker, now=timestamp)
-        started_at = worker["started_at"]
-        heartbeat_at = worker["supervisor"]["pulse_at"]
-        stopped_at = worker["stopped_at"]
-        age = timestamp - heartbeat_at
-        fresh = bool(
-            stopped_at is None
-            and age <= float(stale_after_seconds)
-        )
-        intake = _runtime_lane_summary(
-            worker["lanes"]["intake"],
-            now=timestamp,
-            supervisor_fresh=fresh,
-        )
-        worker_lane = _runtime_lane_summary(
-            worker["lanes"]["worker"],
-            now=timestamp,
-            supervisor_fresh=fresh,
-        )
-        return {
-            "started_at": started_at,
-            "heartbeat_at": heartbeat_at,
-            "stopped_at": stopped_at,
-            "heartbeat_age_seconds": age,
-            "heartbeat_fresh": fresh,
-            "runtime_ready": bool(intake["ready"] and worker_lane["ready"]),
-            "intake": intake,
-            "worker": worker_lane,
-        }
+            return _runtime_status_from_heartbeat(
+                worker,
+                now=timestamp,
+                stale_after_seconds=stale_after,
+            )
 
     def _read_worker_status(self) -> dict[str, Any]:
         descriptor = -1
@@ -5420,6 +5389,80 @@ def instance_lock_is_held(path: Path) -> bool:
         lock_file.close()
 
 
+def instance_lock_is_held_at(directory_fd: int, name: str = "bot.lock") -> bool:
+    """Inspect one descriptor-bound worker lock without creating or following it."""
+    if type(name) is not str or not name or Path(name).name != name:
+        raise ValueError("lock name must be one plain filename")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+        except FileNotFoundError:
+            return False
+        validate_private_lock_file(directory_fd, descriptor, name)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # The visible leaf must still identify the inode whose lock was
+            # observed; otherwise a replacement could manufacture a false
+            # running result while the original owner remains alive.
+            validate_private_lock_file(directory_fd, descriptor, name)
+            return True
+        validate_private_lock_file(directory_fd, descriptor, name)
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    except TelegramStateError:
+        raise
+    except OSError as exc:
+        raise TelegramStateError("Cannot inspect Telegram worker lock") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def read_runtime_status_at(
+    directory_fd: int,
+    name: str = "heartbeat.json",
+    *,
+    now: float | None = None,
+    stale_after_seconds: float = 90.0,
+) -> tuple[dict[str, Any], float]:
+    """Read runtime heartbeat plus its post-read observation time."""
+    stale_after = _runtime_stale_after(stale_after_seconds)
+    # Read before sampling the wall clock so an atomic heartbeat replacement
+    # immediately after entry cannot appear to come from the future.
+    try:
+        raw = read_text_at(
+            directory_fd,
+            name,
+            max_bytes=_MAX_RUNTIME_HEARTBEAT_BYTES,
+        )
+    except FileNotFoundError:
+        timestamp = _worker_timestamp(now)
+        return _missing_runtime_status(), timestamp
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TelegramStateError("Cannot read Telegram runtime heartbeat") from exc
+    timestamp = _worker_timestamp(now)
+    try:
+        worker = json.loads(raw)
+        if not isinstance(worker, dict):
+            raise TelegramStateError("Invalid Telegram runtime heartbeat")
+        return (
+            _runtime_status_from_heartbeat(
+                worker,
+                now=timestamp,
+                stale_after_seconds=stale_after,
+            ),
+            timestamp,
+        )
+    except TelegramStateError:
+        raise
+    except (UnicodeDecodeError, ValueError, RecursionError, TypeError) as exc:
+        raise TelegramStateError("Invalid Telegram runtime heartbeat") from exc
+
+
 def _worker_timestamp(value: float | None = None) -> float:
     timestamp = time.time() if value is None else value
     if (
@@ -5695,6 +5738,56 @@ def _runtime_lane_summary(
         )
     )
     return {**copy.deepcopy(checkpoint), "ready": ready}
+
+
+def _runtime_stale_after(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("stale_after_seconds must be a positive finite number")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "stale_after_seconds must be a positive finite number"
+        ) from exc
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise ValueError("stale_after_seconds must be a positive finite number")
+    return normalized
+
+
+def _runtime_status_from_heartbeat(
+    worker: dict[str, Any],
+    *,
+    now: float,
+    stale_after_seconds: float,
+) -> dict[str, Any]:
+    if not worker:
+        return _missing_runtime_status()
+    normalized = _normalized_runtime_heartbeat(worker, now=now)
+    started_at = normalized["started_at"]
+    heartbeat_at = normalized["supervisor"]["pulse_at"]
+    stopped_at = normalized["stopped_at"]
+    age = now - heartbeat_at
+    fresh = bool(stopped_at is None and age <= stale_after_seconds)
+    intake = _runtime_lane_summary(
+        normalized["lanes"]["intake"],
+        now=now,
+        supervisor_fresh=fresh,
+    )
+    worker_lane = _runtime_lane_summary(
+        normalized["lanes"]["worker"],
+        now=now,
+        supervisor_fresh=fresh,
+    )
+    return {
+        "started_at": started_at,
+        "heartbeat_at": heartbeat_at,
+        "stopped_at": stopped_at,
+        "heartbeat_age_seconds": age,
+        "heartbeat_fresh": fresh,
+        "runtime_ready": bool(intake["ready"] and worker_lane["ready"]),
+        "intake": intake,
+        "worker": worker_lane,
+    }
 
 
 def _missing_runtime_status() -> dict[str, Any]:

@@ -1,6 +1,6 @@
 # MondayOS — Architectural Decision Records
 
-**Last Updated:** 2026-10-15
+**Last Updated:** 2026-10-19
 
 This file is the canonical log of all architectural decisions made for MondayOS. Decisions are recorded in the format described in [DOCUMENTATION_STANDARDS.md](DOCUMENTATION_STANDARDS.md).
 
@@ -1831,3 +1831,91 @@ authorization.
   PR reconciliation or leak newly edited task text into the recovered PR title.
 - Operators must start a fresh reviewed delivery after a legitimate pre-push
   task edit.
+
+---
+
+## ADR-033: Telegram Automatic Recovery Is Liveness-Only and Generation-Bound
+
+**Date:** 2026-10-19
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+`monday telegram --health` is an operator-readiness probe. In addition to the
+daemon lock and runtime progress, it reports queue capacity, unresolved
+message outboxes, provider availability, and live-build readiness. Those
+conditions matter operationally, but restarting the process cannot repair
+them. Using the complete health result as a restart trigger would turn a
+Telegram outage, provider outage, full queue, or pending notice into a restart
+loop. A single stale sample can also race normal startup, backoff, or recovery.
+
+launchd `KeepAlive` can replace a process that exits, but it cannot identify a
+still-running daemon whose supervisor or one progress lane has stopped making
+progress. Automatic recovery therefore needs a separate, durable and tightly
+bounded policy.
+
+### Decision
+
+MondayOS exposes `monday telegram --watchdog --json` as a liveness-only probe
+for one fixed per-user launchd target, `com.mondayos.telegram`. It observes only
+whether that service is loaded, whether the single-worker lock is held, and
+whether the strict daemon, supervisor, intake, and worker heartbeat records
+show live progress. Queue pressure, acceptance/refusal/delivery/lifecycle
+outboxes, provider availability, and live-build readiness are never restart
+reasons.
+
+A restart is eligible only when the service is loaded, the worker lock is held,
+and a valid strict heartbeat supplies an exact `started_at`. A missing lock,
+missing or invalid heartbeat, or absent generation is a fail-closed,
+non-restartable `state-unreadable` observation for operator diagnosis.
+
+A restart requires two observations with the same liveness failure, the same
+exact daemon generation identified by heartbeat `started_at`, and unchanged
+relevant progress evidence. Samples must be 45–150 seconds apart; new progress,
+a longer observation gap, or a backwards clock adjustment starts a new evidence
+window. The watchdog rereads the observation before its durable checkpoint and
+again after that checkpoint immediately before acting. It then invokes the
+fixed argv-only command `launchctl kickstart -k` for the daemon. Recovery is
+verified only when a subsequent observation reports a different `started_at`;
+command success alone is not proof of a new daemon.
+
+Restart requests have a five-minute cooldown and a limit of three in any
+rolling hour. Missing services are reported rather than bootstrapped. Invalid
+durable queue state is also preserved for operator recovery rather than treated
+as a restart opportunity. Watchdog state and locking use private, no-follow
+local files alongside Telegram runtime state.
+
+The example `com.mondayos.telegram-watchdog` LaunchAgent runs once at load and
+every 60 seconds. Its definition contains a fixed command shape, working
+directory, explicit `PATH`, and fixed output paths, but no credentials and no
+`KeepAlive` policy.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Restart whenever `--health` is nonzero | Readiness failures such as queue pressure, pending outboxes, and unavailable providers are not repaired by restarting. |
+| Restart after one liveness failure | A transient sample can race startup, backoff, or ordinary scheduling delay. |
+| Let each run target a supplied launchd label | A configurable label would broaden the watchdog into a generic process-control surface. |
+| Treat a successful `kickstart` exit as recovery | The command can return without proving that a new daemon generation is alive. |
+| Use unlimited `KeepAlive` retries | It provides no durable debounce, generation proof, cooldown, or hourly restart budget for a hung but running process. |
+
+### Consequences
+
+- Automatic recovery can replace a demonstrably stuck Telegram daemon without
+  converting readiness incidents into restart storms.
+- Restart intent survives watchdog crashes, and a changed `started_at` provides
+  explicit proof that launchd created a new daemon generation.
+- At least two matching samples and 45 seconds are required before a restart;
+  with the example interval, this normally spans two watchdog invocations.
+- The final recheck narrows but cannot make observation and a label-scoped
+  launchd action atomic. If launchd replaces the process in that interval, the
+  request applies to the process currently owned by the same fixed service
+  label; the watchdog never targets an unverified numeric PID.
+- The five-minute cooldown and three-per-hour budget deliberately leave a
+  persistently failing service for operator inspection instead of looping.
+- Operators still use `--health` for full readiness and must resolve queue,
+  outbox, provider, and build-capability incidents directly.

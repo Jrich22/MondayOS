@@ -148,6 +148,20 @@ fail closed. Restart the normal daemon to replace a legacy heartbeat. Full
 installation and recovery procedures are in
 [SETUP_GUIDE.md](SETUP_GUIDE.md) and [RUNBOOK.md](RUNBOOK.md).
 
+`monday telegram --watchdog --json` is a separate liveness-only probe for the
+fixed `com.mondayos.telegram` launchd service. It requires two matching samples
+for the exact heartbeat `started_at` generation and unchanged progress evidence
+45–150 seconds apart. New progress or a longer gap resets the evidence window.
+It rechecks before and after checkpointing a restart and verifies recovery only
+by a new `started_at`. Its restart budget is one request per five minutes and
+at most three per hour. Unlike `--health`, it ignores queue pressure, acceptance,
+refusal, delivery, and lifecycle outboxes, provider availability, and
+live-build readiness because restarting cannot repair them. The daemon service
+must be loaded, its worker lock held, and its heartbeat valid with an exact
+`started_at`; a missing lock, missing or invalid heartbeat, or absent generation
+fails closed with a non-restartable `state-unreadable` result for operator
+diagnosis.
+
 At startup MondayOS verifies the bot identity and removes any prior webhook
 without dropping queued updates. Polling and webhooks cannot be used at the same
 time, so this ensures one predictable delivery path.
@@ -433,7 +447,25 @@ launchctl bootstrap "gui/$(id -u)" \
 launchctl print "gui/$(id -u)/com.mondayos.telegram"
 ```
 
-Restart or stop it with:
+For bounded liveness recovery, install the second credential-free LaunchAgent:
+
+```bash
+cp deploy/launchd/com.mondayos.telegram-watchdog.plist.example \
+  ~/Library/LaunchAgents/com.mondayos.telegram-watchdog.plist
+# Replace all five REPLACE_WITH_MONDAYOS_ROOT occurrences with the same root.
+plutil -lint ~/Library/LaunchAgents/com.mondayos.telegram-watchdog.plist
+launchctl bootstrap "gui/$(id -u)" \
+  ~/Library/LaunchAgents/com.mondayos.telegram-watchdog.plist
+launchctl print "gui/$(id -u)/com.mondayos.telegram-watchdog"
+```
+
+It runs `monday --project-root ROOT telegram --watchdog --json` at load and
+every 60 seconds. The watchdog plist has an explicit `PATH` but no credentials
+and no `KeepAlive`; its output paths are
+`logs/telegram-watchdog-stdout.log` and
+`logs/telegram-watchdog-stderr.log`.
+
+Restart or stop the normal daemon with:
 
 ```bash
 launchctl kickstart -k "gui/$(id -u)/com.mondayos.telegram"
