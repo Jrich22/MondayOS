@@ -9,6 +9,45 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Autonomous builds now admit only `backlog`, `assigned`, or `in-progress`
+  tasks. Under the task lock, Monday freshly revalidates the target and exact
+  canonical title, objective, and acceptance criteria immediately before start,
+  starts the task, and requires an exact `in-progress` reread before worktree or
+  model work. Canonical task content over 50,000 characters is rejected
+  explicitly instead of being silently truncated.
+- Final build publication now captures the complete task revision, repeats the
+  exact status, target, content, and revision authorization after every pre-push
+  callback, and defers the local commit until those callbacks have completed.
+  New records carry an explicit, legacy-safe deferred-order marker. Pre-commit
+  crashes in `publication-ready` require owned HEAD-at-base and remote-branch
+  absence. A marked `pushing` record without a SHA also covers a death inside
+  `commit()` through owned-ref and remote-absence proof. A returned commit is
+  durably held in `prepared_commit_sha` and requires HEAD-at-prepared proof until
+  the post-commit task, revision, and final history proofs promote it to
+  `commit_sha` immediately before push. A failed promotion checkpoint restores
+  the prepared shape so an uncalled push cannot strand later delivery.
+- A prepared-commit crash or failure can permit a new identity only with exact
+  reviewed-artifact and controller-owned worktree evidence plus a fresh proof
+  that its unique branch is absent. Structurally accepted outcomes keep
+  publication, observation, reconciliation, and interruption state pristine,
+  transient failures remain deterministic retry leaves, and a nontransient
+  retry child can retire a leaf only after the complete predecessor chain is
+  revalidated. Exact-ID recovery now precedes live task-content validation;
+  after push it cannot be vetoed by a later task or lineage change, and it uses
+  a fixed generic PR title rather than live, unreviewed task content. Any other
+  malformed terminal publication or lifecycle evidence blocks a successor;
+  only a complete successfully observed terminal PR identity is settled. Task
+  reconciliation failure is tracked separately and preserves that remote proof,
+  while a failed later GitHub refresh makes stale terminal state non-authoritative.
+- Temporary remote-absence proof outages now remain typed transient outcomes:
+  retry admission advances through the deterministic lineage after recovery,
+  and exact stale-delivery recovery preserves its nonterminal identity. A
+  typed transient predecessor-record read is preserved the same way, while a
+  confirmed branch, missing/malformed record, or nontransient failure remains
+  fail-closed.
+
 ### Added
 
 - A bounded, request-free Telegram lifecycle-notice outbox that separates

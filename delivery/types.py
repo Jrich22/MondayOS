@@ -127,6 +127,13 @@ class DeliveryJob:
     retry_attempt: int = 0
     interrupted_from_phase: str = ""
     interruption_proof_sha256: str = ""
+    # A local commit is not publication authority. It is checkpointed here
+    # until the post-commit task gate promotes it to ``commit_sha``.
+    prepared_commit_sha: str = ""
+    # New workflows deliberately defer the local commit until every progress
+    # callback has run.  Legacy records default false so a publication-ready
+    # record without a commit cannot be reinterpreted as safely unpublished.
+    deferred_commit_authorization: bool = False
 
     @property
     def terminal(self) -> bool:
@@ -215,6 +222,10 @@ class DeliveryJob:
             interrupted_from_phase=str(data.get("interrupted_from_phase", "")),
             interruption_proof_sha256=str(
                 data.get("interruption_proof_sha256", "")
+            ),
+            prepared_commit_sha=str(data.get("prepared_commit_sha", "")),
+            deferred_commit_authorization=(
+                data.get("deferred_commit_authorization") is True
             ),
         )
 
