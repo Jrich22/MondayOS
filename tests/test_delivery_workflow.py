@@ -410,6 +410,9 @@ def _persist_owned_stale_delivery(
     local_commit: bool = False,
 ) -> DeliveryJob:
     """Persist a running delivery backed by a real controller-owned worktree."""
+    task_response = workflow.monday.task("get", task_id="TASK-0001")
+    assert getattr(task_response, "success", False)
+    task_data = dict(getattr(task_response, "data", {}) or {})
     base = workflow.repository.resolve_base()
     worktree = workflow.repository.create_worktree("TASK-0001", base)
     commit_sha = ""
@@ -428,7 +431,7 @@ def _persist_owned_stale_delivery(
     job = DeliveryJob(
         delivery_id=delivery_id,
         task_id="TASK-0001",
-        objective="Set VALUE to the reviewed target.",
+        objective=_objective("TASK-0001", task_data),
         repo_root=str(workflow.repository_root),
         project_name=workflow.project_name,
         expected_repository=workflow.expected_repository,
@@ -1716,7 +1719,7 @@ def test_published_retry_recovery_ignores_later_predecessor_publication(
 ) -> None:
     root, remote = _repository(tmp_path)
     github = _GitHub()
-    workflow, _ = _workflow(
+    workflow, monday = _workflow(
         root,
         builder=_Builder([_patch(1, 2)]),
         reviewer=_Reviewer([_pass()]),
@@ -1762,6 +1765,8 @@ def test_published_retry_recovery_ignores_later_predecessor_publication(
     assert durable.phase == "pushing"
     assert durable.pushed is False
     assert _git(remote, "show", f"{durable.branch}:app.py") == "VALUE = 2"
+    monday.title = "Edited only after the retry branch was pushed"
+    monday._touch()
     predecessor_published = False
 
     def publish_predecessor_during_recovery(snapshot: dict[str, Any]) -> None:
@@ -1788,6 +1793,7 @@ def test_published_retry_recovery_ignores_later_predecessor_publication(
     assert recovered.success is True
     assert recovered.status == "pr-open"
     assert recovered.pushed is True
+    assert recovered.objective == durable.objective
     assert push_calls == 1
     assert github.calls == 1
     assert _git(remote, "rev-parse", f"refs/heads/{predecessor.branch}") == (
@@ -2922,6 +2928,237 @@ def test_successor_fails_closed_on_predecessor_binding_tamper(
     assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("title", "Build an unrelated capability"),
+        ("objective", "Replace the previously accepted objective."),
+        ("acceptance_criteria", ["A different outcome is accepted"]),
+    ],
+)
+def test_successor_fails_closed_when_task_specification_changed(
+    tmp_path: Path,
+    field: str,
+    value: str | list[str],
+) -> None:
+    root, remote = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, monday = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    field_slug = field.replace("_", "-")
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id=f"delivery-chain-content-{field_slug}",
+    )
+    setattr(monday, field, value)
+    monday._touch()
+
+    with mock.patch.object(
+        workflow.repository,
+        "push",
+        wraps=workflow.repository.push,
+    ) as push:
+        successor = workflow.run(
+            task_id=predecessor.task_id,
+            delivery_id=f"{predecessor.delivery_id}-r2",
+            predecessor_delivery_id=predecessor.delivery_id,
+            retry_root_delivery_id=predecessor.delivery_id,
+            retry_attempt=2,
+        )
+
+    assert successor.status == "failed"
+    assert successor.success is False
+    assert successor.failure_class == "policy"
+    assert successor.failure_code == "task-changed"
+    assert "changed task specification" in successor.message
+    assert successor.objective != predecessor.objective
+    assert workflow.get(successor.delivery_id).to_dict() == successor.to_dict()
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+    push.assert_not_called()
+    assert _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads") == (
+        "refs/heads/main"
+    )
+
+
+def test_successor_fails_closed_on_empty_legacy_predecessor_specification(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-chain-empty-objective",
+    )
+    predecessor.objective = ""
+    workflow.store.persist(predecessor)
+
+    with mock.patch.object(
+        workflow.repository,
+        "push",
+        wraps=workflow.repository.push,
+    ) as push:
+        successor = workflow.run(
+            task_id=predecessor.task_id,
+            delivery_id=f"{predecessor.delivery_id}-r2",
+            predecessor_delivery_id=predecessor.delivery_id,
+            retry_root_delivery_id=predecessor.delivery_id,
+            retry_attempt=2,
+        )
+
+    assert successor.status == "failed"
+    assert successor.success is False
+    assert successor.failure_class == "policy"
+    assert successor.failure_code == "task-changed"
+    assert "changed task specification" in successor.message
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+    push.assert_not_called()
+
+
+def test_r3_fails_closed_when_root_predecessor_specification_changed(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, _ = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    root_predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-chain-content-root",
+    )
+    retry_two = _safe_retry_predecessor(
+        workflow,
+        delivery_id=f"{root_predecessor.delivery_id}-r2",
+        predecessor_delivery_id=root_predecessor.delivery_id,
+        retry_root_delivery_id=root_predecessor.delivery_id,
+        retry_attempt=2,
+    )
+    assert retry_two.objective == root_predecessor.objective
+    root_predecessor.objective = "tampered root specification"
+    workflow.store.persist(root_predecessor)
+
+    with mock.patch.object(
+        workflow.repository,
+        "push",
+        wraps=workflow.repository.push,
+    ) as push:
+        retry_three = workflow.run(
+            task_id=root_predecessor.task_id,
+            delivery_id=f"{root_predecessor.delivery_id}-r3",
+            predecessor_delivery_id=retry_two.delivery_id,
+            retry_root_delivery_id=root_predecessor.delivery_id,
+            retry_attempt=3,
+        )
+
+    assert retry_three.status == "failed"
+    assert retry_three.success is False
+    assert retry_three.failure_class == "policy"
+    assert retry_three.failure_code == "task-changed"
+    assert "changed task specification" in retry_three.message
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+    push.assert_not_called()
+
+
+def test_atomic_task_changed_retry_reservation_survives_crash_and_allows_fresh_request(
+    tmp_path: Path,
+) -> None:
+    root, _ = _repository(tmp_path)
+    builder = _Builder([_patch(1, 2)])
+    reviewer = _Reviewer([_pass()])
+    validator = _Validator([True])
+    github = _GitHub()
+    workflow, monday = _workflow(
+        root,
+        builder=builder,
+        reviewer=reviewer,
+        validator=validator,
+        github=github,
+    )
+    predecessor = _safe_retry_predecessor(
+        workflow,
+        delivery_id="delivery-chain-retired-content-root",
+    )
+    monday.objective = "A newly requested specification."
+    monday._touch()
+    refused_id = f"{predecessor.delivery_id}-r2"
+    original_reserve = workflow.store.reserve
+
+    def crash_after_terminal_reservation(job: DeliveryJob) -> DeliveryJob | None:
+        existing = original_reserve(job)
+        if job.delivery_id == refused_id:
+            assert existing is None
+            assert job.status == "failed"
+            assert job.failure_code == "task-changed"
+            raise SystemExit("simulated crash after terminal reservation")
+        return existing
+
+    workflow.store.reserve = crash_after_terminal_reservation  # type: ignore[method-assign]
+    with pytest.raises(SystemExit, match="after terminal reservation"):
+        workflow.run(
+            task_id=predecessor.task_id,
+            delivery_id=refused_id,
+            predecessor_delivery_id=predecessor.delivery_id,
+            retry_root_delivery_id=predecessor.delivery_id,
+            retry_attempt=2,
+        )
+    workflow.store.reserve = original_reserve  # type: ignore[method-assign]
+
+    refused = workflow.get(refused_id)
+
+    assert refused.status == "failed"
+    assert refused.phase == "failed"
+    assert refused.failure_code == "task-changed"
+    assert refused.failure_class == "policy"
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+    replayed = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id=refused_id,
+        predecessor_delivery_id=predecessor.delivery_id,
+        retry_root_delivery_id=predecessor.delivery_id,
+        retry_attempt=2,
+    )
+
+    assert replayed.to_dict() == refused.to_dict()
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 0
+
+    fresh = workflow.run(
+        task_id=predecessor.task_id,
+        delivery_id="delivery-fresh-after-content-change",
+    )
+
+    assert fresh.success is True
+    assert fresh.status == "pr-open"
+    assert fresh.predecessor_delivery_id == ""
+    assert fresh.objective == refused.objective
+    assert builder.calls == reviewer.calls == validator.calls == github.calls == 1
+
+
 def test_valid_predecessor_allows_deterministic_successor_and_survives_reload(
     tmp_path: Path,
 ) -> None:
@@ -2954,6 +3191,7 @@ def test_valid_predecessor_allows_deterministic_successor_and_survives_reload(
     assert successor.success is True
     assert successor.status == "pr-open"
     assert successor.predecessor_delivery_id == predecessor.delivery_id
+    assert successor.objective == predecessor.objective
     assert builder.calls == reviewer.calls == validator.calls == github.calls == 1
 
     replay_builder = _Builder([_patch(1, 9)])

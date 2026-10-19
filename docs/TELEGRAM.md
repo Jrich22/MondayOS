@@ -411,6 +411,16 @@ pull-request creation. An older branch that appears during the delay or build,
 any other matching live pull request regardless of its timestamps, a changed
 target, or unavailable proof stops the successor before the next irreversible
 operation.
+The same proof binds every retry generation to one nonempty canonical title,
+objective, and acceptance-criteria snapshot. If that specification changes
+during backoff, the deterministic child stops as `task-changed` before model or
+repository work, no later automatic generation is scheduled, and a new user
+request is required. The unpublished refusal retires the stale retry leaf so a
+fresh request can proceed. Its deterministic identity and complete terminal
+result are written in one reservation, preventing a worker crash from stranding
+an unclassified retry child. Recovery of an already-invoked exact identity
+remains artifact-bound and can still reconcile a branch that was pushed before
+the task changed.
 MondayOS makes at most six delivery runs over a bounded 24-hour window, using
 increasing delays and any longer controller-provided retry hint. It never starts
 a fresh identity after a remote branch, push, pull request, or uncertain

@@ -13,6 +13,10 @@ class ArtifactSecurityError(ValueError):
     """A proposed artifact violated the delivery security policy."""
 
 
+class TaskChangedError(ArtifactSecurityError):
+    """Canonical task content no longer authorizes the requested delivery."""
+
+
 def protected_path_reason(relative: str) -> str | None:
     """Return why a normalized repository path must stay outside model control.
 

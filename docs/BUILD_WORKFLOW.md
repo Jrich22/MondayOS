@@ -157,6 +157,20 @@ successor stops before push. Once the exact successor branch is pushed, opening
 or recovering its pull request is reconciliation and a later lineage change
 cannot veto it.
 
+Automatic retry authority is also bound to the complete canonical task
+specification: title, objective, and acceptance criteria. Every predecessor in
+the chain must retain a nonempty canonical specification exactly equal to the
+new successor's specification. A missing legacy value or any edit during retry
+backoff produces a durable `task-changed` policy result before builder, Git, or
+GitHub work and requires a fresh delivery request. That proven-unpublished
+policy child may retire the old retry leaf using identity-only lineage checks,
+so the content refusal cannot wedge the task; it never authorizes another
+request-free retry. A pre-reservation refusal is fully terminal before its
+delivery identity is atomically created, so a crash cannot leave a blank
+nonterminal retry child between identity reservation and failure persistence.
+Exact-ID recovery still precedes live task reads, preserving reconciliation of
+an already-pushed reviewed artifact after later task edits.
+
 A typed transient outage while proving remote-branch absence still stops the
 current attempt, but it is not converted into a permanent unsafe verdict. At
 new retry admission it produces a transient deterministic child, allowing the

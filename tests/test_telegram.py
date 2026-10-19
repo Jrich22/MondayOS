@@ -2810,6 +2810,129 @@ class TestTelegramStateAndRunner(TelegramFixture):
             f"{delivery_id}-r3",
         )
 
+    def test_task_changed_retry_stops_at_r2_and_replays_staged_outcome_once(self):
+        update_id = 844
+        root_delivery_id = self._seed_delivery_retry(update_id, now=100.0)
+        self.state.acknowledge(update_id)
+        retry_two = f"{root_delivery_id}-r2"
+        self.monday.delivery_runs[retry_two] = {
+            "delivery_id": retry_two,
+            "task_id": "TASK-0001",
+            "status": "failed",
+            "phase": "failed",
+            "success": False,
+            "branch": "",
+            "commit_sha": "",
+            "pr_url": "",
+            "pushed": False,
+            "changed_files": [],
+            "attempts": [],
+            "failure_code": "task-changed",
+            "failure_class": "policy",
+            "retry_after_seconds": 0,
+            "message": "The reviewed task changed during retry backoff.",
+        }
+
+        class FailingOutcomeClient(FakeTelegramClient):
+            fail_outcome = True
+
+            def send_message(self, chat_id, text):
+                if self.fail_outcome and (
+                    "Monday retried the delivery automatically." in text
+                ):
+                    raise TelegramAPIError("temporary outage", retryable=True)
+                return super().send_message(chat_id, text)
+
+        client = FailingOutcomeClient()
+        service = TelegramBotService(
+            self.monday,
+            client,
+            self.state,
+            self.config,
+        )
+        worker = TelegramJobWorker(
+            service,
+            self.state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        with (
+            patch("telegram_bot.service.time.time", return_value=161.0),
+            patch("telegram_bot.state.time.time", return_value=161.0),
+        ):
+            self.assertTrue(worker.run_delivery_retry_once())
+
+        staged = self.state.delivery_retry(update_id)
+        self.assertEqual(staged["delivery_id"], retry_two)
+        self.assertEqual(staged["attempt"], 2)
+        self.assertEqual(staged["outcome_phase"], "failed")
+        self.assertEqual(staged["outcome"]["failure_code"], "task-changed")
+        self.assertEqual(staged["outcome"]["failure_class"], "policy")
+        self.assertEqual(
+            [
+                kwargs["delivery_id"]
+                for action, kwargs in self.monday.build_calls
+                if action == "run"
+            ],
+            [retry_two],
+        )
+
+        client.fail_outcome = False
+        restarted_state = TelegramState(self.config.state_path)
+        restarted_service = TelegramBotService(
+            self.monday,
+            client,
+            restarted_state,
+            self.config,
+        )
+        restarted_worker = TelegramJobWorker(
+            restarted_service,
+            restarted_state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        replay_at = staged["next_attempt_at"]
+        with (
+            patch("telegram_bot.service.time.time", return_value=replay_at),
+            patch("telegram_bot.state.time.time", return_value=replay_at),
+        ):
+            self.assertTrue(restarted_worker.run_delivery_retry_once())
+
+        self.assertEqual(restarted_state.delivery_retry(update_id), {})
+        completed = restarted_state.completed_job(update_id)
+        self.assertEqual(completed["delivery_retry"]["phase"], "failed")
+        self.assertEqual(completed["delivery_retry"]["outcome_phase"], "failed")
+        self.assertEqual(completed["delivery_retry"]["delivery_id"], retry_two)
+        self.assertEqual(completed["delivery_retry"]["attempt"], 2)
+        self.assertEqual(
+            completed["delivery_retry"]["failure_code"],
+            "task-changed",
+        )
+        self.assertEqual(completed["delivery_result"]["failure_code"], "task-changed")
+        self.assertEqual(completed["delivery_result"]["failure_class"], "policy")
+        self.assertEqual(
+            [
+                kwargs["delivery_id"]
+                for action, kwargs in self.monday.build_calls
+                if action == "run"
+            ],
+            [retry_two],
+        )
+        self.assertFalse(restarted_worker.run_delivery_retry_once())
+        self.assertFalse(any(
+            kwargs.get("delivery_id") == f"{root_delivery_id}-r3"
+            for action, kwargs in self.monday.build_calls
+            if action == "run"
+        ))
+        self.assertEqual(
+            sum(
+                "Monday retried the delivery automatically." in text
+                for _chat_id, text in client.sent
+            ),
+            1,
+        )
+
     def test_delivery_retry_passes_immediate_predecessor_identity(self):
         update_id = 845
         config, root_delivery_id = self._seed_interrupted_live_build_checkpoint(

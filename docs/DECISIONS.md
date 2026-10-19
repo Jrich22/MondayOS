@@ -2001,3 +2001,84 @@ outboxes.
 - Users may miss or rarely receive a repeated intermediate message; terminal
   result and PR lifecycle truth retain restart-safe delivery independently.
 - Receipt confirmation remains required before any accepted job can execute.
+
+---
+
+## ADR-035: Automatic Delivery Retries Are Canonical-Specification-Bound
+
+**Date:** 2026-10-19
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+Automatic delivery recovery intentionally creates deterministic request-free
+successors after a transient pre-publication failure. The scheduler bound those
+successors to the same task, registered project, repository, retry root, and
+predecessor lineage. A genuinely new successor nevertheless populated its
+objective from the current live task. If the title, objective, or acceptance
+criteria changed during retry backoff, the predecessor checks still passed and
+the new live content became both the builder input and the value checked before
+publication. The retry could therefore open a pull request for a specification
+that was never part of the accepted request which authorized its root delivery.
+
+Simply treating every content mismatch as malformed lineage would stop the
+unsafe retry but also leave the original transient source as the permanent
+lineage leaf. Future explicit requests would then be forced to name that stale
+predecessor and could not safely start work for the edited specification.
+
+### Decision
+
+Every newly admitted automatic retry must match the nonempty canonical task
+specification stored by every predecessor in its complete bounded chain. The
+canonical value includes task ID, title, objective, and acceptance criteria. A
+missing legacy value or any mismatch raises the typed `TaskChangedError`, which
+persists the deterministic child as a `task-changed` policy result before any
+builder, validator, reviewer, commit, push, or GitHub call.
+
+Failures discovered before ordinary reservation are prepared completely in
+memory and passed to the identity store as their first atomic record. The store
+either creates that terminal record or returns a concurrently created exact
+identity for normal binding validation. It never first writes a blank reserved
+job and relies on a second failure checkpoint, so process death immediately
+after reservation cannot strand a nonterminal retry identity.
+
+Identity and content proofs remain separate. Normal retry admission and every
+pre-publication chain recheck require both. When durable-history evaluation
+later verifies a terminal `task-changed` child, it uses identity-only lineage
+checks plus the existing proof that the child and its predecessors stayed
+unpublished. That child may retire the stale retry leaf, allowing a new explicit
+delivery request for the edited specification, but it cannot authorize another
+request-free retry.
+
+Existing delivery identities still take the exact-ID recovery path before live
+task-content reads. If an approved branch was already pushed, later task or
+predecessor edits cannot strand pull-request reconciliation or substitute new
+content into the reviewed artifact.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Let every retry use the current task content | A request-free liveness mechanism would gain authority to implement a different specification. |
+| Compare only the immediate predecessor | A changed or malformed root could be hidden behind an otherwise matching middle generation. |
+| Classify content drift as generic artifact corruption | The refusal is an ordinary task-authority change and must safely retire the stale unpublished lineage so a fresh request can proceed. |
+| Repair missing legacy objectives from the live task | That would manufacture historical authorization from content that may have changed after the predecessor ran. |
+| Recheck live content before exact-ID recovery | A post-push task edit could strand an already-approved public branch without its pull request. |
+
+### Consequences
+
+- Editing title, objective, or acceptance criteria during retry backoff stops
+  automatic work before any model or repository side effect.
+- A crash immediately after the first retry-child reservation still leaves a
+  complete terminal `task-changed` record for idempotent replay.
+- Empty or noncanonical legacy predecessor content fails closed rather than
+  inheriting the current live specification.
+- Every generation in a multi-hop retry chain must describe the same canonical
+  specification.
+- A fresh explicit request can proceed after the durable `task-changed` refusal
+  proves the stale lineage stayed unpublished.
+- Exact-ID reconciliation retains the original reviewed specification and
+  remains available after publication even if the task later changes.
