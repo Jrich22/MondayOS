@@ -22,7 +22,17 @@ from core.vcs import RepoScope, git, scope_for
 
 def _run(cwd: Path, *args: str) -> None:
     subprocess.run(
-        ["git", *args],
+        [
+            "git",
+            # A detached automatic maintenance process can outlive `git commit`
+            # and race TemporaryDirectory cleanup on CI. These fixture repos are
+            # intentionally tiny, so maintenance and auto-gc provide no value.
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+            *args,
+        ],
         cwd=cwd,
         check=True,
         capture_output=True,
