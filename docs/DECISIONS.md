@@ -1060,8 +1060,15 @@ since publication. Legacy records do not acquire this mutation authority. A
 newer open delivery remains authoritative over every outcome from an older PR,
 including a merge. Otherwise, terminal reconciliation lets an exact reviewed
 merge complete an eligible task idempotently, while a closed or SHA-diverged PR
-returns a task still in `REVIEW` to `IN_PROGRESS`. Completed, cancelled,
-blocked, retargeted, or otherwise human-managed states are not overridden.
+returns a task still in `REVIEW` to `IN_PROGRESS`. Before either mutation, the
+observer recomputes the canonical title, objective, and acceptance criteria and
+requires exact equality with the content bound to the reviewed delivery. A
+changed or malformed specification, or a legacy record without that binding,
+settles as `state-changed` without mutating the task. Complete task revisions
+are deliberately not compared here because status, history, and work-log
+changes do not alter what the artifact was reviewed to implement. Completed,
+cancelled, blocked, retargeted, or otherwise human-managed states are not
+overridden.
 
 Observation is serialized with publication finalization by the repository
 workflow lease. Any terminal task transition is then performed under the same
@@ -1101,7 +1108,9 @@ lifecycle monitor.
 - Operators receive only bounded lifecycle/check summaries. Detailed CI
   investigation remains in GitHub.
 - MondayOS can complete or reopen its local task after verified terminal
-  evidence, but merge and deployment remain human/external actions.
+  evidence only while its canonical specification still matches the reviewed
+  delivery; post-review edits require a new delivery. Merge and deployment
+  remain human/external actions.
 
 ---
 

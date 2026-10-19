@@ -875,6 +875,28 @@ class DeliveryWorkflow:
                 )
                 return
 
+            would_mutate_task = bool(
+                (job.pr_state == "merged" and status in {"in-progress", "review"})
+                or (
+                    job.pr_state in {"closed", "diverged"}
+                    and status == "review"
+                )
+            )
+            if would_mutate_task:
+                try:
+                    current_content = _objective(job.task_id, task_data)
+                except Exception:
+                    current_content = ""
+                if not job.objective or current_content != job.objective:
+                    job.task_reconciliation = "state-changed"
+                    job.task_reconciled_at = now
+                    job.observation_message = (
+                        f"{self._observation_message(job)} The task specification "
+                        "no longer matches the reviewed delivery; no task state "
+                        "was changed."
+                    )
+                    return
+
             if job.pr_state == "merged":
                 if status == "completed":
                     job.task_reconciliation = "already-completed"
