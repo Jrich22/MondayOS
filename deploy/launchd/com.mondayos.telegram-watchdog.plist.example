@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mondayos.telegram-watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_WITH_MONDAYOS_ROOT/.venv/bin/monday</string>
+    <string>--project-root</string>
+    <string>REPLACE_WITH_MONDAYOS_ROOT</string>
+    <string>telegram</string>
+    <string>--watchdog</string>
+    <string>--json</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>REPLACE_WITH_MONDAYOS_ROOT</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- LaunchAgents do not inherit an interactive shell PATH. This contains
+         locations only, never credentials. -->
+    <key>PATH</key>
+    <string>/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>REPLACE_WITH_MONDAYOS_ROOT/logs/telegram-watchdog-stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>REPLACE_WITH_MONDAYOS_ROOT/logs/telegram-watchdog-stderr.log</string>
+</dict>
+</plist>

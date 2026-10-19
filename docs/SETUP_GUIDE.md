@@ -187,6 +187,39 @@ Logs are written to `logs/telegram-stdout.log` and
 `logs/telegram-stderr.log`. Operational queue and delivery state lives under
 `logs/telegram/` and `logs/delivery/`.
 
+Install the separate credential-free liveness watchdog after the normal daemon
+is loaded:
+
+```bash
+cp deploy/launchd/com.mondayos.telegram-watchdog.plist.example \
+  ~/Library/LaunchAgents/com.mondayos.telegram-watchdog.plist
+# Replace all five REPLACE_WITH_MONDAYOS_ROOT occurrences with the same absolute
+# repository path used by the daemon plist.
+plutil -lint ~/Library/LaunchAgents/com.mondayos.telegram-watchdog.plist
+launchctl bootstrap "gui/$(id -u)" \
+  ~/Library/LaunchAgents/com.mondayos.telegram-watchdog.plist
+launchctl print "gui/$(id -u)/com.mondayos.telegram-watchdog"
+```
+
+The watchdog runs once at load and every 60 seconds. It considers only daemon
+liveness. Restart eligibility requires a loaded service, a held worker lock,
+and a valid heartbeat with an exact `started_at` generation. A missing lock,
+missing or invalid heartbeat, or absent `started_at` fails closed for operator
+diagnosis and never triggers a restart. For an eligible stopped-daemon,
+stale-supervisor, or stuck progress-lane failure, restart requires two matching
+samples for that exact generation and unchanged progress evidence 45–150
+seconds apart. New progress or a longer sample gap starts a new evidence
+window. Before requesting `launchctl kickstart -k`, the watchdog rechecks,
+checkpoints the request, and rechecks once more; it confirms success only after
+observing a new `started_at`. Restarts have a five-minute cooldown and a maximum of three
+requests per hour. Queue pressure, pending receipt/refusal/delivery/lifecycle
+outboxes, provider availability, and live-build readiness can make `--health`
+unhealthy, but never cause this watchdog to restart the daemon.
+
+Watchdog output is written to `logs/telegram-watchdog-stdout.log` and
+`logs/telegram-watchdog-stderr.log`. The plist contains only an explicit
+`PATH`; keep tokens and keys in the Git-ignored `.env`.
+
 ## 7. Keep the Mac mini awake
 
 In **System Settings → Energy Saver**, enable the setting that prevents
@@ -206,6 +239,7 @@ its `.venv` on a locally mounted disk that is available at login.
 
 ```bash
 launchctl print "gui/$(id -u)/com.mondayos.telegram"
+launchctl print "gui/$(id -u)/com.mondayos.telegram-watchdog"
 monday telegram --health
 monday status
 monday build capabilities
@@ -214,9 +248,9 @@ tail -n 50 logs/telegram-stderr.log
 ```
 
 Then send `/status` in the allowlisted private Telegram chat. MondayOS is ready
-when `monday telegram --health` reports healthy, status responds, build
-capabilities are ready, GitHub authentication is valid, and the error log has
-no current startup loop. Monitoring systems can use
+when both LaunchAgents are loaded, `monday telegram --health` reports healthy,
+status responds, build capabilities are ready, GitHub authentication is valid,
+and the error log has no current startup loop. Monitoring systems can use
 `monday telegram --health --json`; it performs no Telegram network request and
 returns a nonzero status when configuration, the daemon supervisor heartbeat,
 the independent intake or worker progress lease, inbox capacity, required

@@ -68,7 +68,7 @@ Then send `/status` in the allowlisted private Telegram chat. Healthy means:
 - the disk has comfortable free space; and
 - Telegram responds without repeating startup or authentication errors.
 
-For a local watchdog or another monitoring process, use:
+For external monitoring or operator automation, use:
 
 ```bash
 monday telegram --health --json
@@ -83,6 +83,51 @@ live-build capabilities are not ready. A lane in `starting`, `backoff`, or
 when the supervisor still pulses. An idle worker is healthy. If the heartbeat
 is reported as legacy or invalid after an upgrade, restart the normal daemon;
 never hand-edit `logs/telegram/heartbeat.json`.
+
+## Bounded liveness watchdog
+
+The separately loaded `com.mondayos.telegram-watchdog` LaunchAgent runs this
+local, credential-free sample at load and every 60 seconds:
+
+```bash
+monday telegram --watchdog --json
+```
+
+This is deliberately narrower than `--health`. It may restart only when the
+daemon service is loaded, its worker lock is held, a valid heartbeat supplies
+an exact `started_at`, and that heartbeat reports a restartable stopped-daemon,
+stale-supervisor, or stuck progress-lane failure.
+A missing lock, missing or invalid heartbeat, or absent `started_at` is a
+fail-closed `state-unreadable` observation for operator diagnosis, not a restart
+trigger. The watchdog also does **not** restart for a full inbox, pending
+acceptance, refusal, delivery, or lifecycle outboxes, provider availability,
+or live-build readiness; those conditions require normal operator diagnosis
+rather than a process restart.
+
+Before restarting, the watchdog requires the same failure, exact daemon
+generation (the heartbeat `started_at`), and unchanged relevant progress
+evidence in two samples 45–150 seconds apart. New progress, a longer gap, or a
+backwards clock adjustment starts a new evidence window. It rechecks that
+fingerprint before and after checkpointing the restart request, then calls the
+fixed target
+`launchctl kickstart -k "gui/$(id -u)/com.mondayos.telegram"` and reports it as
+verified only after a later sample observes a new `started_at`. A restart
+request starts a five-minute cooldown, and no more than three requests are
+allowed in any hour.
+
+Inspect the service and its fixed output paths with:
+
+```bash
+launchctl print "gui/$(id -u)/com.mondayos.telegram-watchdog"
+tail -n 50 logs/telegram-watchdog-stdout.log
+tail -n 50 logs/telegram-watchdog-stderr.log
+```
+
+The durable debounce and restart checkpoint is
+`logs/telegram/watchdog.json`. Do not hand-edit or delete it to bypass a
+cooldown or exhausted hourly budget. If the watchdog reports
+`service-not-loaded`, load the normal daemon; it intentionally does not
+bootstrap a missing service.
 
 Use `monday build history --limit 20` to review recent deliveries. For a known
 delivery ID:
@@ -144,28 +189,39 @@ retryable request-free message is unresolved.
 
 ## Logs and safe rotation
 
-Current process output is in:
+Current daemon and watchdog output is in:
 
 - `logs/telegram-stdout.log`
 - `logs/telegram-stderr.log`
+- `logs/telegram-watchdog-stdout.log`
+- `logs/telegram-watchdog-stderr.log`
 
 Queue state and delivery records are in `logs/telegram/` and `logs/delivery/`.
 Those directories are operational state, not disposable logs.
 
-Rotate only the two top-level output logs. Stop the service first so the worker
-does not keep writing through an old file descriptor:
+Rotate only these four top-level output logs. Stop the watchdog first and then
+the daemon so neither process keeps writing through an old file descriptor:
 
 ```bash
+launchctl bootout "gui/$(id -u)" \
+  ~/Library/LaunchAgents/com.mondayos.telegram-watchdog.plist
 launchctl bootout "gui/$(id -u)" \
   ~/Library/LaunchAgents/com.mondayos.telegram.plist
 mv logs/telegram-stdout.log "logs/telegram-stdout.$(date +%Y%m%d-%H%M%S).log"
 mv logs/telegram-stderr.log "logs/telegram-stderr.$(date +%Y%m%d-%H%M%S).log"
-touch logs/telegram-stdout.log logs/telegram-stderr.log
+mv logs/telegram-watchdog-stdout.log \
+  "logs/telegram-watchdog-stdout.$(date +%Y%m%d-%H%M%S).log"
+mv logs/telegram-watchdog-stderr.log \
+  "logs/telegram-watchdog-stderr.$(date +%Y%m%d-%H%M%S).log"
+touch logs/telegram-stdout.log logs/telegram-stderr.log \
+  logs/telegram-watchdog-stdout.log logs/telegram-watchdog-stderr.log
 launchctl bootstrap "gui/$(id -u)" \
   ~/Library/LaunchAgents/com.mondayos.telegram.plist
+launchctl bootstrap "gui/$(id -u)" \
+  ~/Library/LaunchAgents/com.mondayos.telegram-watchdog.plist
 ```
 
-If either current log does not exist, skip its `mv`; launchd creates it on the
+If any current log does not exist, skip its `mv`; launchd creates it on the
 next start. Compress reviewed historical output logs and retain them according
 to the operator's incident policy. Never rotate, truncate, or remove
 `logs/telegram/state.json`, `logs/delivery/`, or an active delivery worktree.
