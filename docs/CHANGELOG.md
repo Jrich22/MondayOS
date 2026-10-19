@@ -11,6 +11,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- After a Telegram live-build request has passed its durable acceptance-receipt
+  gate, its starting, phase-progress, and nonterminal reconciliation messages
+  are now best-effort. Retryable, rate-limit, or permanent Telegram delivery
+  failures cannot delay, abort, or dead-letter the accepted exact build;
+  deduplication advances only after a confirmed send, while terminal results
+  and PR lifecycle truth remain on their durable request-free outboxes.
 - Temporary Git repositories used by repository-boundary tests now disable
   detached automatic maintenance and auto-garbage-collection. This removes a
   cross-version CI teardown race in which Git could keep writing inside

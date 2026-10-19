@@ -187,6 +187,14 @@ destination can discard its message, but the exact PR watcher still reconciles
 verified merge, closure, or divergence state. Health remains nonzero while a
 retryable request-free message is unresolved.
 
+Starting, phase-progress, and still-running live-build messages after the
+accepted-job receipt are best-effort rather than outboxed. If one is absent,
+do not resend the build request: Monday continues the same deterministic
+delivery locally, and `/status TASK-ID` or delivery history remains the source
+for diagnosis. A later phase can appear without an earlier courtesy message;
+the terminal result and PR lifecycle notifications still use their durable
+outboxes.
+
 ## Logs and safe rotation
 
 Current daemon and watchdog output is in:

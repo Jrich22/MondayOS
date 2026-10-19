@@ -985,11 +985,11 @@ class TelegramBotService:
             return
         job = self._state.job(update_id)
         if not bool(job.get("live_started_announced")):
-            self._client.send_message(
+            if self._send_live_status(
                 chat_id,
                 f"Created {task_id}. Monday is starting its live build now.",
-            )
-            self._state.set_job(update_id, live_started_announced=True)
+            ):
+                self._state.set_job(update_id, live_started_announced=True)
         self._run_live_build(update_id, chat_id, task_id)
 
     def _deliver_existing(self, update_id: int, chat_id: int, task_id: str) -> None:
@@ -1020,11 +1020,11 @@ class TelegramBotService:
             project_name=project_name,
         )
         if not bool(job.get("live_started_announced")):
-            self._client.send_message(
+            if self._send_live_status(
                 chat_id,
                 f"Monday is starting a live build for {task_id}.",
-            )
-            self._state.set_job(update_id, live_started_announced=True)
+            ):
+                self._state.set_job(update_id, live_started_announced=True)
         self._run_live_build(update_id, chat_id, task_id)
 
     def _run_live_build(self, update_id: int, chat_id: int, task_id: str) -> None:
@@ -1146,8 +1146,8 @@ class TelegramBotService:
             self._state.job(update_id).get("last_delivery_progress_text") or ""
         )
         if text and text != prior:
-            self._client.send_message(chat_id, text)
-            self._state.set_job(update_id, last_delivery_progress_text=text)
+            if self._send_live_status(chat_id, text):
+                self._state.set_job(update_id, last_delivery_progress_text=text)
         raise TelegramUpdatePendingError(
             f"Telegram update {update_id} live delivery is still in progress"
         )
@@ -1267,8 +1267,22 @@ class TelegramBotService:
         )
         if not text or text == str(prior.get("last_delivery_progress_text") or ""):
             return
-        self._client.send_message(chat_id, text)
-        self._state.set_job(update_id, last_delivery_progress_text=text)
+        if self._send_live_status(chat_id, text):
+            self._state.set_job(update_id, last_delivery_progress_text=text)
+
+    def _send_live_status(self, chat_id: int, text: str) -> bool:
+        """Best-effort a nonterminal status after durable request acceptance.
+
+        The accepted build and its exact delivery identity are authoritative.
+        A courtesy-status outage must not abort that work or turn it into a
+        poison Telegram job. Terminal results use the durable delivery outbox
+        instead and never pass through this helper.
+        """
+        try:
+            self._client.send_message(chat_id, text)
+        except TelegramAPIError:
+            return False
+        return True
 
     def _retry_delivery_progress(self, event: Any) -> None:
         """Renew a retry build lease without recreating its acknowledged job."""

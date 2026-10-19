@@ -451,6 +451,14 @@ Monday/model jobs, including `Monday.build()`, so build concurrency remains one
 even while intake stays responsive. Unauthorized and otherwise ignored content
 is not queued.
 
+After the receipt gate, live-build starting, phase-progress, and still-running
+messages are best-effort status only. Telegram API failures at those sends do
+not escape into the build callback, replace the delivery's pending state, or
+dead-letter the accepted job. The bounded delivery snapshot is saved before a
+progress send, and a status deduplication marker advances only after Telegram
+confirms the message. Terminal results, retry scheduling, and PR lifecycle
+changes continue through their durable request-free outboxes.
+
 Queued, running, waiting, and retrying work is recovered after restart with
 stable Telegram job, task, run, and delivery identities. Unexpected poison work
 is bounded to three handler attempts. A controller-classified transient failure

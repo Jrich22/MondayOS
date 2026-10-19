@@ -204,7 +204,9 @@ a live build opens a PR, request-free follow-up state survives restarts and
 reports meaningful GitHub check, merge, closure, or head-divergence changes.
 PR observation and task reconciliation continue independently when Telegram is
 rate-limited, blocked, or no longer allowlisted; message retries use their own
-bounded request-free outbox.
+bounded request-free outbox. After receipt confirmation, live-build starting
+and progress messages are best-effort and cannot cancel the accepted exact
+delivery.
 
 ---
 

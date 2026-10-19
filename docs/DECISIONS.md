@@ -1928,3 +1928,76 @@ directory, explicit `PATH`, and fixed output paths, but no credentials and no
   persistently failing service for operator inspection instead of looping.
 - Operators still use `--health` for full readiness and must resolve queue,
   outbox, provider, and build-capability incidents directly.
+
+---
+
+## ADR-034: Accepted Live Builds Do Not Depend on Courtesy-Status Delivery
+
+**Date:** 2026-10-19
+
+**Status:** Accepted
+
+**Deciders:** Product Owner, MondayOS
+
+### Context
+
+The durable Telegram acceptance receipt correctly prevents a worker from
+claiming work until the user has been told that Monday saved it. After that
+gate, however, the live-build handler still synchronously sent a starting
+message, each phase update, and a still-running reconciliation message. A
+Telegram API error from any of those informational sends escaped through the
+handler. A retryable error could hold the FIFO head, a permanent error could
+dead-letter an accepted job before its build ran, and a progress-callback error
+could abort the delivery controller itself. A pending-message error could also
+replace the typed pending result for an exact build already running.
+
+These messages are useful visibility, but they are not authorization or
+delivery truth. The accepted task, deterministic delivery identity, bounded
+progress snapshot, terminal delivery result, and verified PR lifecycle are the
+authoritative state.
+
+### Decision
+
+After the acceptance receipt is durably confirmed, only live-build starting,
+phase-progress, and nonterminal reconciliation messages use a best-effort send
+boundary. Retryable, rate-limit, and permanent `TelegramAPIError` outcomes are
+discarded without retaining their diagnostic text, and the same accepted exact
+delivery continues. A nonterminal result always returns the typed pending
+outcome even when its status message could not be sent.
+
+The controller saves each bounded progress or delivery snapshot before the
+send. `live_started_announced` and `last_delivery_progress_text` advance only
+after Telegram confirms delivery, so a later exact reconciliation can retry a
+missed fixed message. A crash at the remote/local checkpoint may still repeat a
+courtesy message. Those messages intentionally have no outbox and can also be
+skipped during an outage.
+
+The boundary catches only sanitized Telegram API failures. Unexpected program,
+state, or custom-client exceptions retain the worker's bounded poison-retry
+behavior instead of being hidden. Acceptance receipts remain a hard execution
+gate. Task creation errors, delivery identity validation, terminal results,
+automatic retry scheduling, and PR observation remain fail-closed. Terminal,
+retry-scheduled, and lifecycle messages keep their bounded request-free durable
+outboxes.
+
+### Alternatives Considered
+
+| Alternative | Reason Not Chosen |
+|---|---|
+| Keep propagating every Telegram send failure | Transport availability could delay, abort, or dead-letter work that was already accepted locally. |
+| Change the worker's global Telegram error policy | Receipt delivery, command replies, terminal outboxes, and build status have different authority and durability requirements. |
+| Outbox every phase update | Progress is high-volume, supersedable visibility; persisting every phase would add state pressure without improving delivery truth. |
+| Catch every exception around the client | Programming and state defects would be hidden and could silently corrupt execution behavior. |
+| Mark a message announced before sending | A transient failure would permanently suppress the only later attempt even though Telegram never confirmed it. |
+
+### Consequences
+
+- An accepted live build continues with the same task and delivery identity
+  through Telegram outages, rate limits, blocked bots, or deleted chats.
+- Courtesy-message availability cannot occupy the FIFO, abort a progress
+  callback, or convert a still-running delivery into a poison job.
+- Durable progress remains observable locally even when its Telegram rendering
+  is absent, and raw transport diagnostics never enter state.
+- Users may miss or rarely receive a repeated intermediate message; terminal
+  result and PR lifecycle truth retain restart-safe delivery independently.
+- Receipt confirmation remains required before any accepted job can execute.
