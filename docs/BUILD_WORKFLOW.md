@@ -291,8 +291,14 @@ PR, merges, or deploys.
 If a newer PR-backed delivery exists for the same task, any terminal outcome for
 an older PR is recorded but does not change the task underneath the newer work.
 Otherwise, a verified merge of an exact reviewed head completes an eligible task
-idempotently. Completed, cancelled, blocked, retargeted, and otherwise
-human-managed task states are not overridden by the observer.
+idempotently, and a verified close or divergence can reopen a task still in
+`REVIEW`. Before either mutation, the observer requires the task's current
+canonical title, objective, and acceptance criteria to exactly equal the input
+bound to the reviewed delivery. A changed or malformed specification, or a
+legacy delivery without that canonical binding, records `state-changed` and
+leaves the task untouched. Status, history, and work-log changes alone do not
+invalidate this content check. Completed, cancelled, blocked, retargeted, and
+otherwise human-managed task states are not overridden by the observer.
 
 ## Validation containment
 

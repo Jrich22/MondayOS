@@ -25,7 +25,7 @@ from delivery.github import PullRequestResult
 from delivery.security import ArtifactSecurityError
 from delivery.types import DeliveryJob
 from delivery.validation import MondayValidationRunner, ValidationResult
-from delivery.workflow import DeliveryWorkflow
+from delivery.workflow import DeliveryWorkflow, _objective
 from tasks import TaskManager, TaskPriority, TaskStatus, TaskType
 
 
@@ -522,10 +522,13 @@ def _miss_initial_delivery_lookup(workflow: DeliveryWorkflow) -> Any:
 
 def _observable_delivery(workflow: DeliveryWorkflow, root: Path) -> DeliveryJob:
     metadata = root.resolve().stat()
+    task = workflow.monday.task("get", task_id="TASK-0001")
+    assert getattr(task, "success", False)
+    task_data = dict(getattr(task, "data", {}) or {})
     job = DeliveryJob(
         delivery_id="delivery-observe-1",
         task_id="TASK-0001",
-        objective="Set VALUE to the reviewed target.",
+        objective=_objective("TASK-0001", task_data),
         repo_root=str(root.resolve()),
         status="pr-open",
         phase="completed",
@@ -663,6 +666,116 @@ def test_observe_verified_merge_completes_task_exactly_once(tmp_path: Path) -> N
     assert second.task_reconciliation == "already-completed"
     assert monday.status == "completed"
     assert monday.calls.count("complete") == 1
+
+
+@pytest.mark.parametrize("lifecycle", ["merged", "closed", "diverged"])
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("title", "A different reviewed outcome"),
+        ("objective", "Implement a different specification."),
+        ("acceptance_criteria", ["a different result is required"]),
+    ],
+)
+def test_observe_terminal_pr_refuses_changed_task_specification(
+    tmp_path: Path,
+    lifecycle: str,
+    field: str,
+    replacement: object,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(
+        lifecycle=lifecycle,
+        checks="passed" if lifecycle == "merged" else "failed",
+        merge_commit_sha="4" * 40 if lifecycle == "merged" else "",
+    )
+    monday = _Monday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    setattr(monday, field, replacement)
+
+    observed = workflow.observe(job.delivery_id)
+
+    assert observed.pr_state == lifecycle
+    assert observed.task_reconciliation == "state-changed"
+    assert observed.task_reconciled_at
+    assert "no task state was changed" in observed.observation_message
+    assert monday.status == "review"
+    assert monday.calls.count("complete") == 0
+    assert monday.calls.count("start") == 0
+
+
+@pytest.mark.parametrize("lifecycle", ["merged", "closed", "diverged"])
+def test_observe_terminal_pr_refuses_legacy_unbound_task_content(
+    tmp_path: Path,
+    lifecycle: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(
+        lifecycle=lifecycle,
+        checks="passed" if lifecycle == "merged" else "failed",
+        merge_commit_sha="4" * 40 if lifecycle == "merged" else "",
+    )
+    monday = _Monday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    job.objective = ""
+    workflow.store.persist(job)
+
+    observed = workflow.observe(job.delivery_id)
+
+    assert observed.task_reconciliation == "state-changed"
+    assert monday.status == "review"
+    assert monday.calls.count("complete") == 0
+    assert monday.calls.count("start") == 0
+
+
+@pytest.mark.parametrize("lifecycle", ["merged", "closed"])
+def test_observe_terminal_pr_fails_closed_on_unparseable_task_content(
+    tmp_path: Path,
+    lifecycle: str,
+) -> None:
+    root, _ = _repository(tmp_path)
+    github = _ObserverGitHub(
+        lifecycle=lifecycle,
+        checks="passed" if lifecycle == "merged" else "failed",
+        merge_commit_sha="4" * 40 if lifecycle == "merged" else "",
+    )
+    monday = _Monday()
+    monday.status = "review"
+    workflow, _ = _workflow(
+        root,
+        builder=_Builder([_patch(1, 2)]),
+        reviewer=_Reviewer([_pass()]),
+        validator=_Validator([True]),
+        github=github,
+        monday=monday,
+    )
+    job = _observable_delivery(workflow, root)
+    monday.acceptance_criteria = None  # type: ignore[assignment]
+
+    observed = workflow.observe(job.delivery_id)
+
+    assert observed.task_reconciliation == "state-changed"
+    assert monday.status == "review"
+    assert monday.calls.count("complete") == 0
+    assert monday.calls.count("start") == 0
 
 
 @pytest.mark.parametrize("lifecycle", ["merged", "closed"])

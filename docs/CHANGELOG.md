@@ -11,6 +11,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Terminal pull-request reconciliation now revalidates the task's exact
+  canonical title, objective, and acceptance criteria before completing or
+  reopening it. A post-review specification edit, malformed task payload, or
+  legacy delivery without canonical task content records `state-changed` and
+  leaves the task untouched, while ordinary status and work-log changes remain
+  eligible because they do not alter the reviewed specification.
 - Autonomous builds now admit only `backlog`, `assigned`, or `in-progress`
   tasks. Under the task lock, Monday freshly revalidates the target and exact
   canonical title, objective, and acceptance criteria immediately before start,
