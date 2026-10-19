@@ -11,6 +11,10 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Temporary Git repositories used by repository-boundary tests now disable
+  detached automatic maintenance and auto-garbage-collection. This removes a
+  cross-version CI teardown race in which Git could keep writing inside
+  `.git` after a fixture command returned.
 - Terminal pull-request reconciliation now revalidates the task's exact
   canonical title, objective, and acceptance criteria before completing or
   reopening it. A post-review specification edit, malformed task payload, or
