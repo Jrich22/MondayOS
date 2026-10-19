@@ -12,6 +12,10 @@ outbound long polling, so it does not open a public port or require a tunnel.
 - With live builds enabled, edits an isolated worktree, validates, automatically
   repairs, requires ChatGPT approval of the exact artifact, and opens a PR.
 - Reports team/build progress back to the originating chat.
+- Once a live-build request's acceptance receipt is confirmed, its starting,
+  phase, and still-running messages are informational and best-effort. A
+  Telegram outage cannot stop or dead-letter the accepted exact delivery;
+  confirmed sends alone advance their low-noise deduplication markers.
 - Automatically retries a live build when the delivery controller explicitly
   classifies a pre-publication model or tool failure as temporary. Delayed
   retries are request-free, survive restarts, and do not block newer requests.
@@ -57,6 +61,14 @@ update retention—is the source of truth for pending work. Receipt sends are
 at-least-once: a crash after Telegram accepts the message but before the local
 checkpoint can produce the same fixed receipt twice, while the job still runs
 only once.
+
+After that receipt is durably confirmed, live-build starting, phase-progress,
+and nonterminal reconciliation messages never govern execution. They may be
+skipped during a Telegram outage or repeated after an uncheckpointed remote
+send, but the task and deterministic delivery identity continue locally.
+Terminal build results, scheduled-retry notices, and PR lifecycle changes are
+not best-effort: they retain their bounded request-free outboxes and independent
+retry policy.
 
 ## Create the bot
 

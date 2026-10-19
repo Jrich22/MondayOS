@@ -652,6 +652,7 @@ class TestTelegramService(TelegramFixture):
         self.assertRegex(request["delivery_id"], r"^delivery-telegram-[0-9a-f]{20}$")
         job = self.state.completed_job(10)
         self.assertEqual(job["workflow"], "live-build")
+        self.assertTrue(job["live_started_announced"])
         self.assertEqual(job["delivery_id"], request["delivery_id"])
         self.assertEqual(job["delivery_status"], "pr-open")
         self.assertEqual(job["delivery_progress"]["phase"], "pushing")
@@ -1407,6 +1408,25 @@ class TestTelegramStateAndRunner(TelegramFixture):
         notice = self.state.acceptance_receipt_notice(update_id)
         self.assertEqual(notice.get("job_id"), f"JOB-{update_id}")
         self.state.complete_acceptance_receipt(update_id, delivered=True)
+
+    def _worker_for_accepted_update(
+        self,
+        *,
+        state: TelegramState,
+        service: TelegramBotService,
+        update: dict,
+    ) -> TelegramJobWorker:
+        normalized = service.normalize_update(update)
+        self.assertIsNotNone(normalized)
+        update_id = int(update["update_id"])
+        state.enqueue(update_id, normalized)
+        state.complete_acceptance_receipt(update_id, delivered=True)
+        return TelegramJobWorker(
+            service,
+            state,
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
 
     def _seed_pr_lifecycle_source(
         self,
@@ -8533,6 +8553,368 @@ class TestTelegramStateAndRunner(TelegramFixture):
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(self.state.job(100)["phase"], "queued")
+
+    def test_accepted_live_build_ignores_start_notice_api_failures(self):
+        error_factories = (
+            (
+                "retryable",
+                lambda: TelegramAPIError(
+                    "START-NOTICE-SECRET-retryable",
+                    retryable=True,
+                ),
+            ),
+            ("rate-limit", lambda: TelegramRateLimitError(17)),
+            (
+                "permanent",
+                lambda: TelegramAPIError(
+                    "START-NOTICE-SECRET-permanent",
+                    retryable=False,
+                ),
+            ),
+        )
+
+        for command in ("build", "deliver"):
+            for index, (label, error_factory) in enumerate(error_factories, start=1):
+                with self.subTest(command=command, failure=label):
+                    update_id = (100 if command == "build" else 200) + index
+                    state_path = self.root / f"start-{command}-{label}.json"
+                    state = TelegramState(state_path)
+                    monday = FakeMonday()
+                    if command == "deliver":
+                        created = monday.task(
+                            "create",
+                            title="Existing",
+                            objective="Ship it",
+                            priority="P2",
+                        )
+                        text = f"/deliver {created.task_id}"
+                    else:
+                        text = "/build Ship the accepted request"
+
+                    class FailingStartClient(FakeTelegramClient):
+                        def __init__(self, failure_factory):
+                            super().__init__()
+                            self.failure_factory = failure_factory
+                            self.start_attempts = 0
+
+                        def send_message(self, chat_id, message):
+                            if "starting" in message:
+                                self.start_attempts += 1
+                                raise self.failure_factory()
+                            return super().send_message(chat_id, message)
+
+                    client = FailingStartClient(error_factory)
+                    config = TelegramConfig(
+                        token=_fake_token(),
+                        allowed_user_ids=frozenset({7}),
+                        project_root=self.root,
+                        live_build=True,
+                    )
+                    service = TelegramBotService(monday, client, state, config)
+                    service.bind_bot_identity(client.get_me())
+                    worker = self._worker_for_accepted_update(
+                        state=state,
+                        service=service,
+                        update=_update(update_id=update_id, text=text),
+                    )
+
+                    self.assertTrue(worker.run_once())
+
+                    completed = state.completed_job(update_id)
+                    self.assertEqual(client.start_attempts, 1)
+                    self.assertEqual(monday.build_executions, 1)
+                    self.assertEqual(len(monday.build_calls), 1)
+                    self.assertEqual(completed["phase"], "completed")
+                    self.assertEqual(completed["delivery_status"], "pr-open")
+                    self.assertFalse(bool(completed.get("live_started_announced")))
+                    self.assertNotIn("attempt_count", completed)
+                    self.assertEqual(state.pending_count, 0)
+                    self.assertEqual(state.pending_delivery_notice_count, 1)
+                    self.assertEqual(completed["follow_up"]["phase"], "pending")
+                    self.assertNotIn(
+                        "START-NOTICE-SECRET",
+                        state_path.read_text(encoding="utf-8"),
+                    )
+
+                    build_count = monday.build_executions
+                    self.assertTrue(worker.run_delivery_notice_once())
+                    self.assertEqual(monday.build_executions, build_count)
+                    self.assertEqual(state.pending_delivery_notice_count, 0)
+                    self.assertTrue(
+                        state.completed_job(update_id)["delivery_final_sent"]
+                    )
+
+    def test_accepted_live_build_ignores_progress_notice_api_failures(self):
+        error_factories = (
+            (
+                "retryable",
+                lambda: TelegramAPIError(
+                    "PROGRESS-NOTICE-SECRET-retryable",
+                    retryable=True,
+                ),
+            ),
+            ("rate-limit", lambda: TelegramRateLimitError(19)),
+            (
+                "permanent",
+                lambda: TelegramAPIError(
+                    "PROGRESS-NOTICE-SECRET-permanent",
+                    retryable=False,
+                ),
+            ),
+        )
+
+        for index, (label, error_factory) in enumerate(error_factories, start=1):
+            with self.subTest(failure=label):
+                update_id = 300 + index
+                state_path = self.root / f"progress-{label}.json"
+                state = TelegramState(state_path)
+                monday = FakeMonday()
+
+                class FailingProgressClient(FakeTelegramClient):
+                    def __init__(self, failure_factory):
+                        super().__init__()
+                        self.failure_factory = failure_factory
+                        self.progress_attempts = 0
+
+                    def send_message(self, chat_id, message):
+                        if message == "Monday prepared an isolated build workspace.":
+                            self.progress_attempts += 1
+                            raise self.failure_factory()
+                        return super().send_message(chat_id, message)
+
+                client = FailingProgressClient(error_factory)
+                config = TelegramConfig(
+                    token=_fake_token(),
+                    allowed_user_ids=frozenset({7}),
+                    project_root=self.root,
+                    live_build=True,
+                )
+                service = TelegramBotService(monday, client, state, config)
+                service.bind_bot_identity(client.get_me())
+                worker = self._worker_for_accepted_update(
+                    state=state,
+                    service=service,
+                    update=_update(
+                        update_id=update_id,
+                        text="/build Keep building after progress send failure",
+                    ),
+                )
+
+                self.assertTrue(worker.run_once())
+
+                completed = state.completed_job(update_id)
+                self.assertEqual(client.progress_attempts, 1)
+                self.assertEqual(monday.build_executions, 1)
+                self.assertEqual(completed["delivery_progress"]["phase"], "pushing")
+                self.assertEqual(completed["delivery_status"], "pr-open")
+                self.assertNotIn("attempt_count", completed)
+                self.assertEqual(state.pending_delivery_notice_count, 1)
+                self.assertNotIn(
+                    "PROGRESS-NOTICE-SECRET",
+                    state_path.read_text(encoding="utf-8"),
+                )
+
+    def test_courtesy_send_failure_does_not_block_the_next_accepted_job(self):
+        state = TelegramState(self.root / "courtesy-fifo.json")
+        monday = FakeMonday()
+
+        class FirstStartFailsClient(FakeTelegramClient):
+            def send_message(self, chat_id, message):
+                if "Created TASK-0001" in message and "starting" in message:
+                    raise TelegramAPIError("chat unavailable", retryable=False)
+                return super().send_message(chat_id, message)
+
+        client = FirstStartFailsClient()
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(monday, client, state, config)
+        service.bind_bot_identity(client.get_me())
+        worker = self._worker_for_accepted_update(
+            state=state,
+            service=service,
+            update=_update(update_id=351, text="/build First accepted build"),
+        )
+        second = _update(update_id=352, text="/build Second accepted build")
+        normalized = service.normalize_update(second)
+        self.assertIsNotNone(normalized)
+        state.enqueue(352, normalized)
+        state.complete_acceptance_receipt(352, delivered=True)
+
+        self.assertTrue(worker.run_once())
+        self.assertTrue(worker.run_once())
+
+        self.assertEqual(monday.build_executions, 2)
+        self.assertEqual(state.pending_count, 0)
+        self.assertEqual(state.completed_job(351)["delivery_status"], "pr-open")
+        self.assertEqual(state.completed_job(352)["delivery_status"], "pr-open")
+        self.assertEqual(state.pending_delivery_notice_count, 2)
+
+    def test_pending_live_build_notice_failures_preserve_exact_reconciliation(self):
+        error_factories = (
+            (
+                "retryable",
+                lambda: TelegramAPIError(
+                    "PENDING-NOTICE-SECRET-retryable",
+                    retryable=True,
+                ),
+            ),
+            ("rate-limit", lambda: TelegramRateLimitError(23)),
+            (
+                "permanent",
+                lambda: TelegramAPIError(
+                    "PENDING-NOTICE-SECRET-permanent",
+                    retryable=False,
+                ),
+            ),
+        )
+
+        for index, (label, error_factory) in enumerate(error_factories, start=1):
+            with self.subTest(failure=label):
+                update_id = 400 + index
+                state_path = self.root / f"pending-{label}.json"
+                state = TelegramState(state_path)
+                monday = FakeMonday()
+                created = monday.task(
+                    "create",
+                    title="Existing",
+                    objective="Ship it",
+                    priority="P2",
+                )
+
+                class FailingPendingClient(FakeTelegramClient):
+                    def __init__(self, failure_factory):
+                        super().__init__()
+                        self.failure_factory = failure_factory
+                        self.failure_enabled = True
+                        self.pending_attempts = 0
+
+                    def send_message(self, chat_id, message):
+                        if message == "Monday is validating the build.":
+                            self.pending_attempts += 1
+                            if self.failure_enabled:
+                                raise self.failure_factory()
+                        return super().send_message(chat_id, message)
+
+                client = FailingPendingClient(error_factory)
+                config = TelegramConfig(
+                    token=_fake_token(),
+                    allowed_user_ids=frozenset({7}),
+                    project_root=self.root,
+                    live_build=True,
+                )
+                service = TelegramBotService(monday, client, state, config)
+                service.bind_bot_identity(client.get_me())
+                update = _update(
+                    update_id=update_id,
+                    text=f"/deliver {created.task_id}",
+                )
+                delivery_id = service._delivery_id(update_id)
+                monday.delivery_runs[delivery_id] = {
+                    "delivery_id": delivery_id,
+                    "task_id": created.task_id,
+                    "status": "running",
+                    "phase": "validating",
+                    "success": False,
+                    "branch": "codex/task-0001-12345678",
+                    "commit_sha": "",
+                    "pr_url": "",
+                    "changed_files": ["app.py"],
+                    "attempts": [{"number": 1, "status": "validating"}],
+                    "message": "Validation is still running.",
+                }
+                worker = self._worker_for_accepted_update(
+                    state=state,
+                    service=service,
+                    update=update,
+                )
+
+                with self.assertRaises(TelegramUpdatePendingError):
+                    worker.run_once()
+
+                pending = state.job(update_id)
+                self.assertEqual(pending["phase"], "waiting")
+                self.assertEqual(pending["delivery_id"], delivery_id)
+                self.assertNotIn("last_delivery_progress_text", pending)
+                self.assertNotIn("attempt_count", pending)
+                self.assertEqual(client.pending_attempts, 1)
+                self.assertNotIn(
+                    "PENDING-NOTICE-SECRET",
+                    state_path.read_text(encoding="utf-8"),
+                )
+
+                client.failure_enabled = False
+                with self.assertRaises(TelegramUpdatePendingError):
+                    worker.run_once()
+                checkpointed = state.job(update_id)
+                self.assertEqual(
+                    checkpointed["last_delivery_progress_text"],
+                    "Monday is validating the build.",
+                )
+                self.assertEqual(client.pending_attempts, 2)
+                sent_before = len(client.sent)
+
+                with self.assertRaises(TelegramUpdatePendingError):
+                    worker.run_once()
+                self.assertEqual(client.pending_attempts, 2)
+                self.assertEqual(len(client.sent), sent_before)
+
+                monday.delivery_runs[delivery_id].update({
+                    "status": "pr-open",
+                    "phase": "completed",
+                    "success": True,
+                    "commit_sha": "a" * 40,
+                    "pr_url": "https://github.com/example/mondayos/pull/55",
+                    "message": "Pull request opened.",
+                })
+                self.assertTrue(worker.run_once())
+
+                self.assertEqual(len(monday.build_calls), 4)
+                self.assertEqual(
+                    {call[1]["delivery_id"] for call in monday.build_calls},
+                    {delivery_id},
+                )
+                self.assertEqual(
+                    state.completed_job(update_id)["delivery_status"],
+                    "pr-open",
+                )
+                self.assertEqual(state.pending_delivery_notice_count, 1)
+
+    def test_non_telegram_start_notice_error_remains_retryable_failure(self):
+        update_id = 500
+        state = TelegramState(self.root / "non-telegram-start-error.json")
+        monday = FakeMonday()
+
+        class BrokenClient(FakeTelegramClient):
+            def send_message(self, chat_id, message):
+                if "starting" in message:
+                    raise RuntimeError("programming failure")
+                return super().send_message(chat_id, message)
+
+        client = BrokenClient()
+        config = TelegramConfig(
+            token=_fake_token(),
+            allowed_user_ids=frozenset({7}),
+            project_root=self.root,
+            live_build=True,
+        )
+        service = TelegramBotService(monday, client, state, config)
+        service.bind_bot_identity(client.get_me())
+        worker = self._worker_for_accepted_update(
+            state=state,
+            service=service,
+            update=_update(update_id=update_id, text="/build Expose code defects"),
+        )
+
+        with self.assertRaises(TelegramUpdateRetryError):
+            worker.run_once()
+
+        self.assertEqual(monday.build_executions, 0)
+        self.assertEqual(state.job(update_id)["phase"], "retrying")
+        self.assertEqual(state.job(update_id)["attempt_count"], 1)
 
     def test_nonterminal_live_build_remains_pending_until_runner_reconciles_it(self):
         created = self.monday.task(
